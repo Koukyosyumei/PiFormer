@@ -1,0 +1,180 @@
+  ---
+  PiFormer: Implementation Plan
+
+  Goal
+
+  Prove correct inference of a ZK-friendly linear transformer in SNARK, with:
+  - A Python/PyTorch training pipeline for the custom model
+  - A Rust prover/verifier built on top of Jolt's infrastructure
+
+  ---
+  Core Ideas (from IDEA.md + extensions)
+
+  1. Linear Attention (replaces Softmax)
+
+  Standard: Attention(Q,K,V) = softmax(QK^T/√d) V — expensive in circuits (exp, division, normalization)
+
+  ZK-friendly: Attention(Q,K,V) = φ(Q)(φ(K)^T V)
+
+  This avoids the softmax row-wise normalization and makes the computation associative, reducing from O(n²d) to O(nd²) — and more importantly, each operation is
+  a polynomial/lookup.
+
+  2. Structured Lookup Activation φ (Lasso-amenable)
+
+  The kernel function φ is implemented as a learnable, additively decomposed lookup table:
+
+  φ(x) = Σ_i table_i[x mod 2^(bits/c)]
+
+  - Decomposes a 16-bit input into c=2 sub-tables of 256 entries each
+  - This matches Jolt's Lasso lookup argument structure: O(c · n^(1/c)) commitment size
+  - Tables are learned during training and frozen for proving
+
+  3. Power-of-Two Linformer Projection
+
+  Restrict projection matrices E, F to entries in {0, 1, -1, 2, 4, 8, ...}:
+  - Matrix-vector products become shift-and-add, not general multiplications
+  - In the circuit: multiply by 2^k = left-shift → no general field multiplication needed
+  - Reduces the number of multiplication gates significantly
+
+  4. Constraint Fusion (from zkGPT)
+
+  Batch multiple sub-proofs (per head, per layer) via:
+  - Random linear combination of constraints
+  - Single sumcheck over batched witness columns
+  - Reduces verifier cost from O(layers × heads) to O(1) amortized
+
+  ---
+  Architecture
+
+  ┌─────────────────────────────────────────────────────────┐
+  │                  Python / PyTorch                       │
+  │                                                         │
+  │  PiFormerConfig  ──►  PiFormerModel                     │
+  │                         ├── StructuredLookupActivation  │
+  │                         ├── LinearAttentionLayer        │
+  │                         └── PowerOfTwoProjection        │
+  │                                                         │
+  │  Training loop ──► export weights + quantized trace     │
+  └──────────────────────────────┬──────────────────────────┘
+                                 │ JSON/bincode export
+                                 ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │                  Rust / PiFormer Prover                 │
+  │                                                         │
+  │  src/                                                   │
+  │  ├── field/         BN254 Fr arithmetic (from Jolt)     │
+  │  ├── poly/          DensePolynomial, Dory PCS           │
+  │  ├── lookup/        Lasso argument for φ tables         │
+  │  ├── attention/     Linear attention constraint system  │
+  │  ├── linformer/     Power-of-two projection constraints │
+  │  ├── fusion/        Constraint fusion (batched sumcheck)│
+  │  ├── prover.rs      PiFormerProver                      │
+  │  └── verifier.rs    PiFormerVerifier                    │
+  └─────────────────────────────────────────────────────────┘
+
+  ---
+  Implementation Phases
+
+  Phase 1 — Python Training Pipeline
+
+  ┌─────────────────────────────┬─────────────────────────────────────────────────────────────┐
+  │          Component          │                           Details                           │
+  ├─────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ StructuredLookupActivation  │ Learnable tables, additive decomposition (already sketched) │
+  ├─────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ LinearAttentionLayer        │ φ(Q)(φ(K)^T V), no softmax                                  │
+  ├─────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ PowerOfTwoLinear            │ Weight quantization to {0, ±1, 2^k}                         │
+  ├─────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ PiFormerBlock               │ Attention + FFN (FFN with structured activations)           │
+  ├─────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ PiFormerModel               │ Stack of blocks, embedding, head                            │
+  ├─────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ Weight export               │ Serialize quantized weights + table entries                 │
+  ├─────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ Quantization-aware training │ Match integer scale used in SNARK circuit                   │
+  └─────────────────────────────┴─────────────────────────────────────────────────────────────┘
+
+  Phase 2 — Rust Field & Polynomial Layer
+
+  Reuse from Jolt's jolt-core:
+  - JoltField / BN254 Fr
+  - DensePolynomial, MultilinearPolynomial
+  - Dory commitment scheme
+  - SumcheckProof / ProverTranscript
+
+  Add PiFormer-specific:
+  - Fixed-point integer representation (e.g., Q8.8 or Q16.16) for field encoding
+
+  Phase 3 — Lasso Lookup for φ
+
+  Build on Jolt's instruction_lookups pattern:
+  - Define subtable structure matching the Python StructuredLookupActivation
+  - Prove output = Σ_i table_i[idx_i] via Lasso sumcheck
+  - Commitment to table values (frozen after training)
+
+  Phase 4 — Linear Attention Circuit
+
+  Arithmetic constraints for φ(Q)(φ(K)^T V):
+  1. Prove φ is applied correctly to each Q, K entry (via lookup from Phase 3)
+  2. Prove A = φ(K)^T V (matrix multiply, fixed-point field arithmetic)
+  3. Prove out = φ(Q) · A (matrix-vector product)
+
+  For Power-of-Two projection: constraint y = 2^k · x is a simple bit-shift, representable as a single field multiplication by a constant.
+
+  Phase 5 — Constraint Fusion
+
+  - Batch all per-layer/per-head sumchecks via random challenge from the transcript
+  - Single combined sumcheck polynomial
+  - Verifier checks one proof regardless of depth
+
+  Phase 6 — End-to-End Integration
+
+  - Python exports model weights → Rust reads them
+  - Rust generates proof for a given input sequence
+  - Rust verifier checks proof
+
+  ---
+  Additional Ideas to Explore
+
+  A. Fixed-point quantization alignment
+  The Python training loop should simulate integer arithmetic to eliminate the train/prove gap. Train with fake-quantized operations so weights and activations
+  are provably representable in the field.
+
+  B. Streaming / chunk-wise proofs for long sequences
+  For autoregressive generation, prove one token at a time and fold into an accumulator (like Nova/IVC). Each step's proof is small and constant-size.
+
+  C. Sparse attention pattern constraint
+  If φ(Q)φ(K)^T is known to be sparse (structured sparsity from training), exploit this in the sumcheck by proving only non-zero terms. Reduces proving cost for
+  long contexts.
+
+  D. MLE-based matrix multiply
+  Express A = φ(K)^T V as a multilinear extension evaluation, so it fits directly into the sumcheck protocol without row-by-row constraint expansion.
+
+  E. Shared table argument across layers
+  If multiple layers use the same φ table (shared weights), prove table correctness once and reference it in all layers via a batched Lasso instance.
+
+  ---
+  Key Design Decisions
+
+  ┌───────────────────────┬──────────────────────┬─────────────────────────────────────────────┐
+  │       Decision        │        Choice        │                   Reason                    │
+  ├───────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ Proving backend       │ Jolt/Spartan + Lasso │ Lookup-native, BN254, good Rust impl        │
+  ├───────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ Polynomial commitment │ Dory (from Jolt)     │ Efficient for multilinear, no trusted setup │
+  ├───────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ Field                 │ BN254 Fr             │ Jolt default, wide ecosystem                │
+  ├───────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ Attention type        │ Linear (associative) │ Avoids softmax, SNARK-friendly              │
+  ├───────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ φ structure           │ Additive sub-tables  │ Matches Lasso decomposition, learnable      │
+  ├───────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ Projection constraint │ Power-of-two weights │ Replaces mul gates with constants           │
+  ├───────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ Batching              │ Constraint fusion    │ Sublinear verifier in layer count           │
+  ├───────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ GPU support           │ None (for now)       │ CPU-only as stated                          │
+  └───────────────────────┴──────────────────────┴─────────────────────────────────────────────┘
+
+  ---

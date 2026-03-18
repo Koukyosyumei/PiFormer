@@ -1,0 +1,64 @@
+"""
+ZK-friendly activation via additively decomposed lookup tables.
+
+φ(x) = Σ_{i=0}^{c-1} table_i[ (x_int >> (i * bits_per_chunk)) & mask ]
+
+The additive decomposition matches Jolt's Lasso lookup argument:
+each sub-table of size 2^(num_bits/c) can be committed separately,
+giving O(c · 2^(num_bits/c)) total commitment cost vs O(2^num_bits) for a flat table.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class StructuredLookupActivation(nn.Module):
+    """
+    Learnable activation function implemented as a sum of sub-table lookups.
+
+    Args:
+        num_bits: Total quantization bits for the input (e.g. 8 or 16).
+        c: Number of sub-tables (decomposition depth). Must divide num_bits.
+        scale: Quantization scale; x_int = clamp(round(x / scale), 0, 2^num_bits - 1).
+
+    In the SNARK, each sub-table lookup is proved via a Lasso sumcheck argument.
+    The additive decomposition lets us commit to c tables of size 2^(num_bits/c)
+    instead of one table of size 2^num_bits.
+    """
+
+    def __init__(self, num_bits: int = 8, c: int = 2, scale: float = 1.0):
+        super().__init__()
+        assert num_bits % c == 0, "num_bits must be divisible by c"
+        self.num_bits = num_bits
+        self.c = c
+        self.bits_per_chunk = num_bits // c
+        self.chunk_size = 2 ** self.bits_per_chunk
+        self.scale = scale
+
+        # Initialize sub-tables to approximate GeLU / c shape so training converges faster.
+        self.tables = nn.ParameterList()
+        for _ in range(c):
+            indices = torch.arange(self.chunk_size, dtype=torch.float32)
+            x_approx = (indices / self.chunk_size - 0.5) * 4.0
+            init = F.gelu(x_approx) / c
+            self.tables.append(nn.Parameter(init))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. Quantize to non-negative integer index.
+        x_int = torch.clamp(
+            (x / self.scale).round(), 0, 2 ** self.num_bits - 1
+        ).long()
+
+        # 2. Decompose and sum sub-table lookups.
+        output = torch.zeros_like(x, dtype=torch.float32)
+        temp = x_int
+        for i in range(self.c):
+            chunk_idx = temp % self.chunk_size
+            output = output + self.tables[i][chunk_idx]
+            temp = temp // self.chunk_size
+        return output
+
+    def export_tables(self) -> list[list[float]]:
+        """Return detached sub-table values for the Rust prover."""
+        return [t.detach().tolist() for t in self.tables]
