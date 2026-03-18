@@ -10,3 +10,6 @@
 [submodule "reference/mcl"]
 	path = reference/mcl
 	url = https://github.com/herumi/mcl
+[submodule "lib/dory"]
+	path = lib/dory
+	url = https://github.com/a16z/dory

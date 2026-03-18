@@ -10,6 +10,7 @@ use piformer_prover::{
     F,
     attention::LinearAttentionInstance,
     lookup::LassoInstance,
+    pcs::HyraxParams,
     prover::{PiFormerProver, PiFormerWitness},
     verifier::PiFormerVerifier,
 };
@@ -89,6 +90,12 @@ fn main() {
     let q_lasso = build_lasso(&q);
     let k_lasso = build_lasso(&k);
 
+    // --- Hyrax setup (nu = bits_per_chunk/2, sigma = bits_per_chunk - nu) ---
+    let nu    = bits_per_chunk / 2;
+    let sigma = bits_per_chunk - nu;
+    println!("Generating Hyrax parameters (sigma={sigma})...");
+    let params = HyraxParams::new(sigma);
+
     // --- Assemble witness ---
     let inst = LinearAttentionInstance {
         seq_len, d_head, q, k, v, phi_q, phi_k, context, out, q_lasso, k_lasso,
@@ -97,11 +104,11 @@ fn main() {
 
     // --- Prove ---
     println!("Proving linear attention...");
-    let proof = PiFormerProver::prove(&witness);
+    let proof = PiFormerProver::prove(&witness, &params);
 
     // --- Verify ---
     println!("Verifying...");
-    match PiFormerVerifier::verify(&proof, &witness) {
+    match PiFormerVerifier::verify(&proof, &witness, &params) {
         Ok(())  => println!("✓ Proof verified successfully!"),
         Err(e)  => eprintln!("✗ Verification FAILED: {e}"),
     }

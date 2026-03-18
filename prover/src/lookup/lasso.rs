@@ -1,28 +1,27 @@
-//! Simplified Lasso lookup argument for the structured activation φ.
+//! Lasso lookup argument for the structured activation φ.
 //!
 //! **What we prove:**
 //!   For each query j ∈ [n]:
 //!     output_j = Σ_{k=0}^{c-1} T_k[ chunk_k(idx_j) ]
 //!   where chunk_k(x) = (x >> (k * m)) & ((1<<m)-1), m = bits_per_chunk.
 //!
-//! **How (batched MLE evaluation via sumcheck):**
+//! **How (batched MLE evaluation via sumcheck + Hyrax PCS):**
 //!
 //!   For each sub-table k:
-//!   1. Represent T_k as a DenseMLPoly over m variables (size 2^m).
+//!   1. Commit to T_k via Hyrax: C_k = HyraxCommit(T_k).
 //!   2. Build a "selector" polynomial
 //!        L_k(x) = Σ_j ρ^j · eq(binary(chunk_k(idx_j)), x)
-//!      which has exactly one nonzero "spike" at each queried index.
 //!   3. Run sumcheck:
 //!        Σ_{x ∈ {0,1}^m} T_k(x) · L_k(x) = Σ_j ρ^j · T_k[chunk_k(idx_j)]
-//!   4. Open T_k at the random sumcheck point r_k (trivial PCS: reveal T_k(r_k)).
-//!      A production system replaces this with a Dory/IPA opening proof.
+//!   4. Open T_k at the random sumcheck point r_k via Hyrax, yielding a proof
+//!      that the claimed T_k(r_k) is consistent with the committed polynomial.
 //!
-//! **Note on security:** The trivial PCS is sound only in an honest-prover / testing
-//! setting. The prover commits T_k before seeing queries; the opening at random r
-//! is binding under the random-oracle assumption plus the PCS binding property.
+//! The Hyrax commitment is a transparent (no trusted setup) vector commitment
+//! over BN254 G1, with O(√N) proof size and O(√N) verifier work.
 
 use ark_ff::Field;
 use crate::field::{F, eq_eval, index_to_bits};
+use crate::pcs::{HyraxCommitment, HyraxParams, HyraxProof, hyrax_commit, hyrax_open, hyrax_verify};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{SumcheckProof, prove_sumcheck, verify_sumcheck};
 use crate::transcript::Transcript;
@@ -39,20 +38,50 @@ pub struct LassoInstance {
     pub bits_per_chunk: usize,
 }
 
-/// Proof for a Lasso lookup.
+/// Proof for a Lasso lookup (with Hyrax PCS).
 pub struct LassoProof {
-    pub sumcheck_proofs: Vec<SumcheckProof>,
-    /// T_k(r_k): prover's evaluation claim at the sumcheck random point (trivial PCS).
-    pub table_openings: Vec<F>,
-    /// Claimed batched sum per sub-table: Σ_j ρ^j · T_k[chunk_k(idx_j)].
+    /// Batched sum per sub-table: Σ_j ρ^j · T_k[chunk_k(idx_j)].
     pub sub_claims: Vec<F>,
+    /// Sumcheck proof per sub-table.
+    pub sumcheck_proofs: Vec<SumcheckProof>,
+    /// Claimed T_k(r_k) at the sumcheck random point.
+    pub table_openings: Vec<F>,
+    /// Hyrax commitments to each sub-table (sent to verifier).
+    pub hyrax_commitments: Vec<HyraxCommitment>,
+    /// Hyrax opening proofs for T_k(r_k).
+    pub hyrax_proofs: Vec<HyraxProof>,
 }
 
-pub fn prove_lasso(instance: &LassoInstance, transcript: &mut Transcript) -> LassoProof {
+pub fn prove_lasso(
+    instance: &LassoInstance,
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> LassoProof {
     let c   = instance.tables.len();
     let m   = instance.bits_per_chunk;
     let n   = instance.query_indices.len();
     let mask = (1usize << m) - 1;
+
+    // nu + sigma = m; choose nu = m/2 (square-ish layout)
+    let nu    = m / 2;
+    let sigma = m - nu;
+    assert_eq!(params.sigma, sigma, "HyraxParams sigma mismatch");
+
+    // Step 1: commit to each sub-table and absorb commitments into transcript
+    let mut hyrax_commitments = Vec::with_capacity(c);
+    for k in 0..c {
+        let commitment = hyrax_commit(&instance.tables[k], nu, params);
+        for pt in &commitment.row_coms {
+            let bytes = {
+                use ark_serialize::CanonicalSerialize;
+                let mut buf = Vec::new();
+                pt.serialize_compressed(&mut buf).unwrap();
+                buf
+            };
+            transcript.append_bytes(b"hyrax_com", &bytes);
+        }
+        hyrax_commitments.push(commitment);
+    }
 
     // Commit claimed outputs to transcript
     for &out in &instance.outputs {
@@ -65,17 +94,17 @@ pub fn prove_lasso(instance: &LassoInstance, transcript: &mut Transcript) -> Las
 
     let mut sumcheck_proofs = Vec::with_capacity(c);
     let mut table_openings  = Vec::with_capacity(c);
+    let mut hyrax_proofs    = Vec::with_capacity(c);
     let mut sub_claims      = Vec::with_capacity(c);
 
     for k in 0..c {
         let t_poly = DenseMLPoly::new(instance.tables[k].clone());
 
-        // Build L_k as a dense MLE
+        // Build selector polynomial L_k as a dense MLE
         let size = 1usize << m;
         let mut l_evals = vec![F::ZERO; size];
         for j in 0..n {
             let ch = chunk(instance.query_indices[j], k, m, mask);
-            // Add ρ^j · eq(binary(ch), ·) point-wise
             for x in 0..size {
                 let mut eq_val = F::ONE;
                 for bit in 0..m {
@@ -90,34 +119,52 @@ pub fn prove_lasso(instance: &LassoInstance, transcript: &mut Transcript) -> Las
 
         // Claimed sum for this sub-table
         let claimed: F = (0..n)
-            .map(|j| {
-                let ch = chunk(instance.query_indices[j], k, m, mask);
-                rho_pows[j] * instance.tables[k][ch]
-            })
+            .map(|j| rho_pows[j] * instance.tables[k][chunk(instance.query_indices[j], k, m, mask)])
             .sum();
         sub_claims.push(claimed);
 
         let (sc_proof, r_vec) = prove_sumcheck(&t_poly, &l_poly, claimed, transcript);
 
-        // Trivial PCS: reveal T_k(r_vec) directly
+        // Hyrax opening at r_vec
         let opening = t_poly.evaluate(&r_vec);
         transcript.append_field(b"lasso_opening", &opening);
+        let hyrax_proof = hyrax_open(&instance.tables[k], &r_vec, nu, sigma);
+
         table_openings.push(opening);
         sumcheck_proofs.push(sc_proof);
+        hyrax_proofs.push(hyrax_proof);
     }
 
-    LassoProof { sumcheck_proofs, table_openings, sub_claims }
+    LassoProof { sub_claims, sumcheck_proofs, table_openings, hyrax_commitments, hyrax_proofs }
 }
 
 pub fn verify_lasso(
     proof: &LassoProof,
     instance: &LassoInstance,
     transcript: &mut Transcript,
+    params: &HyraxParams,
 ) -> Result<(), String> {
     let c    = instance.tables.len();
     let m    = instance.bits_per_chunk;
     let n    = instance.query_indices.len();
     let mask = (1usize << m) - 1;
+
+    let nu    = m / 2;
+    let sigma = m - nu;
+    assert_eq!(params.sigma, sigma, "HyraxParams sigma mismatch");
+
+    // Replay commitment absorptions
+    for k in 0..c {
+        for pt in &proof.hyrax_commitments[k].row_coms {
+            let bytes = {
+                use ark_serialize::CanonicalSerialize;
+                let mut buf = Vec::new();
+                pt.serialize_compressed(&mut buf).unwrap();
+                buf
+            };
+            transcript.append_bytes(b"hyrax_com", &bytes);
+        }
+    }
 
     for &out in &instance.outputs {
         transcript.append_field(b"lasso_out", &out);
@@ -126,12 +173,9 @@ pub fn verify_lasso(
     let rho_pows = powers_of(rho, n);
 
     for k in 0..c {
-        // Recompute expected sub-claim from public inputs
+        // Check sub-claim matches public inputs
         let expected: F = (0..n)
-            .map(|j| {
-                let ch = chunk(instance.query_indices[j], k, m, mask);
-                rho_pows[j] * instance.tables[k][ch]
-            })
+            .map(|j| rho_pows[j] * instance.tables[k][chunk(instance.query_indices[j], k, m, mask)])
             .sum();
         if expected != proof.sub_claims[k] {
             return Err(format!("Lasso sub-claim mismatch for table {k}"));
@@ -140,33 +184,41 @@ pub fn verify_lasso(
         let (r_vec, _) = verify_sumcheck(&proof.sumcheck_proofs[k], proof.sub_claims[k], m, transcript)
             .map_err(|e| format!("Table {k} sumcheck: {e}"))?;
 
-        // Verify trivial PCS: the verifier recomputes L_k(r_vec) and checks
-        // T_k(r_vec) · L_k(r_vec) equals the final sumcheck claim.
+        // Replay opening absorption
+        let t_opening = proof.table_openings[k];
+        transcript.append_field(b"lasso_opening", &t_opening);
+
+        // Verify sumcheck final claim: T_k(r) · L_k(r) == final
         //
-        // Note on bit ordering: DenseMLPoly fixes the MSB (highest-bit variable) first
-        // in each sumcheck round (because evals[i] for i < half has the top bit = 0).
-        // So r_vec[0] corresponds to bit_{m-1}, r_vec[1] to bit_{m-2}, ..., r_vec[m-1]
-        // to bit_0. We reverse r_vec so that index_to_bits (LSB-first) pairs correctly.
+        // Note on bit ordering: DenseMLPoly fixes the MSB first (r_vec[0] = bit_{m-1}).
+        // index_to_bits is LSB-first, and eq_eval pairs r_rev[i] with bits[i].
+        // So we reverse r_vec before computing L_k(r).
         let r_rev: Vec<F> = r_vec.iter().copied().rev().collect();
         let l_at_r: F = (0..n)
             .map(|j| {
                 let ch   = chunk(instance.query_indices[j], k, m, mask);
-                let bits = index_to_bits(ch, m);   // LSB-first: bits[i] = bit_i(ch)
-                rho_pows[j] * eq_eval(&bits, &r_rev) // r_rev[i] = r_vec[m-1-i] = challenge for bit_i
+                let bits = index_to_bits(ch, m);
+                rho_pows[j] * eq_eval(&bits, &r_rev)
             })
             .sum();
-
-        let t_opening = proof.table_openings[k];
-        transcript.append_field(b"lasso_opening", &t_opening);
 
         let expected_final = t_opening * l_at_r;
         let actual_final   = proof.sumcheck_proofs[k].final_eval_f
             * proof.sumcheck_proofs[k].final_eval_g;
         if expected_final != actual_final {
             return Err(format!(
-                "Table {k} PCS check failed: T(r)*L(r)={expected_final:?} ≠ final={actual_final:?}"
+                "Table {k} sumcheck final check failed: T(r)*L(r)={expected_final:?} ≠ final={actual_final:?}"
             ));
         }
+
+        // Verify Hyrax opening: T_k(r_vec) == t_opening
+        hyrax_verify(
+            &proof.hyrax_commitments[k],
+            t_opening,
+            &r_vec,
+            &proof.hyrax_proofs[k],
+            params,
+        ).map_err(|e| format!("Table {k} Hyrax: {e}"))?;
     }
     Ok(())
 }

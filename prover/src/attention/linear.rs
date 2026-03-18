@@ -13,6 +13,7 @@
 use ark_ff::PrimeField;
 use crate::field::F;
 use crate::lookup::{LassoInstance, LassoProof, prove_lasso, verify_lasso};
+use crate::pcs::HyraxParams;
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{SumcheckProof, prove_sumcheck, verify_sumcheck};
 use crate::transcript::Transcript;
@@ -50,13 +51,14 @@ pub struct LinearAttentionProof {
 pub fn prove_linear_attention(
     inst: &LinearAttentionInstance,
     transcript: &mut Transcript,
+    params: &HyraxParams,
 ) -> LinearAttentionProof {
     let T = inst.seq_len;
     let D = inst.d_head;
 
     // Step 1 & 2: Lasso for φ(Q) and φ(K)
-    let phi_q_proof = prove_lasso(&inst.q_lasso, transcript);
-    let phi_k_proof = prove_lasso(&inst.k_lasso, transcript);
+    let phi_q_proof = prove_lasso(&inst.q_lasso, transcript, params);
+    let phi_k_proof = prove_lasso(&inst.k_lasso, transcript, params);
 
     // Step 3: Prove one entry of context = φ(K)^T · V
     //   Verifier picks (i*, j*) via Fiat-Shamir.
@@ -96,13 +98,14 @@ pub fn verify_linear_attention(
     proof: &LinearAttentionProof,
     inst: &LinearAttentionInstance,
     transcript: &mut Transcript,
+    params: &HyraxParams,
 ) -> Result<(), String> {
     let T = inst.seq_len;
     let D = inst.d_head;
 
-    verify_lasso(&proof.phi_q_proof, &inst.q_lasso, transcript)
+    verify_lasso(&proof.phi_q_proof, &inst.q_lasso, transcript, params)
         .map_err(|e| format!("phi_q: {e}"))?;
-    verify_lasso(&proof.phi_k_proof, &inst.k_lasso, transcript)
+    verify_lasso(&proof.phi_k_proof, &inst.k_lasso, transcript, params)
         .map_err(|e| format!("phi_k: {e}"))?;
 
     // Replicate the verifier's Fiat-Shamir choices

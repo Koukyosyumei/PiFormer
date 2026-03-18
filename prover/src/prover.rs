@@ -9,6 +9,7 @@
 
 use crate::attention::{LinearAttentionInstance, LinearAttentionProof, prove_linear_attention};
 use crate::field::F;
+use crate::pcs::HyraxParams;
 use crate::transcript::Transcript;
 
 /// Proof for the entire model inference (all layers, all heads).
@@ -26,7 +27,7 @@ pub struct PiFormerWitness {
 pub struct PiFormerProver;
 
 impl PiFormerProver {
-    pub fn prove(witness: &PiFormerWitness) -> PiFormerProof {
+    pub fn prove(witness: &PiFormerWitness, params: &HyraxParams) -> PiFormerProof {
         let mut transcript = Transcript::new(b"PiFormer-v0.1");
 
         let mut block_proofs = Vec::new();
@@ -38,7 +39,7 @@ impl PiFormerProver {
             let mut head_proofs = Vec::new();
             for (head_idx, inst) in layer_heads.iter().enumerate() {
                 transcript.append_bytes(b"head", &(head_idx as u64).to_le_bytes());
-                head_proofs.push(prove_linear_attention(inst, &mut transcript));
+                head_proofs.push(prove_linear_attention(inst, &mut transcript, params));
             }
             block_proofs.push(head_proofs);
         }
