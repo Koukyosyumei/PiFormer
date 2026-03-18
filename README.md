@@ -1,2 +1,3 @@
 # PiFormer
-Efficient SNARKs for Linear Transformers via Structured Lookup Attention
+
+> Efficient SNARKs for Linear Transformers via Structured Lookup Attention
