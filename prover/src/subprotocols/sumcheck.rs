@@ -9,22 +9,22 @@
 //! **Prover cost:** O(n · 2^n) field multiplications.
 //! **Verifier cost:** O(n) field operations (plus one external oracle query for f(r)·g(r)).
 
-use ark_ff::Field;
 use crate::field::F;
 use crate::poly::DenseMLPoly;
 use crate::transcript::Transcript;
+use ark_ff::Field;
 
 /// A round polynomial g_i(X) given by its values at X = 0, 1, 2.
 #[derive(Clone, Debug)]
 pub struct RoundPoly {
-    pub evals: [F; 3],  // [g(0), g(1), g(2)]
+    pub evals: [F; 3], // [g(0), g(1), g(2)]
 }
 
 impl RoundPoly {
     /// Evaluate at arbitrary x via quadratic Lagrange interpolation through (0,g0),(1,g1),(2,g2).
     pub fn evaluate(&self, x: F) -> F {
         let [g0, g1, g2] = self.evals;
-        let two  = F::from(2u64);
+        let two = F::from(2u64);
         let inv2 = two.inverse().unwrap();
         // L_0(x) = (x-1)(x-2)/2
         // L_1(x) = -x(x-2) = x(2-x)
@@ -57,7 +57,10 @@ pub fn prove_sumcheck(
     claim: F,
     transcript: &mut Transcript,
 ) -> (SumcheckProof, Vec<F>) {
-    assert_eq!(f.num_vars, g.num_vars, "f and g must have the same number of variables");
+    assert_eq!(
+        f.num_vars, g.num_vars,
+        "f and g must have the same number of variables"
+    );
     let n = f.num_vars;
 
     transcript.append_field(b"sc_claim", &claim);
@@ -65,7 +68,7 @@ pub fn prove_sumcheck(
     let mut f_cur = f.clone();
     let mut g_cur = g.clone();
     let mut round_polys = Vec::with_capacity(n);
-    let mut challenges  = Vec::with_capacity(n);
+    let mut challenges = Vec::with_capacity(n);
 
     for _ in 0..n {
         let half = f_cur.evaluations.len() >> 1;
@@ -91,7 +94,9 @@ pub fn prove_sumcheck(
             })
             .sum();
 
-        let rp = RoundPoly { evals: [e0, e1, e2] };
+        let rp = RoundPoly {
+            evals: [e0, e1, e2],
+        };
 
         // Absorb round polynomial into transcript
         for e in &rp.evals {
@@ -109,7 +114,14 @@ pub fn prove_sumcheck(
     let final_eval_f = f_cur.evaluations[0];
     let final_eval_g = g_cur.evaluations[0];
 
-    (SumcheckProof { round_polys, final_eval_f, final_eval_g }, challenges)
+    (
+        SumcheckProof {
+            round_polys,
+            final_eval_f,
+            final_eval_g,
+        },
+        challenges,
+    )
 }
 
 /// Verify a sumcheck proof.
@@ -126,7 +138,8 @@ pub fn verify_sumcheck(
     if proof.round_polys.len() != num_vars {
         return Err(format!(
             "Wrong number of round polys: got {}, expected {}",
-            proof.round_polys.len(), num_vars
+            proof.round_polys.len(),
+            num_vars
         ));
     }
 
@@ -140,7 +153,9 @@ pub fn verify_sumcheck(
         if rp.evals[0] + rp.evals[1] != current {
             return Err(format!(
                 "Round {}: g(0)+g(1) = {:?} ≠ claim {:?}",
-                i, rp.evals[0] + rp.evals[1], current
+                i,
+                rp.evals[0] + rp.evals[1],
+                current
             ));
         }
         for e in &rp.evals {
@@ -161,4 +176,99 @@ pub fn verify_sumcheck(
     }
 
     Ok((challenges, final_claim))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::poly::DenseMLPoly;
+    use crate::transcript::Transcript;
+    use ark_ff::{One, Zero};
+
+    /// Helper to compute the brute-force sum of f(x) * g(x) over {0,1}^n
+    fn compute_brute_force_sum(f: &DenseMLPoly, g: &DenseMLPoly) -> F {
+        f.evaluations
+            .iter()
+            .zip(g.evaluations.iter())
+            .map(|(&fa, &ga)| fa * ga)
+            .sum()
+    }
+
+    #[test]
+    fn test_sumcheck_happy_path_2var() {
+        let mut transcript = Transcript::new(b"test");
+
+        // f(x0, x1) = [1, 2, 3, 4]
+        // g(x0, x1) = [5, 6, 7, 8]
+        // Sum = 1*5 + 2*6 + 3*7 + 4*8 = 5 + 12 + 21 + 32 = 70
+        let f = DenseMLPoly::new(vec![F::from(1), F::from(2), F::from(3), F::from(4)]);
+        let g = DenseMLPoly::new(vec![F::from(5), F::from(6), F::from(7), F::from(8)]);
+        let claim = compute_brute_force_sum(&f, &g);
+        assert_eq!(claim, F::from(70));
+
+        // Prover
+        let (proof, challenges) = prove_sumcheck(&f, &g, claim, &mut transcript);
+
+        // Verifier
+        let mut verifier_transcript = Transcript::new(b"test");
+        let result = verify_sumcheck(&proof, claim, f.num_vars, &mut verifier_transcript);
+
+        assert!(result.is_ok(), "Verification failed: {:?}", result.err());
+        let (v_challenges, _) = result.unwrap();
+        assert_eq!(challenges, v_challenges);
+
+        // Final consistency: Check if final_eval_f and final_eval_g are actually f(r) and g(r)
+        assert_eq!(proof.final_eval_f, f.evaluate(&challenges));
+        assert_eq!(proof.final_eval_g, g.evaluate(&challenges));
+    }
+
+    #[test]
+    fn test_sumcheck_invalid_claim() {
+        let mut transcript = Transcript::new(b"test");
+        let f = DenseMLPoly::new(vec![F::from(1), F::from(2)]);
+        let g = DenseMLPoly::new(vec![F::from(3), F::from(4)]);
+
+        // Correct sum is 1*3 + 2*4 = 11. Let's claim 12.
+        let false_claim = F::from(12);
+
+        let (proof, _) = prove_sumcheck(&f, &g, false_claim, &mut transcript);
+
+        let mut verifier_transcript = Transcript::new(b"test");
+        let result = verify_sumcheck(&proof, false_claim, f.num_vars, &mut verifier_transcript);
+
+        // Verifier should catch g_0(0) + g_0(1) != false_claim
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sumcheck_tampered_proof() {
+        let mut transcript = Transcript::new(b"test");
+        let f = DenseMLPoly::new(vec![F::from(1), F::from(2), F::from(3), F::from(4)]);
+        let g = DenseMLPoly::new(vec![F::from(1), F::from(1), F::from(1), F::from(1)]);
+        let claim = compute_brute_force_sum(&f, &g);
+
+        let (mut proof, _) = prove_sumcheck(&f, &g, claim, &mut transcript);
+
+        // Tamper with one of the round evaluations
+        proof.round_polys[0].evals[0] += F::one();
+
+        let mut verifier_transcript = Transcript::new(b"test");
+        let result = verify_sumcheck(&proof, claim, f.num_vars, &mut verifier_transcript);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sumcheck_zero_polynomials() {
+        let n = 3;
+        let f = DenseMLPoly::zero(n);
+        let g = DenseMLPoly::zero(n);
+        let claim = F::zero();
+
+        let mut transcript = Transcript::new(b"test");
+        let (proof, _) = prove_sumcheck(&f, &g, claim, &mut transcript);
+
+        let mut verifier_transcript = Transcript::new(b"test");
+        let result = verify_sumcheck(&proof, claim, n, &mut verifier_transcript);
+        assert!(result.is_ok());
+    }
 }
