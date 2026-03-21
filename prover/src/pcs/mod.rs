@@ -82,7 +82,11 @@ pub fn hyrax_commit(evals: &[F], nu: usize, params: &HyraxParams) -> HyraxCommit
         .map(|i| msm(&params.gens, &evals[i * num_cols..(i + 1) * num_cols]))
         .collect();
 
-    HyraxCommitment { row_coms, nu, sigma }
+    HyraxCommitment {
+        row_coms,
+        nu,
+        sigma,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -101,7 +105,11 @@ pub struct HyraxProof {
 pub fn hyrax_open(evals: &[F], point: &[F], nu: usize, sigma: usize) -> HyraxProof {
     let num_cols = 1 << sigma;
     assert_eq!(point.len(), nu + sigma, "point dimension mismatch");
-    assert_eq!(evals.len(), (1 << nu) * num_cols, "eval length mismatch in open");
+    assert_eq!(
+        evals.len(),
+        (1 << nu) * num_cols,
+        "eval length mismatch in open"
+    );
 
     // DenseMLPoly::fix_first_variable processes challenges MSB-first (r[0] → bit_{n-1}).
     // Our lagrange_basis assigns r[k] to bit_k(i) (LSB-first).
@@ -136,7 +144,7 @@ pub fn hyrax_verify(
     proof: &HyraxProof,
     params: &HyraxParams,
 ) -> Result<(), String> {
-    let nu    = commitment.nu;
+    let nu = commitment.nu;
     let sigma = commitment.sigma;
     assert_eq!(point.len(), nu + sigma, "point dimension mismatch");
 
@@ -154,9 +162,15 @@ pub fn hyrax_verify(
     }
 
     // Check 2: inner product
-    let inner: F = r_vec.iter().zip(proof.w_prime.iter()).map(|(&r, &w)| r * w).sum();
+    let inner: F = r_vec
+        .iter()
+        .zip(proof.w_prime.iter())
+        .map(|(&r, &w)| r * w)
+        .sum();
     if inner != eval {
-        return Err(format!("Hyrax: inner product check failed: got {inner:?}, expected {eval:?}"));
+        return Err(format!(
+            "Hyrax: inner product check failed: got {inner:?}, expected {eval:?}"
+        ));
     }
 
     Ok(())
@@ -177,7 +191,7 @@ pub fn lagrange_basis(point: &[F]) -> Vec<F> {
         let half = table.len();
         let mut new = vec![F::ZERO; half * 2];
         for (i, &v) in table.iter().enumerate() {
-            new[i]        = v * (F::ONE - r);
+            new[i] = v * (F::ONE - r);
             new[i + half] = v * r;
         }
         table = new;
@@ -198,4 +212,88 @@ fn msm(bases: &[G1Affine], scalars: &[F]) -> G1Affine {
 /// MSM where scalars are already F field elements (same as `msm` but avoids confusion).
 fn msm_g1(bases: &[G1Affine], scalars: &[F]) -> G1Affine {
     msm(bases, scalars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_std::{test_rng, UniformRand};
+
+    /// Tests a complete workflow of the Hyrax commitment scheme:
+    /// 1. Parameters generation
+    /// 2. Polynomial commitment
+    /// 3. Evaluation and proof generation
+    /// 4. Successful verification
+    /// 5. Verification failure on malicious input
+    #[test]
+    fn test_hyrax_full_flow() {
+        let mut rng = test_rng();
+
+        // Let nu = 2, sigma = 3 (Total variables = 5, Table size = 32)
+        let nu = 2;
+        let sigma = 3;
+        let params = HyraxParams::new(sigma);
+
+        // Generate a random multilinear polynomial (evaluations on the Boolean hypercube)
+        let num_evals = 1 << (nu + sigma);
+        let evals: Vec<Fr> = (0..num_evals).map(|_| Fr::rand(&mut rng)).collect();
+
+        // 1. Commit
+        let commitment = hyrax_commit(&evals, nu, &params);
+
+        // 2. Choose a random evaluation point
+        let point: Vec<Fr> = (0..(nu + sigma)).map(|_| Fr::rand(&mut rng)).collect();
+
+        // Calculate the ground truth evaluation using a naive MLE evaluation
+        // for verification of the test itself.
+        let full_lagrange = lagrange_basis(&point.iter().rev().copied().collect::<Vec<_>>());
+        let expected_eval: Fr = evals
+            .iter()
+            .zip(full_lagrange.iter())
+            .map(|(e, l)| *e * l)
+            .sum();
+
+        // 3. Open
+        let proof = hyrax_open(&evals, &point, nu, sigma);
+
+        // 4. Verify (Success)
+        let result = hyrax_verify(&commitment, expected_eval, &point, &proof, &params);
+        assert!(
+            result.is_ok(),
+            "Verification should pass: {:?}",
+            result.err()
+        );
+
+        // 5. Verify (Failure - Wrong Evaluation)
+        let fake_eval = expected_eval + Fr::from(1u64);
+        let result_fail = hyrax_verify(&commitment, fake_eval, &point, &proof, &params);
+        assert!(
+            result_fail.is_err(),
+            "Verification should fail with wrong evaluation"
+        );
+
+        // 6. Verify (Failure - Wrong Proof)
+        let mut malicious_proof = proof.clone();
+        malicious_proof.w_prime[0] += Fr::from(1u64);
+        let result_fail_proof = hyrax_verify(
+            &commitment,
+            expected_eval,
+            &point,
+            &malicious_proof,
+            &params,
+        );
+        assert!(
+            result_fail_proof.is_err(),
+            "Verification should fail with corrupted proof"
+        );
+    }
+
+    #[test]
+    fn test_lagrange_basis_sum_to_one() {
+        let mut rng = test_rng();
+        let point: Vec<Fr> = (0..5).map(|_| Fr::rand(&mut rng)).collect();
+        let basis = lagrange_basis(&point);
+        let sum: Fr = basis.iter().sum();
+        assert_eq!(sum, Fr::ONE, "Lagrange basis evaluations must sum to 1");
+    }
 }
