@@ -19,12 +19,14 @@
 //! The Hyrax commitment is a transparent (no trusted setup) vector commitment
 //! over BN254 G1, with O(√N) proof size and O(√N) verifier work.
 
-use ark_ff::Field;
-use crate::field::{F, eq_eval, index_to_bits};
-use crate::pcs::{HyraxCommitment, HyraxParams, HyraxProof, hyrax_commit, hyrax_open, hyrax_verify};
+use crate::field::{eq_eval, index_to_bits, F};
+use crate::pcs::{
+    hyrax_commit, hyrax_open, hyrax_verify, HyraxCommitment, HyraxParams, HyraxProof,
+};
 use crate::poly::DenseMLPoly;
-use crate::subprotocols::{SumcheckProof, prove_sumcheck, verify_sumcheck};
+use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
+use ark_ff::Field;
 
 /// Public description of a lookup instance.
 pub struct LassoInstance {
@@ -57,13 +59,13 @@ pub fn prove_lasso(
     transcript: &mut Transcript,
     params: &HyraxParams,
 ) -> LassoProof {
-    let c   = instance.tables.len();
-    let m   = instance.bits_per_chunk;
-    let n   = instance.query_indices.len();
+    let c = instance.tables.len();
+    let m = instance.bits_per_chunk;
+    let n = instance.query_indices.len();
     let mask = (1usize << m) - 1;
 
     // nu + sigma = m; choose nu = m/2 (square-ish layout)
-    let nu    = m / 2;
+    let nu = m / 2;
     let sigma = m - nu;
     assert_eq!(params.sigma, sigma, "HyraxParams sigma mismatch");
 
@@ -93,9 +95,9 @@ pub fn prove_lasso(
     let rho_pows = powers_of(rho, n);
 
     let mut sumcheck_proofs = Vec::with_capacity(c);
-    let mut table_openings  = Vec::with_capacity(c);
-    let mut hyrax_proofs    = Vec::with_capacity(c);
-    let mut sub_claims      = Vec::with_capacity(c);
+    let mut table_openings = Vec::with_capacity(c);
+    let mut hyrax_proofs = Vec::with_capacity(c);
+    let mut sub_claims = Vec::with_capacity(c);
 
     for k in 0..c {
         let t_poly = DenseMLPoly::new(instance.tables[k].clone());
@@ -109,7 +111,7 @@ pub fn prove_lasso(
                 let mut eq_val = F::ONE;
                 for bit in 0..m {
                     let a = F::from(((ch >> bit) & 1) as u64);
-                    let b = F::from(((x  >> bit) & 1) as u64);
+                    let b = F::from(((x >> bit) & 1) as u64);
                     eq_val *= a * b + (F::ONE - a) * (F::ONE - b);
                 }
                 l_evals[x] += rho_pows[j] * eq_val;
@@ -135,7 +137,13 @@ pub fn prove_lasso(
         hyrax_proofs.push(hyrax_proof);
     }
 
-    LassoProof { sub_claims, sumcheck_proofs, table_openings, hyrax_commitments, hyrax_proofs }
+    LassoProof {
+        sub_claims,
+        sumcheck_proofs,
+        table_openings,
+        hyrax_commitments,
+        hyrax_proofs,
+    }
 }
 
 pub fn verify_lasso(
@@ -144,12 +152,12 @@ pub fn verify_lasso(
     transcript: &mut Transcript,
     params: &HyraxParams,
 ) -> Result<(), String> {
-    let c    = instance.tables.len();
-    let m    = instance.bits_per_chunk;
-    let n    = instance.query_indices.len();
+    let c = instance.tables.len();
+    let m = instance.bits_per_chunk;
+    let n = instance.query_indices.len();
     let mask = (1usize << m) - 1;
 
-    let nu    = m / 2;
+    let nu = m / 2;
     let sigma = m - nu;
     assert_eq!(params.sigma, sigma, "HyraxParams sigma mismatch");
 
@@ -172,6 +180,17 @@ pub fn verify_lasso(
     let rho = transcript.challenge_field::<F>(b"lasso_rho");
     let rho_pows = powers_of(rho, n);
 
+    // 1. Calculate the batched sum of claimed outputs: Σ_j ρ^j · output_j
+    let output_batched_sum: F = (0..n).map(|j| rho_pows[j] * instance.outputs[j]).sum();
+    // 2. Calculate the sum of all sub-claims: Σ_k (Σ_j ρ^j · T_k[chunk_k(idx_j)])
+    let sub_claims_combined_sum: F = proof.sub_claims.iter().sum();
+    // 3. The Grand Sum Identity: The sum of outputs must match the sum of table lookups
+    if output_batched_sum != sub_claims_combined_sum {
+        return Err(
+            "Lasso Grand Sum Identity failed: outputs do not match table lookups".to_string(),
+        );
+    }
+
     for k in 0..c {
         // Check sub-claim matches public inputs
         let expected: F = (0..n)
@@ -181,8 +200,13 @@ pub fn verify_lasso(
             return Err(format!("Lasso sub-claim mismatch for table {k}"));
         }
 
-        let (r_vec, _) = verify_sumcheck(&proof.sumcheck_proofs[k], proof.sub_claims[k], m, transcript)
-            .map_err(|e| format!("Table {k} sumcheck: {e}"))?;
+        let (r_vec, _) = verify_sumcheck(
+            &proof.sumcheck_proofs[k],
+            proof.sub_claims[k],
+            m,
+            transcript,
+        )
+        .map_err(|e| format!("Table {k} sumcheck: {e}"))?;
 
         // Replay opening absorption
         let t_opening = proof.table_openings[k];
@@ -196,15 +220,15 @@ pub fn verify_lasso(
         let r_rev: Vec<F> = r_vec.iter().copied().rev().collect();
         let l_at_r: F = (0..n)
             .map(|j| {
-                let ch   = chunk(instance.query_indices[j], k, m, mask);
+                let ch = chunk(instance.query_indices[j], k, m, mask);
                 let bits = index_to_bits(ch, m);
                 rho_pows[j] * eq_eval(&bits, &r_rev)
             })
             .sum();
 
         let expected_final = t_opening * l_at_r;
-        let actual_final   = proof.sumcheck_proofs[k].final_eval_f
-            * proof.sumcheck_proofs[k].final_eval_g;
+        let actual_final =
+            proof.sumcheck_proofs[k].final_eval_f * proof.sumcheck_proofs[k].final_eval_g;
         if expected_final != actual_final {
             return Err(format!(
                 "Table {k} sumcheck final check failed: T(r)*L(r)={expected_final:?} ≠ final={actual_final:?}"
@@ -218,7 +242,8 @@ pub fn verify_lasso(
             &r_vec,
             &proof.hyrax_proofs[k],
             params,
-        ).map_err(|e| format!("Table {k} Hyrax: {e}"))?;
+        )
+        .map_err(|e| format!("Table {k} Hyrax: {e}"))?;
     }
     Ok(())
 }
@@ -241,4 +266,124 @@ fn powers_of(rho: F, n: usize) -> Vec<F> {
         cur *= rho;
     }
     v
+}
+
+#[cfg(test)]
+mod lasso_tests {
+    use super::*;
+    use crate::field::F;
+    use crate::transcript::Transcript;
+    use ark_ff::{One, Zero};
+
+    /// Helper to create a dummy 2-chunk Lasso instance.
+    /// Table size = 2^4 = 16. Total address space = 16 * 16 = 256.
+    fn setup_test_instance() -> LassoInstance {
+        let m = 4;
+        let c = 2;
+        let table_size = 1 << m;
+
+        // Table 0: T[i] = i
+        let t0: Vec<F> = (0..table_size).map(|i| F::from(i as u64)).collect();
+        // Table 1: T[i] = i * 10
+        let t1: Vec<F> = (0..table_size).map(|i| F::from((i * 10) as u64)).collect();
+
+        // Queries: [Index 0x12, Index 0x34]
+        // 0x12 -> chunk0=2, chunk1=1. Output = T0[2] + T1[1] = 2 + 10 = 12
+        // 0x34 -> chunk0=4, chunk1=3. Output = T0[4] + T1[3] = 4 + 30 = 34
+        let query_indices = vec![0x12, 0x34];
+        let outputs = vec![F::from(12), F::from(34)];
+
+        LassoInstance {
+            tables: vec![t0, t1],
+            query_indices,
+            outputs,
+            bits_per_chunk: m,
+        }
+    }
+
+    #[test]
+    fn test_lasso_e2e_success() {
+        let instance = setup_test_instance();
+        let m = instance.bits_per_chunk;
+
+        // For Hyrax, nu + sigma = m. Let's pick sigma = m/2 = 2.
+        let sigma = m / 2;
+        let params = HyraxParams::new(sigma);
+
+        // --- Prover Side ---
+        let mut prover_transcript = Transcript::new(b"lasso-protocol");
+        let proof = prove_lasso(&instance, &mut prover_transcript, &params);
+
+        // --- Verifier Side ---
+        let mut verifier_transcript = Transcript::new(b"lasso-protocol");
+        let result = verify_lasso(&proof, &instance, &mut verifier_transcript, &params);
+
+        assert!(
+            result.is_ok(),
+            "Lasso verification failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_lasso_rejects_wrong_output() {
+        let mut instance = setup_test_instance();
+        let sigma = instance.bits_per_chunk / 2;
+        let params = HyraxParams::new(sigma);
+
+        // Maliciously change the claimed output
+        instance.outputs[0] = F::from(999);
+
+        let mut prover_transcript = Transcript::new(b"lasso-protocol");
+        let proof = prove_lasso(&instance, &mut prover_transcript, &params);
+
+        let mut verifier_transcript = Transcript::new(b"lasso-protocol");
+        let result = verify_lasso(&proof, &instance, &mut verifier_transcript, &params);
+
+        // Verifier should catch the sub-claim mismatch immediately
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Grand Sum Identity failed"));
+    }
+
+    #[test]
+    fn test_lasso_tampered_sumcheck() {
+        let instance = setup_test_instance();
+        let sigma = instance.bits_per_chunk / 2;
+        let params = HyraxParams::new(sigma);
+
+        let mut prover_transcript = Transcript::new(b"lasso-protocol");
+        let mut proof = prove_lasso(&instance, &mut prover_transcript, &params);
+
+        // Tamper with a sumcheck round polynomial
+        proof.sumcheck_proofs[0].round_polys[0].evals[0] += F::one();
+
+        let mut verifier_transcript = Transcript::new(b"lasso-protocol");
+        let result = verify_lasso(&proof, &instance, &mut verifier_transcript, &params);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lasso_rejects_tampered_sub_claim_specifically() {
+        let instance = setup_test_instance();
+        let sigma = instance.bits_per_chunk / 2;
+        let params = HyraxParams::new(sigma);
+        let mut prover_transcript = Transcript::new(b"lasso-protocol");
+        let mut proof = prove_lasso(&instance, &mut prover_transcript, &params);
+
+        // --- CLEVER TAMPERING ---
+        // Add 1 to sub_claim[0] and subtract 1 from sub_claim[1].
+        // The total sum (Grand Sum) remains unchanged!
+        proof.sub_claims[0] += F::one();
+        proof.sub_claims[1] -= F::one();
+
+        let mut verifier_transcript = Transcript::new(b"lasso-protocol");
+        let result = verify_lasso(&proof, &instance, &mut verifier_transcript, &params);
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+
+        // Now this check will definitely fail!
+        assert!(err_msg.contains("Lasso sub-claim mismatch for table 0"));
+    }
 }
