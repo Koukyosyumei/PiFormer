@@ -102,7 +102,7 @@ pub fn prove_linear_attention(
     let g_ctx = DenseMLPoly::from_vec_padded(g_ctx_vec);
 
     transcript.append_field(b"claimed_ctx", &ctx_at_r);
-    let (context_sumcheck, r_inner_t) = prove_sumcheck(&f_ctx, &g_ctx, ctx_at_r, transcript);
+    let (context_sumcheck, _r_inner_t) = prove_sumcheck(&f_ctx, &g_ctx, ctx_at_r, transcript);
 
     let phi_k_at_r = context_sumcheck.final_eval_f;
     let v_at_r = context_sumcheck.final_eval_g;
@@ -218,7 +218,7 @@ fn eval_cols(matrix: &[Vec<F>], r_row: &[F], rows: usize, cols: usize) -> Vec<F>
 
 /// Evaluates the rows of a 2D matrix at a fixed column challenge.
 /// Returns a 1D vector of length `rows`.
-fn eval_rows(matrix: &[Vec<F>], r_col: &[F], rows: usize, cols: usize) -> Vec<F> {
+fn eval_rows(matrix: &[Vec<F>], r_col: &[F], rows: usize, _cols: usize) -> Vec<F> {
     let mut res = Vec::with_capacity(rows);
     for r in 0..rows {
         let poly = DenseMLPoly::from_vec_padded(matrix[r].clone());

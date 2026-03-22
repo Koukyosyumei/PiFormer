@@ -273,13 +273,12 @@ mod lasso_tests {
     use super::*;
     use crate::field::F;
     use crate::transcript::Transcript;
-    use ark_ff::{One, Zero};
+    use ark_ff::One;
 
     /// Helper to create a dummy 2-chunk Lasso instance.
     /// Table size = 2^4 = 16. Total address space = 16 * 16 = 256.
     fn setup_test_instance() -> LassoInstance {
         let m = 4;
-        let c = 2;
         let table_size = 1 << m;
 
         // Table 0: T[i] = i

@@ -214,6 +214,16 @@ fn msm_g1(bases: &[G1Affine], scalars: &[F]) -> G1Affine {
     msm(bases, scalars)
 }
 
+/// Convenience constructor: create HyraxParams sized for a table with
+/// `bits_per_chunk` variables (table size = 2^bits_per_chunk).
+///
+/// Uses the standard Hyrax split: nu = bits_per_chunk/2, sigma = bits_per_chunk - nu.
+pub fn setup_hyrax_params(bits_per_chunk: usize) -> HyraxParams {
+    let nu = bits_per_chunk / 2;
+    let sigma = bits_per_chunk - nu;
+    HyraxParams::new(sigma)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

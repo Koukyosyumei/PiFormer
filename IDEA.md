@@ -4,7 +4,7 @@ We propose a modified attention and trasnformer algorithm for efficient SNARK.
 
 - linear attention instead of softmax attention: $Attention(Q, K, V) = \phi(Q)(\phi(K)^T V)$
 - We define the activation kernel function $\phi$ as the learnable and structured lookup table to obtain both efficiency and accuracy.
-- Power-of-Two Linformer Projection: restrict the element of projection matricies to 2^{k} or \{0, 1, -1\}, whose multiplication is easier to compute.
+- Ternary Linformer Projection: restrict the element of projection matricies to \{0, 1, -1\}, whose multiplication is easier to compute.
 - constraint Fusion inspried from zkGPT.
 
 
