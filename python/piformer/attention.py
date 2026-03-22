@@ -4,7 +4,7 @@ ZK-friendly linear attention layer.
 Attention(Q, K, V) = φ(Q) (φ(K)^T V) / Z
 
 - φ is StructuredLookupActivation (proved via Lasso in the SNARK)
-- Projections use PowerOfTwoLinear (no general multiplications in circuit)
+- Projections use TernaryLinear (no general multiplications in circuit)
 - No softmax: replaces exp+row-normalize with a kernel feature map
 - Associativity: compute (φ(K)^T V) first → O(n d²) not O(n² d)
 """
@@ -12,7 +12,7 @@ Attention(Q, K, V) = φ(Q) (φ(K)^T V) / Z
 import torch
 import torch.nn as nn
 from .activation import StructuredLookupActivation
-from .projection import PowerOfTwoLinear
+from .projection import TernaryLinear
 
 
 class LinearAttentionLayer(nn.Module):
@@ -46,10 +46,10 @@ class LinearAttentionLayer(nn.Module):
         self.d_head = d_model // n_heads
         self.eps = eps
 
-        self.q_proj = PowerOfTwoLinear(d_model, d_model, max_exp=max_exp, bias=False)
-        self.k_proj = PowerOfTwoLinear(d_model, d_model, max_exp=max_exp, bias=False)
-        self.v_proj = PowerOfTwoLinear(d_model, d_model, max_exp=max_exp, bias=False)
-        self.out_proj = PowerOfTwoLinear(d_model, d_model, max_exp=max_exp, bias=True)
+        self.q_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=False)
+        self.k_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=False)
+        self.v_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=False)
+        self.out_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=True)
 
         # Single φ shared by Q and K projections.
         self.phi = StructuredLookupActivation(num_bits=num_bits, c=c, scale=scale)
