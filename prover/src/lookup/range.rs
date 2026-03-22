@@ -307,4 +307,71 @@ mod range_tests {
             "Should reject tampered multiplicity opening"
         );
     }
+
+    /// 16-bit range: values fit in one chunk (no high-chunk splitting needed).
+    #[test]
+    fn test_range_proof_16bit_values() {
+        let values = vec![
+            F::from(0u64),
+            F::from(1u64),
+            F::from(1000u64),
+            F::from(65535u64), // max 16-bit value
+        ];
+        let num_vars = values.len().next_power_of_two().trailing_zeros() as usize;
+        let witness = RangeProofWitness { values };
+
+        let mut pt = Transcript::new(b"range16");
+        let (proof, _) = prove_range(&witness, 16, &mut pt).unwrap();
+
+        let mut vt = Transcript::new(b"range16");
+        let result = verify_range(&proof, num_vars, 16, &mut vt);
+        assert!(result.is_ok(), "16-bit range proof failed: {:?}", result.err());
+    }
+
+    /// Power-of-two number of values.
+    #[test]
+    fn test_range_proof_power_of_two_count() {
+        let values: Vec<F> = (0..8u64).map(|i| F::from(i * 1000)).collect();
+        let num_vars = 3usize; // log2(8)
+        let witness = RangeProofWitness { values };
+
+        let mut pt = Transcript::new(b"range_pow2");
+        let (proof, _) = prove_range(&witness, 32, &mut pt).unwrap();
+
+        let mut vt = Transcript::new(b"range_pow2");
+        let result = verify_range(&proof, num_vars, 32, &mut vt);
+        assert!(result.is_ok(), "power-of-two count range proof failed: {:?}", result.err());
+    }
+
+    /// All values equal zero: an edge case for multiplicity counters.
+    #[test]
+    fn test_range_proof_all_zeros() {
+        let values = vec![F::zero(); 4];
+        let num_vars = 2usize;
+        let witness = RangeProofWitness { values };
+
+        let mut pt = Transcript::new(b"range_zeros");
+        let (proof, _) = prove_range(&witness, 16, &mut pt).unwrap();
+
+        let mut vt = Transcript::new(b"range_zeros");
+        let result = verify_range(&proof, num_vars, 16, &mut vt);
+        assert!(result.is_ok(), "all-zeros range proof failed: {:?}", result.err());
+    }
+
+    /// Tampered chunk opening (proof.chunk_opens[0]) should be caught.
+    #[test]
+    fn test_rejects_tampered_chunk_opening_vector() {
+        let witness = setup_witness();
+        let num_vars = witness.values.len().next_power_of_two().trailing_zeros() as usize;
+
+        let mut pt = Transcript::new(b"range_test");
+        let (mut proof, _) = prove_range(&witness, 32, &mut pt).unwrap();
+
+        // Corrupt the w_prime inside the first chunk opening proof
+        proof.chunk_opens[0].w_prime[0] += F::one();
+
+        let mut vt = Transcript::new(b"range_test");
+        let result = verify_range(&proof, num_vars, 32, &mut vt);
+        assert!(result.is_err(), "Should reject corrupted chunk opening proof");
+    }
 }

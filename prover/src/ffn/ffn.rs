@@ -500,4 +500,70 @@ mod ffn_tests {
         let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
         assert!(result.is_err(), "Should reject tampered weights");
     }
+
+    /// Tampering with the input X while keeping io_coms fixed should be detected
+    /// via the Hyrax opening check on X.
+    #[test]
+    fn test_rejects_tampered_x_input() {
+        let (pk, mut witness, inst, io_coms) = setup_test_pipeline();
+        let lasso_params = HyraxParams::new(2);
+
+        // Tamper with X (but io_coms.x_com is still bound to the original X)
+        witness.x[0][0] += F::one();
+
+        let mut pt = Transcript::new(b"ffn-test");
+        let proof = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+
+        let mut vt = Transcript::new(b"ffn-test");
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
+        assert!(result.is_err(), "Should reject tampered X input");
+    }
+
+    /// Tampering with the output Y while keeping io_coms fixed should be detected.
+    #[test]
+    fn test_rejects_tampered_y_output() {
+        let (pk, mut witness, inst, io_coms) = setup_test_pipeline();
+        let lasso_params = HyraxParams::new(2);
+
+        witness.y[0][0] += F::one();
+
+        let mut pt = Transcript::new(b"ffn-test");
+        let proof = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+
+        let mut vt = Transcript::new(b"ffn-test");
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
+        assert!(result.is_err(), "Should reject tampered Y output");
+    }
+
+    /// Tampering with the intermediate activation A should be detected.
+    #[test]
+    fn test_rejects_tampered_activation_a() {
+        let (pk, mut witness, inst, io_coms) = setup_test_pipeline();
+        let lasso_params = HyraxParams::new(2);
+
+        witness.a[0][0] += F::one();
+
+        let mut pt = Transcript::new(b"ffn-test");
+        let proof = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+
+        let mut vt = Transcript::new(b"ffn-test");
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
+        assert!(result.is_err(), "Should reject tampered activation A");
+    }
+
+    /// Tampering with W1 internally (but not recomputing vk.w1_com) should fail.
+    #[test]
+    fn test_rejects_tampered_w1() {
+        let (mut pk, witness, inst, io_coms) = setup_test_pipeline();
+        let lasso_params = HyraxParams::new(2);
+
+        pk.w1[0][0] += F::one();
+
+        let mut pt = Transcript::new(b"ffn-test");
+        let proof = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+
+        let mut vt = Transcript::new(b"ffn-test");
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
+        assert!(result.is_err(), "Should reject tampered W1");
+    }
 }

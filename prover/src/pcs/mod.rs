@@ -323,4 +323,111 @@ mod tests {
         let sum: Fr = basis.iter().sum();
         assert_eq!(sum, Fr::ONE, "Lagrange basis evaluations must sum to 1");
     }
+
+    #[test]
+    fn test_lagrange_basis_on_hypercube_is_indicator() {
+        // At a binary point, exactly one basis element is 1 and all others 0.
+        let n = 3;
+        for idx in 0..(1usize << n) {
+            let point: Vec<Fr> = (0..n)
+                .map(|k| if (idx >> k) & 1 == 1 { Fr::ONE } else { Fr::ZERO })
+                .collect();
+            let basis = lagrange_basis(&point);
+            for (i, &b) in basis.iter().enumerate() {
+                if i == idx {
+                    assert_eq!(b, Fr::ONE, "basis[{i}] should be 1 at binary point {idx}");
+                } else {
+                    assert_eq!(b, Fr::ZERO, "basis[{i}] should be 0 at binary point {idx}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_hyrax_commit_open_verify_zero_poly() {
+        // Committing to the all-zero polynomial should still verify correctly.
+        let nu = 2;
+        let sigma = 2;
+        let params = HyraxParams::new(sigma);
+        let evals = vec![Fr::ZERO; 1 << (nu + sigma)];
+
+        let commitment = hyrax_commit(&evals, nu, &params);
+
+        let mut rng = test_rng();
+        let point: Vec<Fr> = (0..(nu + sigma)).map(|_| Fr::rand(&mut rng)).collect();
+        let proof = hyrax_open(&evals, &point, nu, sigma);
+        let result = hyrax_verify(&commitment, Fr::ZERO, &point, &proof, &params);
+        assert!(result.is_ok(), "Zero polynomial should verify: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_hyrax_nu_zero_single_row() {
+        // nu=0 means the polynomial is a single row (no row variables).
+        let nu = 0;
+        let sigma = 3;
+        let params = HyraxParams::new(sigma);
+        let mut rng = test_rng();
+        let evals: Vec<Fr> = (0..(1 << sigma)).map(|_| Fr::rand(&mut rng)).collect();
+
+        let commitment = hyrax_commit(&evals, nu, &params);
+        assert_eq!(commitment.row_coms.len(), 1, "nu=0 should give a single row commitment");
+
+        let point: Vec<Fr> = (0..sigma).map(|_| Fr::rand(&mut rng)).collect();
+        let proof = hyrax_open(&evals, &point, nu, sigma);
+
+        // Compute expected eval manually
+        let basis = lagrange_basis(&point.iter().rev().copied().collect::<Vec<_>>());
+        let expected: Fr = evals.iter().zip(basis.iter()).map(|(e, l)| *e * l).sum();
+
+        let result = hyrax_verify(&commitment, expected, &point, &proof, &params);
+        assert!(result.is_ok(), "nu=0 verify should pass: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_hyrax_eval_matches_dense_ml_poly() {
+        // Cross-check: Hyrax opening eval must match DenseMLPoly::evaluate.
+        use crate::poly::DenseMLPoly;
+        let nu = 2;
+        let sigma = 2;
+        let params = HyraxParams::new(sigma);
+        let mut rng = test_rng();
+        let evals: Vec<Fr> = (0..(1 << (nu + sigma))).map(|_| Fr::rand(&mut rng)).collect();
+
+        let poly = DenseMLPoly::new(evals.clone());
+        let point: Vec<Fr> = (0..(nu + sigma)).map(|_| Fr::rand(&mut rng)).collect();
+
+        let expected = poly.evaluate(&point);
+        let proof = hyrax_open(&evals, &point, nu, sigma);
+        let commitment = hyrax_commit(&evals, nu, &params);
+
+        let result = hyrax_verify(&commitment, expected, &point, &proof, &params);
+        assert!(result.is_ok(), "Hyrax eval should match DenseMLPoly eval: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_params_from_vars_even() {
+        let (nu, sigma, params) = params_from_vars(6);
+        assert_eq!(nu, 3);
+        assert_eq!(sigma, 3);
+        assert_eq!(params.sigma, 3);
+        assert_eq!(params.gens.len(), 1 << 3);
+    }
+
+    #[test]
+    fn test_params_from_vars_odd() {
+        let (nu, sigma, params) = params_from_vars(5);
+        assert_eq!(nu, 2);
+        assert_eq!(sigma, 3);
+        assert_eq!(params.sigma, 3);
+    }
+
+    #[test]
+    fn test_setup_hyrax_params_produces_correct_sigma() {
+        for bpc in [2, 4, 6, 8] {
+            let params = setup_hyrax_params(bpc);
+            let expected_sigma = bpc - bpc / 2;
+            assert_eq!(params.sigma, expected_sigma, "bits_per_chunk={bpc}");
+            assert_eq!(params.gens.len(), 1 << expected_sigma);
+        }
+    }
 }

@@ -271,4 +271,97 @@ mod tests {
         let result = verify_sumcheck(&proof, claim, n, &mut verifier_transcript);
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn test_sumcheck_one_variable() {
+        // f = [3, 7], g = [2, 5]; sum = 3*2 + 7*5 = 41
+        let f = DenseMLPoly::new(vec![F::from(3u64), F::from(7u64)]);
+        let g = DenseMLPoly::new(vec![F::from(2u64), F::from(5u64)]);
+        let claim = compute_brute_force_sum(&f, &g);
+        assert_eq!(claim, F::from(41u64));
+
+        let mut pt = Transcript::new(b"test1");
+        let (proof, challenges) = prove_sumcheck(&f, &g, claim, &mut pt);
+        assert_eq!(proof.round_polys.len(), 1);
+
+        let mut vt = Transcript::new(b"test1");
+        let result = verify_sumcheck(&proof, claim, 1, &mut vt);
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let (v_challenges, _) = result.unwrap();
+        assert_eq!(challenges, v_challenges);
+    }
+
+    #[test]
+    fn test_sumcheck_four_variables() {
+        let n = 4;
+        let f = DenseMLPoly::new((1u64..=16).map(F::from).collect());
+        let g = DenseMLPoly::new((1u64..=16).map(|i| F::from(i * 2)).collect());
+        let claim = compute_brute_force_sum(&f, &g);
+
+        let mut pt = Transcript::new(b"test4");
+        let (proof, challenges) = prove_sumcheck(&f, &g, claim, &mut pt);
+
+        let mut vt = Transcript::new(b"test4");
+        let result = verify_sumcheck(&proof, claim, n, &mut vt);
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        // Cross-check prover's final claims against direct polynomial evaluation
+        let (r, _) = result.unwrap();
+        assert_eq!(proof.final_eval_f, f.evaluate(&r));
+        assert_eq!(proof.final_eval_g, g.evaluate(&r));
+        assert_eq!(challenges, r);
+    }
+
+    #[test]
+    fn test_sumcheck_g_all_ones() {
+        // When g = all-ones, the sum equals Σ f(x), and the sumcheck
+        // reduces to a claim about the sum of f.
+        let n = 3;
+        let f = DenseMLPoly::new(vec![
+            F::from(1u64),
+            F::from(2u64),
+            F::from(3u64),
+            F::from(4u64),
+            F::from(5u64),
+            F::from(6u64),
+            F::from(7u64),
+            F::from(8u64),
+        ]);
+        let g = DenseMLPoly::new(vec![F::ONE; 8]);
+        let claim = f.sum_over_hypercube(); // = 36
+
+        let mut pt = Transcript::new(b"ones");
+        let (proof, _) = prove_sumcheck(&f, &g, claim, &mut pt);
+
+        let mut vt = Transcript::new(b"ones");
+        let result = verify_sumcheck(&proof, claim, n, &mut vt);
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn test_sumcheck_round_poly_evaluate_at_0_and_1() {
+        // Verify that the RoundPoly evaluates correctly at the boolean points.
+        let rp = RoundPoly {
+            evals: [F::from(3u64), F::from(7u64), F::from(15u64)],
+        };
+        assert_eq!(rp.evaluate(F::ZERO), F::from(3u64));
+        assert_eq!(rp.evaluate(F::ONE), F::from(7u64));
+        assert_eq!(rp.evaluate(F::from(2u64)), F::from(15u64));
+    }
+
+    #[test]
+    fn test_sumcheck_wrong_num_vars_returns_err() {
+        let f = DenseMLPoly::new(vec![F::ONE; 4]);
+        let g = DenseMLPoly::new(vec![F::ONE; 4]);
+        let claim = compute_brute_force_sum(&f, &g);
+
+        let mut pt = Transcript::new(b"mismatch");
+        let (proof, _) = prove_sumcheck(&f, &g, claim, &mut pt);
+
+        // Pass num_vars=3 but proof has only 2 round polys
+        let mut vt = Transcript::new(b"mismatch");
+        let result = verify_sumcheck(&proof, claim, 3, &mut vt);
+        assert!(result.is_err());
+    }
 }

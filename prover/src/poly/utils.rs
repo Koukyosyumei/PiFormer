@@ -55,3 +55,150 @@ pub fn vec_to_mle(vec: &[F], len: usize) -> DenseMLPoly {
     // 4. DenseMLPolyとして返す
     DenseMLPoly::new(evals)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_ff::Zero;
+
+    // -----------------------------------------------------------------------
+    // mat_to_mle tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mat_to_mle_2x2_exact() {
+        let mat = vec![
+            vec![F::from(1u64), F::from(2u64)],
+            vec![F::from(3u64), F::from(4u64)],
+        ];
+        let mle = mat_to_mle(&mat, 2, 2);
+        assert_eq!(mle.evaluations.len(), 4);
+        assert_eq!(mle.evaluations[0], F::from(1u64)); // mat[0][0]
+        assert_eq!(mle.evaluations[1], F::from(2u64)); // mat[0][1]
+        assert_eq!(mle.evaluations[2], F::from(3u64)); // mat[1][0]
+        assert_eq!(mle.evaluations[3], F::from(4u64)); // mat[1][1]
+    }
+
+    #[test]
+    fn test_mat_to_mle_non_power_of_two_pads_correctly() {
+        // 3x3 → r_p2=4, c_p2=4, total=16
+        let mat = vec![
+            vec![F::from(1u64), F::from(2u64), F::from(3u64)],
+            vec![F::from(4u64), F::from(5u64), F::from(6u64)],
+            vec![F::from(7u64), F::from(8u64), F::from(9u64)],
+        ];
+        let mle = mat_to_mle(&mat, 3, 3);
+        assert_eq!(mle.evaluations.len(), 16);
+        assert_eq!(mle.evaluations[0], F::from(1u64));
+        assert_eq!(mle.evaluations[2], F::from(3u64));
+        assert_eq!(mle.evaluations[3], F::zero()); // col padding
+        assert_eq!(mle.evaluations[4], F::from(4u64));
+        assert_eq!(mle.evaluations[7], F::zero()); // col padding
+        // Row 3 (all zero, row padding)
+        assert_eq!(mle.evaluations[12], F::zero());
+        assert_eq!(mle.evaluations[15], F::zero());
+    }
+
+    #[test]
+    fn test_mat_to_mle_single_row() {
+        let mat = vec![vec![F::from(10u64), F::from(20u64)]];
+        let mle = mat_to_mle(&mat, 1, 2);
+        assert_eq!(mle.evaluations.len(), 2);
+        assert_eq!(mle.evaluations[0], F::from(10u64));
+        assert_eq!(mle.evaluations[1], F::from(20u64));
+    }
+
+    #[test]
+    fn test_mat_to_mle_single_element() {
+        let mat = vec![vec![F::from(42u64)]];
+        let mle = mat_to_mle(&mat, 1, 1);
+        assert_eq!(mle.evaluations.len(), 1);
+        assert_eq!(mle.evaluations[0], F::from(42u64));
+    }
+
+    #[test]
+    fn test_mat_to_mle_all_zeros() {
+        let mat = vec![vec![F::zero(); 4]; 4];
+        let mle = mat_to_mle(&mat, 4, 4);
+        assert!(mle.evaluations.iter().all(|&x| x.is_zero()));
+    }
+
+    #[test]
+    fn test_mat_to_mle_reported_dims_larger_than_actual() {
+        // Declare 4x4 but only provide 2x2 data — extra entries should be zero
+        let mat = vec![
+            vec![F::from(1u64), F::from(2u64)],
+            vec![F::from(3u64), F::from(4u64)],
+        ];
+        let mle = mat_to_mle(&mat, 4, 4);
+        assert_eq!(mle.evaluations.len(), 16);
+        assert_eq!(mle.evaluations[0], F::from(1u64));
+        assert_eq!(mle.evaluations[1], F::from(2u64));
+        // Row 1 starts at index 4 (c_p2=4)
+        assert_eq!(mle.evaluations[4], F::from(3u64));
+        assert_eq!(mle.evaluations[5], F::from(4u64));
+        // Remaining entries must be zero
+        for idx in [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+            assert_eq!(mle.evaluations[idx], F::zero(), "index {idx} should be zero");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // vec_to_mle tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_vec_to_mle_exact_power_of_two() {
+        let v = vec![
+            F::from(10u64),
+            F::from(20u64),
+            F::from(30u64),
+            F::from(40u64),
+        ];
+        let mle = vec_to_mle(&v, 4);
+        assert_eq!(mle.evaluations.len(), 4);
+        assert_eq!(mle.evaluations[0], F::from(10u64));
+        assert_eq!(mle.evaluations[3], F::from(40u64));
+    }
+
+    #[test]
+    fn test_vec_to_mle_pads_to_next_power_of_two() {
+        let v = vec![F::from(1u64), F::from(2u64), F::from(3u64)];
+        let mle = vec_to_mle(&v, 3);
+        assert_eq!(mle.evaluations.len(), 4);
+        assert_eq!(mle.evaluations[0], F::from(1u64));
+        assert_eq!(mle.evaluations[1], F::from(2u64));
+        assert_eq!(mle.evaluations[2], F::from(3u64));
+        assert_eq!(mle.evaluations[3], F::zero()); // padding
+    }
+
+    #[test]
+    fn test_vec_to_mle_minimum_size() {
+        // len=1 → padded to 2 (enforced minimum)
+        let v = vec![F::from(99u64)];
+        let mle = vec_to_mle(&v, 1);
+        assert_eq!(mle.evaluations.len(), 2);
+        assert_eq!(mle.evaluations[0], F::from(99u64));
+        assert_eq!(mle.evaluations[1], F::zero());
+    }
+
+    #[test]
+    fn test_vec_to_mle_reported_len_larger() {
+        // len=8 but only 3 elements provided — remaining should be zero
+        let v = vec![F::from(5u64), F::from(6u64), F::from(7u64)];
+        let mle = vec_to_mle(&v, 8);
+        assert_eq!(mle.evaluations.len(), 8);
+        assert_eq!(mle.evaluations[0], F::from(5u64));
+        assert_eq!(mle.evaluations[2], F::from(7u64));
+        for i in 3..8 {
+            assert_eq!(mle.evaluations[i], F::zero());
+        }
+    }
+
+    #[test]
+    fn test_vec_to_mle_all_zeros() {
+        let v = vec![F::zero(); 4];
+        let mle = vec_to_mle(&v, 4);
+        assert!(mle.evaluations.iter().all(|&x| x.is_zero()));
+    }
+}

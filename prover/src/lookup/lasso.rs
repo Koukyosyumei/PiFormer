@@ -386,4 +386,92 @@ mod lasso_tests {
         // Now this check will definitely fail!
         assert!(err_msg.contains("Lasso sub-claim mismatch for table 0"));
     }
+
+    /// Single-table Lasso: c=1, queries index directly into the table.
+    #[test]
+    fn test_lasso_single_table() {
+        let m = 4;
+        let table_size = 1 << m;
+        // T[i] = i^2 mod table_size (structured table)
+        let t0: Vec<F> = (0..table_size)
+            .map(|i| F::from((i * i % table_size) as u64))
+            .collect();
+
+        let query_indices = vec![0, 1, 3, 7, 15];
+        let outputs: Vec<F> = query_indices
+            .iter()
+            .map(|&idx| t0[idx])
+            .collect();
+
+        let instance = LassoInstance {
+            tables: vec![t0],
+            query_indices,
+            outputs,
+            bits_per_chunk: m,
+        };
+        let sigma = m / 2;
+        let params = HyraxParams::new(sigma);
+
+        let mut pt = Transcript::new(b"single-table");
+        let proof = prove_lasso(&instance, &mut pt, &params);
+
+        let mut vt = Transcript::new(b"single-table");
+        let result = verify_lasso(&proof, &instance, &mut vt, &params);
+        assert!(result.is_ok(), "single-table lasso failed: {:?}", result.err());
+    }
+
+    /// Single-query Lasso: only one lookup entry to prove.
+    #[test]
+    fn test_lasso_single_query() {
+        let m = 4;
+        let table_size = 1 << m;
+        let t0: Vec<F> = (0..table_size).map(|i| F::from(i as u64)).collect();
+        let t1: Vec<F> = (0..table_size).map(|i| F::from((i * 5) as u64)).collect();
+
+        // Single query: index 0x23 → chunk0=3, chunk1=2
+        // Output = T0[3] + T1[2] = 3 + 10 = 13
+        let instance = LassoInstance {
+            tables: vec![t0, t1],
+            query_indices: vec![0x23],
+            outputs: vec![F::from(13u64)],
+            bits_per_chunk: m,
+        };
+        let sigma = m / 2;
+        let params = HyraxParams::new(sigma);
+
+        let mut pt = Transcript::new(b"single-query");
+        let proof = prove_lasso(&instance, &mut pt, &params);
+
+        let mut vt = Transcript::new(b"single-query");
+        let result = verify_lasso(&proof, &instance, &mut vt, &params);
+        assert!(result.is_ok(), "single-query lasso failed: {:?}", result.err());
+    }
+
+    /// Verify the internal `chunk` helper function correctness.
+    #[test]
+    fn test_chunk_helper() {
+        let m = 4;
+        let mask = (1usize << m) - 1;
+
+        // Index 0xAB: chunk0 = 0xB = 11, chunk1 = 0xA = 10
+        assert_eq!(chunk(0xAB, 0, m, mask), 0xB);
+        assert_eq!(chunk(0xAB, 1, m, mask), 0xA);
+
+        // Index 0x12: chunk0 = 0x2 = 2, chunk1 = 0x1 = 1
+        assert_eq!(chunk(0x12, 0, m, mask), 0x2);
+        assert_eq!(chunk(0x12, 1, m, mask), 0x1);
+    }
+
+    /// Verify the `powers_of` helper function.
+    #[test]
+    fn test_powers_of_helper() {
+        let rho = F::from(3u64);
+        let pows = powers_of(rho, 5);
+        assert_eq!(pows.len(), 5);
+        assert_eq!(pows[0], F::ONE);
+        assert_eq!(pows[1], F::from(3u64));
+        assert_eq!(pows[2], F::from(9u64));
+        assert_eq!(pows[3], F::from(27u64));
+        assert_eq!(pows[4], F::from(81u64));
+    }
 }
