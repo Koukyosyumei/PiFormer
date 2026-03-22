@@ -21,7 +21,9 @@
 
 use crate::field::F;
 use crate::lookup::{prove_lasso, verify_lasso, LassoInstance, LassoProof};
-use crate::pcs::{hyrax_commit, hyrax_open, hyrax_verify, HyraxCommitment, HyraxParams, HyraxProof};
+use crate::pcs::{
+    hyrax_commit, hyrax_open, hyrax_verify, HyraxCommitment, HyraxParams, HyraxProof,
+};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
@@ -82,7 +84,9 @@ impl Mat2D {
         assert_eq!(r_row.len(), self.num_vars_row);
         (0..self.num_cols)
             .map(|c| {
-                let col: Vec<F> = (0..self.num_rows).map(|r| self.evals[r * self.num_cols + c]).collect();
+                let col: Vec<F> = (0..self.num_rows)
+                    .map(|r| self.evals[r * self.num_cols + c])
+                    .collect();
                 DenseMLPoly::from_vec_padded(col).evaluate(r_row)
             })
             .collect()
@@ -348,8 +352,14 @@ pub fn verify_ffn(
     if a_com_check.row_coms != proof.a_com.row_coms {
         return Err("FFN A commitment mismatch".to_string());
     }
-    hyrax_verify(&proof.a_com, proof.a_eval, &point_a, &proof.a_open, &a_params)
-        .map_err(|e| format!("FFN A open: {e}"))?;
+    hyrax_verify(
+        &proof.a_com,
+        proof.a_eval,
+        &point_a,
+        &proof.a_open,
+        &a_params,
+    )
+    .map_err(|e| format!("FFN A open: {e}"))?;
 
     // Verify W2 opening
     let nu_w2 = w2_mat.total_vars() / 2;
@@ -357,8 +367,14 @@ pub fn verify_ffn(
     let w2_params = HyraxParams::new(sigma_w2);
     let mut point_w2 = r_k.clone();
     point_w2.extend_from_slice(&ry_d);
-    hyrax_verify(&proof.w2_com, proof.w2_eval, &point_w2, &proof.w2_open, &w2_params)
-        .map_err(|e| format!("FFN W2 open: {e}"))?;
+    hyrax_verify(
+        &proof.w2_com,
+        proof.w2_eval,
+        &point_w2,
+        &proof.w2_open,
+        &w2_params,
+    )
+    .map_err(|e| format!("FFN W2 open: {e}"))?;
     // Sanity: W2 commitment matches public W2
     let w2_com_check = hyrax_commit(&w2_mat.evals, nu_w2, &w2_params);
     if w2_com_check.row_coms != proof.w2_com.row_coms {
@@ -366,8 +382,13 @@ pub fn verify_ffn(
     }
 
     // --- Step 2: Lasso ---
-    verify_lasso(&proof.activation_proof, &inst.activation_lasso, transcript, params)
-        .map_err(|e| format!("FFN activation Lasso: {e}"))?;
+    verify_lasso(
+        &proof.activation_proof,
+        &inst.activation_lasso,
+        transcript,
+        params,
+    )
+    .map_err(|e| format!("FFN activation Lasso: {e}"))?;
 
     // --- Step 3: M sumcheck ---
     let rx_m = challenge_vec(transcript, t_vars, b"ffn_rx_m");
@@ -385,8 +406,14 @@ pub fn verify_ffn(
     // Verify M opening
     let mut point_m = rx_m.clone();
     point_m.extend_from_slice(&ry_k);
-    hyrax_verify(&proof.m_com, proof.m_eval, &point_m, &proof.m_open, &m_params)
-        .map_err(|e| format!("FFN M open: {e}"))?;
+    hyrax_verify(
+        &proof.m_com,
+        proof.m_eval,
+        &point_m,
+        &proof.m_open,
+        &m_params,
+    )
+    .map_err(|e| format!("FFN M open: {e}"))?;
 
     // Verify X opening
     let nu_x = x_mat.total_vars() / 2;
@@ -394,8 +421,14 @@ pub fn verify_ffn(
     let x_params = HyraxParams::new(sigma_x);
     let mut point_x = rx_m.clone();
     point_x.extend_from_slice(&r_j);
-    hyrax_verify(&proof.x_com, proof.x_eval, &point_x, &proof.x_open, &x_params)
-        .map_err(|e| format!("FFN X open: {e}"))?;
+    hyrax_verify(
+        &proof.x_com,
+        proof.x_eval,
+        &point_x,
+        &proof.x_open,
+        &x_params,
+    )
+    .map_err(|e| format!("FFN X open: {e}"))?;
     let x_com_check = hyrax_commit(&x_mat.evals, nu_x, &x_params);
     if x_com_check.row_coms != proof.x_com.row_coms {
         return Err("FFN X commitment mismatch".to_string());
@@ -407,8 +440,14 @@ pub fn verify_ffn(
     let w1_params = HyraxParams::new(sigma_w1);
     let mut point_w1 = r_j.clone();
     point_w1.extend_from_slice(&ry_k);
-    hyrax_verify(&proof.w1_com, proof.w1_eval, &point_w1, &proof.w1_open, &w1_params)
-        .map_err(|e| format!("FFN W1 open: {e}"))?;
+    hyrax_verify(
+        &proof.w1_com,
+        proof.w1_eval,
+        &point_w1,
+        &proof.w1_open,
+        &w1_params,
+    )
+    .map_err(|e| format!("FFN W1 open: {e}"))?;
     let w1_com_check = hyrax_commit(&w1_mat.evals, nu_w1, &w1_params);
     if w1_com_check.row_coms != proof.w1_com.row_coms {
         return Err("FFN W1 commitment mismatch".to_string());
@@ -422,7 +461,9 @@ pub fn verify_ffn(
 // ---------------------------------------------------------------------------
 
 fn challenge_vec(transcript: &mut Transcript, len: usize, label: &[u8]) -> Vec<F> {
-    (0..len).map(|_| transcript.challenge_field::<F>(label)).collect()
+    (0..len)
+        .map(|_| transcript.challenge_field::<F>(label))
+        .collect()
 }
 
 fn absorb_commitment(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) {
@@ -515,7 +556,15 @@ mod ffn_tests {
         // Recompute Y = A · W2
         let y = matmul(&a, &w2, seq_len, d_ff, d_model);
 
-        FFNInstance { x, m, a, y, w1, w2, activation_lasso }
+        FFNInstance {
+            x,
+            m,
+            a,
+            y,
+            w1,
+            w2,
+            activation_lasso,
+        }
     }
 
     #[test]

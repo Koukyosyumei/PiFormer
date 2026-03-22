@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod ffn;
 pub mod field;
 pub mod lookup;
 pub mod pcs;
@@ -9,4 +10,3 @@ pub mod transcript;
 pub mod verifier;
 
 pub use field::F;
-pub mod pipeline;
