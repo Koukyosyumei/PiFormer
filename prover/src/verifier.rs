@@ -12,7 +12,7 @@ use crate::pcs::{HyraxCommitment, HyraxParams};
 use crate::transcript::Transcript;
 
 // Sub-module keys and verifiers
-use crate::attention::attention::{verify_linear_attention, LinearAttentionInstance};
+use crate::attention::attention::{absorb_com, verify_linear_attention, LinearAttentionInstance};
 use crate::attention::layernorm::{
     verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey,
 };
@@ -24,7 +24,7 @@ use crate::ffn::ffn::{verify_ffn, FFNInstance, FFNProvingKey, FFNVerifyingKey};
 use ark_ec::{AffineRepr, CurveGroup}; // Arkworks 0.4.0+ の正しいトレイト
 use std::ops::AddAssign;
 
-use crate::prover::TransformerBlockProof; // Imported from prover.rs
+use crate::prover::{TransformerBlockProof, TransformerModelProof, TransformerModelVerifyingKey}; // Imported from prover.rs
 
 // ---------------------------------------------------------------------------
 // Global Verifying Key
@@ -32,6 +32,7 @@ use crate::prover::TransformerBlockProof; // Imported from prover.rs
 
 /// Contains ALL static weight commitments for one block.
 /// Loaded ONCE offline. O(1) size regardless of model depth.
+#[derive(Clone)]
 pub struct TransformerBlockVerifyingKey {
     pub seq_len: usize,
     pub d_model: usize,
@@ -192,4 +193,68 @@ pub fn add_commitments(a: &HyraxCommitment, b: &HyraxCommitment) -> HyraxCommitm
         nu: a.nu,
         sigma: a.sigma,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Model Verifier (E2E)
+// ---------------------------------------------------------------------------
+
+/// Verifies the entire LLM forward pass.
+/// The verifier guarantees that `logits_com` is the mathematically correct
+/// output of the model for the given input `x_in_com`.
+pub fn verify_transformer_model_succinct(
+    proof: &TransformerModelProof,
+    vk: &TransformerModelVerifyingKey,
+    inst_attn: &LinearAttentionInstance,
+    inst_ffn: &FFNInstance,
+    transcript: &mut Transcript,
+    lasso_params: &HyraxParams,
+) -> Result<(), String> {
+    // 1. Bind Initial Input
+    absorb_com(transcript, b"x_in_com", &proof.x_in_com);
+
+    // 2. Block Verification Chaining
+    let mut current_x_com = proof.x_in_com.clone();
+
+    for i in 0..vk.num_blocks {
+        let bp = &proof.block_proofs[i];
+
+        // Reconstruct the expected output commitment for this block
+        let x_mid_com = add_commitments(&current_x_com, &bp.out_attn_com);
+        let expected_x_out_com = add_commitments(&x_mid_com, &bp.out_ffn_com);
+
+        // Verify the block
+        verify_transformer_block(
+            bp,
+            &current_x_com,
+            &expected_x_out_com,
+            &vk.block_vks[i],
+            inst_attn,
+            inst_ffn,
+            transcript,
+            lasso_params,
+        )
+        .map_err(|e| format!("Block {} failed: {}", i, e))?;
+
+        // Chain the output to the next block
+        current_x_com = expected_x_out_com;
+    }
+
+    // 3. Final LayerNorm Verification
+    let ln_io = LayerNormIOCommitments {
+        x_com: current_x_com.clone(),
+        y_com: proof.final_ln_out_com.clone(),
+    };
+    verify_layernorm(&proof.final_ln_proof, &ln_io, &vk.final_ln_vk, transcript)
+        .map_err(|e| format!("Final LN failed: {}", e))?;
+
+    // 4. LM Head Verification
+    let lm_io = ProjectionIOCommitments {
+        x_com: proof.final_ln_out_com.clone(),
+        y_com: proof.logits_com.clone(),
+    };
+    verify_projection_succinct(&proof.lm_head_proof, &vk.lm_head_vk, &lm_io, transcript)
+        .map_err(|e| format!("LM Head failed: {}", e))?;
+
+    Ok(())
 }

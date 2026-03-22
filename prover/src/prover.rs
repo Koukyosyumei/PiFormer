@@ -23,14 +23,16 @@ use crate::transcript::Transcript;
 
 // Sub-module imports (Assuming the interfaces we built previously)
 use crate::attention::attention::{
-    prove_linear_attention, AttentionIOCommitments, LinearAttentionInstance, LinearAttentionProof,
-    LinearAttentionWitness,
+    absorb_com, prove_linear_attention, AttentionIOCommitments, LinearAttentionInstance,
+    LinearAttentionProof, LinearAttentionWitness,
 };
 use crate::attention::layernorm::{
-    prove_layernorm, LayerNormIOCommitments, LayerNormProof, LayerNormWitness,
+    prove_layernorm, LayerNormIOCommitments, LayerNormProof, LayerNormVerifyingKey,
+    LayerNormWitness,
 };
 use crate::attention::projection::{
-    prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionWitness,
+    prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionProvingKey,
+    ProjectionVerifyingKey, ProjectionWitness,
 };
 use crate::ffn::ffn::{prove_ffn, FFNIOCommitments, FFNInstance, FFNProof, FFNWitness};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey}; // Imported from verifier.rs
@@ -207,5 +209,127 @@ pub fn prove_transformer_block(
         out_attn_com,
         x_norm2_com,
         out_ffn_com,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Global Model Keys and Structures
+// ---------------------------------------------------------------------------
+#[derive(Clone)]
+pub struct TransformerModelVerifyingKey {
+    pub num_blocks: usize,
+    pub seq_len: usize,
+    pub d_model: usize,
+    pub vocab_size: usize,
+
+    pub block_vks: Vec<TransformerBlockVerifyingKey>,
+    pub final_ln_vk: LayerNormVerifyingKey,
+    pub lm_head_vk: ProjectionVerifyingKey,
+}
+
+pub struct TransformerModelProvingKey {
+    pub vk: TransformerModelVerifyingKey,
+    pub block_pks: Vec<crate::verifier::TransformerBlockVerifyingKey>, // 簡略化のためVKと同じものをPKとして扱う
+    pub lm_head_pk: ProjectionProvingKey,
+}
+
+pub struct TransformerModelWitness {
+    pub x_in: Vec<Vec<F>>, // Initial embeddings
+    pub block_witnesses: Vec<TransformerBlockWitness>,
+    pub final_ln_wit: LayerNormWitness,
+    pub lm_head_wit: ProjectionWitness,
+}
+
+pub struct TransformerModelProof {
+    pub x_in_com: HyraxCommitment, // コミットされた入力
+    pub block_proofs: Vec<TransformerBlockProof>,
+    pub final_ln_proof: LayerNormProof,
+    pub lm_head_proof: ProjectionProof,
+
+    // パイプライン接続用の中間コミットメント
+    pub final_ln_out_com: HyraxCommitment,
+    pub logits_com: HyraxCommitment, // 最終出力（Logits）のコミットメント
+}
+
+// ---------------------------------------------------------------------------
+// Model Prover (E2E)
+// ---------------------------------------------------------------------------
+
+pub fn prove_transformer_model(
+    pk: &TransformerModelProvingKey,
+    witness: &TransformerModelWitness,
+    inst_attn: &LinearAttentionInstance,
+    inst_ffn: &FFNInstance,
+    transcript: &mut Transcript,
+    lasso_params: &HyraxParams,
+) -> Result<TransformerModelProof, String> {
+    let t = pk.vk.seq_len;
+    let d = pk.vk.d_model;
+    let v = pk.vk.vocab_size;
+
+    let commit_mat = |mat: &[Vec<F>], rows: usize, cols: usize| -> HyraxCommitment {
+        let mle = mat_to_mle(mat, rows, cols);
+        let vars =
+            rows.next_power_of_two().trailing_zeros() + cols.next_power_of_two().trailing_zeros();
+        let nu = vars as usize / 2;
+        let sigma = (vars as usize - nu).max(1);
+        hyrax_commit(&mle.evaluations, nu, &HyraxParams::new(sigma))
+    };
+
+    // 1. Initial Input Commitment
+    let x_in_com = commit_mat(&witness.x_in, t, d);
+    absorb_com(transcript, b"x_in_com", &x_in_com);
+
+    // 2. Iterate through Transformer Blocks
+    let mut block_proofs = Vec::with_capacity(pk.vk.num_blocks);
+    let mut current_x_com = x_in_com.clone();
+
+    for i in 0..pk.vk.num_blocks {
+        let block_proof = prove_transformer_block(
+            &witness.block_witnesses[i],
+            &current_x_com,
+            &pk.block_pks[i],
+            inst_attn,
+            inst_ffn,
+            transcript,
+            lasso_params,
+        )?;
+
+        // 次のブロックへの入力となる残差接続出力のコミットメントを計算
+        let x_mid_com = add_commitments(&current_x_com, &block_proof.out_attn_com);
+        let next_x_com = add_commitments(&x_mid_com, &block_proof.out_ffn_com);
+
+        current_x_com = next_x_com;
+        block_proofs.push(block_proof);
+    }
+
+    // 3. Final LayerNorm
+    let final_ln_out_com = commit_mat(&witness.final_ln_wit.y, t, d);
+    let ln_io = LayerNormIOCommitments {
+        x_com: current_x_com.clone(),
+        y_com: final_ln_out_com.clone(),
+    };
+    let final_ln_proof = prove_layernorm(
+        &witness.final_ln_wit,
+        &ln_io,
+        &pk.vk.final_ln_vk,
+        transcript,
+    )?;
+
+    // 4. LM Head (Final Projection to Vocab Size)
+    let logits_com = commit_mat(&witness.lm_head_wit.y, t, v);
+    let lm_io = ProjectionIOCommitments {
+        x_com: final_ln_out_com.clone(),
+        y_com: logits_com.clone(),
+    };
+    let lm_head_proof = prove_projection(&pk.lm_head_pk, &witness.lm_head_wit, &lm_io, transcript)?;
+
+    Ok(TransformerModelProof {
+        x_in_com,
+        block_proofs,
+        final_ln_proof,
+        lm_head_proof,
+        final_ln_out_com,
+        logits_com,
     })
 }

@@ -34,6 +34,7 @@ pub struct FFNIOCommitments {
 }
 
 /// Preprocessing Key for the Verifier. (Static model weights)
+#[derive(Clone)]
 pub struct FFNVerifyingKey {
     pub seq_len: usize,
     pub d_model: usize,
@@ -43,6 +44,7 @@ pub struct FFNVerifyingKey {
 }
 
 /// Preprocessing Key for the Prover.
+#[derive(Clone)]
 pub struct FFNProvingKey {
     pub vk: FFNVerifyingKey,
     pub w1: Vec<Vec<F>>,

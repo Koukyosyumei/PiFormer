@@ -32,6 +32,7 @@ pub struct LayerNormIOCommitments {
 }
 
 /// Preprocessing key. Contains public weights.
+#[derive(Clone)]
 pub struct LayerNormVerifyingKey {
     pub seq_len: usize,
     pub d_head: usize,

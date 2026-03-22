@@ -34,6 +34,7 @@ pub struct ProjectionIOCommitments {
 
 /// Preprocessing Key for the Verifier.
 /// Contains the cryptographic commitment to the static model weights.
+#[derive(Clone)]
 pub struct ProjectionVerifyingKey {
     pub seq_len: usize,
     pub d_in: usize,
@@ -43,6 +44,7 @@ pub struct ProjectionVerifyingKey {
 
 /// Preprocessing Key for the Prover.
 /// Contains the raw static weights and the Verifying Key.
+#[derive(Clone)]
 pub struct ProjectionProvingKey {
     pub vk: ProjectionVerifyingKey,
     pub w: Vec<Vec<F>>,

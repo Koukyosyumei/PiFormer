@@ -344,7 +344,7 @@ fn challenge_vec(transcript: &mut Transcript, len: usize, label: &[u8]) -> Vec<F
         .map(|_| transcript.challenge_field::<F>(label))
         .collect()
 }
-fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) {
+pub fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) {
     for pt in &com.row_coms {
         let mut buf = Vec::new();
         pt.serialize_compressed(&mut buf).unwrap();

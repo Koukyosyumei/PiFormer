@@ -5,6 +5,7 @@ pub mod lookup;
 pub mod pcs;
 pub mod poly;
 pub mod prover;
+pub mod setup;
 pub mod subprotocols;
 pub mod transcript;
 pub mod verifier;
