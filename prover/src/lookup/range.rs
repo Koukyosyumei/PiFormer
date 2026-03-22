@@ -57,9 +57,7 @@ pub fn verify_range(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn build_lasso_instance(
-    inst: &RangeProofInstance,
-) -> Result<(LassoInstance, HyraxParams), String> {
+fn build_lasso_instance(inst: &RangeProofInstance) -> Result<(LassoInstance, HyraxParams), String> {
     let c = RANGE_C;
     let bits_per_chunk = (inst.bits + c - 1) / c; // ceiling division
     if bits_per_chunk > 16 {
