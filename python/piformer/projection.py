@@ -13,63 +13,74 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class PowerOfTwoLinear(nn.Module):
+class TernaryLinear(nn.Module):
     """
-    Linear layer whose weights are quantized to power-of-two values.
-
-    Args:
-        in_features, out_features: standard Linear dims.
-        max_exp: highest power; candidates are {0, ±1, ±2, ±4, ..., ±2^max_exp}.
-        bias: whether to include a (non-quantized) bias term.
+    重みを {-1, 0, 1} に制限した ZKPフレンドリーな線形層。
+    MatMul-free ネットワークの核となる構造。
     """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        max_exp: int = 4,
-        bias: bool = True,
-    ):
+    def __init__(self, in_features, out_features,
+                 min_exp: int = 0, #-4,  # 2^-4 = 0.0625 まで表現
+                 max_exp: int = 4, bias=True):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.max_exp = max_exp
 
-        self.weight = nn.Parameter(
-            torch.randn(out_features, in_features) * 0.02
-        )
+        # 実数値の重み（学習用）
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.02)
+
+        # 学習可能なスケール因子 (alpha)
+        # 3値重みにこれを掛けることで、モデルの表現力を維持する
+        self.alpha = nn.Parameter(torch.tensor(1.0))
+
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
             self.register_parameter("bias", None)
 
-        # Candidate set: 0, ±1, ±2, ±4, ..., ±2^max_exp
-        pos = [2.0 ** k for k in range(max_exp + 1)]
-        candidates = sorted(set([0.0] + pos + [-v for v in pos]))
-        self.register_buffer(
-            "candidates", torch.tensor(candidates, dtype=torch.float32)
-        )
-
     def _quantize(self, w: torch.Tensor) -> torch.Tensor:
-        """Snap each weight to the nearest candidate."""
-        diffs = (w.unsqueeze(-1) - self.candidates).abs()
-        best = diffs.argmin(dim=-1)
-        return self.candidates[best]
+        """
+        重みを {-1, 0, 1} に量子化する。
+        """
+        # 1. 重みをスケーリング（平均を引いて中心を合わせる手法もあるが、ここではシンプルに）
+        # alpha は量子化後の値の大きさを決定する
+
+        # 2. 閾値の計算 (BitNet等の手法: 重みの絶対値の平均の一定割合を 0 にする)
+        # ここではシンプルに、全体の平均を基準に 0 領域を作る
+        delta = 0.7 * w.abs().mean()
+
+        # 3. 三値化プロセス
+        # w > delta  =>  1
+        # w < -delta => -1
+        # else       =>  0
+        w_q = torch.zeros_like(w)
+        w_q[w > delta] = 1
+        w_q[w < -delta] = -1
+
+        # 4. alpha を掛けて実スケールに戻す (W_final = alpha * {-1, 0, 1})
+        # ZKP上では alpha は行列演算の「後」に1回掛けるだけ。
+        return w_q * self.alpha
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 学習時は STE (Straight-Through Estimator)
         if self.training:
-            # STE: quantized value in forward, real gradient in backward
-            w_q = self._quantize(self.weight).detach() + (
-                self.weight - self.weight.detach()
-            )
+            w_q = self._quantize(self.weight).detach() + (self.weight - self.weight.detach())
         else:
             w_q = self._quantize(self.weight)
+
+        # 行列演算 (ZKP側では加減算のみになる)
         return F.linear(x, w_q, self.bias)
 
+    @torch.no_grad()
     def export_weights(self) -> dict:
-        """Return quantized weights for the Rust prover."""
-        w_q = self._quantize(self.weight).detach()
+        """Rust / Jolt 側で利用するためのデータ書き出し"""
+        # 量子化された {-1, 0, 1} のインデックスのみを書き出す
+        delta = 0.7 * self.weight.abs().mean()
+        w_indices = torch.zeros_like(self.weight)
+        w_indices[self.weight > delta] = 1
+        w_indices[self.weight < -delta] = -1
+
         return {
-            "weight": w_q.tolist(),
-            "bias": self.bias.detach().tolist() if self.bias is not None else None,
+            "weight_indices": w_indices.cpu().int().tolist(), # {-1, 0, 1} のみ
+            "alpha": self.alpha.item(),
+            "bias": self.bias.cpu().tolist() if self.bias is not None else None,
         }

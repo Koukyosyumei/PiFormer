@@ -11,13 +11,13 @@ Each block consists of:
 import torch
 import torch.nn as nn
 from .attention import LinearAttentionLayer
-from .projection import PowerOfTwoLinear
+from .projection import TernaryLinear
 from .activation import StructuredLookupActivation
 
 
 class PiFormerFFN(nn.Module):
     """
-    Feed-forward block using PowerOfTwoLinear + StructuredLookupActivation.
+    Feed-forward block using TernaryLinear + StructuredLookupActivation.
 
     In the SNARK:
     - fc1, fc2 use constant (power-of-two) multiplications → only additions needed
@@ -34,9 +34,9 @@ class PiFormerFFN(nn.Module):
         max_exp: int = 4,
     ):
         super().__init__()
-        self.fc1 = PowerOfTwoLinear(d_model, d_ff, max_exp=max_exp)
+        self.fc1 = TernaryLinear(d_model, d_ff, max_exp=max_exp)
         self.act = StructuredLookupActivation(num_bits=num_bits, c=c, scale=scale)
-        self.fc2 = PowerOfTwoLinear(d_ff, d_model, max_exp=max_exp)
+        self.fc2 = TernaryLinear(d_ff, d_model, max_exp=max_exp)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc2(self.act(self.fc1(x)))
@@ -117,7 +117,7 @@ class PiFormerModel(nn.Module):
             ]
         )
         self.norm = nn.LayerNorm(d_model)
-        self.head = PowerOfTwoLinear(d_model, vocab_size, max_exp=max_exp, bias=False)
+        self.head = TernaryLinear(d_model, vocab_size, max_exp=max_exp, bias=False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """

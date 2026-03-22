@@ -38,10 +38,19 @@ class StructuredLookupActivation(nn.Module):
 
         # Initialize sub-tables to approximate GeLU / c shape so training converges faster.
         self.tables = nn.ParameterList()
-        for _ in range(c):
+
+        total_size = 2 ** num_bits
+        for i in range(c):
             indices = torch.arange(self.chunk_size, dtype=torch.float32)
-            x_approx = (indices / self.chunk_size - 0.5) * 4.0
-            init = F.gelu(x_approx) / c
+            if i == c - 1: # 最上位テーブル
+                # 上位ビットのインデックスがカバーする範囲の「代表値」でGeLUを計算
+                # 例: 8bit, c=2なら 16刻みで値をサンプリング
+                x_idx = indices * (self.chunk_size ** i) + (self.chunk_size ** i) / 2
+                x_approx = (x_idx / total_size - 0.5) * 8.0 # [-4, 4]スケール
+                init = F.gelu(x_approx)
+            else:
+                # 下位テーブルは 0 で初期化してギザギザを防ぐ
+                init = torch.zeros(self.chunk_size)
             self.tables.append(nn.Parameter(init))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
