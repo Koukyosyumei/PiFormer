@@ -144,7 +144,10 @@ pub fn prove_projection(
 
     // 3. Sumcheck: Y(r_t, r_out) = Σ_k X(r_t, k) * W(k, r_out)
     let f_x = DenseMLPoly::from_vec_padded(eval_rows(&x_mle, t_bits, &r_t));
-    let g_w = DenseMLPoly::from_vec_padded(eval_cols(&w_mle, in_bits, &r_out));
+    //let g_w = DenseMLPoly::from_vec_padded(eval_cols(&w_mle, in_bits, &r_out));
+
+    let g_w_evals = eval_cols_ternary(&pk.w, &r_out, d_in, d_out);
+    let g_w = DenseMLPoly::from_vec_padded(g_w_evals);
 
     let (sumcheck, r_k) = prove_sumcheck(&f_x, &g_w, y_eval, transcript);
 
@@ -285,6 +288,44 @@ fn eval_cols(poly: &DenseMLPoly, n_row_vars: usize, r_col: &[F]) -> Vec<F> {
         .collect()
 }
 
+fn eval_cols_ternary(w_raw: &[Vec<F>], r_out: &[F], d_in: usize, d_out: usize) -> Vec<F> {
+    // 1. eq(j, r_out) を事前計算 (O(d_out))
+    // 後のループで使い回すことで、計算量を劇的に減らす
+    let eq_evals = compute_eq_evals(r_out, d_out);
+
+    let mut res = vec![F::ZERO; d_in.next_power_of_two()];
+
+    // 2. コアループ: 有限体乗算 (Mul) はゼロ！
+    for k in 0..d_in {
+        let mut sum = F::ZERO;
+        for j in 0..d_out {
+            // 重みが 0 の場合はメモリアクセスと計算を完全にスキップ (Sparsityの活用)
+            if w_raw[k][j] == F::ONE {
+                sum += eq_evals[j];
+            } else if w_raw[k][j] == F::ZERO - F::ONE {
+                sum -= eq_evals[j]
+            } else if w_raw[k][j] != F::ZERO {
+                unreachable!("Weight must be ternary [-1, 0, 1]")
+            }
+        }
+        res[k] = sum;
+    }
+    res
+}
+
+/// eq(j, r) 多項式のすべての評価点を O(D) で計算するヘルパー
+fn compute_eq_evals(r: &[F], n: usize) -> Vec<F> {
+    let mut evals = vec![F::ONE; n.next_power_of_two()];
+    for (i, &ri) in r.iter().enumerate() {
+        let bit_step = 1 << i;
+        for j in 0..bit_step {
+            evals[j + bit_step] = evals[j] * ri;
+            evals[j] = evals[j] * (F::ONE - ri);
+        }
+    }
+    evals
+}
+
 fn combine(a: &[F], b: &[F]) -> Vec<F> {
     let mut res = a.to_vec();
     res.extend_from_slice(b);
@@ -336,7 +377,13 @@ mod projection_tests {
         }
         for i in 0..d_in {
             for j in 0..d_out {
-                w[i][j] = F::from((i * j + 2) as u64);
+                if i % 3 == 0 {
+                    w[i][j] = F::ONE;
+                } else if i % 3 == 1 {
+                    w[i][j] = F::ZERO;
+                } else {
+                    w[i][j] = F::ZERO - F::ONE;
+                }
             }
         }
 
@@ -424,7 +471,7 @@ mod projection_tests {
 
         // Malicious prover tries to use different weights (W) internally
         // to pass the Sumcheck math relationship.
-        pk.w[0][1] += F::one();
+        pk.w[0][1] = F::zero();
 
         let mut pt = Transcript::new(b"proj_test");
         let proof = prove_projection(&pk, &witness, &io_coms, &mut pt).unwrap();
