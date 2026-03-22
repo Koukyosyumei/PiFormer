@@ -1,46 +1,276 @@
 """
 Export a trained PiFormerModel to JSON for consumption by the Rust prover.
 
-Schema:
-{
-  "d_model": int,
-  "embedding": [[float, ...]],              # vocab_size × d_model
-  "pos_embedding": [[float, ...]],          # max_seq_len × d_model
-  "blocks": [
-    {
-      "attn": {
-        "n_heads": int,
-        "d_head": int,
-        "q_proj": {"weight": [[...]], "bias": null_or_list},
-        "k_proj": {...},
-        "v_proj": {...},
-        "out_proj": {...},
-        "phi_tables": [[...], [...]]        # c sub-tables, each of size 2^bits_per_chunk
-      },
-      "ffn": {
-        "fc1": {"weight": [[...]], "bias": [...]},
-        "fc2": {...},
-        "phi_tables": [[...], [...]]
-      },
-      "norm1": {"weight": [...], "bias": [...]},
-      "norm2": {...}
-    },
-    ...
-  ],
-  "norm": {"weight": [...], "bias": [...]},
-  "head": {"weight": [[...]], "bias": null}
-}
+Two export targets are supported:
+
+1. ``export_weights_rust`` — writes a ``weights.json`` whose schema matches
+   ``json_io::JsonWeights`` in the Rust prover.  All values are BN254 field
+   elements encoded as 0x-prefixed 64-nibble hex strings.
+
+2. ``export_witness_rust`` — runs the integer forward pass via
+   ``WitnessGenerator`` and writes a ``witness.json`` whose schema matches
+   ``json_io::JsonWitness``.
+
+3. ``export_all`` — convenience wrapper that calls both.
+
+Quantization conventions
+------------------------
+* LayerNorm weights: ``gamma_int[j] = max(1, round(weight[j] * ln_scale))``,
+  ``beta_int[j]  = round(bias[j] * ln_scale) + beta_floor``.
+  A per-layer ``beta_floor`` is auto-computed via ``min_beta_floor`` so all
+  LayerNorm output values are non-negative (required by the Rust range proof).
+
+* Projection weights: ternary {−alpha_int, 0, +alpha_int}.  The Rust circuit
+  computes ``Y[i][j] = Σ_k X[i][k] · W[k][j]`` (W is d_in × d_out), while
+  PyTorch stores weight as (out_features × in_features), so we transpose.
+
+* φ activation tables: ``table_int[k][i] = max(0, round(table_float[k][i]))``.
+  Tables are part of the witness / Lasso instance, not the weight file.
+
+* Legacy ``export_model`` (old float format) is preserved for backward
+  compatibility.
 """
+
+from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import List, Optional
 
 import torch.nn as nn
 
 from .model import PiFormerModel
+from .quant import (
+    extract_ternary_weight_matrix,
+    int_to_field_hex,
+    mat_to_json,
+    mat_transpose,
+    min_beta_floor,
+    vec_to_json,
+)
+from .witness import WitnessGenerator
 
 
-def _export_ln(ln: nn.LayerNorm) -> dict:
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _ln_weights_int(
+    ln: nn.LayerNorm,
+    x_rows: Optional[List[List[int]]],
+    d: int,
+    ln_scale: int,
+    extra_beta_floor: int,
+) -> tuple[List[int], List[int]]:
+    """Convert a PyTorch LayerNorm to integer (gamma, beta) vectors.
+
+    gamma_int[j] = max(1, round(weight[j] * ln_scale))
+    beta_int[j]  = round(bias[j] * ln_scale) + beta_floor
+
+    ``beta_floor`` is computed adaptively from ``x_rows`` if provided,
+    otherwise ``extra_beta_floor`` is used as a conservative default.
+    """
+    gamma_int = [max(1, round(float(w) * ln_scale)) for w in ln.weight]
+    beta_raw = [round(float(b) * ln_scale) for b in ln.bias]
+
+    if x_rows is not None:
+        floor = min_beta_floor(x_rows, gamma_int, d) + extra_beta_floor
+    else:
+        floor = extra_beta_floor
+
+    beta_int = [b + floor for b in beta_raw]
+    return gamma_int, beta_int
+
+
+def _proj_weight_int(
+    linear: "TernaryLinear",  # noqa: F821
+    quant_scale: int,
+) -> List[List[int]]:
+    """Extract integer (d_in × d_out) weight matrix from a TernaryLinear.
+
+    PyTorch stores weight as (out_features × in_features); the Rust prover
+    expects (d_in × d_out), so we transpose.
+    """
+    weight_float = linear.weight.detach().tolist()  # out × in
+    alpha = float(linear.alpha)
+    w_out_in = extract_ternary_weight_matrix(weight_float, alpha, quant_scale)
+    return mat_transpose(w_out_in)  # → in × out
+
+
+# ---------------------------------------------------------------------------
+# Rust-native weight export
+# ---------------------------------------------------------------------------
+
+
+def export_weights_rust(
+    model: PiFormerModel,
+    out_path: str,
+    *,
+    quant_scale: int = 64,
+    ln_scale: int = 4,
+    extra_beta_floor: int = 8,
+) -> None:
+    """Write ``weights.json`` in the format expected by the Rust prover.
+
+    Args:
+        model:             Trained PiFormerModel (eval mode recommended).
+        out_path:          Destination file path.
+        quant_scale:       Integer scale applied to TernaryLinear alpha values.
+        ln_scale:          Integer scale applied to LayerNorm gamma/beta.
+        extra_beta_floor:  Extra margin added to the auto-computed beta_floor
+                           for safety.
+
+    Raises:
+        ValueError: if model.blocks[0].attn.n_heads != 1.
+    """
+    model.eval()
+    d = model.d_model
+
+    if model.blocks and model.blocks[0].attn.n_heads != 1:
+        raise ValueError(
+            "The Rust prover is single-head only.  "
+            f"Got n_heads={model.blocks[0].attn.n_heads}. "
+            "Either use n_heads=1 or extend the Rust prover."
+        )
+
+    n_layers = len(model.blocks)
+    vocab_size = model.embedding.num_embeddings
+    d_ff = model.blocks[0].ffn.fc1.out_features if n_layers > 0 else 0
+
+    # We don't have runtime x_rows at export time, so use extra_beta_floor
+    # conservatively.  The witness exporter (export_witness_rust) will use
+    # actual activations for tighter bounds.
+    def _ln(ln: nn.LayerNorm) -> tuple[List[int], List[int]]:
+        return _ln_weights_int(ln, None, d, ln_scale, extra_beta_floor)
+
+    blocks_json = []
+    for blk in model.blocks:
+        attn = blk.attn
+        ln1_gamma, ln1_beta = _ln(blk.norm1)
+        ln2_gamma, ln2_beta = _ln(blk.norm2)
+
+        q_w = _proj_weight_int(attn.q_proj, quant_scale)   # d × d
+        k_w = _proj_weight_int(attn.k_proj, quant_scale)
+        v_w = _proj_weight_int(attn.v_proj, quant_scale)
+        o_w = _proj_weight_int(attn.out_proj, quant_scale)
+        ffn_w1 = _proj_weight_int(blk.ffn.fc1, quant_scale)  # d × d_ff
+        ffn_w2 = _proj_weight_int(blk.ffn.fc2, quant_scale)  # d_ff × d
+
+        blocks_json.append({
+            "ln1_gamma": vec_to_json(ln1_gamma),
+            "ln1_beta":  vec_to_json(ln1_beta),
+            "q_w":  mat_to_json(q_w),
+            "k_w":  mat_to_json(k_w),
+            "v_w":  mat_to_json(v_w),
+            "o_w":  mat_to_json(o_w),
+            "ln2_gamma": vec_to_json(ln2_gamma),
+            "ln2_beta":  vec_to_json(ln2_beta),
+            "ffn_w1": mat_to_json(ffn_w1),
+            "ffn_w2": mat_to_json(ffn_w2),
+        })
+
+    final_ln_gamma, final_ln_beta = _ln(model.norm)
+    lm_head_w = _proj_weight_int(model.head, quant_scale)  # d × vocab_size
+
+    payload = {
+        "num_blocks":       n_layers,
+        "d_model":          d,
+        "d_ff":             d_ff,
+        "vocab_size":       vocab_size,
+        "blocks":           blocks_json,
+        "final_ln_gamma":   vec_to_json(final_ln_gamma),
+        "final_ln_beta":    vec_to_json(final_ln_beta),
+        "lm_head_w":        mat_to_json(lm_head_w),
+    }
+
+    Path(out_path).write_text(json.dumps(payload, indent=2))
+    print(f"[export] weights.json → {out_path}  "
+          f"(num_blocks={n_layers}, d_model={d}, d_ff={d_ff}, vocab={vocab_size})")
+
+
+# ---------------------------------------------------------------------------
+# Rust-native witness export
+# ---------------------------------------------------------------------------
+
+
+def export_witness_rust(
+    model: PiFormerModel,
+    token_ids: List[int],
+    out_path: str,
+    *,
+    quant_scale: int = 64,
+    ln_scale: int = 4,
+    extra_beta_floor: int = 8,
+    lasso_sigma: int = 4,
+) -> None:
+    """Run the integer forward pass and write ``witness.json``.
+
+    Args:
+        model:             Trained PiFormerModel (eval mode recommended).
+        token_ids:         List of integer token ids (length = seq_len).
+        out_path:          Destination file path.
+        quant_scale:       Integer scale for activations / ternary weights.
+        ln_scale:          Integer scale for LayerNorm gamma/beta.
+        extra_beta_floor:  Extra safety margin added to auto beta_floor.
+        lasso_sigma:       Hyrax sigma parameter used by the Lasso prover
+                           (must match the value passed to ``piformer prove``).
+    """
+    gen = WitnessGenerator(
+        quant_scale=quant_scale,
+        ln_scale=ln_scale,
+        extra_beta_floor=extra_beta_floor,
+        lasso_sigma=lasso_sigma,
+    )
+    witness_dict = gen.generate(model, token_ids)
+    Path(out_path).write_text(json.dumps(witness_dict, indent=2))
+    print(f"[export] witness.json → {out_path}  "
+          f"(seq_len={len(token_ids)}, lasso_sigma={lasso_sigma})")
+
+
+# ---------------------------------------------------------------------------
+# Convenience wrapper
+# ---------------------------------------------------------------------------
+
+
+def export_all(
+    model: PiFormerModel,
+    token_ids: List[int],
+    *,
+    weights_path: str = "weights.json",
+    witness_path: str = "witness.json",
+    quant_scale: int = 64,
+    ln_scale: int = 4,
+    extra_beta_floor: int = 8,
+    lasso_sigma: int = 4,
+) -> None:
+    """Export both weights and witness in a single call.
+
+    Writes:
+        ``weights_path``  — JSON weights for ``piformer setup``
+        ``witness_path``  — JSON witness for ``piformer prove``
+    """
+    export_weights_rust(
+        model, weights_path,
+        quant_scale=quant_scale,
+        ln_scale=ln_scale,
+        extra_beta_floor=extra_beta_floor,
+    )
+    export_witness_rust(
+        model, token_ids, witness_path,
+        quant_scale=quant_scale,
+        ln_scale=ln_scale,
+        extra_beta_floor=extra_beta_floor,
+        lasso_sigma=lasso_sigma,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Legacy float export (backward compatibility)
+# ---------------------------------------------------------------------------
+
+
+def _export_ln_float(ln: nn.LayerNorm) -> dict:
     return {
         "weight": ln.weight.detach().tolist(),
         "bias": ln.bias.detach().tolist(),
@@ -48,7 +278,11 @@ def _export_ln(ln: nn.LayerNorm) -> dict:
 
 
 def export_model(model: PiFormerModel, output_path: str) -> None:
-    """Serialize all quantized weights to JSON at *output_path*."""
+    """Serialize floating-point weights to JSON (legacy format).
+
+    This function produces the *old* schema used before quantization alignment
+    was implemented.  For the Rust prover use ``export_weights_rust`` instead.
+    """
     model.eval()
 
     blocks_data = []
@@ -76,8 +310,8 @@ def export_model(model: PiFormerModel, output_path: str) -> None:
                     "phi_c": blk.ffn.act.c,
                     "phi_scale": blk.ffn.act.scale,
                 },
-                "norm1": _export_ln(blk.norm1),
-                "norm2": _export_ln(blk.norm2),
+                "norm1": _export_ln_float(blk.norm1),
+                "norm2": _export_ln_float(blk.norm2),
             }
         )
 
@@ -86,7 +320,7 @@ def export_model(model: PiFormerModel, output_path: str) -> None:
         "embedding": model.embedding.weight.detach().tolist(),
         "pos_embedding": model.pos_embedding.weight.detach().tolist(),
         "blocks": blocks_data,
-        "norm": _export_ln(model.norm),
+        "norm": _export_ln_float(model.norm),
         "head": model.head.export_weights(),
     }
 

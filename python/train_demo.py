@@ -1,10 +1,38 @@
+"""
+PiFormer training demo.
+
+Trains a tiny character-level language model, then exports both the quantized
+weight file (weights.json) and a sample witness (witness.json) in the format
+expected by the Rust prover.
+
+Usage:
+    python train_demo.py
+
+After training you can run:
+    cd ../prover
+    cargo run --release --bin piformer -- setup \
+        --weights piformer_weights.json --seq-len 8 \
+        --pk model.pk --vk model.vk
+    cargo run --release --bin piformer -- prove \
+        --pk model.pk --witness piformer_witness.json --proof proof.bin
+    cargo run --release --bin piformer -- verify \
+        --vk model.vk --proof proof.bin
+
+Note: n_heads must be 1 — the Rust prover is single-head only.
+"""
+
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-import numpy as np
-from piformer.model import PiFormerModel
 
-# --- 1. 超軽量データセットの作成 (Tiny Shakespeare Subset) ---
+from piformer.model import PiFormerModel
+from piformer.export import export_all
+
+
+# ---------------------------------------------------------------------------
+# 1. Dataset
+# ---------------------------------------------------------------------------
+
 class CharDataset(Dataset):
     def __init__(self, data, seq_len):
         chars = sorted(list(set(data)))
@@ -23,64 +51,102 @@ class CharDataset(Dataset):
         y = torch.tensor(chunk[1:], dtype=torch.long)
         return x, y
 
-# --- 2. 学習設定 ---
-# ダミーデータ（または小さなテキスト）
-text_data = "to be, or not to be, that is the question: whether 'tis nobler in the mind to suffer" * 100
-seq_len = 32
-dataset = CharDataset(text_data, seq_len)
+
+# ---------------------------------------------------------------------------
+# 2. Training setup
+# ---------------------------------------------------------------------------
+
+text_data = (
+    "to be, or not to be, that is the question: "
+    "whether 'tis nobler in the mind to suffer"
+) * 100
+
+SEQ_LEN = 8   # keep small so the Rust prover's seq_len matches
+
+dataset = CharDataset(text_data, SEQ_LEN)
 loader = DataLoader(dataset, batch_size=16, shuffle=True)
 
-# モデルの初期化 (非常に小さく設定)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# n_heads=1 is required by the single-head Rust prover
 model = PiFormerModel(
     vocab_size=dataset.vocab_size,
-    d_model=64,
-    n_heads=2,
-    n_layers=2,
-    d_ff=128,
-    max_seq_len=seq_len,
+    d_model=8,
+    n_heads=1,
+    n_layers=1,
+    d_ff=16,
+    max_seq_len=SEQ_LEN,
     num_bits=8,
     c=2,
     scale=0.1,
-    max_exp=4
+    max_exp=4,
 ).to(device)
 
-# 最適化（STEを使用しているため、通常のAdamでOK）
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 criterion = torch.nn.CrossEntropyLoss()
 
-# --- 3. 学習ループ ---
-print(f"Starting training on {device}...")
+# ---------------------------------------------------------------------------
+# 3. Training loop
+# ---------------------------------------------------------------------------
+
+print(f"Starting training on {device}…")
 model.train()
 for epoch in range(10):
-    total_loss = 0
+    total_loss = 0.0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-
         optimizer.zero_grad()
-        logits = model(x) # (B, T, vocab_size)
-
-        # Flatten for loss
+        logits = model(x)
         loss = criterion(logits.view(-1, dataset.vocab_size), y.view(-1))
         loss.backward()
         optimizer.step()
-
         total_loss += loss.item()
+    print(f"  Epoch {epoch+1:2d}/10  loss={total_loss / len(loader):.4f}")
 
-    avg_loss = total_loss / len(loader)
-    print(f"Epoch {epoch+1}/10, Loss: {avg_loss:.4f}")
+# ---------------------------------------------------------------------------
+# 4. Quick generation test
+# ---------------------------------------------------------------------------
 
-# --- 4. 生成テスト (学習できているかの確認) ---
 model.eval()
 with torch.no_grad():
     start_str = "to be"
-    input_ids = torch.tensor([dataset.char_to_idx[ch] for ch in start_str]).unsqueeze(0).to(device)
+    input_ids = torch.tensor(
+        [dataset.char_to_idx[ch] for ch in start_str]
+    ).unsqueeze(0).to(device)
 
     generated = start_str
     for _ in range(20):
         logits = model(input_ids)
         next_token = logits[0, -1, :].argmax().item()
         generated += dataset.idx_to_char[next_token]
-        input_ids = torch.cat([input_ids, torch.tensor([[next_token]]).to(device)], dim=1)
+        input_ids = torch.cat(
+            [input_ids, torch.tensor([[next_token]]).to(device)], dim=1
+        )
 
-    print(f"\nGenerated text: '{generated}'")
+    print(f"\nGenerated: '{generated}'")
+
+# ---------------------------------------------------------------------------
+# 5. Export weights + witness for the Rust prover
+# ---------------------------------------------------------------------------
+
+# Pick a short prompt whose length matches SEQ_LEN so the prover's seq_len
+# parameter is consistent.
+sample_prompt = "to be, o"[:SEQ_LEN]
+token_ids = [dataset.char_to_idx[ch] for ch in sample_prompt]
+
+export_all(
+    model,
+    token_ids,
+    weights_path="piformer_weights.json",
+    witness_path="piformer_witness.json",
+    quant_scale=64,
+    ln_scale=4,
+    extra_beta_floor=8,
+    lasso_sigma=4,
+)
+
+print(
+    "\nExport complete.\n"
+    "  piformer_weights.json  ← use with: piformer setup --weights\n"
+    "  piformer_witness.json  ← use with: piformer prove  --witness\n"
+)
