@@ -29,6 +29,7 @@ use crate::transcript::Transcript;
 use ark_ff::Field;
 
 /// Public description of a lookup instance.
+#[derive(Clone)]
 pub struct LassoInstance {
     /// c sub-tables T_0, ..., T_{c-1}, each of size 2^bits_per_chunk.
     pub tables: Vec<Vec<F>>,

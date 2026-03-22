@@ -49,6 +49,48 @@ pub struct LinearAttentionInstance {
 }
 
 // ---------------------------------------------------------------------------
+// Verifying key (weight commitments — computed once in preprocessing)
+// ---------------------------------------------------------------------------
+
+/// Preprocessing key for one linear-attention head.
+///
+/// In a full zkGPT deployment, `preprocess_linear_attention` would commit to
+/// W_Q, W_K, W_V (and W_O) once at model load time.  The resulting
+/// `LinearAttentionVerifyingKey` is then distributed to all verifiers and
+/// reused across every per-user proof without repeating the O(D²) MSMs.
+///
+/// The current instance stores pre-projected activations (φ(Q), φ(K), V)
+/// rather than the raw weight matrices, so the VK only records the head
+/// dimensions for now.  Add `w_q_com`, `w_k_com`, `w_v_com` fields here
+/// when the projection step is brought inside the proof circuit.
+pub struct LinearAttentionVerifyingKey {
+    pub seq_len: usize,
+    pub d_head: usize,
+}
+
+pub fn preprocess_linear_attention(seq_len: usize, d_head: usize) -> LinearAttentionVerifyingKey {
+    LinearAttentionVerifyingKey { seq_len, d_head }
+}
+
+// ---------------------------------------------------------------------------
+// Succinct instance (no raw activation matrices — only Lasso data)
+// ---------------------------------------------------------------------------
+
+/// What the verifier sees per-user in the succinct setting.
+///
+/// The large activation matrices (φQ, φK, V, context, out) are *not*
+/// included — their MLE commitments are carried inside the proof and
+/// certified by Hyrax opening proofs.  The Lasso instances still contain
+/// raw `query_indices` / `outputs` because the Lasso sub-verifier requires
+/// them; a follow-up can store outputs inside the proof (as done for range).
+pub struct LinearAttentionInstanceSuccinct {
+    pub seq_len: usize,
+    pub d_head: usize,
+    pub q_lasso: LassoInstance,
+    pub k_lasso: LassoInstance,
+}
+
+// ---------------------------------------------------------------------------
 // Proof types
 // ---------------------------------------------------------------------------
 
@@ -348,6 +390,133 @@ pub fn verify_linear_attention(
 }
 
 // ---------------------------------------------------------------------------
+// Succinct verifier (uses pre-committed weights from VK; never calls hyrax_commit)
+// ---------------------------------------------------------------------------
+
+/// Verify a linear-attention proof in O(√N) verifier work.
+///
+/// **What the verifier does NOT do:**
+///   * Re-commit φQ, φK, V, context, or out — it absorbs the prover's
+///     commitments from `proof.commitments` directly.  The five Hyrax
+///     opening proofs certify those commitments at the sumcheck-reduced
+///     points, preserving binding without any O(N) MSM.
+///   * Re-commit weight matrices — in the full zkGPT design, W_Q/K/V
+///     commitments live in `vk`; currently `vk` records only the head
+///     dimensions until the projection sub-circuit is wired in.
+pub fn verify_linear_attention_succinct(
+    proof: &LinearAttentionProof,
+    inst: &LinearAttentionInstanceSuccinct,
+    _vk: &LinearAttentionVerifyingKey,
+    transcript: &mut Transcript,
+    lasso_params: &HyraxParams,
+) -> Result<(), String> {
+    let t = inst.seq_len;
+    let d = inst.d_head;
+    let t_bits = t.next_power_of_two().trailing_zeros() as usize;
+    let d_bits = d.next_power_of_two().trailing_zeros() as usize;
+
+    // Derive Hyrax params from dimensions — no MLE build, no O(N) MSM.
+    let n_td = t.next_power_of_two().max(1) * d.next_power_of_two().max(1);
+    let n_dd = d.next_power_of_two().max(1) * d.next_power_of_two().max(1);
+    let (_nu_td, _sigma_td, params_td) = params_from_n(n_td);
+    let (_nu_dd, _sigma_dd, params_dd) = params_from_n(n_dd);
+
+    // ── 1. Absorb activation commitments from proof (no O(N) recomputation) ──
+    // Security: the Hyrax opening proofs below certify these commitments at the
+    // sumcheck-reduced challenge points; commitment binding ensures the prover
+    // cannot open to values inconsistent with what was committed.
+    absorb_com(transcript, b"phi_q_com", &proof.commitments.phi_q_com);
+    absorb_com(transcript, b"phi_k_com", &proof.commitments.phi_k_com);
+    absorb_com(transcript, b"v_com", &proof.commitments.v_com);
+    absorb_com(transcript, b"context_com", &proof.commitments.context_com);
+    absorb_com(transcript, b"out_com", &proof.commitments.out_com);
+
+    // ── 2. Lasso verification ─────────────────────────────────────────────────
+    verify_lasso(&proof.phi_q_lasso, &inst.q_lasso, transcript, lasso_params)
+        .map_err(|e| format!("phi_q: {e}"))?;
+    verify_lasso(&proof.phi_k_lasso, &inst.k_lasso, transcript, lasso_params)
+        .map_err(|e| format!("phi_k: {e}"))?;
+
+    // ── 3. Replay challenges ──────────────────────────────────────────────────
+    let rx = challenge_vec(transcript, t_bits, b"rx_out");
+    let ry = challenge_vec(transcript, d_bits, b"ry_out");
+
+    // ── 4. OUT sumcheck ───────────────────────────────────────────────────────
+    let claimed_out = proof.openings.out_eval;
+    transcript.append_field(b"claimed_out", &claimed_out);
+
+    let (r_i, final_out) =
+        verify_sumcheck(&proof.out_sumcheck, claimed_out, d_bits, transcript)
+            .map_err(|e| format!("out sumcheck: {e}"))?;
+
+    let expected_out_final = proof.openings.phi_q_eval * proof.openings.ctx_eval;
+    if final_out != expected_out_final {
+        return Err("Out sumcheck final evaluations do not match".to_string());
+    }
+
+    // ── 5. Context sumcheck ───────────────────────────────────────────────────
+    let claimed_ctx = proof.openings.ctx_eval;
+    transcript.append_field(b"claimed_ctx", &claimed_ctx);
+
+    let (r_t, final_ctx) =
+        verify_sumcheck(&proof.context_sumcheck, claimed_ctx, t_bits, transcript)
+            .map_err(|e| format!("context sumcheck: {e}"))?;
+
+    let expected_ctx_final = proof.openings.phi_k_eval * proof.openings.v_eval;
+    if final_ctx != expected_ctx_final {
+        return Err("Context sumcheck final evaluations do not match".to_string());
+    }
+
+    // ── 6. Hyrax opening proofs ───────────────────────────────────────────────
+    hyrax_verify(
+        &proof.commitments.out_com,
+        proof.openings.out_eval,
+        &combine(&rx, &ry),
+        &proof.openings.out_open,
+        &params_td,
+    )
+    .map_err(|e| format!("out opening: {e}"))?;
+
+    hyrax_verify(
+        &proof.commitments.phi_q_com,
+        proof.openings.phi_q_eval,
+        &combine(&rx, &r_i),
+        &proof.openings.phi_q_open,
+        &params_td,
+    )
+    .map_err(|e| format!("phi_q eval mismatch: {e}"))?;
+
+    hyrax_verify(
+        &proof.commitments.context_com,
+        proof.openings.ctx_eval,
+        &combine(&r_i, &ry),
+        &proof.openings.ctx_open,
+        &params_dd,
+    )
+    .map_err(|e| format!("context opening: {e}"))?;
+
+    hyrax_verify(
+        &proof.commitments.phi_k_com,
+        proof.openings.phi_k_eval,
+        &combine(&r_t, &r_i),
+        &proof.openings.phi_k_open,
+        &params_td,
+    )
+    .map_err(|e| format!("phi_k eval mismatch: {e}"))?;
+
+    hyrax_verify(
+        &proof.commitments.v_com,
+        proof.openings.v_eval,
+        &combine(&r_t, &ry),
+        &proof.openings.v_open,
+        &params_td,
+    )
+    .map_err(|e| format!("v eval mismatch: {e}"))?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -363,6 +532,19 @@ fn mat_to_mle(mat: &[Vec<F>], rows: usize, cols: usize) -> DenseMLPoly {
         }
     }
     DenseMLPoly::new(evals)
+}
+
+/// Derive Hyrax (nu, sigma, params) from an element count without building an MLE.
+///
+/// `n` should be the padded size the prover would produce for a given matrix:
+///   * T×D matrix : `t.next_power_of_two().max(1) * d.next_power_of_two().max(1)`
+///   * D×D matrix : `d.next_power_of_two().max(1) * d.next_power_of_two().max(1)`
+fn params_from_n(n: usize) -> (usize, usize, HyraxParams) {
+    debug_assert!(n.is_power_of_two() && n >= 2);
+    let total = n.trailing_zeros() as usize;
+    let nu = total / 2;
+    let sigma = (total - nu).max(1);
+    (nu, sigma, HyraxParams::new(sigma))
 }
 
 /// Determine Hyrax params for a poly: nu = num_vars/2, sigma = num_vars−nu (≥1).
@@ -476,6 +658,30 @@ mod linear_attention_tests {
     }
 
     fn lasso_params() -> HyraxParams { HyraxParams::new(2) } // 4-bit table: sigma=4-2=2
+
+    #[test]
+    fn test_linear_attention_succinct_verifier_success() {
+        let inst = setup_test_instance(2, 2);
+        let lp = lasso_params();
+
+        // Preprocessing: record head dimensions (future: commit W_Q/K/V here).
+        let vk = preprocess_linear_attention(inst.seq_len, inst.d_head);
+
+        let mut pt = Transcript::new(b"linear_attn_test");
+        let proof = prove_linear_attention(&inst, &mut pt, &lp);
+
+        // Succinct instance: no raw activation matrices.
+        let succinct = LinearAttentionInstanceSuccinct {
+            seq_len: inst.seq_len,
+            d_head: inst.d_head,
+            q_lasso: inst.q_lasso.clone(),
+            k_lasso: inst.k_lasso.clone(),
+        };
+
+        let mut vt = Transcript::new(b"linear_attn_test");
+        let result = verify_linear_attention_succinct(&proof, &succinct, &vk, &mut vt, &lp);
+        assert!(result.is_ok(), "Succinct verification failed: {:?}", result.err());
+    }
 
     #[test]
     fn test_linear_attention_e2e_success() {

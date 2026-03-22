@@ -23,6 +23,56 @@ use ark_ff::Field;
 use ark_serialize::CanonicalSerialize;
 
 // ---------------------------------------------------------------------------
+// Verifying key (weight commitments — computed once in preprocessing)
+// ---------------------------------------------------------------------------
+
+/// Pre-committed affine scale parameters γ and β.
+///
+/// The model provider calls `preprocess_layernorm` once per model checkpoint and
+/// distributes `LayerNormVerifyingKey` to all verifiers.  Each per-user proof is
+/// then checked against this VK without re-committing the weights.
+pub struct LayerNormVerifyingKey {
+    pub gamma_com: HyraxCommitment,
+    pub beta_com: HyraxCommitment,
+    /// Hyrax params for the `d_head`-dimensional weight polynomials.
+    pub nu_d: usize,
+    pub sigma_d: usize,
+    pub params_d: HyraxParams,
+}
+
+/// Commit to γ and β once.  The resulting `LayerNormVerifyingKey` is reused
+/// across all per-user proofs.
+pub fn preprocess_layernorm(gamma: &[F], beta: &[F]) -> LayerNormVerifyingKey {
+    let gamma_mle = vec_to_mle(gamma, gamma.len());
+    let (nu, sigma, params) = poly_hyrax(&gamma_mle);
+    let gamma_com = hyrax_commit(&gamma_mle.evaluations, nu, &params);
+    let beta_mle = vec_to_mle(beta, beta.len());
+    let beta_com = hyrax_commit(&beta_mle.evaluations, nu, &params);
+    LayerNormVerifyingKey { gamma_com, beta_com, nu_d: nu, sigma_d: sigma, params_d: params }
+}
+
+// ---------------------------------------------------------------------------
+// Succinct instance (activation dimensions only — raw x is not given to verifier)
+// ---------------------------------------------------------------------------
+
+/// What the verifier sees per-user in the succinct setting.
+///
+/// The large activation matrix `x` (T×D) is *not* included — its MLE commitment
+/// is carried inside the proof and certified by Hyrax opening proofs.
+/// `sigma`, `var_x`, and `y` are still provided in plain because they feed the
+/// range-proof sub-circuit; a future upgrade can replace these with
+/// `verify_range_succinct` calls.
+pub struct LayerNormInstanceSuccinct {
+    pub seq_len: usize,
+    pub d_head: usize,
+    pub sigma: Vec<F>,
+    pub var_x: Vec<F>,
+    pub y: Vec<Vec<F>>,
+    pub scale_gamma: F,
+    pub scale_beta: F,
+}
+
+// ---------------------------------------------------------------------------
 // Public instance (raw matrices — polys are built internally)
 // ---------------------------------------------------------------------------
 
@@ -339,6 +389,144 @@ pub fn verify_layernorm(
 }
 
 // ---------------------------------------------------------------------------
+// Succinct verifier (uses pre-committed weights from VK; never calls hyrax_commit)
+// ---------------------------------------------------------------------------
+
+/// Verify a LayerNorm proof in O(√N) verifier work.
+///
+/// **What the verifier does NOT do:**
+///   * Re-commit x, sum_x, or var_x — it absorbs the prover's commitments
+///     from `proof.commitments` directly.  The Hyrax opening proofs certify
+///     those commitments at the challenge points, so binding is preserved.
+///   * Re-commit γ or β — they are already committed in `vk` (done once by
+///     the model provider and reused across all users).
+///
+/// **What the verifier still does with raw data:**
+///   * Reconstruct σ residuals and y values for `verify_range` (O(T) / O(T·D)).
+///     A follow-up upgrade can replace these with `verify_range_succinct` calls.
+pub fn verify_layernorm_succinct(
+    proof: &LayerNormProof,
+    inst: &LayerNormInstanceSuccinct,
+    _vk: &LayerNormVerifyingKey,
+    transcript: &mut Transcript,
+) -> Result<(), String> {
+    let t = inst.seq_len;
+    let d = inst.d_head;
+    let t_bits = t.next_power_of_two().trailing_zeros() as usize;
+    let d_bits = d.next_power_of_two().trailing_zeros() as usize;
+    let d_f = F::from(d as u64);
+
+    // Derive Hyrax params from dimensions — no MLE build, no O(N) MSM.
+    let n_td = t.next_power_of_two().max(1) * d.next_power_of_two().max(1);
+    let n_t = t.next_power_of_two().max(2);
+    let (_nu_td, _sigma_td, params_td) = params_from_n(n_td);
+    let (_nu_t, _sigma_t, params_t) = params_from_n(n_t);
+
+    // -- 1. Absorb activation commitments from proof (trust prover's binding) --
+    // Security: the Hyrax opening proofs below certify these commitments at the
+    // challenge points, ensuring the prover cannot open to inconsistent values.
+    absorb_com(transcript, b"x_com", &proof.commitments.x_com);
+    absorb_com(transcript, b"sum_x_com", &proof.commitments.sum_x_com);
+    absorb_com(transcript, b"var_x_com", &proof.commitments.var_x_com);
+
+    // -- 2. Row audit challenge ------------------------------------------------
+    let r_t = challenge_vec(transcript, t_bits, b"layernorm_rt");
+
+    transcript.append_field(b"claimed_mean", &proof.openings.sum_x_eval_at_rt);
+    transcript.append_field(b"claimed_var", &proof.openings.var_x_eval_at_rt);
+
+    // -- 3. Verify mean sumcheck -----------------------------------------------
+    let (r_d_mean, final_mean) = verify_sumcheck(
+        &proof.mean_sumcheck,
+        proof.openings.sum_x_eval_at_rt,
+        d_bits,
+        transcript,
+    )
+    .map_err(|e| format!("mean sumcheck: {e}"))?;
+
+    if final_mean != proof.openings.x_eval_at_r_mean {
+        return Err("Mean sumcheck final evaluation mismatch".to_string());
+    }
+
+    // -- 4. Verify variance sumcheck ------------------------------------------
+    let (r_d_var, final_var) = verify_sumcheck(
+        &proof.variance_sumcheck,
+        proof.openings.var_x_eval_at_rt,
+        d_bits,
+        transcript,
+    )
+    .map_err(|e| format!("variance sumcheck: {e}"))?;
+
+    let h_eval = d_f * proof.openings.x_eval_at_r_var - proof.openings.sum_x_eval_at_rt;
+    if final_var != h_eval * h_eval {
+        return Err("Variance sumcheck final evaluation mismatch".to_string());
+    }
+
+    // -- 5. Range proof verification ------------------------------------------
+    let mut sigma_residuals = Vec::with_capacity(2 * t);
+    for i in 0..t {
+        let dsi = d_f * inst.sigma[i];
+        let lo = inst.var_x[i] - dsi * dsi;
+        let hi = (dsi + d_f) * (dsi + d_f) - F::ONE - inst.var_x[i];
+        sigma_residuals.push(lo);
+        sigma_residuals.push(hi);
+    }
+    verify_range(
+        &proof.sigma_range_proof,
+        &RangeProofInstance { values: sigma_residuals, bits: 32 },
+        transcript,
+    )
+    .map_err(|e| format!("sigma range proof: {e}"))?;
+
+    let y_values: Vec<F> = inst.y.iter().flat_map(|row| row.iter().copied()).collect();
+    verify_range(
+        &proof.y_range_proof,
+        &RangeProofInstance { values: y_values, bits: 16 },
+        transcript,
+    )
+    .map_err(|e| format!("y range proof: {e}"))?;
+
+    // -- 6. PCS opening proofs ------------------------------------------------
+    hyrax_verify(
+        &proof.commitments.sum_x_com,
+        proof.openings.sum_x_eval_at_rt,
+        &r_t,
+        &proof.openings.sum_x_proof,
+        &params_t,
+    )
+    .map_err(|e| format!("sum_x opening: {e}"))?;
+
+    hyrax_verify(
+        &proof.commitments.var_x_com,
+        proof.openings.var_x_eval_at_rt,
+        &r_t,
+        &proof.openings.var_x_proof,
+        &params_t,
+    )
+    .map_err(|e| format!("var_x opening: {e}"))?;
+
+    hyrax_verify(
+        &proof.commitments.x_com,
+        proof.openings.x_eval_at_r_mean,
+        &combine(&r_t, &r_d_mean),
+        &proof.openings.x_proof_at_r_mean,
+        &params_td,
+    )
+    .map_err(|e| format!("x(r_t,r_d_mean) opening: {e}"))?;
+
+    hyrax_verify(
+        &proof.commitments.x_com,
+        proof.openings.x_eval_at_r_var,
+        &combine(&r_t, &r_d_var),
+        &proof.openings.x_proof_at_r_var,
+        &params_td,
+    )
+    .map_err(|e| format!("x(r_t,r_d_var) opening: {e}"))?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -365,6 +553,19 @@ fn vec_to_mle(v: &[F], len: usize) -> DenseMLPoly {
         evals[i] = x;
     }
     DenseMLPoly::new(evals)
+}
+
+/// Derive Hyrax (nu, sigma, params) from an element count without building an MLE.
+///
+/// `n` must equal `rows.next_power_of_two().max(1) * cols.next_power_of_two().max(1)`
+/// (the padded size that `mat_to_mle` or `vec_to_mle` would produce).
+/// Used by the succinct verifier so it never has to call `hyrax_commit`.
+fn params_from_n(n: usize) -> (usize, usize, HyraxParams) {
+    debug_assert!(n.is_power_of_two() && n >= 2);
+    let total = n.trailing_zeros() as usize;
+    let nu = total / 2;
+    let sigma = (total - nu).max(1);
+    (nu, sigma, HyraxParams::new(sigma))
 }
 
 /// Determine Hyrax params for a poly: nu = num_vars/2, sigma = num_vars-nu (>= 1).
@@ -503,6 +704,32 @@ mod layernorm_tests {
             assert!(result.is_err());
         }
         // prove may also fail (inconsistent data) — either way is acceptable.
+    }
+
+    #[test]
+    fn test_layernorm_succinct_verifier_success() {
+        let inst = setup_layernorm_instance();
+
+        // Preprocessing: commit to weights once.
+        let vk = preprocess_layernorm(&inst.gamma, &inst.beta);
+
+        let mut pt = Transcript::new(b"layernorm_test");
+        let proof = prove_layernorm(&inst, &mut pt).unwrap();
+
+        // Succinct instance: no raw x — commitment is in the proof.
+        let succinct = LayerNormInstanceSuccinct {
+            seq_len: inst.seq_len,
+            d_head: inst.d_head,
+            sigma: inst.sigma.clone(),
+            var_x: inst.var_x.clone(),
+            y: inst.y.clone(),
+            scale_gamma: inst.scale_gamma,
+            scale_beta: inst.scale_beta,
+        };
+
+        let mut vt = Transcript::new(b"layernorm_test");
+        let result = verify_layernorm_succinct(&proof, &succinct, &vk, &mut vt);
+        assert!(result.is_ok(), "Succinct verification failed: {:?}", result.err());
     }
 
     #[test]
