@@ -255,7 +255,7 @@ pub struct TransformerModelProof {
 // Model Prover (E2E)
 // ---------------------------------------------------------------------------
 
-pub fn prove_transformer_model(
+pub fn prove(
     pk: &TransformerModelProvingKey,
     witness: &TransformerModelWitness,
     inst_attn: &LinearAttentionInstance,

@@ -202,7 +202,7 @@ pub fn add_commitments(a: &HyraxCommitment, b: &HyraxCommitment) -> HyraxCommitm
 /// Verifies the entire LLM forward pass.
 /// The verifier guarantees that `logits_com` is the mathematically correct
 /// output of the model for the given input `x_in_com`.
-pub fn verify_transformer_model_succinct(
+pub fn verify(
     proof: &TransformerModelProof,
     vk: &TransformerModelVerifyingKey,
     inst_attn: &LinearAttentionInstance,
