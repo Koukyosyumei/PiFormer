@@ -11,7 +11,7 @@
 //!     space at a single random point (r_t, r_d, r_b) in O(1) time.
 
 use crate::field::F;
-use crate::lookup::range::{prove_range, verify_range, RangeProof, RangeProofInstance};
+use crate::lookup::range::{prove_range, verify_range, RangeProof, RangeProofWitness};
 use crate::pcs::{
     hyrax_commit, hyrax_open, hyrax_verify, params_from_n, poly_hyrax, HyraxCommitment,
     HyraxParams, HyraxProof,
@@ -158,8 +158,8 @@ pub fn prove_layernorm(
 
     // 6. Range Proofs & Constraint Fusion Challenges
     // Instead of building arrays for Verifier, Prover does it locally.
-    let r_sig_t = challenge_vec(transcript, t_bits, b"rsig_t");
-    let r_sig_b = transcript.challenge_field::<F>(b"rsig_b"); // 1 bit for lo/hi toggle
+    //let r_sig_t = challenge_vec(transcript, t_bits, b"rsig_t");
+    //let r_sig_b = transcript.challenge_field::<F>(b"rsig_b"); // 1 bit for lo/hi toggle
 
     let mut sigma_res = Vec::with_capacity(2 * t);
     for i in 0..t {
@@ -167,17 +167,17 @@ pub fn prove_layernorm(
         sigma_res.push(witness.var_x[i] - dsi * dsi); // lo
         sigma_res.push((dsi + d_f) * (dsi + d_f) - F::ONE - witness.var_x[i]); // hi
     }
-    let sigma_range_proof = prove_range(
-        &RangeProofInstance {
-            values: sigma_res,
-            bits: 32,
-        },
-        transcript,
-    )?;
+    // 【重要】prove_rangeから返された r_sig を、以降の計算で使用する！
+    let (sigma_range_proof, r_sig) =
+        prove_range(&RangeProofWitness { values: sigma_res }, 16, transcript)?;
+    let r_sig_t = r_sig[0..t_bits].to_vec();
+    let r_sig_b = r_sig[t_bits];
 
-    let r_y_t = challenge_vec(transcript, t_bits, b"ry_t");
-    let r_y_d = challenge_vec(transcript, d_bits, b"ry_d");
-    let r_y_b = transcript.challenge_field::<F>(b"ry_b"); // 1 bit for lo/hi toggle
+    /*
+        let r_y_t = challenge_vec(transcript, t_bits, b"ry_t");
+        let r_y_d = challenge_vec(transcript, d_bits, b"ry_d");
+        let r_y_b = transcript.challenge_field::<F>(b"ry_b"); // 1 bit for lo/hi toggle
+    */
 
     let mut y_res = Vec::with_capacity(2 * t * d);
     let two = F::from(2u64);
@@ -193,13 +193,11 @@ pub fn prove_layernorm(
             y_res.push(sig_d * (two * y_ij + F::ONE) - F::ONE - expr2); // hi
         }
     }
-    let y_range_proof = prove_range(
-        &RangeProofInstance {
-            values: y_res,
-            bits: 32,
-        },
-        transcript,
-    )?;
+    // 【重要】prove_rangeから返された r_y を、以降の計算で使用する！
+    let (y_range_proof, r_y) = prove_range(&RangeProofWitness { values: y_res }, 16, transcript)?;
+    let r_y_t = r_y[0..t_bits].to_vec();
+    let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
+    let r_y_b = r_y[t_bits + d_bits];
 
     // 7. Openings
     let sum_x_at_rt = sum_x_mle.evaluate(&r_t);
@@ -340,33 +338,26 @@ pub fn verify_layernorm(
     }
 
     // 3. Sigma Constraint Fusion (O(1))
-    // We combine the 2N residual array using a single boolean challenge r_sig_b
-    let r_sig_t = challenge_vec(transcript, t_bits, b"rsig_t");
-    let r_sig_b = transcript.challenge_field::<F>(b"rsig_b");
+    // 【重要】Verifierも、verify_range_succinct から返された評価点を受け取る
+    let (r_sig, sig_eval) = verify_range(&proof.sigma_range_proof, t_bits + 1, 16, transcript)?;
+    let r_sig_t = r_sig[0..t_bits].to_vec();
+    let r_sig_b = r_sig[t_bits];
 
     let dsi = d_f * proof.openings.sigma_at_rsig;
     let lo_sig = proof.openings.var_x_at_rsig - dsi * dsi;
     let hi_sig = (dsi + d_f) * (dsi + d_f) - F::ONE - proof.openings.var_x_at_rsig;
     let expected_sig_res = (F::ONE - r_sig_b) * lo_sig + r_sig_b * hi_sig;
 
-    // Notice: In a fully succinct pipeline, verify_range expects the evaluated claim `expected_sig_res`.
-    // We pass empty values array here to simulate the succinct API boundary.
-    verify_range(
-        &proof.sigma_range_proof,
-        &RangeProofInstance {
-            values: vec![],
-            bits: 32,
-        },
-        transcript,
-    )
-    .map_err(|e| format!("Sigma range: {e}"))?;
+    if sig_eval != expected_sig_res {
+        return Err("Sigma constraint fusion mismatch".into());
+    }
 
     // 4. Y Constraint Fusion (O(D) to eval public weights, O(1) for residual)
-    let r_y_t = challenge_vec(transcript, t_bits, b"ry_t");
-    let r_y_d = challenge_vec(transcript, d_bits, b"ry_d");
-    let r_y_b = transcript.challenge_field::<F>(b"ry_b");
+    let (r_y, y_eval) = verify_range(&proof.y_range_proof, t_bits + d_bits + 1, 16, transcript)?;
+    let r_y_t = r_y[0..t_bits].to_vec();
+    let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
+    let r_y_b = r_y[t_bits + d_bits];
 
-    // Evaluate public gamma/beta at r_y_d in O(D)
     let gamma_r = vec_to_mle(&vk.gamma, d).evaluate(&r_y_d);
     let beta_r = vec_to_mle(&vk.beta, d).evaluate(&r_y_d);
 
@@ -381,17 +372,29 @@ pub fn verify_layernorm(
     let hi_y = sig_d * (two * proof.openings.y_at_ry + F::ONE) - F::ONE - expr2;
     let expected_y_res = (F::ONE - r_y_b) * lo_y + r_y_b * hi_y;
 
-    verify_range(
-        &proof.y_range_proof,
-        &RangeProofInstance {
-            values: vec![],
-            bits: 32,
-        },
-        transcript,
-    )
-    .map_err(|e| format!("Y range: {e}"))?;
+    if y_eval != expected_y_res {
+        return Err("Y constraint fusion mismatch".into());
+    }
 
     // 5. Openings (Binding check against IO and Internal commitments)
+    // 1. sum_x_at_rt
+    hyrax_verify(
+        &proof.internal_coms.sum_x_com,
+        proof.openings.sum_x_at_rt,
+        &r_t,
+        &proof.openings.sum_x_rt_proof,
+        &params_t,
+    )?;
+    // 2. var_x_at_rt
+    hyrax_verify(
+        &proof.internal_coms.var_x_com,
+        proof.openings.var_x_at_rt,
+        &r_t,
+        &proof.openings.var_x_rt_proof,
+        &params_t,
+    )?;
+
+    // 3. x_at_rt_rmean
     hyrax_verify(
         &io_coms.x_com,
         proof.openings.x_at_rt_rmean,
@@ -399,6 +402,7 @@ pub fn verify_layernorm(
         &proof.openings.x_rt_rmean_proof,
         &params_td,
     )?;
+    // 4. x_at_rt_rvar
     hyrax_verify(
         &io_coms.x_com,
         proof.openings.x_at_rt_rvar,
@@ -406,6 +410,25 @@ pub fn verify_layernorm(
         &proof.openings.x_rt_rvar_proof,
         &params_td,
     )?;
+
+    // 5. var_x_at_rsig
+    hyrax_verify(
+        &proof.internal_coms.var_x_com,
+        proof.openings.var_x_at_rsig,
+        &r_sig_t,
+        &proof.openings.var_x_rsig_proof,
+        &params_t,
+    )?;
+    // 6. sigma_at_rsig
+    hyrax_verify(
+        &proof.internal_coms.sigma_com,
+        proof.openings.sigma_at_rsig,
+        &r_sig_t,
+        &proof.openings.sigma_rsig_proof,
+        &params_t,
+    )?;
+
+    // 7. x_at_ry
     hyrax_verify(
         &io_coms.x_com,
         proof.openings.x_at_ry,
@@ -413,6 +436,7 @@ pub fn verify_layernorm(
         &proof.openings.x_ry_proof,
         &params_td,
     )?;
+    // 8. y_at_ry
     hyrax_verify(
         &io_coms.y_com,
         proof.openings.y_at_ry,
@@ -421,13 +445,7 @@ pub fn verify_layernorm(
         &params_td,
     )?;
 
-    hyrax_verify(
-        &proof.internal_coms.sum_x_com,
-        proof.openings.sum_x_at_rt,
-        &r_t,
-        &proof.openings.sum_x_rt_proof,
-        &params_t,
-    )?;
+    // 9. sum_x_at_ryt
     hyrax_verify(
         &proof.internal_coms.sum_x_com,
         proof.openings.sum_x_at_ryt,
@@ -435,27 +453,7 @@ pub fn verify_layernorm(
         &proof.openings.sum_x_ryt_proof,
         &params_t,
     )?;
-    hyrax_verify(
-        &proof.internal_coms.var_x_com,
-        proof.openings.var_x_at_rt,
-        &r_t,
-        &proof.openings.var_x_rt_proof,
-        &params_t,
-    )?;
-    hyrax_verify(
-        &proof.internal_coms.var_x_com,
-        proof.openings.var_x_at_rsig,
-        &r_sig_t,
-        &proof.openings.var_x_rsig_proof,
-        &params_t,
-    )?;
-    hyrax_verify(
-        &proof.internal_coms.sigma_com,
-        proof.openings.sigma_at_rsig,
-        &r_sig_t,
-        &proof.openings.sigma_rsig_proof,
-        &params_t,
-    )?;
+    // 10. sigma_at_ryt
     hyrax_verify(
         &proof.internal_coms.sigma_com,
         proof.openings.sigma_at_ryt,

@@ -219,6 +219,11 @@ pub fn verify_linear_attention(
     let (_nu_dd, _sigma_dd, params_dd) = params_from_n(n_dd);
 
     // 1. Absorb internal commitments (Prover's local variables)
+    absorb_com(transcript, b"q_com", &io_coms.q_com);
+    absorb_com(transcript, b"k_com", &io_coms.k_com);
+    absorb_com(transcript, b"v_com", &io_coms.v_com);
+    absorb_com(transcript, b"out_com", &io_coms.out_com);
+
     absorb_com(transcript, b"phi_q_com", &proof.internal_coms.phi_q_com);
     absorb_com(transcript, b"phi_k_com", &proof.internal_coms.phi_k_com);
     absorb_com(transcript, b"context_com", &proof.internal_coms.context_com);
