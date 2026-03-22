@@ -224,6 +224,7 @@ pub fn setup_hyrax_params(bits_per_chunk: usize) -> HyraxParams {
     HyraxParams::new(sigma)
 }
 
+<<<<<<< HEAD
 pub fn params_from_vars(total_vars: usize) -> (usize, usize, HyraxParams) {
     let nu = total_vars / 2;
     let sigma = (total_vars - nu).max(1);
@@ -241,6 +242,8 @@ pub fn params_from_n(n: usize) -> (usize, usize, HyraxParams) {
     params_from_vars(total_vars)
 }
 
+=======
+>>>>>>> main
 #[cfg(test)]
 mod tests {
     use super::*;

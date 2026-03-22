@@ -94,7 +94,11 @@ This structure exactly matches the **Lasso** lookup argument (§3.5), which is d
 
 Projection matrices $W_Q, W_K, W_V, W_O$ and FFN weight matrices are constrained to entries in
 
+<<<<<<< HEAD
 $$\mathcal{W} = \{0\} \cup \{\pm 2^k \mid k = 0, 1, \ldots, k_{\max}\}$$
+=======
+$$\mathcal{W} = \{0\} \cup \{-1, 0, 1\} \tag{3}$$
+>>>>>>> main
 
 A matrix-vector product $y = Wx$ with $W \in \mathcal{W}^{m \times n}$ in the circuit requires only additions and multiplications by field constants (left-shifts). There are no general field multiplications, so this is **free** in the sumcheck constraint system.
 
