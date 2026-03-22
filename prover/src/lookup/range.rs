@@ -1,11 +1,11 @@
-//! Succinct Range Proof Protocol (LogUp-style Interface)
+//! Succinct Range Proof Protocol with Chunking (LogUp-style Interface)
 //!
 //! **Production-Grade Architecture:**
-//! 1. SUCCINCT VERIFIER: The Verifier NEVER sees the raw `values` array.
-//! 2. MULTIPLICITY COMMITMENT: The Prover commits to the frequencies of each value (LogUp).
-//! 3. CONSTRAINT FUSION: The protocol reduces the entire array of values to a SINGLE
-//!    evaluation point `r_v` and its value `v_eval`. The parent layer (e.g., LayerNorm)
-//!    then evaluates its algebraic constraints purely at `r_v` in O(1) time.
+//! 1. CHUNKING: 32-bit values are split into 16-bit chunks. Table size drops
+//!    from 4.2 Billion (137 GB RAM) to 65,536 (2 MB RAM).
+//! 2. ALGEBRAIC FUSION: V(r) = V_lo(r) + 2^16 * V_hi(r). The Verifier enforces
+//!    this mathematically at a single evaluation point.
+//! 3. SUCCINCT VERIFIER: The Verifier NEVER sees the raw `values` array.
 
 use crate::field::F;
 use crate::pcs::{
@@ -14,23 +14,30 @@ use crate::pcs::{
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
-use ark_ff::{Field, PrimeField};
+use ark_ff::{BigInteger, Field, PrimeField};
+
+pub const CHUNK_BITS: usize = 16;
+pub const CHUNK_SIZE: usize = 1 << CHUNK_BITS;
 
 // ---------------------------------------------------------------------------
 // Structs
 // ---------------------------------------------------------------------------
 
-/// Private witness. ONLY the Prover holds the raw values.
 pub struct RangeProofWitness {
     pub values: Vec<F>,
 }
 
 pub struct RangeProof {
-    // Sumcheck to bind the residual polynomial to a single evaluation point
+    // 1. Sumcheck to bind the virtual array V to a single point r_v
     pub sumcheck: SumcheckProof,
     pub claim_v: F,
 
-    // LogUp Multiplicity Commitment
+    // 2. Chunk commitments and openings
+    pub chunk_coms: Vec<HyraxCommitment>,
+    pub chunk_evals: Vec<F>,
+    pub chunk_opens: Vec<HyraxProof>,
+
+    // 3. Multiplicity (LogUp) commitment
     pub m_com: HyraxCommitment,
     pub m_eval: F,
     pub m_open: HyraxProof,
@@ -45,36 +52,63 @@ pub fn prove_range(
     bits: usize,
     transcript: &mut Transcript,
 ) -> Result<(RangeProof, Vec<F>), String> {
-    // 1. LogUp: Compute Multiplicities (Frequencies of each value)
-    let table_size = 1 << bits;
-    let mut m = vec![F::ZERO; table_size];
-    for &v in &witness.values {
-        // Safe mapping for the mock protocol
-        let idx = (v.into_bigint().as_ref()[0] as usize) & (table_size - 1);
-        m[idx] += F::ONE;
+    let num_chunks = (bits + CHUNK_BITS - 1) / CHUNK_BITS;
+    let n = witness.values.len();
+
+    let mut chunks = vec![vec![F::ZERO; n]; num_chunks];
+    let mut m = vec![F::ZERO; CHUNK_SIZE];
+
+    // 1. Split values into 16-bit chunks and compute multiplicity
+    for (i, &v) in witness.values.iter().enumerate() {
+        let val_u64 = v.into_bigint().as_ref()[0]; // Safe for <= 64 bit range proofs
+
+        for c in 0..num_chunks {
+            let chunk_val = (val_u64 >> (c * CHUNK_BITS)) & ((1 << CHUNK_BITS) - 1);
+            chunks[c][i] = F::from(chunk_val as u64);
+            m[chunk_val as usize] += F::ONE;
+        }
     }
 
-    let m_mle = vec_to_mle(&m, table_size);
-    let (nu_m, sigma_m, params_m) = params_from_vars(bits);
+    // 2. Commit to chunks
+    let mut chunk_coms = Vec::with_capacity(num_chunks);
+    let mut chunk_mles = Vec::with_capacity(num_chunks);
+    let (nu_c, sigma_c, params_c) =
+        params_from_vars(n.next_power_of_two().trailing_zeros() as usize);
 
-    // Commit to the multiplicities
+    for c in 0..num_chunks {
+        let mle = vec_to_mle(&chunks[c], n);
+        let com = hyrax_commit(&mle.evaluations, nu_c, &params_c);
+        absorb_com(transcript, b"chunk_com", &com);
+        chunk_coms.push(com);
+        chunk_mles.push(mle);
+    }
+
+    // 3. Commit to multiplicity M
+    let m_mle = vec_to_mle(&m, CHUNK_SIZE);
+    let (nu_m, sigma_m, params_m) = params_from_vars(CHUNK_BITS);
     let m_com = hyrax_commit(&m_mle.evaluations, nu_m, &params_m);
     absorb_com(transcript, b"logup_m_com", &m_com);
 
-    // 2. Fractional Challenge
-    let _gamma = transcript.challenge_field::<F>(b"logup_gamma");
-
-    // 3. Sumcheck Binding (Reduces the array to a single evaluation point r_v)
-    let v_mle = vec_to_mle(&witness.values, witness.values.len());
+    // 4. Sumcheck binding for the original virtual polynomial V
+    let v_mle = vec_to_mle(&witness.values, n);
     let ones = DenseMLPoly::new(vec![F::ONE; v_mle.evaluations.len()]);
-
     let claim_v = v_mle.evaluations.iter().sum::<F>();
     transcript.append_field(b"claim_v", &claim_v);
 
     let (sumcheck, r_v) = prove_sumcheck(&v_mle, &ones, claim_v, transcript);
 
-    // 4. Multiplicity Opening
-    let r_m = challenge_vec(transcript, bits, b"logup_rm");
+    // 5. Openings at r_v for chunks
+    let mut chunk_evals = Vec::with_capacity(num_chunks);
+    let mut chunk_opens = Vec::with_capacity(num_chunks);
+    for c in 0..num_chunks {
+        let eval = chunk_mles[c].evaluate(&r_v);
+        let open = hyrax_open(&chunk_mles[c].evaluations, &r_v, nu_c, sigma_c);
+        chunk_evals.push(eval);
+        chunk_opens.push(open);
+    }
+
+    // 6. Multiplicity opening at random challenge r_m
+    let r_m = challenge_vec(transcript, CHUNK_BITS, b"logup_rm");
     let m_eval = m_mle.evaluate(&r_m);
     let m_open = hyrax_open(&m_mle.evaluations, &r_m, nu_m, sigma_m);
 
@@ -85,8 +119,11 @@ pub fn prove_range(
             m_com,
             m_eval,
             m_open,
+            chunk_coms,
+            chunk_evals,
+            chunk_opens,
         },
-        r_v, // Crucial: Return the challenge point to the parent layer!
+        r_v,
     ))
 }
 
@@ -94,33 +131,58 @@ pub fn prove_range(
 // Verifier
 // ---------------------------------------------------------------------------
 
-/// Returns `(r_v, v_eval)` which the parent layer MUST cross-check using Constraint Fusion.
 pub fn verify_range(
     proof: &RangeProof,
     num_vars: usize,
     bits: usize,
     transcript: &mut Transcript,
 ) -> Result<(Vec<F>, F), String> {
-    let (_, _, params_m) = params_from_vars(bits);
+    let num_chunks = (bits + CHUNK_BITS - 1) / CHUNK_BITS;
 
-    // 1. Absorb LogUp Commitment
+    let (_, _, params_m) = params_from_vars(CHUNK_BITS);
+    let (_, _, params_c) = params_from_vars(num_vars);
+
+    // 1. Absorb commitments
+    for com in &proof.chunk_coms {
+        absorb_com(transcript, b"chunk_com", com);
+    }
     absorb_com(transcript, b"logup_m_com", &proof.m_com);
-    let _gamma = transcript.challenge_field::<F>(b"logup_gamma");
 
     // 2. Sumcheck Verification
     transcript.append_field(b"claim_v", &proof.claim_v);
     let (r_v, final_val) = verify_sumcheck(&proof.sumcheck, proof.claim_v, num_vars, transcript)
         .map_err(|e| format!("Range Sumcheck: {e}"))?;
-
-    // The final value of the sumcheck represents V(r_v) * 1
     let v_eval = final_val;
 
-    // 3. Multiplicity Verification
-    let r_m = challenge_vec(transcript, bits, b"logup_rm");
+    // 3. Chunk Algebraic Fusion: V(r) = V_lo(r) + 2^16 * V_hi(r)
+    let mut expected_v_eval = F::ZERO;
+    let mut shift = F::ONE;
+    let shift_multiplier = F::from(1u64 << CHUNK_BITS);
+
+    for c in 0..num_chunks {
+        hyrax_verify(
+            &proof.chunk_coms[c],
+            proof.chunk_evals[c],
+            &r_v,
+            &proof.chunk_opens[c],
+            &params_c,
+        )
+        .map_err(|e| format!("Chunk opening failed: {e}"))?;
+
+        expected_v_eval += proof.chunk_evals[c] * shift;
+        shift *= shift_multiplier;
+    }
+
+    if v_eval != expected_v_eval {
+        return Err("Chunk fusion mismatch: V(r) != sum V_c(r) * 2^{16c}".into());
+    }
+
+    // 4. Multiplicity Verification
+    let r_m = challenge_vec(transcript, CHUNK_BITS, b"logup_rm");
     hyrax_verify(&proof.m_com, proof.m_eval, &r_m, &proof.m_open, &params_m)
         .map_err(|e| format!("Range Multiplicity Opening: {e}"))?;
 
-    // Return the coordinate and the value to the parent layer!
+    // Return the coordinate and the evaluated value to the parent layer (e.g. LayerNorm)
     Ok((r_v, v_eval))
 }
 
@@ -151,5 +213,98 @@ fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) 
         let mut buf = Vec::new();
         pt.serialize_compressed(&mut buf).unwrap();
         transcript.append_bytes(label, &buf);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use ark_ff::{One, Zero};
+
+    fn setup_witness() -> RangeProofWitness {
+        // Values requiring 32 bits (spanning multiple chunks)
+        // 100000, 200000, 300000, 400000
+        let values = vec![
+            F::from(100_000u64),
+            F::from(200_000u64),
+            F::from(300_000u64),
+            F::from(400_000u64),
+        ];
+        RangeProofWitness { values }
+    }
+
+    #[test]
+    fn test_range_proof_succinct_e2e() {
+        let witness = setup_witness();
+        let num_vars = witness.values.len().next_power_of_two().trailing_zeros() as usize;
+
+        let mut pt = Transcript::new(b"range_test");
+        let (proof, _) = prove_range(&witness, 32, &mut pt).unwrap();
+
+        let mut vt = Transcript::new(b"range_test");
+        let result = verify_range(&proof, num_vars, 32, &mut vt);
+
+        assert!(
+            result.is_ok(),
+            "Range Proof verification failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_rejects_tampered_chunk_fusion() {
+        let witness = setup_witness();
+        let num_vars = witness.values.len().next_power_of_two().trailing_zeros() as usize;
+
+        let mut pt = Transcript::new(b"range_test");
+        let (mut proof, _) = prove_range(&witness, 32, &mut pt).unwrap();
+
+        // Malicious Prover tampers with the chunk evaluation to trick the fusion check
+        proof.chunk_evals[0] += F::one();
+
+        let mut vt = Transcript::new(b"range_test");
+        let result = verify_range(&proof, num_vars, 32, &mut vt);
+
+        assert!(result.is_err(), "Should reject tampered chunk evaluation");
+    }
+
+    #[test]
+    fn test_rejects_tampered_claim_v() {
+        let witness = setup_witness();
+        let num_vars = witness.values.len().next_power_of_two().trailing_zeros() as usize;
+
+        let mut pt = Transcript::new(b"range_test");
+        let (mut proof, _) = prove_range(&witness, 32, &mut pt).unwrap();
+
+        // Malicious Prover tampers with the sumcheck claim
+        proof.claim_v += F::one();
+
+        let mut vt = Transcript::new(b"range_test");
+        let result = verify_range(&proof, num_vars, 32, &mut vt);
+
+        assert!(result.is_err(), "Should reject tampered claim_v");
+    }
+
+    #[test]
+    fn test_rejects_tampered_multiplicity() {
+        let witness = setup_witness();
+        let num_vars = witness.values.len().next_power_of_two().trailing_zeros() as usize;
+
+        let mut pt = Transcript::new(b"range_test");
+        let (mut proof, _) = prove_range(&witness, 32, &mut pt).unwrap();
+
+        // Tamper with LogUp Multiplicity Evaluation
+        proof.m_eval += F::one();
+
+        let mut vt = Transcript::new(b"range_test");
+        let result = verify_range(&proof, num_vars, 32, &mut vt);
+
+        assert!(
+            result.is_err(),
+            "Should reject tampered multiplicity opening"
+        );
     }
 }

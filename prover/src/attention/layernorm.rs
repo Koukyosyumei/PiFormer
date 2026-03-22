@@ -169,7 +169,7 @@ pub fn prove_layernorm(
     }
     // 【重要】prove_rangeから返された r_sig を、以降の計算で使用する！
     let (sigma_range_proof, r_sig) =
-        prove_range(&RangeProofWitness { values: sigma_res }, 16, transcript)?;
+        prove_range(&RangeProofWitness { values: sigma_res }, 32, transcript)?;
     let r_sig_t = r_sig[0..t_bits].to_vec();
     let r_sig_b = r_sig[t_bits];
 
@@ -194,7 +194,7 @@ pub fn prove_layernorm(
         }
     }
     // 【重要】prove_rangeから返された r_y を、以降の計算で使用する！
-    let (y_range_proof, r_y) = prove_range(&RangeProofWitness { values: y_res }, 16, transcript)?;
+    let (y_range_proof, r_y) = prove_range(&RangeProofWitness { values: y_res }, 32, transcript)?;
     let r_y_t = r_y[0..t_bits].to_vec();
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
     let r_y_b = r_y[t_bits + d_bits];
@@ -339,7 +339,7 @@ pub fn verify_layernorm(
 
     // 3. Sigma Constraint Fusion (O(1))
     // 【重要】Verifierも、verify_range_succinct から返された評価点を受け取る
-    let (r_sig, sig_eval) = verify_range(&proof.sigma_range_proof, t_bits + 1, 16, transcript)?;
+    let (r_sig, sig_eval) = verify_range(&proof.sigma_range_proof, t_bits + 1, 32, transcript)?;
     let r_sig_t = r_sig[0..t_bits].to_vec();
     let r_sig_b = r_sig[t_bits];
 
@@ -353,7 +353,7 @@ pub fn verify_layernorm(
     }
 
     // 4. Y Constraint Fusion (O(D) to eval public weights, O(1) for residual)
-    let (r_y, y_eval) = verify_range(&proof.y_range_proof, t_bits + d_bits + 1, 16, transcript)?;
+    let (r_y, y_eval) = verify_range(&proof.y_range_proof, t_bits + d_bits + 1, 32, transcript)?;
     let r_y_t = r_y[0..t_bits].to_vec();
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
     let r_y_b = r_y[t_bits + d_bits];
