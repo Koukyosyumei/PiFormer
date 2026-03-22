@@ -20,12 +20,14 @@
 //!    proves that the committed chunks correctly reconstruct the value polynomial,
 //!    closing the gap that Lasso alone cannot close.
 //!
-//! 5. **Hyrax openings at r:** each Hyrax open proof certifies that the
+//! 5. **Hyrax openings at r:** each Hyrax opening proof certifies that the
 //!    committed C_i evaluates to the claimed value at r.
 
 use crate::field::F;
 use crate::lookup::lasso::{prove_lasso, verify_lasso, LassoInstance, LassoProof};
-use crate::pcs::{hyrax_commit, hyrax_open, hyrax_verify, HyraxCommitment, HyraxParams, HyraxProof};
+use crate::pcs::{
+    hyrax_commit, hyrax_open, hyrax_verify, HyraxCommitment, HyraxParams, HyraxProof,
+};
 use crate::poly::DenseMLPoly;
 use crate::transcript::Transcript;
 use ark_ff::{Field, PrimeField};
@@ -38,86 +40,77 @@ const CHUNK_BITS: usize = 8;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Public instance for a batched range proof.
+/// Instance for a range proof.  Both prover and verifier hold raw values.
 pub struct RangeProofInstance {
-    /// Values to prove; each must lie in [0, 2^bits).
+    /// Values to prove are each in [0, 2^bits).
     pub values: Vec<F>,
-    /// Total range in bits (e.g. 32 → prove [0, 2^32)).
-    /// Must be a multiple of CHUNK_BITS (= 8).
+    /// Total bit width (must be a positive multiple of CHUNK_BITS = 8).
     pub bits: usize,
 }
 
-/// A complete chunked range proof.
 pub struct RangeProof {
-    /// Hyrax commitments to chunk polynomials C_0, …, C_{c-1}.
+    /// Hyrax commitments to each chunk polynomial C_i(·).
     pub chunk_coms: Vec<HyraxCommitment>,
-    /// Evaluations C_i(r) at the recombination challenge r.
+    /// C_i(r) at the random recombination point r.
     pub chunk_evals: Vec<F>,
-    /// Hyrax opening proofs for each C_i(r).
+    /// Hyrax opening proofs for each C_i at r.
     pub chunk_opens: Vec<HyraxProof>,
-    /// Lasso proof that every C_i(j) ∈ [0, 2^CHUNK_BITS).
+    /// Lasso proof certifying every chunk evaluation lies in [0, 256).
     pub lasso_proof: LassoProof,
 }
 
 // ---------------------------------------------------------------------------
-// Prover
+// Prover: O(N) computation, produces binding proof
 // ---------------------------------------------------------------------------
 
-/// Prove that every value in `inst.values` lies in [0, 2^{inst.bits}).
 pub fn prove_range(
     inst: &RangeProofInstance,
     transcript: &mut Transcript,
 ) -> Result<RangeProof, String> {
     validate(inst)?;
+    let num_chunks = inst.bits / CHUNK_BITS;
 
-    let (num_chunks, chunk_params) = setup(inst);
-    let n      = inst.values.len();
-    let n_p2   = n.next_power_of_two().max(2); // ≥ 2 so n_vars ≥ 1
-    let n_vars = n_p2.trailing_zeros() as usize;
-    let nu     = n_vars / 2;
-    let sigma  = n_vars - nu;
-    let hyrax  = HyraxParams::new(sigma);
+    // HyraxParams for Lasso on the 256-entry identity table.
+    let lasso_params = HyraxParams::new(CHUNK_BITS - CHUNK_BITS / 2);
 
-    // ── 1. Decompose values into c chunk arrays ──────────────────────────────
-    let mask = (1usize << CHUNK_BITS) - 1;
-    let mut chunk_evals_all = vec![vec![F::ZERO; n_p2]; num_chunks];
-    let mut lasso_queries   = Vec::with_capacity(n * num_chunks);
-    let mut lasso_outputs   = Vec::with_capacity(n * num_chunks);
+    // Pad value count to a power of two (>= 2 so num_vars >= 1).
+    let n_padded = inst.values.len().next_power_of_two().max(2);
+    let n_vars = n_padded.trailing_zeros() as usize;
+    let nu = n_vars / 2;
+    let sigma = n_vars - nu;
+    let chunk_params = HyraxParams::new(sigma);
 
-    for (j, &v) in inst.values.iter().enumerate() {
-        let v_int = v.into_bigint().as_ref()[0] as usize;
-        for i in 0..num_chunks {
-            let ch = (v_int >> (i * CHUNK_BITS)) & mask;
-            chunk_evals_all[i][j] = F::from(ch as u64);
-            // Chunk-major ordering: all queries for chunk i before chunk i+1.
-            // Appended below after the outer loop to keep the right order.
-            let _ = ch; // populated below
-        }
-    }
-    // Flatten in chunk-major order (chunk 0 all values, then chunk 1, …)
+    // -- 1. Chunk decomposition -----------------------------------------------
+    let mask = (1u64 << CHUNK_BITS) - 1;
+    let mut chunk_evals_all = vec![vec![F::ZERO; n_padded]; num_chunks];
+    let mut lasso_queries = Vec::with_capacity(n_padded * num_chunks);
+    let mut lasso_outputs = Vec::with_capacity(n_padded * num_chunks);
+
     for i in 0..num_chunks {
-        for j in 0..n {
-            let v_int = inst.values[j].into_bigint().as_ref()[0] as usize;
+        for j in 0..n_padded {
+            let v_int = if j < inst.values.len() {
+                inst.values[j].into_bigint().as_ref()[0]
+            } else {
+                0
+            };
             let ch = (v_int >> (i * CHUNK_BITS)) & mask;
-            lasso_queries.push(ch);
-            lasso_outputs.push(F::from(ch as u64));
+            let ch_f = F::from(ch);
+            chunk_evals_all[i][j] = ch_f;
+            lasso_queries.push(ch as usize);
+            lasso_outputs.push(ch_f);
         }
     }
 
-    // ── 2. Commit to each chunk polynomial; absorb into transcript ───────────
-    let chunk_coms: Vec<HyraxCommitment> = chunk_evals_all
-        .iter()
-        .map(|evals| {
-            let com = hyrax_commit(evals, nu, &hyrax);
-            absorb_com(transcript, &com);
-            com
-        })
-        .collect();
+    // -- 2. Commit to each chunk polynomial; absorb into transcript -----------
+    let mut chunk_coms = Vec::with_capacity(num_chunks);
+    for i in 0..num_chunks {
+        let com = hyrax_commit(&chunk_evals_all[i], nu, &chunk_params);
+        absorb_com(transcript, b"chunk_com", &com);
+        chunk_coms.push(com);
+    }
 
-    // ── 3. Lasso: prove each chunk ∈ [0, 2^CHUNK_BITS) ──────────────────────
-    let identity_table: Vec<F> = (0..1usize << CHUNK_BITS)
-        .map(|i| F::from(i as u64))
-        .collect();
+    // -- 3. Lasso: prove every chunk value lies in [0, 256) ------------------
+    let identity_table: Vec<F> = (0..1 << CHUNK_BITS).map(|i| F::from(i as u64)).collect();
     let lasso_proof = prove_lasso(
         &LassoInstance {
             tables: vec![identity_table],
@@ -126,81 +119,88 @@ pub fn prove_range(
             bits_per_chunk: CHUNK_BITS,
         },
         transcript,
-        &chunk_params,
+        &lasso_params,
     );
 
-    // ── 4. Recombination challenge r ─────────────────────────────────────────
-    let r = squeeze_r(transcript, n_vars);
-
-    // ── 5. Evaluate + open each chunk polynomial at r ────────────────────────
-    let chunk_evals: Vec<F> = chunk_evals_all
-        .iter()
-        .map(|evals| DenseMLPoly::new(evals.clone()).evaluate(&r))
-        .collect();
-    let chunk_opens: Vec<HyraxProof> = chunk_evals_all
-        .iter()
-        .map(|evals| hyrax_open(evals, &r, nu, sigma))
+    // -- 4. Squeeze recombination challenge and open each chunk ---------------
+    let r: Vec<F> = (0..n_vars)
+        .map(|_| transcript.challenge_field::<F>(b"range_r"))
         .collect();
 
-    Ok(RangeProof { chunk_coms, chunk_evals, chunk_opens, lasso_proof })
+    let mut chunk_evals = Vec::with_capacity(num_chunks);
+    let mut chunk_opens = Vec::with_capacity(num_chunks);
+    for i in 0..num_chunks {
+        let eval = DenseMLPoly::new(chunk_evals_all[i].clone()).evaluate(&r);
+        let open = hyrax_open(&chunk_evals_all[i], &r, nu, sigma);
+        chunk_evals.push(eval);
+        chunk_opens.push(open);
+    }
+
+    Ok(RangeProof {
+        chunk_coms,
+        chunk_evals,
+        chunk_opens,
+        lasso_proof,
+    })
 }
 
 // ---------------------------------------------------------------------------
-// Verifier
+// Verifier: checks commitments, Lasso, and algebraic recombination
 // ---------------------------------------------------------------------------
 
-/// Verify a chunked range proof.
 pub fn verify_range(
     proof: &RangeProof,
     inst: &RangeProofInstance,
     transcript: &mut Transcript,
 ) -> Result<(), String> {
     validate(inst)?;
+    let num_chunks = inst.bits / CHUNK_BITS;
+    let lasso_params = HyraxParams::new(CHUNK_BITS - CHUNK_BITS / 2);
 
-    let (num_chunks, chunk_params) = setup(inst);
-    let n      = inst.values.len();
-    let n_p2   = n.next_power_of_two().max(2);
-    let n_vars = n_p2.trailing_zeros() as usize;
-    let nu     = n_vars / 2;
-    let sigma  = n_vars - nu;
-    let hyrax  = HyraxParams::new(sigma);
+    let n_padded = inst.values.len().next_power_of_two().max(2);
+    let n_vars = n_padded.trailing_zeros() as usize;
+    let nu = n_vars / 2;
+    let sigma = n_vars - nu;
+    let chunk_params = HyraxParams::new(sigma);
 
-    if proof.chunk_coms.len() != num_chunks
-        || proof.chunk_evals.len() != num_chunks
-        || proof.chunk_opens.len() != num_chunks
-    {
-        return Err("Range proof has wrong number of chunks".to_string());
-    }
-
-    // ── 1. Recompute chunk arrays from public values ─────────────────────────
-    let mask = (1usize << CHUNK_BITS) - 1;
-    let mut chunk_evals_all = vec![vec![F::ZERO; n_p2]; num_chunks];
-    let mut lasso_queries   = Vec::with_capacity(n * num_chunks);
-    let mut lasso_outputs   = Vec::with_capacity(n * num_chunks);
+    // -- 1. Recompute chunk decomposition from inst.values -------------------
+    let mask = (1u64 << CHUNK_BITS) - 1;
+    let mut chunk_evals_all = vec![vec![F::ZERO; n_padded]; num_chunks];
+    let mut lasso_queries = Vec::with_capacity(n_padded * num_chunks);
+    let mut lasso_outputs = Vec::with_capacity(n_padded * num_chunks);
 
     for i in 0..num_chunks {
-        for j in 0..n {
-            let v_int = inst.values[j].into_bigint().as_ref()[0] as usize;
+        for j in 0..n_padded {
+            let v_int = if j < inst.values.len() {
+                inst.values[j].into_bigint().as_ref()[0]
+            } else {
+                0
+            };
             let ch = (v_int >> (i * CHUNK_BITS)) & mask;
-            chunk_evals_all[i][j] = F::from(ch as u64);
-            lasso_queries.push(ch);
-            lasso_outputs.push(F::from(ch as u64));
+            let ch_f = F::from(ch);
+            chunk_evals_all[i][j] = ch_f;
+            lasso_queries.push(ch as usize);
+            lasso_outputs.push(ch_f);
         }
     }
 
-    // ── 2. Absorb chunk commitments; sanity-check against public values ───────
-    for (i, com) in proof.chunk_coms.iter().enumerate() {
-        absorb_com(transcript, com);
-        let expected = hyrax_commit(&chunk_evals_all[i], nu, &hyrax);
-        if expected.row_coms != com.row_coms {
-            return Err(format!("Chunk {i} commitment does not match public values"));
+    // -- 2. Check chunk commitments match recomputed values ------------------
+    if proof.chunk_coms.len() != num_chunks {
+        return Err(format!(
+            "expected {num_chunks} chunk commitments, got {}",
+            proof.chunk_coms.len()
+        ));
+    }
+    for i in 0..num_chunks {
+        let expected = hyrax_commit(&chunk_evals_all[i], nu, &chunk_params);
+        if expected.row_coms != proof.chunk_coms[i].row_coms {
+            return Err(format!("chunk {i} commitment mismatch"));
         }
+        absorb_com(transcript, b"chunk_com", &proof.chunk_coms[i]);
     }
 
-    // ── 3. Lasso verification ────────────────────────────────────────────────
-    let identity_table: Vec<F> = (0..1usize << CHUNK_BITS)
-        .map(|i| F::from(i as u64))
-        .collect();
+    // -- 3. Verify Lasso (using real query indices derived from inst.values) --
+    let identity_table: Vec<F> = (0..1 << CHUNK_BITS).map(|i| F::from(i as u64)).collect();
     verify_lasso(
         &proof.lasso_proof,
         &LassoInstance {
@@ -210,28 +210,21 @@ pub fn verify_range(
             bits_per_chunk: CHUNK_BITS,
         },
         transcript,
-        &chunk_params,
-    )
-    .map_err(|e| format!("Range Lasso: {e}"))?;
+        &lasso_params,
+    )?;
 
-    // ── 4. Recombination challenge r ─────────────────────────────────────────
-    let r = squeeze_r(transcript, n_vars);
+    // -- 4. Squeeze recombination challenge -----------------------------------
+    let r: Vec<F> = (0..n_vars)
+        .map(|_| transcript.challenge_field::<F>(b"range_r"))
+        .collect();
 
-    // ── 5. Hyrax opening proofs ───────────────────────────────────────────────
-    for i in 0..num_chunks {
-        hyrax_verify(&proof.chunk_coms[i], proof.chunk_evals[i], &r, &proof.chunk_opens[i], &hyrax)
-            .map_err(|e| format!("Chunk {i} Hyrax open: {e}"))?;
+    // -- 5. Recombination check: V(r) = Σ C_i(r) * 2^(i*8) ------------------
+    // Compute V(r) directly from raw values (verifier has them).
+    let mut v_values = vec![F::ZERO; n_padded];
+    for (j, &v) in inst.values.iter().enumerate() {
+        v_values[j] = v;
     }
-
-    // ── 6. Recombination check: V(r) = Σ C_i(r) · 2^(i·CHUNK_BITS) ──────────
-    let v_poly = {
-        let mut v_evals = vec![F::ZERO; n_p2];
-        for (j, &v) in inst.values.iter().enumerate() {
-            v_evals[j] = v;
-        }
-        DenseMLPoly::new(v_evals)
-    };
-    let v_at_r = v_poly.evaluate(&r);
+    let v_r = DenseMLPoly::new(v_values).evaluate(&r);
 
     let mut recombined = F::ZERO;
     let mut shift = F::ONE;
@@ -240,11 +233,20 @@ pub fn verify_range(
         recombined += proof.chunk_evals[i] * shift;
         shift *= base;
     }
+    if v_r != recombined {
+        return Err("Algebraic recombination check failed".to_string());
+    }
 
-    if recombined != v_at_r {
-        return Err(format!(
-            "Recombination check failed: V(r)={v_at_r:?} ≠ Σ C_i(r)·2^(i·8)={recombined:?}"
-        ));
+    // -- 6. Verify Hyrax openings for each chunk at r ------------------------
+    for i in 0..num_chunks {
+        hyrax_verify(
+            &proof.chunk_coms[i],
+            proof.chunk_evals[i],
+            &r,
+            &proof.chunk_opens[i],
+            &chunk_params,
+        )
+        .map_err(|e| format!("chunk {i} opening failed: {e}"))?;
     }
 
     Ok(())
@@ -267,25 +269,11 @@ fn validate(inst: &RangeProofInstance) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns (num_chunks, HyraxParams sized for the identity table).
-fn setup(inst: &RangeProofInstance) -> (usize, HyraxParams) {
-    let num_chunks = inst.bits / CHUNK_BITS;
-    // Lasso HyraxParams: nu + sigma = CHUNK_BITS; choose nu = CHUNK_BITS/2.
-    let lasso_sigma = CHUNK_BITS - CHUNK_BITS / 2;
-    (num_chunks, HyraxParams::new(lasso_sigma))
-}
-
-fn squeeze_r(transcript: &mut Transcript, n_vars: usize) -> Vec<F> {
-    (0..n_vars)
-        .map(|_| transcript.challenge_field::<F>(b"range_r"))
-        .collect()
-}
-
-fn absorb_com(transcript: &mut Transcript, com: &HyraxCommitment) {
+fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) {
     for pt in &com.row_coms {
         let mut buf = Vec::new();
         pt.serialize_compressed(&mut buf).unwrap();
-        transcript.append_bytes(b"chunk_com", &buf);
+        transcript.append_bytes(label, &buf);
     }
 }
 
@@ -339,11 +327,8 @@ mod range_tests {
         roundtrip(b"rbatch", inst(vals, 8)).expect("large-batch range proof failed");
     }
 
-    /// Out-of-range value: the recombination check must catch it.
-    ///
-    /// With bits=8 and v=999: the chunk is 999 & 0xFF = 231 (valid in [0,256)).
-    /// Lasso accepts the chunk, but V(r) = 999*L_j(r) ≠ 231*L_j(r) = C_0(r),
-    /// so the recombination check fails.
+    /// Out-of-range value: the verifier recomputes chunk commitments from the
+    /// tampered instance, which differ from the proof's committed chunks.
     #[test]
     fn test_range_out_of_range_rejected() {
         let good = inst(vec![10, 20, 30], 8);
