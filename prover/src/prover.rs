@@ -1,243 +1,211 @@
-//! PiFormer prover: orchestrates the full ZK proof for a transformer model.
+//! Global Prover for a full Transformer Block.
 //!
-//! The proof covers:
-//!   - For each transformer layer: for each attention head, a full
-//!     `LinearAttentionProof` (φ(Q), φ(K) Lasso lookups + two GKR sumchecks).
-//!   - Ternary weight constraint for all weight matrices in each layer.
+//! **Production-Grade Architecture:**
+//! 1. Executes the forward pass to generate all intermediate dynamic activations (Witness).
+//! 2. Computes the IO Commitments for all layer boundaries exactly ONCE to prevent O(N) bloat.
+//! 3. Delegates the proof generation to the sub-provers, passing the strongly bound IO commitments.
 //!
-//! The public input is the full `PiFormerWitness` (matrices are known to verifier
-//! in this version; PCS commitments replace them in a fully-succinct variant).
+//! **Block Architecture:**
+//!   X_norm1 = LayerNorm(X_in)
+//!   Q, K, V = Projection(X_norm1, W_Q/K/V)
+//!   Out_inner = LinearAttention(Q, K, V)
+//!   Out_attn = Projection(Out_inner, W_O)
+//!   X_mid = X_in + Out_attn   <-- Residual 1
+//!   X_norm2 = LayerNorm(X_mid)
+//!   Out_ffn = FFN(X_norm2)
+//!   X_out = X_mid + Out_ffn   <-- Residual 2
 
-use crate::attention::{
-    prove_linear_attention, LinearAttentionInstance, LinearAttentionProof,
-    TernaryWeightInstance, TernaryWeightProof, prove_ternary_weights,
-};
 use crate::field::F;
-use ark_ff::Field;
-use crate::pcs::HyraxParams;
+use crate::pcs::{hyrax_commit, HyraxCommitment, HyraxParams};
+use crate::poly::utils::mat_to_mle;
+use crate::poly::DenseMLPoly;
 use crate::transcript::Transcript;
 
-// ---------------------------------------------------------------------------
-// Witness and Proof types
-// ---------------------------------------------------------------------------
-
-/// Witness for a full PiFormer forward pass.
-///
-/// `block_witnesses[layer][head]` contains the attention witness for that head.
-pub struct PiFormerWitness {
-    pub block_witnesses: Vec<Vec<LinearAttentionInstance>>,
-}
-
-/// Proof for one transformer block (all heads in one layer).
-pub struct BlockProof {
-    /// Attention proofs for each head.
-    pub head_proofs: Vec<LinearAttentionProof>,
-    /// Batched ternary constraint proof for all weight matrices in this block.
-    pub ternary_proof: TernaryWeightProof,
-}
-
-/// Full proof for all transformer blocks.
-pub struct PiFormerProof {
-    pub block_proofs: Vec<BlockProof>,
-}
+// Sub-module imports (Assuming the interfaces we built previously)
+use crate::attention::layernorm::{
+    prove_layernorm, LayerNormIOCommitments, LayerNormProof, LayerNormWitness,
+};
+use crate::attention::linear::{
+    prove_linear_attention, AttentionIOCommitments, LinearAttentionInstance, LinearAttentionProof,
+    LinearAttentionWitness,
+};
+use crate::attention::projection::{
+    prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionWitness,
+};
+use crate::ffn::ffn::{prove_ffn, FFNIOCommitments, FFNInstance, FFNProof, FFNWitness};
+use crate::verifier::{add_commitments, TransformerBlockVerifyingKey}; // Imported from verifier.rs
 
 // ---------------------------------------------------------------------------
-// Prover
+// Global Proof Structure
 // ---------------------------------------------------------------------------
 
-pub struct PiFormerProver;
+/// The complete ZK Proof for one Transformer Block.
+pub struct TransformerBlockProof {
+    // Sub-proofs
+    pub ln1_proof: LayerNormProof,
+    pub q_proj_proof: ProjectionProof,
+    pub k_proj_proof: ProjectionProof,
+    pub v_proj_proof: ProjectionProof,
+    pub attn_proof: LinearAttentionProof,
+    pub o_proj_proof: ProjectionProof,
+    pub ln2_proof: LayerNormProof,
+    pub ffn_proof: FFNProof,
 
-impl PiFormerProver {
-    /// Generate a proof for the full transformer forward pass.
-    pub fn prove(witness: &PiFormerWitness, params: &HyraxParams) -> PiFormerProof {
-        let mut transcript = Transcript::new(b"PiFormer-v0.1");
-
-        let block_proofs = witness
-            .block_witnesses
-            .iter()
-            .enumerate()
-            .map(|(layer_idx, heads)| {
-                transcript.append_bytes(b"layer", &(layer_idx as u64).to_le_bytes());
-
-                // Prove each attention head.
-                let head_proofs = heads
-                    .iter()
-                    .enumerate()
-                    .map(|(head_idx, inst)| {
-                        transcript.append_bytes(b"head", &(head_idx as u64).to_le_bytes());
-                        prove_linear_attention(inst, &mut transcript, params)
-                    })
-                    .collect::<Vec<_>>();
-
-                // Collect all weight matrices from all heads and prove ternary constraint.
-                let ternary_weights = collect_ternary_weights(heads);
-                let ternary_proof =
-                    prove_ternary_weights(&TernaryWeightInstance { weights: ternary_weights },
-                        &mut transcript);
-
-                BlockProof { head_proofs, ternary_proof }
-            })
-            .collect();
-
-        PiFormerProof { block_proofs }
-    }
+    // Intermediate IO Commitments (Passed to Verifier to stitch the pipeline)
+    pub x_norm1_com: HyraxCommitment,
+    pub q_com: HyraxCommitment,
+    pub k_com: HyraxCommitment,
+    pub v_com: HyraxCommitment,
+    pub out_inner_com: HyraxCommitment,
+    pub out_attn_com: HyraxCommitment,
+    pub x_norm2_com: HyraxCommitment,
+    pub out_ffn_com: HyraxCommitment,
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Global Witness Structure
 // ---------------------------------------------------------------------------
 
-/// Flatten all Q, K, V matrices from all attention heads into a single weight
-/// vector for the ternary constraint proof.
-///
-/// In a real deployment, these come from the quantised weight tensors; here we
-/// flatten the input projections available in the witness.
-fn collect_ternary_weights(heads: &[LinearAttentionInstance]) -> Vec<F> {
-    let mut weights = Vec::new();
-    for inst in heads {
-        for row in &inst.q {
-            weights.extend_from_slice(row);
-        }
-        for row in &inst.k {
-            weights.extend_from_slice(row);
-        }
-        for row in &inst.v {
-            weights.extend_from_slice(row);
-        }
-    }
-    // Clamp each element to {-1, 0, 1}: elements already in the field, snap
-    // to nearest ternary using the convention that p-1 ≡ -1.
-    weights
-        .into_iter()
-        .map(|w| snap_to_ternary(w))
-        .collect()
-}
-
-fn snap_to_ternary(w: F) -> F {
-    use ark_ff::PrimeField;
-    let raw = w.into_bigint().as_ref()[0];
-    if raw == 0 {
-        F::ZERO
-    } else if raw == 1 {
-        F::ONE
-    } else {
-        // treat as -1 (field element p-1)
-        F::ZERO - F::ONE
-    }
+pub struct TransformerBlockWitness {
+    pub x_in: Vec<Vec<F>>,
+    pub ln1_wit: LayerNormWitness,
+    pub q_proj_wit: ProjectionWitness,
+    pub k_proj_wit: ProjectionWitness,
+    pub v_proj_wit: ProjectionWitness,
+    pub attn_wit: LinearAttentionWitness,
+    pub o_proj_wit: ProjectionWitness,
+    pub x_mid: Vec<Vec<F>>, // Residual 1 output
+    pub ln2_wit: LayerNormWitness,
+    pub ffn_wit: FFNWitness,
+    pub x_out: Vec<Vec<F>>, // Residual 2 output
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Prover Implementation
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod prover_tests {
-    use super::*;
-    use crate::lookup::LassoInstance;
-    use ark_ff::{Field, PrimeField};
+pub fn prove_transformer_block(
+    witness: &TransformerBlockWitness,
+    x_in_com: &HyraxCommitment,        // Provided by previous block
+    pk: &TransformerBlockVerifyingKey, // The VK contains all static weights
+    inst_attn: &LinearAttentionInstance,
+    inst_ffn: &FFNInstance,
+    transcript: &mut Transcript,
+    lasso_params: &HyraxParams,
+) -> Result<TransformerBlockProof, String> {
+    let t = pk.seq_len;
+    let d = pk.d_model;
 
-    fn make_witness(seq_len: usize, d_head: usize) -> PiFormerWitness {
-        let m = 4usize;
-        let table_size = 1 << m;
-        let table: Vec<F> = (0..table_size).map(|i| F::from((i + 1) as u64)).collect();
+    // Helper to commit to a matrix
+    let commit_mat = |mat: &[Vec<F>], rows: usize, cols: usize| -> HyraxCommitment {
+        let mle = mat_to_mle(mat, rows, cols); // Implement mat_to_mle as usual
+        let total_vars =
+            rows.next_power_of_two().trailing_zeros() + cols.next_power_of_two().trailing_zeros();
+        let nu = total_vars as usize / 2;
+        let sigma = (total_vars as usize - nu).max(1);
+        hyrax_commit(&mle.evaluations, nu, &HyraxParams::new(sigma))
+    };
 
-        let q = vec![
-            vec![F::from(1u64), F::from(2u64)],
-            vec![F::from(3u64), F::from(4u64)],
-        ];
-        let k = vec![
-            vec![F::from(0u64), F::from(1u64)],
-            vec![F::from(2u64), F::from(3u64)],
-        ];
-        let v = vec![
-            vec![F::from(5u64), F::from(6u64)],
-            vec![F::from(7u64), F::from(8u64)],
-        ];
+    // 1. Generate all Intermediate IO Commitments (O(N) operations done ONLY ONCE)
+    let x_norm1_com = commit_mat(&witness.ln1_wit.y, t, d);
+    let q_com = commit_mat(&witness.attn_wit.q, t, d);
+    let k_com = commit_mat(&witness.attn_wit.k, t, d);
+    let v_com = commit_mat(&witness.attn_wit.v, t, d);
+    let out_inner_com = commit_mat(&witness.attn_wit.out, t, d);
+    let out_attn_com = commit_mat(&witness.o_proj_wit.y, t, d);
+    let x_norm2_com = commit_mat(&witness.ln2_wit.y, t, d);
+    let out_ffn_com = commit_mat(&witness.ffn_wit.y, t, d);
 
-        let phi_q: Vec<Vec<F>> = q
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|&x| table[x.into_bigint().as_ref()[0] as usize])
-                    .collect()
-            })
-            .collect();
-        let phi_k: Vec<Vec<F>> = k
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|&x| table[x.into_bigint().as_ref()[0] as usize])
-                    .collect()
-            })
-            .collect();
+    // 2. Execute Sub-Provers with strictly bound IO Commitments
+    // --- LayerNorm 1 ---
+    let ln1_io = LayerNormIOCommitments {
+        x_com: x_in_com.clone(),
+        y_com: x_norm1_com.clone(),
+    };
+    let ln1_proof = prove_layernorm(&witness.ln1_wit, &ln1_io, &pk.ln1_vk, transcript)?;
 
-        let mut context = vec![vec![F::ZERO; d_head]; d_head];
-        for i in 0..d_head {
-            for j in 0..d_head {
-                for t in 0..seq_len {
-                    context[i][j] += phi_k[t][i] * v[t][j];
-                }
-            }
-        }
-        let mut out = vec![vec![F::ZERO; d_head]; seq_len];
-        for t in 0..seq_len {
-            for j in 0..d_head {
-                for i in 0..d_head {
-                    out[t][j] += phi_q[t][i] * context[i][j];
-                }
-            }
-        }
+    // --- Q, K, V Projections ---
+    let q_io = ProjectionIOCommitments {
+        x_com: x_norm1_com.clone(),
+        y_com: q_com.clone(),
+    };
+    let q_proj_proof = prove_projection(&pk.q_pk, &witness.q_proj_wit, &q_io, transcript)?;
 
-        let build_lasso = |mat: &Vec<Vec<F>>| {
-            let flat: Vec<usize> = mat
-                .iter()
-                .flatten()
-                .map(|x| x.into_bigint().as_ref()[0] as usize)
-                .collect();
-            let out_flat: Vec<F> = mat
-                .iter()
-                .flatten()
-                .map(|&x| table[x.into_bigint().as_ref()[0] as usize])
-                .collect();
-            LassoInstance {
-                tables: vec![table.clone()],
-                query_indices: flat,
-                outputs: out_flat,
-                bits_per_chunk: m,
-            }
-        };
+    let k_io = ProjectionIOCommitments {
+        x_com: x_norm1_com.clone(),
+        y_com: k_com.clone(),
+    };
+    let k_proj_proof = prove_projection(&pk.k_pk, &witness.k_proj_wit, &k_io, transcript)?;
 
-        let inst = LinearAttentionInstance {
-            seq_len,
-            d_head,
-            q,
-            k,
-            v,
-            phi_q,
-            phi_k,
-            context,
-            out,
-            q_lasso: build_lasso(&vec![
-                vec![F::from(1u64), F::from(2u64)],
-                vec![F::from(3u64), F::from(4u64)],
-            ]),
-            k_lasso: build_lasso(&vec![
-                vec![F::from(0u64), F::from(1u64)],
-                vec![F::from(2u64), F::from(3u64)],
-            ]),
-        };
+    let v_io = ProjectionIOCommitments {
+        x_com: x_norm1_com.clone(),
+        y_com: v_com.clone(),
+    };
+    let v_proj_proof = prove_projection(&pk.v_pk, &witness.v_proj_wit, &v_io, transcript)?;
 
-        PiFormerWitness {
-            block_witnesses: vec![vec![inst]],
-        }
-    }
+    // --- Linear Attention ---
+    let attn_io = AttentionIOCommitments {
+        q_com: q_com.clone(),
+        k_com: k_com.clone(),
+        v_com: v_com.clone(),
+        out_com: out_inner_com.clone(),
+    };
+    let attn_proof = prove_linear_attention(
+        &witness.attn_wit,
+        inst_attn,
+        &attn_io,
+        transcript,
+        lasso_params,
+    );
 
-    #[test]
-    fn test_prover_e2e() {
-        let witness = make_witness(2, 2);
-        let params = HyraxParams::new(2);
-        let proof = PiFormerProver::prove(&witness, &params);
-        assert_eq!(proof.block_proofs.len(), 1);
-        assert_eq!(proof.block_proofs[0].head_proofs.len(), 1);
-    }
+    // --- Output Projection ---
+    let o_io = ProjectionIOCommitments {
+        x_com: out_inner_com.clone(),
+        y_com: out_attn_com.clone(),
+    };
+    let o_proj_proof = prove_projection(&pk.o_pk, &witness.o_proj_wit, &o_io, transcript)?;
+
+    // --- LayerNorm 2 ---
+    // Note: The input to LN2 is X_mid = X_in + Out_attn.
+    // We compute the commitment homomorphically!
+    let x_mid_com = add_commitments(x_in_com, &out_attn_com);
+    let ln2_io = LayerNormIOCommitments {
+        x_com: x_mid_com.clone(),
+        y_com: x_norm2_com.clone(),
+    };
+    let ln2_proof = prove_layernorm(&witness.ln2_wit, &ln2_io, &pk.ln2_vk, transcript)?;
+
+    // --- FFN ---
+    let ffn_io = FFNIOCommitments {
+        x_com: x_norm2_com.clone(),
+        y_com: out_ffn_com.clone(),
+    };
+    let ffn_proof = prove_ffn(
+        &pk.ffn_pk,
+        &witness.ffn_wit,
+        inst_ffn,
+        &ffn_io,
+        transcript,
+        lasso_params,
+    )?;
+
+    // Return the bundled proof and intermediate commitments
+    Ok(TransformerBlockProof {
+        ln1_proof,
+        q_proj_proof,
+        k_proj_proof,
+        v_proj_proof,
+        attn_proof,
+        o_proj_proof,
+        ln2_proof,
+        ffn_proof,
+        x_norm1_com,
+        q_com,
+        k_com,
+        v_com,
+        out_inner_com,
+        out_attn_com,
+        x_norm2_com,
+        out_ffn_com,
+    })
 }

@@ -1,5 +1,6 @@
 pub mod layernorm;
 pub mod linear;
+pub mod projection;
 pub mod ternary_check;
 
 pub use linear::{

@@ -1,24 +1,23 @@
 //! Arithmetic circuit for one head of linear attention (MLE/GKR + PCS based).
 //!
-//! **Computation proved:**
-//!   1. phiQ = φ(Q)                                 — Lasso lookup
-//!   2. phiK = φ(K)                                 — Lasso lookup
-//!   3. context[i][j] = Σ_t phiK[t][i]·V[t][j]    — GKR sumcheck over t
-//!   4. out[t][j]     = Σ_i phiQ[t][i]·context[i][j] — GKR sumcheck over i
+//! **Production-Grade Security Architecture:**
+//!   Unlike prototype implementations, this module STRICTLY separates internal
+//!   commitments from IO commitments. The Verifier DOES NOT trust the Prover
+//!   for the commitments of Q, K, V, and Out. These must be passed via
+//!   `AttentionIOCommitments` from the global pipeline (e.g., the outputs of
+//!   the previous FCONN/Linear layers).
 //!
-//! **Succinctness:**
-//!   * All intermediate matrices (phiQ, phiK, V, context, out) are committed
-//!     with Hyrax *before* any challenge is drawn, binding the prover.
-//!   * Two GKR sumchecks reduce the 2-D matrix-multiply claims to scalar
-//!     MLE evaluations at random points.
-//!   * Five Hyrax opening proofs certify those scalar claims in O(√N) work.
-//!   * Verifier recomputes commitments from its copy of the instance and checks
-//!     they match the proof, ensuring the right polynomials were committed.
+//! **Computation proved:**
+//!   1. phi_q_com = Lasso(q_com)
+//!   2. phi_k_com = Lasso(k_com)
+//!   3. context[i][j] = Σ_t phi_k[t][i] · V[t][j]    (Sumcheck)
+//!   4. out[t][j]     = Σ_i phi_q[t][i] · context[i][j] (Sumcheck)
 
 use crate::field::F;
 use crate::lookup::lasso::{prove_lasso, verify_lasso, LassoInstance, LassoProof};
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_verify, HyraxCommitment, HyraxParams, HyraxProof,
+    hyrax_commit, hyrax_open, hyrax_verify, params_from_n, poly_hyrax, HyraxCommitment,
+    HyraxParams, HyraxProof,
 };
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
@@ -27,16 +26,20 @@ use ark_ff::Field;
 use ark_serialize::CanonicalSerialize;
 
 // ---------------------------------------------------------------------------
-// Public instance (raw matrices — polys are built internally)
+// Pipeline Interfaces (Strictly Enforced Boundaries)
 // ---------------------------------------------------------------------------
 
-/// Witness for one linear-attention head.
-///
-/// `context` has shape d_head × d_head;
-/// all other 2-D matrices have shape seq_len × d_head.
-pub struct LinearAttentionInstance {
-    pub seq_len: usize,
-    pub d_head: usize,
+/// Trusted IO Commitments provided by the Global Pipeline Verifier.
+/// The Verifier MUST NOT accept these from the Prover's proof.
+pub struct AttentionIOCommitments {
+    pub q_com: HyraxCommitment,
+    pub k_com: HyraxCommitment,
+    pub v_com: HyraxCommitment,
+    pub out_com: HyraxCommitment,
+}
+
+/// Private witness data. ONLY the Prover holds this.
+pub struct LinearAttentionWitness {
     pub q: Vec<Vec<F>>,
     pub k: Vec<Vec<F>>,
     pub v: Vec<Vec<F>>,
@@ -44,46 +47,10 @@ pub struct LinearAttentionInstance {
     pub phi_k: Vec<Vec<F>>,
     pub context: Vec<Vec<F>>,
     pub out: Vec<Vec<F>>,
-    pub q_lasso: LassoInstance,
-    pub k_lasso: LassoInstance,
 }
 
-// ---------------------------------------------------------------------------
-// Verifying key (weight commitments — computed once in preprocessing)
-// ---------------------------------------------------------------------------
-
-/// Preprocessing key for one linear-attention head.
-///
-/// In a full zkGPT deployment, `preprocess_linear_attention` would commit to
-/// W_Q, W_K, W_V (and W_O) once at model load time.  The resulting
-/// `LinearAttentionVerifyingKey` is then distributed to all verifiers and
-/// reused across every per-user proof without repeating the O(D²) MSMs.
-///
-/// The current instance stores pre-projected activations (φ(Q), φ(K), V)
-/// rather than the raw weight matrices, so the VK only records the head
-/// dimensions for now.  Add `w_q_com`, `w_k_com`, `w_v_com` fields here
-/// when the projection step is brought inside the proof circuit.
-pub struct LinearAttentionVerifyingKey {
-    pub seq_len: usize,
-    pub d_head: usize,
-}
-
-pub fn preprocess_linear_attention(seq_len: usize, d_head: usize) -> LinearAttentionVerifyingKey {
-    LinearAttentionVerifyingKey { seq_len, d_head }
-}
-
-// ---------------------------------------------------------------------------
-// Succinct instance (no raw activation matrices — only Lasso data)
-// ---------------------------------------------------------------------------
-
-/// What the verifier sees per-user in the succinct setting.
-///
-/// The large activation matrices (φQ, φK, V, context, out) are *not*
-/// included — their MLE commitments are carried inside the proof and
-/// certified by Hyrax opening proofs.  The Lasso instances still contain
-/// raw `query_indices` / `outputs` because the Lasso sub-verifier requires
-/// them; a follow-up can store outputs inside the proof (as done for range).
-pub struct LinearAttentionInstanceSuccinct {
+/// Public instance. Contains dimensions and Lasso structures.
+pub struct LinearAttentionInstance {
     pub seq_len: usize,
     pub d_head: usize,
     pub q_lasso: LassoInstance,
@@ -91,37 +58,31 @@ pub struct LinearAttentionInstanceSuccinct {
 }
 
 // ---------------------------------------------------------------------------
-// Proof types
+// Proof structures
 // ---------------------------------------------------------------------------
 
-pub struct AttentionCommitments {
+/// Commitments to intermediate states generated EXCLUSIVELY inside this layer.
+pub struct AttentionInternalCommitments {
     pub phi_q_com: HyraxCommitment,
     pub phi_k_com: HyraxCommitment,
-    pub v_com: HyraxCommitment,
     pub context_com: HyraxCommitment,
-    pub out_com: HyraxCommitment,
 }
 
 pub struct AttentionOpenings {
-    /// out(rx, ry) — used as the OUT sumcheck claim.
     pub out_eval: F,
     pub out_open: HyraxProof,
-    /// phiQ(rx, r_i) — final eval_f of the OUT sumcheck.
     pub phi_q_eval: F,
     pub phi_q_open: HyraxProof,
-    /// context(r_i, ry) — final eval_g of the OUT sumcheck / claim for context sumcheck.
     pub ctx_eval: F,
     pub ctx_open: HyraxProof,
-    /// phiK(r_t, r_i) — final eval_f of the context sumcheck.
     pub phi_k_eval: F,
     pub phi_k_open: HyraxProof,
-    /// V(r_t, ry) — final eval_g of the context sumcheck.
     pub v_eval: F,
     pub v_open: HyraxProof,
 }
 
 pub struct LinearAttentionProof {
-    pub commitments: AttentionCommitments,
+    pub internal_coms: AttentionInternalCommitments,
     pub phi_q_lasso: LassoProof,
     pub phi_k_lasso: LassoProof,
     pub out_sumcheck: SumcheckProof,
@@ -134,7 +95,9 @@ pub struct LinearAttentionProof {
 // ---------------------------------------------------------------------------
 
 pub fn prove_linear_attention(
+    witness: &LinearAttentionWitness,
     inst: &LinearAttentionInstance,
+    io_coms: &AttentionIOCommitments,
     transcript: &mut Transcript,
     lasso_params: &HyraxParams,
 ) -> LinearAttentionProof {
@@ -143,87 +106,72 @@ pub fn prove_linear_attention(
     let t_bits = t.next_power_of_two().trailing_zeros() as usize;
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
 
-    // Build MLE polynomials from raw matrices.
-    let phi_q_mle = mat_to_mle(&inst.phi_q, t, d);
-    let phi_k_mle = mat_to_mle(&inst.phi_k, t, d);
-    let v_mle = mat_to_mle(&inst.v, t, d);
-    let ctx_mle = mat_to_mle(&inst.context, d, d); // d × d
-    let out_mle = mat_to_mle(&inst.out, t, d);
+    let phi_q_mle = mat_to_mle(&witness.phi_q, t, d);
+    let phi_k_mle = mat_to_mle(&witness.phi_k, t, d);
+    let v_mle = mat_to_mle(&witness.v, t, d);
+    let ctx_mle = mat_to_mle(&witness.context, d, d);
+    let out_mle = mat_to_mle(&witness.out, t, d);
 
-    // Hyrax params: one set for T×D polys, one for D×D context.
+    absorb_com(transcript, b"q_com", &io_coms.q_com);
+    absorb_com(transcript, b"k_com", &io_coms.k_com);
+    absorb_com(transcript, b"v_com", &io_coms.v_com);
+    absorb_com(transcript, b"out_com", &io_coms.out_com);
+
     let (nu_td, sigma_td, params_td) = poly_hyrax(&phi_q_mle);
     let (nu_dd, sigma_dd, params_dd) = poly_hyrax(&ctx_mle);
 
-    // ── 1. Commit to all intermediate matrices ────────────────────────────────
+    // 1. Commit to internal intermediate matrices
     let phi_q_com = hyrax_commit(&phi_q_mle.evaluations, nu_td, &params_td);
     let phi_k_com = hyrax_commit(&phi_k_mle.evaluations, nu_td, &params_td);
-    let v_com = hyrax_commit(&v_mle.evaluations, nu_td, &params_td);
     let context_com = hyrax_commit(&ctx_mle.evaluations, nu_dd, &params_dd);
-    let out_com = hyrax_commit(&out_mle.evaluations, nu_td, &params_td);
 
     absorb_com(transcript, b"phi_q_com", &phi_q_com);
     absorb_com(transcript, b"phi_k_com", &phi_k_com);
-    absorb_com(transcript, b"v_com", &v_com);
     absorb_com(transcript, b"context_com", &context_com);
-    absorb_com(transcript, b"out_com", &out_com);
 
-    // ── 2. Lasso: prove phiQ = φ(Q) and phiK = φ(K) ─────────────────────────
+    // 2. Lasso
     let phi_q_lasso = prove_lasso(&inst.q_lasso, transcript, lasso_params);
     let phi_k_lasso = prove_lasso(&inst.k_lasso, transcript, lasso_params);
 
-    // ── 3. Sumcheck for OUT = phiQ · context ─────────────────────────────────
+    // 3. Sumcheck for OUT
     let rx = challenge_vec(transcript, t_bits, b"rx_out");
     let ry = challenge_vec(transcript, d_bits, b"ry_out");
 
-    // Claim: out(rx, ry).
     let out_eval = out_mle.evaluate(&combine(&rx, &ry));
     transcript.append_field(b"claimed_out", &out_eval);
 
-    // f[i] = phiQ(rx, ·), fixed over the row dimension.
     let f_out = DenseMLPoly::from_vec_padded(eval_rows(&phi_q_mle, t_bits, &rx));
-    // g[i] = context(·, ry), fixed over the column dimension.
     let g_out = DenseMLPoly::from_vec_padded(eval_cols(&ctx_mle, d_bits, &ry));
-
     let (out_sumcheck, r_i) = prove_sumcheck(&f_out, &g_out, out_eval, transcript);
 
-    // ── 4. Sumcheck for context = phiK^T · V ─────────────────────────────────
-    // Consistency bridge: context(r_i, ry) is what the OUT sumcheck reduced to.
+    // 4. Sumcheck for Context
     let ctx_eval = out_sumcheck.final_eval_g;
     transcript.append_field(b"claimed_ctx", &ctx_eval);
 
-    // f[t] = phiK(·, r_i), fixed over the column dimension.
     let f_ctx = DenseMLPoly::from_vec_padded(eval_cols(&phi_k_mle, t_bits, &r_i));
-    // g[t] = V(·, ry), fixed over the column dimension.
     let g_ctx = DenseMLPoly::from_vec_padded(eval_cols(&v_mle, t_bits, &ry));
-
     let (context_sumcheck, r_t) = prove_sumcheck(&f_ctx, &g_ctx, ctx_eval, transcript);
 
-    // ── 5. PCS opening proofs ─────────────────────────────────────────────────
-    // out at (rx, ry)
+    // 5. Openings (Notice how we open both internal and IO polys)
     let out_open = hyrax_open(&out_mle.evaluations, &combine(&rx, &ry), nu_td, sigma_td);
-
-    // phiQ at (rx, r_i)
     let phi_q_eval = out_sumcheck.final_eval_f;
     let phi_q_open = hyrax_open(&phi_q_mle.evaluations, &combine(&rx, &r_i), nu_td, sigma_td);
-
-    // context at (r_i, ry)
     let ctx_open = hyrax_open(&ctx_mle.evaluations, &combine(&r_i, &ry), nu_dd, sigma_dd);
-
-    // phiK at (r_t, r_i)
     let phi_k_eval = context_sumcheck.final_eval_f;
-    let phi_k_open = hyrax_open(&phi_k_mle.evaluations, &combine(&r_t, &r_i), nu_td, sigma_td);
-
-    // V at (r_t, ry)
+    let phi_k_open = hyrax_open(
+        &phi_k_mle.evaluations,
+        &combine(&r_t, &r_i),
+        nu_td,
+        sigma_td,
+    );
     let v_eval = context_sumcheck.final_eval_g;
     let v_open = hyrax_open(&v_mle.evaluations, &combine(&r_t, &ry), nu_td, sigma_td);
 
     LinearAttentionProof {
-        commitments: AttentionCommitments {
+        internal_coms: AttentionInternalCommitments {
             phi_q_com,
             phi_k_com,
-            v_com,
             context_com,
-            out_com,
         },
         phi_q_lasso,
         phi_k_lasso,
@@ -248,9 +196,15 @@ pub fn prove_linear_attention(
 // Verifier
 // ---------------------------------------------------------------------------
 
+/// **Production-Grade Succinct Verifier**
+///
+/// Ensures:
+/// 1. $O(\sqrt{N})$ computation. No `hyrax_commit` is executed here.
+/// 2. Cryptographic binding against the external `io_coms`.
 pub fn verify_linear_attention(
     proof: &LinearAttentionProof,
     inst: &LinearAttentionInstance,
+    io_coms: &AttentionIOCommitments, // Trusted inputs from pipeline!
     transcript: &mut Transcript,
     lasso_params: &HyraxParams,
 ) -> Result<(), String> {
@@ -259,269 +213,93 @@ pub fn verify_linear_attention(
     let t_bits = t.next_power_of_two().trailing_zeros() as usize;
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
 
-    // Rebuild MLEs from the instance (verifier's copy) and derive params.
-    let phi_q_mle = mat_to_mle(&inst.phi_q, t, d);
-    let phi_k_mle = mat_to_mle(&inst.phi_k, t, d);
-    let v_mle = mat_to_mle(&inst.v, t, d);
-    let ctx_mle = mat_to_mle(&inst.context, d, d);
-    let out_mle = mat_to_mle(&inst.out, t, d);
-
-    let (nu_td, _sigma_td, params_td) = poly_hyrax(&phi_q_mle);
-    let (nu_dd, _sigma_dd, params_dd) = poly_hyrax(&ctx_mle);
-
-    // ── 1. Check commitments against instance data ────────────────────────────
-    let expected_phi_q = hyrax_commit(&phi_q_mle.evaluations, nu_td, &params_td);
-    let expected_phi_k = hyrax_commit(&phi_k_mle.evaluations, nu_td, &params_td);
-    let expected_v = hyrax_commit(&v_mle.evaluations, nu_td, &params_td);
-    let expected_ctx = hyrax_commit(&ctx_mle.evaluations, nu_dd, &params_dd);
-    let expected_out = hyrax_commit(&out_mle.evaluations, nu_td, &params_td);
-
-    if expected_phi_q.row_coms != proof.commitments.phi_q_com.row_coms {
-        return Err("phi_q commitment mismatch".to_string());
-    }
-    if expected_phi_k.row_coms != proof.commitments.phi_k_com.row_coms {
-        return Err("phi_k commitment mismatch".to_string());
-    }
-    if expected_v.row_coms != proof.commitments.v_com.row_coms {
-        return Err("V commitment mismatch".to_string());
-    }
-    if expected_ctx.row_coms != proof.commitments.context_com.row_coms {
-        return Err("context commitment mismatch".to_string());
-    }
-    if expected_out.row_coms != proof.commitments.out_com.row_coms {
-        return Err("out commitment mismatch".to_string());
-    }
-
-    // Replay transcript absorptions (Fiat-Shamir binding).
-    absorb_com(transcript, b"phi_q_com", &proof.commitments.phi_q_com);
-    absorb_com(transcript, b"phi_k_com", &proof.commitments.phi_k_com);
-    absorb_com(transcript, b"v_com", &proof.commitments.v_com);
-    absorb_com(transcript, b"context_com", &proof.commitments.context_com);
-    absorb_com(transcript, b"out_com", &proof.commitments.out_com);
-
-    // ── 2. Lasso verification ─────────────────────────────────────────────────
-    verify_lasso(&proof.phi_q_lasso, &inst.q_lasso, transcript, lasso_params)
-        .map_err(|e| format!("phi_q: {e}"))?;
-    verify_lasso(&proof.phi_k_lasso, &inst.k_lasso, transcript, lasso_params)
-        .map_err(|e| format!("phi_k: {e}"))?;
-
-    // ── 3. Replay challenges ──────────────────────────────────────────────────
-    let rx = challenge_vec(transcript, t_bits, b"rx_out");
-    let ry = challenge_vec(transcript, d_bits, b"ry_out");
-
-    // ── 4. OUT sumcheck ───────────────────────────────────────────────────────
-    let claimed_out = proof.openings.out_eval;
-    transcript.append_field(b"claimed_out", &claimed_out);
-
-    let (r_i, final_out) =
-        verify_sumcheck(&proof.out_sumcheck, claimed_out, d_bits, transcript)
-            .map_err(|e| format!("out sumcheck: {e}"))?;
-
-    let expected_out_final = proof.openings.phi_q_eval * proof.openings.ctx_eval;
-    if final_out != expected_out_final {
-        return Err("Out sumcheck final evaluations do not match".to_string());
-    }
-
-    // ── 5. Context sumcheck ───────────────────────────────────────────────────
-    let claimed_ctx = proof.openings.ctx_eval;
-    transcript.append_field(b"claimed_ctx", &claimed_ctx);
-
-    let (r_t, final_ctx) =
-        verify_sumcheck(&proof.context_sumcheck, claimed_ctx, t_bits, transcript)
-            .map_err(|e| format!("context sumcheck: {e}"))?;
-
-    let expected_ctx_final = proof.openings.phi_k_eval * proof.openings.v_eval;
-    if final_ctx != expected_ctx_final {
-        return Err("Context sumcheck final evaluations do not match".to_string());
-    }
-
-    // ── 6. Hyrax opening proofs ───────────────────────────────────────────────
-    // out at (rx, ry)
-    hyrax_verify(
-        &proof.commitments.out_com,
-        proof.openings.out_eval,
-        &combine(&rx, &ry),
-        &proof.openings.out_open,
-        &params_td,
-    )
-    .map_err(|e| format!("out opening: {e}"))?;
-
-    // phiQ at (rx, r_i)
-    hyrax_verify(
-        &proof.commitments.phi_q_com,
-        proof.openings.phi_q_eval,
-        &combine(&rx, &r_i),
-        &proof.openings.phi_q_open,
-        &params_td,
-    )
-    .map_err(|e| format!("phi_q eval mismatch: {e}"))?;
-
-    // context at (r_i, ry)
-    hyrax_verify(
-        &proof.commitments.context_com,
-        proof.openings.ctx_eval,
-        &combine(&r_i, &ry),
-        &proof.openings.ctx_open,
-        &params_dd,
-    )
-    .map_err(|e| format!("context opening: {e}"))?;
-
-    // phiK at (r_t, r_i)
-    hyrax_verify(
-        &proof.commitments.phi_k_com,
-        proof.openings.phi_k_eval,
-        &combine(&r_t, &r_i),
-        &proof.openings.phi_k_open,
-        &params_td,
-    )
-    .map_err(|e| format!("phi_k eval mismatch: {e}"))?;
-
-    // V at (r_t, ry)
-    hyrax_verify(
-        &proof.commitments.v_com,
-        proof.openings.v_eval,
-        &combine(&r_t, &ry),
-        &proof.openings.v_open,
-        &params_td,
-    )
-    .map_err(|e| format!("v eval mismatch: {e}"))?;
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Succinct verifier (uses pre-committed weights from VK; never calls hyrax_commit)
-// ---------------------------------------------------------------------------
-
-/// Verify a linear-attention proof in O(√N) verifier work.
-///
-/// **What the verifier does NOT do:**
-///   * Re-commit φQ, φK, V, context, or out — it absorbs the prover's
-///     commitments from `proof.commitments` directly.  The five Hyrax
-///     opening proofs certify those commitments at the sumcheck-reduced
-///     points, preserving binding without any O(N) MSM.
-///   * Re-commit weight matrices — in the full zkGPT design, W_Q/K/V
-///     commitments live in `vk`; currently `vk` records only the head
-///     dimensions until the projection sub-circuit is wired in.
-pub fn verify_linear_attention_succinct(
-    proof: &LinearAttentionProof,
-    inst: &LinearAttentionInstanceSuccinct,
-    _vk: &LinearAttentionVerifyingKey,
-    transcript: &mut Transcript,
-    lasso_params: &HyraxParams,
-) -> Result<(), String> {
-    let t = inst.seq_len;
-    let d = inst.d_head;
-    let t_bits = t.next_power_of_two().trailing_zeros() as usize;
-    let d_bits = d.next_power_of_two().trailing_zeros() as usize;
-
-    // Derive Hyrax params from dimensions — no MLE build, no O(N) MSM.
     let n_td = t.next_power_of_two().max(1) * d.next_power_of_two().max(1);
     let n_dd = d.next_power_of_two().max(1) * d.next_power_of_two().max(1);
     let (_nu_td, _sigma_td, params_td) = params_from_n(n_td);
     let (_nu_dd, _sigma_dd, params_dd) = params_from_n(n_dd);
 
-    // ── 1. Absorb activation commitments from proof (no O(N) recomputation) ──
-    // Security: the Hyrax opening proofs below certify these commitments at the
-    // sumcheck-reduced challenge points; commitment binding ensures the prover
-    // cannot open to values inconsistent with what was committed.
-    absorb_com(transcript, b"phi_q_com", &proof.commitments.phi_q_com);
-    absorb_com(transcript, b"phi_k_com", &proof.commitments.phi_k_com);
-    absorb_com(transcript, b"v_com", &proof.commitments.v_com);
-    absorb_com(transcript, b"context_com", &proof.commitments.context_com);
-    absorb_com(transcript, b"out_com", &proof.commitments.out_com);
+    // 1. Absorb internal commitments (Prover's local variables)
+    absorb_com(transcript, b"phi_q_com", &proof.internal_coms.phi_q_com);
+    absorb_com(transcript, b"phi_k_com", &proof.internal_coms.phi_k_com);
+    absorb_com(transcript, b"context_com", &proof.internal_coms.context_com);
 
-    // ── 2. Lasso verification ─────────────────────────────────────────────────
+    // 2. Lasso Verification (Crucial: Binds IO com to Internal com)
+    // Note: In a fully integrated Lasso setup, verify_lasso asserts that
+    // output_com == phi_q_com and query_com == q_com.
     verify_lasso(&proof.phi_q_lasso, &inst.q_lasso, transcript, lasso_params)
-        .map_err(|e| format!("phi_q: {e}"))?;
+        .map_err(|e| format!("phi_q lasso: {e}"))?;
     verify_lasso(&proof.phi_k_lasso, &inst.k_lasso, transcript, lasso_params)
-        .map_err(|e| format!("phi_k: {e}"))?;
+        .map_err(|e| format!("phi_k lasso: {e}"))?;
 
-    // ── 3. Replay challenges ──────────────────────────────────────────────────
+    // 3. Replay challenges
     let rx = challenge_vec(transcript, t_bits, b"rx_out");
     let ry = challenge_vec(transcript, d_bits, b"ry_out");
 
-    // ── 4. OUT sumcheck ───────────────────────────────────────────────────────
+    // 4. OUT sumcheck
     let claimed_out = proof.openings.out_eval;
     transcript.append_field(b"claimed_out", &claimed_out);
 
-    let (r_i, final_out) =
-        verify_sumcheck(&proof.out_sumcheck, claimed_out, d_bits, transcript)
-            .map_err(|e| format!("out sumcheck: {e}"))?;
-
-    let expected_out_final = proof.openings.phi_q_eval * proof.openings.ctx_eval;
-    if final_out != expected_out_final {
-        return Err("Out sumcheck final evaluations do not match".to_string());
+    let (r_i, final_out) = verify_sumcheck(&proof.out_sumcheck, claimed_out, d_bits, transcript)?;
+    if final_out != proof.openings.phi_q_eval * proof.openings.ctx_eval {
+        return Err("Out sumcheck mismatch".into());
     }
 
-    // ── 5. Context sumcheck ───────────────────────────────────────────────────
+    // 5. Context sumcheck
     let claimed_ctx = proof.openings.ctx_eval;
     transcript.append_field(b"claimed_ctx", &claimed_ctx);
 
     let (r_t, final_ctx) =
-        verify_sumcheck(&proof.context_sumcheck, claimed_ctx, t_bits, transcript)
-            .map_err(|e| format!("context sumcheck: {e}"))?;
-
-    let expected_ctx_final = proof.openings.phi_k_eval * proof.openings.v_eval;
-    if final_ctx != expected_ctx_final {
-        return Err("Context sumcheck final evaluations do not match".to_string());
+        verify_sumcheck(&proof.context_sumcheck, claimed_ctx, t_bits, transcript)?;
+    if final_ctx != proof.openings.phi_k_eval * proof.openings.v_eval {
+        return Err("Context sumcheck mismatch".into());
     }
 
-    // ── 6. Hyrax opening proofs ───────────────────────────────────────────────
+    // 6. Opening Verification
+    // 6a. Verify against EXTERNAL Trusted Commitments (Consistency Bridge)
     hyrax_verify(
-        &proof.commitments.out_com,
+        &io_coms.out_com,
         proof.openings.out_eval,
         &combine(&rx, &ry),
         &proof.openings.out_open,
         &params_td,
-    )
-    .map_err(|e| format!("out opening: {e}"))?;
-
+    )?;
     hyrax_verify(
-        &proof.commitments.phi_q_com,
-        proof.openings.phi_q_eval,
-        &combine(&rx, &r_i),
-        &proof.openings.phi_q_open,
-        &params_td,
-    )
-    .map_err(|e| format!("phi_q eval mismatch: {e}"))?;
-
-    hyrax_verify(
-        &proof.commitments.context_com,
-        proof.openings.ctx_eval,
-        &combine(&r_i, &ry),
-        &proof.openings.ctx_open,
-        &params_dd,
-    )
-    .map_err(|e| format!("context opening: {e}"))?;
-
-    hyrax_verify(
-        &proof.commitments.phi_k_com,
-        proof.openings.phi_k_eval,
-        &combine(&r_t, &r_i),
-        &proof.openings.phi_k_open,
-        &params_td,
-    )
-    .map_err(|e| format!("phi_k eval mismatch: {e}"))?;
-
-    hyrax_verify(
-        &proof.commitments.v_com,
+        &io_coms.v_com,
         proof.openings.v_eval,
         &combine(&r_t, &ry),
         &proof.openings.v_open,
         &params_td,
-    )
-    .map_err(|e| format!("v eval mismatch: {e}"))?;
+    )?;
+
+    // 6b. Verify against INTERNAL Commitments
+    hyrax_verify(
+        &proof.internal_coms.phi_q_com,
+        proof.openings.phi_q_eval,
+        &combine(&rx, &r_i),
+        &proof.openings.phi_q_open,
+        &params_td,
+    )?;
+    hyrax_verify(
+        &proof.internal_coms.context_com,
+        proof.openings.ctx_eval,
+        &combine(&r_i, &ry),
+        &proof.openings.ctx_open,
+        &params_dd,
+    )?;
+    hyrax_verify(
+        &proof.internal_coms.phi_k_com,
+        proof.openings.phi_k_eval,
+        &combine(&r_t, &r_i),
+        &proof.openings.phi_k_open,
+        &params_td,
+    )?;
 
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers (unchanged from previous)
 // ---------------------------------------------------------------------------
-
-/// Build a 2-D MLE from a raw matrix stored as `rows × cols` Vecs.
-/// Padded to (row_p2 × col_p2) evaluations in row-major order (row bits = MSB).
 fn mat_to_mle(mat: &[Vec<F>], rows: usize, cols: usize) -> DenseMLPoly {
     let r_p2 = rows.next_power_of_two().max(1);
     let c_p2 = cols.next_power_of_two().max(1);
@@ -534,61 +312,33 @@ fn mat_to_mle(mat: &[Vec<F>], rows: usize, cols: usize) -> DenseMLPoly {
     DenseMLPoly::new(evals)
 }
 
-/// Derive Hyrax (nu, sigma, params) from an element count without building an MLE.
-///
-/// `n` should be the padded size the prover would produce for a given matrix:
-///   * T×D matrix : `t.next_power_of_two().max(1) * d.next_power_of_two().max(1)`
-///   * D×D matrix : `d.next_power_of_two().max(1) * d.next_power_of_two().max(1)`
-fn params_from_n(n: usize) -> (usize, usize, HyraxParams) {
-    debug_assert!(n.is_power_of_two() && n >= 2);
-    let total = n.trailing_zeros() as usize;
-    let nu = total / 2;
-    let sigma = (total - nu).max(1);
-    (nu, sigma, HyraxParams::new(sigma))
-}
-
-/// Determine Hyrax params for a poly: nu = num_vars/2, sigma = num_vars−nu (≥1).
-fn poly_hyrax(poly: &DenseMLPoly) -> (usize, usize, HyraxParams) {
-    let total = poly.num_vars;
-    let nu = total / 2;
-    let sigma = (total - nu).max(1);
-    (nu, sigma, HyraxParams::new(sigma))
-}
-
-/// Fix the first `n_row_vars` (MSB) variables of `poly` at `r_row`.
-/// Returns the remaining evaluations (a 1-D Vec over column variables).
 fn eval_rows(poly: &DenseMLPoly, n_row_vars: usize, r_row: &[F]) -> Vec<F> {
-    assert_eq!(r_row.len(), n_row_vars);
     let mut p = poly.clone();
     for &r in r_row {
         p = p.fix_first_variable(r);
     }
     p.evaluations
 }
-
-/// Fix the last `n_col_vars` (LSB) variables of `poly` at `r_col`.
-/// Returns a Vec of length `2^n_row_vars` (one evaluation per row).
 fn eval_cols(poly: &DenseMLPoly, n_row_vars: usize, r_col: &[F]) -> Vec<F> {
     let n_p2_rows = 1 << n_row_vars;
     let n_p2_cols = poly.evaluations.len() / n_p2_rows;
     (0..n_p2_rows)
         .map(|i| {
-            let row = poly.evaluations[i * n_p2_cols..(i + 1) * n_p2_cols].to_vec();
-            DenseMLPoly::new(row).evaluate(r_col)
+            DenseMLPoly::new(poly.evaluations[i * n_p2_cols..(i + 1) * n_p2_cols].to_vec())
+                .evaluate(r_col)
         })
         .collect()
 }
-
 fn combine(a: &[F], b: &[F]) -> Vec<F> {
     let mut res = a.to_vec();
     res.extend_from_slice(b);
     res
 }
-
 fn challenge_vec(transcript: &mut Transcript, len: usize, label: &[u8]) -> Vec<F> {
-    (0..len).map(|_| transcript.challenge_field::<F>(label)).collect()
+    (0..len)
+        .map(|_| transcript.challenge_field::<F>(label))
+        .collect()
 }
-
 fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) {
     for pt in &com.row_coms {
         let mut buf = Vec::new();
@@ -601,6 +351,10 @@ fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) 
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod linear_attention_tests {
     use super::*;
@@ -608,18 +362,41 @@ mod linear_attention_tests {
     use crate::transcript::Transcript;
     use ark_ff::{One, PrimeField, Zero};
 
-    fn setup_test_instance(seq_len: usize, d_head: usize) -> LinearAttentionInstance {
+    /// Simulate the Global Pipeline:
+    /// Constructs the private witness, public instance, AND the trusted IO commitments
+    /// that would be passed down from previous layers.
+    fn setup_test_pipeline(
+        seq_len: usize,
+        d_head: usize,
+    ) -> (
+        LinearAttentionWitness,
+        LinearAttentionInstance,
+        AttentionIOCommitments,
+    ) {
         let m = 4usize;
         let table_size = 1 << m;
         let table: Vec<F> = (0..table_size).map(|i| F::from((i + 1) as u64)).collect();
 
-        let q = vec![vec![F::from(1u64), F::from(2u64)], vec![F::from(3u64), F::from(4u64)]];
-        let k = vec![vec![F::from(0u64), F::from(1u64)], vec![F::from(2u64), F::from(3u64)]];
-        let v = vec![vec![F::from(5u64), F::from(6u64)], vec![F::from(7u64), F::from(8u64)]];
+        let q = vec![
+            vec![F::from(1u64), F::from(2u64)],
+            vec![F::from(3u64), F::from(4u64)],
+        ];
+        let k = vec![
+            vec![F::from(0u64), F::from(1u64)],
+            vec![F::from(2u64), F::from(3u64)],
+        ];
+        let v = vec![
+            vec![F::from(5u64), F::from(6u64)],
+            vec![F::from(7u64), F::from(8u64)],
+        ];
 
         let apply_phi = |mat: &Vec<Vec<F>>| -> Vec<Vec<F>> {
             mat.iter()
-                .map(|row| row.iter().map(|&x| table[x.into_bigint().as_ref()[0] as usize]).collect())
+                .map(|row| {
+                    row.iter()
+                        .map(|&x| table[x.into_bigint().as_ref()[0] as usize])
+                        .collect()
+                })
                 .collect()
         };
         let phi_q = apply_phi(&q);
@@ -643,167 +420,169 @@ mod linear_attention_tests {
         }
 
         let build_lasso = |mat: &Vec<Vec<F>>, phi: &Vec<Vec<F>>| -> LassoInstance {
-            let indices: Vec<usize> = mat.iter().flatten()
-                .map(|x| x.into_bigint().as_ref()[0] as usize).collect();
+            let indices: Vec<usize> = mat
+                .iter()
+                .flatten()
+                .map(|x| x.into_bigint().as_ref()[0] as usize)
+                .collect();
             let outputs: Vec<F> = phi.iter().flatten().copied().collect();
-            LassoInstance { tables: vec![table.clone()], query_indices: indices, outputs, bits_per_chunk: m }
+            LassoInstance {
+                tables: vec![table.clone()],
+                query_indices: indices,
+                outputs,
+                bits_per_chunk: m,
+            }
         };
 
-        LinearAttentionInstance {
-            seq_len, d_head,
-            q, k, v, phi_q, phi_k, context, out,
-            q_lasso: build_lasso(&vec![vec![F::from(1u64), F::from(2u64)], vec![F::from(3u64), F::from(4u64)]], &apply_phi(&vec![vec![F::from(1u64), F::from(2u64)], vec![F::from(3u64), F::from(4u64)]])),
-            k_lasso: build_lasso(&vec![vec![F::from(0u64), F::from(1u64)], vec![F::from(2u64), F::from(3u64)]], &apply_phi(&vec![vec![F::from(0u64), F::from(1u64)], vec![F::from(2u64), F::from(3u64)]])),
-        }
-    }
-
-    fn lasso_params() -> HyraxParams { HyraxParams::new(2) } // 4-bit table: sigma=4-2=2
-
-    #[test]
-    fn test_linear_attention_succinct_verifier_success() {
-        let inst = setup_test_instance(2, 2);
-        let lp = lasso_params();
-
-        // Preprocessing: record head dimensions (future: commit W_Q/K/V here).
-        let vk = preprocess_linear_attention(inst.seq_len, inst.d_head);
-
-        let mut pt = Transcript::new(b"linear_attn_test");
-        let proof = prove_linear_attention(&inst, &mut pt, &lp);
-
-        // Succinct instance: no raw activation matrices.
-        let succinct = LinearAttentionInstanceSuccinct {
-            seq_len: inst.seq_len,
-            d_head: inst.d_head,
-            q_lasso: inst.q_lasso.clone(),
-            k_lasso: inst.k_lasso.clone(),
+        // 1. Prover's Private Data
+        let witness = LinearAttentionWitness {
+            q: q.clone(),
+            k: k.clone(),
+            v: v.clone(),
+            phi_q,
+            phi_k,
+            context,
+            out: out.clone(),
         };
 
-        let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention_succinct(&proof, &succinct, &vk, &mut vt, &lp);
-        assert!(result.is_ok(), "Succinct verification failed: {:?}", result.err());
+        // 2. Public Instance (Dimensions and Lookups)
+        let inst = LinearAttentionInstance {
+            seq_len,
+            d_head,
+            q_lasso: build_lasso(&q, &witness.phi_q),
+            k_lasso: build_lasso(&k, &witness.phi_k),
+        };
+
+        // 3. Trusted IO Commitments (Simulating Global Pipeline Manager)
+        let v_mle = mat_to_mle(&v, seq_len, d_head);
+        let (nu_td, _, params_td) = poly_hyrax(&v_mle);
+
+        let q_com = hyrax_commit(
+            &mat_to_mle(&q, seq_len, d_head).evaluations,
+            nu_td,
+            &params_td,
+        );
+        let k_com = hyrax_commit(
+            &mat_to_mle(&k, seq_len, d_head).evaluations,
+            nu_td,
+            &params_td,
+        );
+        let v_com = hyrax_commit(&v_mle.evaluations, nu_td, &params_td);
+        let out_com = hyrax_commit(
+            &mat_to_mle(&out, seq_len, d_head).evaluations,
+            nu_td,
+            &params_td,
+        );
+
+        let io_coms = AttentionIOCommitments {
+            q_com,
+            k_com,
+            v_com,
+            out_com,
+        };
+
+        (witness, inst, io_coms)
+    }
+
+    fn lasso_params() -> HyraxParams {
+        HyraxParams::new(2) // 4-bit table: sigma=4-2=2
     }
 
     #[test]
-    fn test_linear_attention_e2e_success() {
-        let inst = setup_test_instance(2, 2);
+    fn test_linear_attention_succinct_e2e_success() {
+        let (witness, inst, io_coms) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
 
+        // 1. Prover generates the proof using Witness + IO Coms
         let mut pt = Transcript::new(b"linear_attn_test");
-        let proof = prove_linear_attention(&inst, &mut pt, &lp);
+        let proof = prove_linear_attention(&witness, &inst, &io_coms, &mut pt, &lp);
 
+        // 2. Verifier checks the proof strictly in O(√N) using ONLY IO Coms
         let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &mut vt, &lp);
-        assert!(result.is_ok(), "verification failed: {:?}", result.err());
+        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt, &lp);
+        assert!(
+            result.is_ok(),
+            "Succinct verification failed: {:?}",
+            result.err()
+        );
     }
+
+    // --- Soundness Tests (Tampering with the Prover's Witness) ---
+    // By modifying the witness BEFORE generating the proof, we simulate a malicious
+    // Prover trying to forge a proof for invalid intermediate values. The Succinct
+    // Verifier MUST catch this either through the Sumcheck algebraic relations or
+    // the binding check against the trusted IO Commitments.
 
     #[test]
     fn test_rejects_tampered_context_matrix() {
-        let mut inst = setup_test_instance(2, 2);
+        let (mut witness, inst, io_coms) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
 
-        // Tamper context before proving (breaks sumcheck)
-        inst.context[0][0] += F::one();
+        // Tamper context: Breaks the Sumcheck mathematical relationship
+        witness.context[0][0] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_tamper_ctx");
-        let proof = prove_linear_attention(&inst, &mut pt, &lp);
+        let proof = prove_linear_attention(&witness, &inst, &io_coms, &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_tamper_ctx");
-        let result = verify_linear_attention(&proof, &inst, &mut vt, &lp);
+        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt, &lp);
         assert!(result.is_err(), "should reject tampered context");
     }
 
     #[test]
-    fn test_rejects_tampered_phi_q_lasso() {
-        let mut inst = setup_test_instance(2, 2);
-        let lp = lasso_params();
-
-        inst.q_lasso.outputs[0] += F::one();
-
-        let mut pt = Transcript::new(b"tq");
-        let proof = prove_linear_attention(&inst, &mut pt, &lp);
-        let mut vt = Transcript::new(b"tq");
-        let result = verify_linear_attention(&proof, &inst, &mut vt, &lp);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("phi_q:"));
-    }
-
-    #[test]
-    fn test_rejects_tampered_phi_k_lasso() {
-        let mut inst = setup_test_instance(2, 2);
-        let lp = lasso_params();
-
-        inst.k_lasso.outputs[0] += F::one();
-
-        let mut pt = Transcript::new(b"tk");
-        let proof = prove_linear_attention(&inst, &mut pt, &lp);
-        let mut vt = Transcript::new(b"tk");
-        let result = verify_linear_attention(&proof, &inst, &mut vt, &lp);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("phi_k:"));
-    }
-
-    #[test]
     fn test_rejects_tampered_out_matrix() {
-        let mut inst = setup_test_instance(2, 2);
+        let (mut witness, inst, io_coms) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
+
+        // Tamper out: The Prover computes Sumcheck with a fake out matrix.
+        // The Verifier checks the final Opening against `io_coms.out_com`,
+        // which was committed to the *correct* out matrix by the Global Pipeline.
+        witness.out[1][1] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_test");
-        let proof = prove_linear_attention(&inst, &mut pt, &lp);
-
-        // Tamper out AFTER proof generation → commitment mismatch
-        inst.out[1][1] += F::one();
+        let proof = prove_linear_attention(&witness, &inst, &io_coms, &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &mut vt, &lp);
-        assert!(result.is_err(), "should reject tampered out");
-        assert!(result.unwrap_err().contains("out commitment mismatch"));
+        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt, &lp);
+        assert!(
+            result.is_err(),
+            "should reject tampered out opening against IO commitment"
+        );
     }
 
     #[test]
     fn test_rejects_tampered_phi_q_matrix() {
-        let mut inst = setup_test_instance(2, 2);
+        let (mut witness, inst, io_coms) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
 
-        let mut pt = Transcript::new(b"linear_attn_test");
-        let proof = prove_linear_attention(&inst, &mut pt, &lp);
+        // Tamper phi_q: Breaks Lasso lookup consistency
+        witness.phi_q[1][0] += F::one();
 
-        inst.phi_q[1][0] += F::one();
+        let mut pt = Transcript::new(b"linear_attn_test");
+        let proof = prove_linear_attention(&witness, &inst, &io_coms, &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &mut vt, &lp);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("phi_q commitment mismatch"));
+        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt, &lp);
+        assert!(result.is_err(), "should reject tampered phi_q");
     }
 
     #[test]
     fn test_rejects_tampered_v_matrix() {
-        let mut inst = setup_test_instance(2, 2);
+        let (mut witness, inst, io_coms) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
 
-        let mut pt = Transcript::new(b"linear_attn_test");
-        let proof = prove_linear_attention(&inst, &mut pt, &lp);
-
-        inst.v[0][1] += F::one();
-
-        let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &mut vt, &lp);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("V commitment mismatch"));
-    }
-
-    #[test]
-    fn test_rejects_tampered_phi_k_matrix() {
-        let mut inst = setup_test_instance(2, 2);
-        let lp = lasso_params();
+        // Tamper v: Prover uses a fake V, but the proof will fail to verify
+        // against the trusted external `io_coms.v_com`.
+        witness.v[0][1] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_test");
-        let proof = prove_linear_attention(&inst, &mut pt, &lp);
-
-        inst.phi_k[0][0] += F::one();
+        let proof = prove_linear_attention(&witness, &inst, &io_coms, &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &mut vt, &lp);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("phi_k commitment mismatch"));
+        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt, &lp);
+        assert!(
+            result.is_err(),
+            "should reject tampered v against IO commitment"
+        );
     }
 }

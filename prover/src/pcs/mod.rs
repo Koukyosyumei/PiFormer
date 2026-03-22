@@ -21,7 +21,7 @@ use ark_ec::{Group, VariableBaseMSM};
 use ark_ff::{Field, PrimeField};
 use sha3::{Digest, Sha3_256};
 
-use crate::field::F;
+use crate::{field::F, poly::DenseMLPoly};
 
 // ---------------------------------------------------------------------------
 // Public parameters
@@ -222,6 +222,23 @@ pub fn setup_hyrax_params(bits_per_chunk: usize) -> HyraxParams {
     let nu = bits_per_chunk / 2;
     let sigma = bits_per_chunk - nu;
     HyraxParams::new(sigma)
+}
+
+pub fn params_from_vars(total_vars: usize) -> (usize, usize, HyraxParams) {
+    let nu = total_vars / 2;
+    let sigma = (total_vars - nu).max(1);
+    (nu, sigma, HyraxParams::new(sigma))
+}
+
+pub fn poly_hyrax(poly: &DenseMLPoly) -> (usize, usize, HyraxParams) {
+    // 修正: next_power_of_two() などを介さず、変数の数をそのまま渡す
+    params_from_vars(poly.num_vars)
+}
+
+// ※layernorm.rs と linear.rs にある params_from_n は以下のようにします
+pub fn params_from_n(n: usize) -> (usize, usize, HyraxParams) {
+    let total_vars = n.trailing_zeros() as usize;
+    params_from_vars(total_vars)
 }
 
 #[cfg(test)]

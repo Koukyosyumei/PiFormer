@@ -3,10 +3,6 @@ name = "piformer-prover"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "example"
-path = "src/bin/example.rs"
-
 [dependencies]
 ark-ff      = "0.4"
 ark-bn254   = "0.4"
