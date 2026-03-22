@@ -22,12 +22,12 @@ use crate::poly::DenseMLPoly;
 use crate::transcript::Transcript;
 
 // Sub-module imports (Assuming the interfaces we built previously)
-use crate::attention::layernorm::{
-    prove_layernorm, LayerNormIOCommitments, LayerNormProof, LayerNormWitness,
-};
-use crate::attention::linear::{
+use crate::attention::attention::{
     prove_linear_attention, AttentionIOCommitments, LinearAttentionInstance, LinearAttentionProof,
     LinearAttentionWitness,
+};
+use crate::attention::layernorm::{
+    prove_layernorm, LayerNormIOCommitments, LayerNormProof, LayerNormWitness,
 };
 use crate::attention::projection::{
     prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionWitness,

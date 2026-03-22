@@ -12,10 +12,10 @@ use crate::pcs::{HyraxCommitment, HyraxParams};
 use crate::transcript::Transcript;
 
 // Sub-module keys and verifiers
+use crate::attention::attention::{verify_linear_attention, LinearAttentionInstance};
 use crate::attention::layernorm::{
     verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey,
 };
-use crate::attention::linear::{verify_linear_attention, LinearAttentionInstance};
 use crate::attention::projection::{
     verify_projection_succinct, ProjectionIOCommitments, ProjectionProvingKey,
     ProjectionVerifyingKey,
@@ -98,7 +98,7 @@ pub fn verify_transformer_block(
     verify_projection_succinct(&proof.v_proj_proof, &vk.v_vk, &v_io, transcript)?;
 
     // --- 3. Linear Attention ---
-    let attn_io = crate::attention::linear::AttentionIOCommitments {
+    let attn_io = crate::attention::attention::AttentionIOCommitments {
         q_com: proof.q_com.clone(),
         k_com: proof.k_com.clone(),
         v_com: proof.v_com.clone(),

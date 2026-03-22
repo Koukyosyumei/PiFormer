@@ -1,9 +1,9 @@
+pub mod attention;
 pub mod layernorm;
-pub mod linear;
 pub mod projection;
 pub mod ternary_check;
 
-pub use linear::{
+pub use attention::{
     prove_linear_attention, verify_linear_attention, LinearAttentionInstance, LinearAttentionProof,
 };
 pub use ternary_check::{
