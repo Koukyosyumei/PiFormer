@@ -115,7 +115,7 @@ with torch.no_grad():
     ).unsqueeze(0).to(device)
 
     generated = start_str
-    for _ in range(20):
+    for _ in range(3):
         logits = model(input_ids)
         next_token = logits[0, -1, :].argmax().item()
         generated += dataset.idx_to_char[next_token]
