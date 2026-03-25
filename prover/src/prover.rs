@@ -389,8 +389,8 @@ mod tests {
             o_w: zero_ternary_mat(D, D),
             ln2_gamma: vec![F::from(2u64); D],
             ln2_beta: vec![F::from(5u64); D],
-            ffn_w1: zero_mat(D, D_FF),
-            ffn_w2: zero_mat(D_FF, D),
+            ffn_w1: zero_ternary_mat(D, D_FF),
+            ffn_w2: zero_ternary_mat(D_FF, D),
         };
         TransformerModelWeights {
             num_blocks: 1,

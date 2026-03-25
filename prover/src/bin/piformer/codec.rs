@@ -702,14 +702,14 @@ fn read_ffn_vk<R: Read>(r: &mut R) -> io::Result<FFNVerifyingKey> {
 
 fn write_ffn_pk<W: Write>(w: &mut W, pk: &FFNProvingKey) -> io::Result<()> {
     write_ffn_vk(w, &pk.vk)?;
-    write_vec_vec_f(w, &pk.w1)?;
-    write_vec_vec_f(w, &pk.w2)
+    write_vec_vec_t(w, &pk.w1)?;
+    write_vec_vec_t(w, &pk.w2)
 }
 fn read_ffn_pk<R: Read>(r: &mut R) -> io::Result<FFNProvingKey> {
     Ok(FFNProvingKey {
         vk: read_ffn_vk(r)?,
-        w1: read_vec_vec_f(r)?,
-        w2: read_vec_vec_f(r)?,
+        w1: read_vec_vec_t(r)?,
+        w2: read_vec_vec_t(r)?,
     })
 }
 

@@ -30,8 +30,8 @@ pub struct TransformerBlockWeights {
     pub ln2_gamma: Vec<F>,
     pub ln2_beta: Vec<F>,
     // FFN
-    pub ffn_w1: Vec<Vec<F>>, // d_model × d_ff
-    pub ffn_w2: Vec<Vec<F>>, // d_ff × d_model
+    pub ffn_w1: Vec<Vec<TernaryValue>>, // d_model × d_ff
+    pub ffn_w2: Vec<Vec<TernaryValue>>, // d_ff × d_model
 }
 
 /// モデル全体の生の重み

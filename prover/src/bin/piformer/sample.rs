@@ -46,8 +46,8 @@ fn make_block(d_model: usize, d_ff: usize) -> TransformerBlockWeights {
         o_w: zero_ternary_mat(d_model, d_model),
         ln2_gamma: vec![F::from(2u64); d_model],
         ln2_beta: vec![F::from(5u64); d_model],
-        ffn_w1: zero_mat(d_model, d_ff),
-        ffn_w2: zero_mat(d_ff, d_model),
+        ffn_w1: zero_ternary_mat(d_model, d_ff),
+        ffn_w2: zero_ternary_mat(d_ff, d_model),
     }
 }
 

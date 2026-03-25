@@ -17,7 +17,7 @@ use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment,
     HyraxParams, HyraxProof,
 };
-use crate::poly::utils::{combine, eval_cols, eval_rows, mat_to_mle};
+use crate::poly::utils::{combine, convert_tm_to_fm, eval_cols, eval_rows, mat_to_mle, TernaryValue};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::{challenge_vec, Transcript};
@@ -46,8 +46,8 @@ pub struct FFNVerifyingKey {
 #[derive(Clone)]
 pub struct FFNProvingKey {
     pub vk: FFNVerifyingKey,
-    pub w1: Vec<Vec<F>>,
-    pub w2: Vec<Vec<F>>,
+    pub w1: Vec<Vec<TernaryValue>>,
+    pub w2: Vec<Vec<TernaryValue>>,
 }
 
 /// Private witness data. ONLY the Prover holds this.
@@ -70,11 +70,11 @@ pub fn preprocess_ffn(
     seq_len: usize,
     d_model: usize,
     d_ff: usize,
-    w1: Vec<Vec<F>>,
-    w2: Vec<Vec<F>>,
+    w1: Vec<Vec<TernaryValue>>,
+    w2: Vec<Vec<TernaryValue>>,
 ) -> FFNProvingKey {
-    let w1_mle = mat_to_mle(&w1, d_model, d_ff);
-    let w2_mle = mat_to_mle(&w2, d_ff, d_model);
+    let w1_mle = mat_to_mle(&convert_tm_to_fm(&w1), d_model, d_ff);
+    let w2_mle = mat_to_mle(&convert_tm_to_fm(&w2), d_ff, d_model);
 
     let in_bits = d_model.next_power_of_two().trailing_zeros() as usize;
     let ff_bits = d_ff.next_power_of_two().trailing_zeros() as usize;
@@ -152,8 +152,8 @@ pub fn prove_ffn(
     let m_mle = mat_to_mle(&witness.m, t, f);
     let a_mle = mat_to_mle(&witness.a, t, f);
     let y_mle = mat_to_mle(&witness.y, t, d);
-    let w1_mle = mat_to_mle(&pk.w1, d, f);
-    let w2_mle = mat_to_mle(&pk.w2, f, d);
+    let w1_mle = mat_to_mle(&convert_tm_to_fm(&pk.w1), d, f);
+    let w2_mle = mat_to_mle(&convert_tm_to_fm(&pk.w2), f, d);
 
     let (nu_x, sigma_x, _params_x) = params_from_vars(t_bits + d_bits);
     let (nu_m, sigma_m, params_m) = params_from_vars(t_bits + f_bits);
@@ -346,23 +346,24 @@ pub fn verify_ffn(
 #[cfg(test)]
 mod ffn_tests {
     use super::*;
-    use ark_ff::Field;
     use ark_ff::One;
     use ark_ff::PrimeField;
+    use crate::poly::utils::TernaryValue;
 
     fn setup_test_pipeline() -> (FFNProvingKey, FFNWitness, FFNInstance, FFNIOCommitments) {
+
         let t = 2usize;
         let d = 2usize;
         let f_dim = 4usize;
         let w1 = vec![
-            vec![F::ONE, F::ZERO, F::ZERO - F::ONE, F::ONE],
-            vec![F::ZERO, F::ONE, F::ONE, F::ZERO],
+            vec![TernaryValue::ONE, TernaryValue::ZERO, TernaryValue::MINUSONE, TernaryValue::ONE],
+            vec![TernaryValue::ZERO, TernaryValue::ONE, TernaryValue::ONE, TernaryValue::ZERO],
         ];
         let w2 = vec![
-            vec![F::ONE, F::ZERO],
-            vec![F::ZERO - F::ONE, F::ONE],
-            vec![F::ONE, F::ZERO - F::ONE],
-            vec![F::ZERO, F::ONE],
+            vec![TernaryValue::ONE, TernaryValue::ZERO],
+            vec![TernaryValue::MINUSONE, TernaryValue::ONE],
+            vec![TernaryValue::ONE, TernaryValue::MINUSONE],
+            vec![TernaryValue::ZERO, TernaryValue::ONE],
         ];
         let x = vec![
             vec![F::from(3u64), F::from(1u64)],
@@ -378,7 +379,9 @@ mod ffn_tests {
                 })
                 .collect()
         };
-        let m = matmul(&x, &w1, t, d, f_dim);
+        let w1_f = convert_tm_to_fm(&w1);
+        let w2_f = convert_tm_to_fm(&w2);
+        let m = matmul(&x, &w1_f, t, d, f_dim);
 
         let table_size = 16usize;
         let m_bits = 4usize;
@@ -400,7 +403,7 @@ mod ffn_tests {
             outputs,
             bits_per_chunk: m_bits,
         };
-        let y = matmul(&a, &w2, t, f_dim, d);
+        let y = matmul(&a, &w2_f, t, f_dim, d);
 
         // 1. Offline Preprocessing
         let pk = preprocess_ffn(t, d, f_dim, w1, w2);
@@ -441,7 +444,7 @@ mod ffn_tests {
         let (mut pk, witness, inst, io_coms) = setup_test_pipeline();
         let lasso_params = HyraxParams::new(2);
 
-        pk.w2[0][0] += F::one(); // Tamper weight internally
+        pk.w2[0][0] = TernaryValue::ZERO; // Tamper weight internally (was ONE)
 
         let mut pt = Transcript::new(b"ffn-test");
         let proof = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
@@ -507,7 +510,7 @@ mod ffn_tests {
         let (mut pk, witness, inst, io_coms) = setup_test_pipeline();
         let lasso_params = HyraxParams::new(2);
 
-        pk.w1[0][0] += F::one();
+        pk.w1[0][0] = TernaryValue::ZERO; // Tamper weight internally (was ONE)
 
         let mut pt = Transcript::new(b"ffn-test");
         let proof = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
