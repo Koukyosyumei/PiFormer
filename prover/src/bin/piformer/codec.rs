@@ -34,7 +34,7 @@ use piformer_prover::{
         lasso::{LassoInstance, LassoProof},
         range::RangeProof,
     },
-    pcs::{HyraxCommitment, HyraxParams, HyraxProof},
+    pcs::{HyraxCommitment, HyraxProof},
     prover::{
         TransformerBlockProof, TransformerModelProof, TransformerModelProvingKey,
         TransformerModelVerifyingKey,

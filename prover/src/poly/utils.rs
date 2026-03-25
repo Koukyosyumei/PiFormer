@@ -57,7 +57,7 @@ pub fn vec_to_mle(vec: &[F], len: usize) -> DenseMLPoly {
     DenseMLPoly::new(evals)
 }
 
-pub fn eval_rows(poly: &DenseMLPoly, n_row_vars: usize, r_row: &[F]) -> Vec<F> {
+pub fn eval_rows(poly: &DenseMLPoly, _n_row_vars: usize, r_row: &[F]) -> Vec<F> {
     let mut p = poly.clone();
     for &r in r_row {
         p = p.fix_first_variable(r);

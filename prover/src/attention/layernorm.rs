@@ -13,8 +13,7 @@
 use crate::field::F;
 use crate::lookup::range::{prove_range, verify_range, RangeProof, RangeProofWitness};
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_n, poly_hyrax, HyraxCommitment,
-    HyraxParams, HyraxProof,
+    absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_n, poly_hyrax, HyraxCommitment, HyraxProof,
 };
 use crate::poly::utils::{combine, eval_rows, mat_to_mle, vec_to_mle};
 use crate::poly::DenseMLPoly;
@@ -121,7 +120,7 @@ pub fn prove_layernorm(
     let var_x_mle = vec_to_mle(&witness.var_x, t);
     let sigma_mle = vec_to_mle(&witness.sigma, t);
 
-    let (nu_td, sigma_td, params_td) = poly_hyrax(&x_mle);
+    let (nu_td, sigma_td, _params_td) = poly_hyrax(&x_mle);
     let (nu_t, sigma_t, params_t) = poly_hyrax(&sum_x_mle);
 
     // 1. Absorb IO commitments
@@ -173,7 +172,7 @@ pub fn prove_layernorm(
     let (sigma_range_proof, r_sig) =
         prove_range(&RangeProofWitness { values: sigma_res }, 32, transcript)?;
     let r_sig_t = r_sig[0..t_bits].to_vec();
-    let r_sig_b = r_sig[t_bits];
+    let _r_sig_b = r_sig[t_bits];
 
     /*
         let r_y_t = challenge_vec(transcript, t_bits, b"ry_t");
@@ -199,7 +198,7 @@ pub fn prove_layernorm(
     let (y_range_proof, r_y) = prove_range(&RangeProofWitness { values: y_res }, 32, transcript)?;
     let r_y_t = r_y[0..t_bits].to_vec();
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
-    let r_y_b = r_y[t_bits + d_bits];
+    let _r_y_b = r_y[t_bits + d_bits];
 
     // 7. Openings
     let sum_x_at_rt = sum_x_mle.evaluate(&r_t);

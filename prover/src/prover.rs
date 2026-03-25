@@ -18,7 +18,6 @@
 use crate::field::F;
 use crate::pcs::{absorb_com, hyrax_commit, HyraxCommitment, HyraxParams};
 use crate::poly::utils::mat_to_mle;
-use crate::poly::DenseMLPoly;
 use crate::transcript::Transcript;
 
 // Sub-module imports (Assuming the interfaces we built previously)

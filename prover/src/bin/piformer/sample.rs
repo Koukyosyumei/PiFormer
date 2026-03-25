@@ -128,7 +128,7 @@ pub fn build_zero_witness(
     let num_queries_td = seq_len * d_model;
     let num_queries_tff = seq_len * d_ff;
     let table_size = 1usize << m_bits;
-    let lasso_sigma = m_bits / 2;
+    let _lasso_sigma = m_bits / 2;
 
     let make_lasso = |num_queries: usize| LassoInstance {
         tables: vec![vec![F::ZERO; table_size]],

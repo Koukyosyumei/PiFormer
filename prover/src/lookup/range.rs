@@ -14,7 +14,7 @@ use crate::pcs::{
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
-use ark_ff::{BigInteger, Field, PrimeField};
+use ark_ff::{Field, PrimeField};
 
 pub const CHUNK_BITS: usize = 16;
 pub const CHUNK_SIZE: usize = 1 << CHUNK_BITS;

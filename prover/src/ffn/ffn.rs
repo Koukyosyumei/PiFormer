@@ -356,7 +356,7 @@ fn mat_to_mle(mat: &[Vec<F>], rows: usize, cols: usize) -> DenseMLPoly {
     DenseMLPoly::new(evals)
 }
 
-fn eval_rows(poly: &DenseMLPoly, n_row_vars: usize, r_row: &[F]) -> Vec<F> {
+fn eval_rows(poly: &DenseMLPoly, _n_row_vars: usize, r_row: &[F]) -> Vec<F> {
     let mut p = poly.clone();
     for &r in r_row {
         p = p.fix_first_variable(r);
@@ -398,7 +398,7 @@ fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) 
 #[cfg(test)]
 mod ffn_tests {
     use super::*;
-    use ark_ff::{One, Zero};
+    use ark_ff::One;
 
     fn setup_test_pipeline() -> (FFNProvingKey, FFNWitness, FFNInstance, FFNIOCommitments) {
         let t = 2usize;

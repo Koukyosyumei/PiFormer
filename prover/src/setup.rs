@@ -5,10 +5,8 @@
 //! 生成された `VerifyingKey` は非常に小さく、スマートコントラクトやスマホに配布されます。
 
 use crate::attention::layernorm::LayerNormVerifyingKey;
-use crate::attention::projection::{
-    preprocess_projection, ProjectionProvingKey, ProjectionVerifyingKey,
-};
-use crate::ffn::ffn::{preprocess_ffn, FFNProvingKey, FFNVerifyingKey};
+use crate::attention::projection::preprocess_projection;
+use crate::ffn::ffn::preprocess_ffn;
 use crate::field::F;
 use crate::prover::{TransformerModelProvingKey, TransformerModelVerifyingKey};
 use crate::verifier::TransformerBlockVerifyingKey;

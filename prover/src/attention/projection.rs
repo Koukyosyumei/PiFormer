@@ -15,7 +15,7 @@
 use crate::field::F;
 use crate::pcs::absorb_com;
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment, HyraxParams,
+    hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment,
     HyraxProof,
 };
 use crate::poly::utils::{combine, eval_cols_ternary, eval_rows, mat_to_mle};

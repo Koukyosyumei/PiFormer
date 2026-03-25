@@ -7,7 +7,6 @@
 //! 3. Commitment Chaining: Intermediate IO commitments passed from the Prover
 //!    are cryptographically bound across adjacent sub-verifiers.
 
-use crate::field::F;
 use crate::pcs::{absorb_com, HyraxCommitment, HyraxParams};
 use crate::transcript::Transcript;
 
