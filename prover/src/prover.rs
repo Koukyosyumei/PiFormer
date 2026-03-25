@@ -454,6 +454,7 @@ mod tests {
             sum_x: vec![F::from(30u64), F::from(70u64)],
             sigma: vec![F::from(7u64), F::from(7u64)],
             sq_sum_x: todo!(),
+            sum_x_sq: todo!(),
         }
     }
 
@@ -472,6 +473,7 @@ mod tests {
             sum_x: vec![F::from(158u64), F::from(198u64)],
             sigma: vec![F::from(83u64), F::from(83u64)],
             sq_sum_x: todo!(),
+            sum_x_sq: todo!(),
         }
     }
 
@@ -490,6 +492,7 @@ mod tests {
             sum_x: vec![F::from(164u64), F::from(204u64)],
             sigma: vec![F::from(87u64), F::from(87u64)],
             sq_sum_x: todo!(),
+            sum_x_sq: todo!(),
         }
     }
 

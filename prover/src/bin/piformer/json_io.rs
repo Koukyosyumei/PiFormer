@@ -337,6 +337,7 @@ fn ln_wit_from_json(j: JsonLayerNormWitness) -> Result<LayerNormWitness, String>
         sum_x: vec_from_json(j.sum_x)?,
         sigma: vec_from_json(j.sigma)?,
         sq_sum_x: todo!(),
+        sum_x_sq: todo!(),
     })
 }
 
