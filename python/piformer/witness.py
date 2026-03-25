@@ -494,8 +494,13 @@ class WitnessGenerator:
         if q_lasso_last is None:
             raise RuntimeError("Model must have at least one block.")
 
+        # Derive lasso_sigma from bits_per_chunk to match lasso.rs:
+        #   nu = m // 2;  sigma = m - nu
+        m = model.blocks[0].attn.phi.bits_per_chunk
+        lasso_sigma = m - m // 2
+
         witness = {
-            "lasso_sigma": self.lasso_sigma,
+            "lasso_sigma": lasso_sigma,
             "x_in": mat_to_json(x_in_int),
             "inst_attn": {
                 "seq_len": seq_len,

@@ -94,7 +94,9 @@ def _proj_weight_int(
     """
     weight_float = linear.weight.detach().tolist()  # out × in
     alpha = float(linear.alpha)
-    w_out_in = extract_ternary_weight_matrix(weight_float, alpha, quant_scale)
+    # Pass alpha=1.0 so entries are exactly {-1, 0, 1}; the Rust prover
+    # expects the raw sign matrix, not values scaled by alpha.
+    w_out_in = extract_ternary_weight_matrix(weight_float, 1.0)
     return mat_transpose(w_out_in)  # → in × out
 
 
@@ -160,14 +162,14 @@ def export_weights_rust(
         blocks_json.append({
             "ln1_gamma": vec_to_json(ln1_gamma),
             "ln1_beta":  vec_to_json(ln1_beta),
-            "q_w":  mat_to_json(q_w),
-            "k_w":  mat_to_json(k_w),
-            "v_w":  mat_to_json(v_w),
-            "o_w":  mat_to_json(o_w),
+            "q_w":  q_w,
+            "k_w":  k_w,
+            "v_w":  v_w,
+            "o_w":  o_w,
             "ln2_gamma": vec_to_json(ln2_gamma),
             "ln2_beta":  vec_to_json(ln2_beta),
-            "ffn_w1": mat_to_json(ffn_w1),
-            "ffn_w2": mat_to_json(ffn_w2),
+            "ffn_w1": ffn_w1,
+            "ffn_w2": ffn_w2,
         })
 
     final_ln_gamma, final_ln_beta = _ln(model.norm)
@@ -181,7 +183,7 @@ def export_weights_rust(
         "blocks":           blocks_json,
         "final_ln_gamma":   vec_to_json(final_ln_gamma),
         "final_ln_beta":    vec_to_json(final_ln_beta),
-        "lm_head_w":        mat_to_json(lm_head_w),
+        "lm_head_w":        lm_head_w,
     }
 
     Path(out_path).write_text(json.dumps(payload, indent=2))
