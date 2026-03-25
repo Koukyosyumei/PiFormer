@@ -21,7 +21,6 @@ use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
 use ark_ff::Field;
-use ark_ff::PrimeField;
 
 // ---------------------------------------------------------------------------
 // Pipeline Interfaces & Keys
