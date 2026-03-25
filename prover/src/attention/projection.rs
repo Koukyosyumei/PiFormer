@@ -13,13 +13,15 @@
 //!   Y[i][j] = Σ_k X[i][k] · W[k][j]
 
 use crate::field::F;
+use crate::pcs::absorb_com;
 use crate::pcs::{
     hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment, HyraxParams,
     HyraxProof,
 };
+use crate::poly::utils::{combine, eval_cols_ternary, eval_rows, mat_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
-use crate::transcript::Transcript;
+use crate::transcript::{challenge_vec, Transcript};
 use ark_ff::Field;
 
 // ---------------------------------------------------------------------------
@@ -251,100 +253,6 @@ pub fn verify_projection_succinct(
     .map_err(|e| format!("W opening failed (Invalid model weights!): {e}"))?;
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn mat_to_mle(mat: &[Vec<F>], rows: usize, cols: usize) -> DenseMLPoly {
-    let r_p2 = rows.next_power_of_two().max(1);
-    let c_p2 = cols.next_power_of_two().max(1);
-    let mut evals = vec![F::ZERO; r_p2 * c_p2];
-    for (i, row) in mat.iter().enumerate() {
-        for (j, &v) in row.iter().enumerate() {
-            evals[i * c_p2 + j] = v;
-        }
-    }
-    DenseMLPoly::new(evals)
-}
-
-fn eval_rows(poly: &DenseMLPoly, n_row_vars: usize, r_row: &[F]) -> Vec<F> {
-    let mut p = poly.clone();
-    for &r in r_row {
-        p = p.fix_first_variable(r);
-    }
-    p.evaluations
-}
-
-fn eval_cols(poly: &DenseMLPoly, n_row_vars: usize, r_col: &[F]) -> Vec<F> {
-    let n_p2_rows = 1 << n_row_vars;
-    let n_p2_cols = poly.evaluations.len() / n_p2_rows;
-    (0..n_p2_rows)
-        .map(|i| {
-            DenseMLPoly::new(poly.evaluations[i * n_p2_cols..(i + 1) * n_p2_cols].to_vec())
-                .evaluate(r_col)
-        })
-        .collect()
-}
-
-fn eval_cols_ternary(w_raw: &[Vec<F>], r_out: &[F], d_in: usize, d_out: usize) -> Vec<F> {
-    // 1. eq(j, r_out) を事前計算 (O(d_out))
-    // 後のループで使い回すことで、計算量を劇的に減らす
-    let eq_evals = compute_eq_evals(r_out, d_out);
-
-    let mut res = vec![F::ZERO; d_in.next_power_of_two()];
-
-    // 2. コアループ: 有限体乗算 (Mul) はゼロ！
-    for k in 0..d_in {
-        let mut sum = F::ZERO;
-        for j in 0..d_out {
-            // 重みが 0 の場合はメモリアクセスと計算を完全にスキップ (Sparsityの活用)
-            if w_raw[k][j] == F::ONE {
-                sum += eq_evals[j];
-            } else if w_raw[k][j] == F::ZERO - F::ONE {
-                sum -= eq_evals[j]
-            } else if w_raw[k][j] != F::ZERO {
-                unreachable!("Weight must be ternary [-1, 0, 1]")
-            }
-        }
-        res[k] = sum;
-    }
-    res
-}
-
-/// eq(j, r) 多項式のすべての評価点を O(D) で計算するヘルパー
-fn compute_eq_evals(r: &[F], n: usize) -> Vec<F> {
-    let mut evals = vec![F::ONE; n.next_power_of_two()];
-    for (i, &ri) in r.iter().enumerate() {
-        let bit_step = 1 << i;
-        for j in 0..bit_step {
-            evals[j + bit_step] = evals[j] * ri;
-            evals[j] = evals[j] * (F::ONE - ri);
-        }
-    }
-    evals
-}
-
-fn combine(a: &[F], b: &[F]) -> Vec<F> {
-    let mut res = a.to_vec();
-    res.extend_from_slice(b);
-    res
-}
-
-fn challenge_vec(transcript: &mut Transcript, len: usize, label: &[u8]) -> Vec<F> {
-    (0..len)
-        .map(|_| transcript.challenge_field::<F>(label))
-        .collect()
-}
-
-fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) {
-    use ark_serialize::CanonicalSerialize;
-    for pt in &com.row_coms {
-        let mut buf = Vec::new();
-        pt.serialize_compressed(&mut buf).unwrap();
-        transcript.append_bytes(label, &buf);
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -13,12 +13,13 @@
 use crate::field::F;
 use crate::lookup::range::{prove_range, verify_range, RangeProof, RangeProofWitness};
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_verify, params_from_n, poly_hyrax, HyraxCommitment,
+    absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_n, poly_hyrax, HyraxCommitment,
     HyraxParams, HyraxProof,
 };
+use crate::poly::utils::{combine, eval_rows, mat_to_mle, vec_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
-use crate::transcript::Transcript;
+use crate::transcript::{challenge_vec, Transcript};
 use ark_ff::Field;
 
 // ---------------------------------------------------------------------------
@@ -464,55 +465,6 @@ pub fn verify_layernorm(
     )?;
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-fn mat_to_mle(mat: &[Vec<F>], rows: usize, cols: usize) -> DenseMLPoly {
-    let r_p2 = rows.next_power_of_two().max(1);
-    let c_p2 = cols.next_power_of_two().max(1);
-    let mut evals = vec![F::ZERO; r_p2 * c_p2];
-    for (i, row) in mat.iter().enumerate() {
-        for (j, &v) in row.iter().enumerate() {
-            evals[i * c_p2 + j] = v;
-        }
-    }
-    DenseMLPoly::new(evals)
-}
-fn vec_to_mle(v: &[F], len: usize) -> DenseMLPoly {
-    let padded = len.next_power_of_two().max(2);
-    let mut evals = vec![F::ZERO; padded];
-    for (i, &x) in v.iter().enumerate() {
-        evals[i] = x;
-    }
-    DenseMLPoly::new(evals)
-}
-
-fn eval_rows(poly: &DenseMLPoly, n_row_vars: usize, r_row: &[F]) -> Vec<F> {
-    let mut p = poly.clone();
-    for &r in r_row {
-        p = p.fix_first_variable(r);
-    }
-    p.evaluations
-}
-fn combine(a: &[F], b: &[F]) -> Vec<F> {
-    let mut res = a.to_vec();
-    res.extend_from_slice(b);
-    res
-}
-fn challenge_vec(transcript: &mut Transcript, len: usize, label: &[u8]) -> Vec<F> {
-    (0..len)
-        .map(|_| transcript.challenge_field::<F>(label))
-        .collect()
-}
-fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) {
-    use ark_serialize::CanonicalSerialize;
-    for pt in &com.row_coms {
-        let mut buf = Vec::new();
-        pt.serialize_compressed(&mut buf).unwrap();
-        transcript.append_bytes(label, &buf);
-    }
 }
 
 // ---------------------------------------------------------------------------

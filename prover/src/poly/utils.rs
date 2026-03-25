@@ -1,5 +1,6 @@
 use crate::field::F;
 use crate::poly::DenseMLPoly; // DenseMLPolyのパスはご自身の構成に合わせてください
+use ark_ff::Field;
 use ark_ff::Zero;
 
 /// 2次元の行列（VecのVec）を DenseMLPoly (多線形延長) に変換します。
@@ -56,6 +57,69 @@ pub fn vec_to_mle(vec: &[F], len: usize) -> DenseMLPoly {
     DenseMLPoly::new(evals)
 }
 
+pub fn eval_rows(poly: &DenseMLPoly, n_row_vars: usize, r_row: &[F]) -> Vec<F> {
+    let mut p = poly.clone();
+    for &r in r_row {
+        p = p.fix_first_variable(r);
+    }
+    p.evaluations
+}
+
+pub fn eval_cols(poly: &DenseMLPoly, n_row_vars: usize, r_col: &[F]) -> Vec<F> {
+    let n_p2_rows = 1 << n_row_vars;
+    let n_p2_cols = poly.evaluations.len() / n_p2_rows;
+    (0..n_p2_rows)
+        .map(|i| {
+            DenseMLPoly::new(poly.evaluations[i * n_p2_cols..(i + 1) * n_p2_cols].to_vec())
+                .evaluate(r_col)
+        })
+        .collect()
+}
+
+pub fn eval_cols_ternary(w_raw: &[Vec<F>], r_out: &[F], d_in: usize, d_out: usize) -> Vec<F> {
+    // 1. eq(j, r_out) を事前計算 (O(d_out))
+    // 後のループで使い回すことで、計算量を劇的に減らす
+    let eq_evals = compute_eq_evals(r_out, d_out);
+
+    let mut res = vec![F::ZERO; d_in.next_power_of_two()];
+
+    // 2. コアループ: 有限体乗算 (Mul) はゼロ！
+    for k in 0..d_in {
+        let mut sum = F::ZERO;
+        for j in 0..d_out {
+            // 重みが 0 の場合はメモリアクセスと計算を完全にスキップ (Sparsityの活用)
+            if w_raw[k][j] == F::ONE {
+                sum += eq_evals[j];
+            } else if w_raw[k][j] == F::ZERO - F::ONE {
+                sum -= eq_evals[j]
+            } else if w_raw[k][j] != F::ZERO {
+                unreachable!("Weight must be ternary [-1, 0, 1]")
+            }
+        }
+        res[k] = sum;
+    }
+    res
+}
+
+/// eq(j, r) 多項式のすべての評価点を O(D) で計算するヘルパー
+pub fn compute_eq_evals(r: &[F], n: usize) -> Vec<F> {
+    let mut evals = vec![F::ONE; n.next_power_of_two()];
+    for (i, &ri) in r.iter().enumerate() {
+        let bit_step = 1 << i;
+        for j in 0..bit_step {
+            evals[j + bit_step] = evals[j] * ri;
+            evals[j] = evals[j] * (F::ONE - ri);
+        }
+    }
+    evals
+}
+
+pub fn combine(a: &[F], b: &[F]) -> Vec<F> {
+    let mut res = a.to_vec();
+    res.extend_from_slice(b);
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,7 +158,7 @@ mod tests {
         assert_eq!(mle.evaluations[3], F::zero()); // col padding
         assert_eq!(mle.evaluations[4], F::from(4u64));
         assert_eq!(mle.evaluations[7], F::zero()); // col padding
-        // Row 3 (all zero, row padding)
+                                                   // Row 3 (all zero, row padding)
         assert_eq!(mle.evaluations[12], F::zero());
         assert_eq!(mle.evaluations[15], F::zero());
     }
@@ -139,7 +203,11 @@ mod tests {
         assert_eq!(mle.evaluations[5], F::from(4u64));
         // Remaining entries must be zero
         for idx in [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
-            assert_eq!(mle.evaluations[idx], F::zero(), "index {idx} should be zero");
+            assert_eq!(
+                mle.evaluations[idx],
+                F::zero(),
+                "index {idx} should be zero"
+            );
         }
     }
 

@@ -16,15 +16,15 @@
 //!   X_out = X_mid + Out_ffn   <-- Residual 2
 
 use crate::field::F;
-use crate::pcs::{hyrax_commit, HyraxCommitment, HyraxParams};
+use crate::pcs::{absorb_com, hyrax_commit, HyraxCommitment, HyraxParams};
 use crate::poly::utils::mat_to_mle;
 use crate::poly::DenseMLPoly;
 use crate::transcript::Transcript;
 
 // Sub-module imports (Assuming the interfaces we built previously)
 use crate::attention::attention::{
-    absorb_com, prove_linear_attention, AttentionIOCommitments, LinearAttentionInstance,
-    LinearAttentionProof, LinearAttentionWitness,
+    prove_linear_attention, AttentionIOCommitments, LinearAttentionInstance, LinearAttentionProof,
+    LinearAttentionWitness,
 };
 use crate::attention::layernorm::{
     prove_layernorm, LayerNormIOCommitments, LayerNormProof, LayerNormVerifyingKey,
@@ -444,7 +444,13 @@ mod tests {
             vec![F::from(4u64), F::from(6u64)],
             vec![F::from(4u64), F::from(6u64)],
         ];
-        LayerNormWitness { x, y, sum_x, var_x, sigma }
+        LayerNormWitness {
+            x,
+            y,
+            sum_x,
+            var_x,
+            sigma,
+        }
     }
 
     /// Build a Lasso instance whose every query indexes slot 0 (output = 0).
@@ -467,16 +473,18 @@ mod tests {
     // Block-level fixture
     // -----------------------------------------------------------------------
 
-    fn build_block_witness_and_instances()
-    -> (TransformerBlockWitness, LinearAttentionInstance, FFNInstance)
-    {
+    fn build_block_witness_and_instances() -> (
+        TransformerBlockWitness,
+        LinearAttentionInstance,
+        FFNInstance,
+    ) {
         let x_in = vec![
             vec![F::from(10u64), F::from(20u64)],
             vec![F::from(30u64), F::from(40u64)],
         ];
 
-        let zeros_td  = vec![vec![F::ZERO; D]; T];
-        let zeros_dd  = vec![vec![F::ZERO; D]; D];
+        let zeros_td = vec![vec![F::ZERO; D]; T];
+        let zeros_dd = vec![vec![F::ZERO; D]; D];
         let zeros_tdf = vec![vec![F::ZERO; D_FF]; T];
 
         // LayerNorm 1 on x_in
@@ -484,23 +492,35 @@ mod tests {
         let y_norm1 = ln1_wit.y.clone();
 
         // Q / K / V projections: y_norm1 × 0 = 0
-        let q_proj_wit = ProjectionWitness { x: y_norm1.clone(), y: zeros_td.clone() };
-        let k_proj_wit = ProjectionWitness { x: y_norm1.clone(), y: zeros_td.clone() };
-        let v_proj_wit = ProjectionWitness { x: y_norm1.clone(), y: zeros_td.clone() };
+        let q_proj_wit = ProjectionWitness {
+            x: y_norm1.clone(),
+            y: zeros_td.clone(),
+        };
+        let k_proj_wit = ProjectionWitness {
+            x: y_norm1.clone(),
+            y: zeros_td.clone(),
+        };
+        let v_proj_wit = ProjectionWitness {
+            x: y_norm1.clone(),
+            y: zeros_td.clone(),
+        };
 
         // Linear attention: all zero activations and products
         let attn_wit = LinearAttentionWitness {
-            q:       zeros_td.clone(),
-            k:       zeros_td.clone(),
-            v:       zeros_td.clone(),
-            phi_q:   zeros_td.clone(),
-            phi_k:   zeros_td.clone(),
+            q: zeros_td.clone(),
+            k: zeros_td.clone(),
+            v: zeros_td.clone(),
+            phi_q: zeros_td.clone(),
+            phi_k: zeros_td.clone(),
             context: zeros_dd.clone(),
-            out:     zeros_td.clone(),
+            out: zeros_td.clone(),
         };
 
         // Output projection: 0 × 0 = 0
-        let o_proj_wit = ProjectionWitness { x: zeros_td.clone(), y: zeros_td.clone() };
+        let o_proj_wit = ProjectionWitness {
+            x: zeros_td.clone(),
+            y: zeros_td.clone(),
+        };
 
         // Residual 1: x_mid = x_in + out_attn = x_in + 0 = x_in
         let x_mid = x_in.clone();
@@ -552,10 +572,8 @@ mod tests {
     // Model-level fixture
     // -----------------------------------------------------------------------
 
-    fn build_model_witness(
-        block_wit: TransformerBlockWitness,
-    ) -> TransformerModelWitness {
-        let x_in  = block_wit.x_in.clone();
+    fn build_model_witness(block_wit: TransformerBlockWitness) -> TransformerModelWitness {
+        let x_in = block_wit.x_in.clone();
         let x_out = block_wit.x_out.clone();
 
         // Final LayerNorm: x_out = x_in (zero residuals), so same witness
@@ -590,8 +608,13 @@ mod tests {
 
         let mut pt = Transcript::new(b"block_e2e");
         let proof = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut pt, &lp,
+            &witness,
+            &x_in_com,
+            &pk.block_pks[0],
+            &inst_attn,
+            &inst_ffn,
+            &mut pt,
+            &lp,
         )
         .unwrap();
 
@@ -601,10 +624,20 @@ mod tests {
 
         let mut vt = Transcript::new(b"block_e2e");
         let result = verify_transformer_block(
-            &proof, &x_in_com, &x_out_com,
-            &pk.block_pks[0], &inst_attn, &inst_ffn, &mut vt, &lp,
+            &proof,
+            &x_in_com,
+            &x_out_com,
+            &pk.block_pks[0],
+            &inst_attn,
+            &inst_ffn,
+            &mut vt,
+            &lp,
         );
-        assert!(result.is_ok(), "Block verification failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Block verification failed: {:?}",
+            result.err()
+        );
     }
 
     /// Passing the wrong x_out_com must trigger the residual-connection binding check.
@@ -618,21 +651,36 @@ mod tests {
 
         let mut pt = Transcript::new(b"block_wrong_out");
         let proof = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut pt, &lp,
+            &witness,
+            &x_in_com,
+            &pk.block_pks[0],
+            &inst_attn,
+            &inst_ffn,
+            &mut pt,
+            &lp,
         )
         .unwrap();
 
         // Provide a commitment to a completely different matrix as x_out.
         let wrong_x_out_com = commit_mat_test(
-            &vec![vec![F::from(1u64), F::from(2u64)], vec![F::from(3u64), F::from(4u64)]],
-            T, D,
+            &vec![
+                vec![F::from(1u64), F::from(2u64)],
+                vec![F::from(3u64), F::from(4u64)],
+            ],
+            T,
+            D,
         );
 
         let mut vt = Transcript::new(b"block_wrong_out");
         let result = verify_transformer_block(
-            &proof, &x_in_com, &wrong_x_out_com,
-            &pk.block_pks[0], &inst_attn, &inst_ffn, &mut vt, &lp,
+            &proof,
+            &x_in_com,
+            &wrong_x_out_com,
+            &pk.block_pks[0],
+            &inst_attn,
+            &inst_ffn,
+            &mut vt,
+            &lp,
         );
         assert!(result.is_err(), "Should reject wrong x_out_com");
     }
@@ -648,8 +696,13 @@ mod tests {
 
         let mut pt = Transcript::new(b"block_tamper_ln1");
         let mut proof = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut pt, &lp,
+            &witness,
+            &x_in_com,
+            &pk.block_pks[0],
+            &inst_attn,
+            &inst_ffn,
+            &mut pt,
+            &lp,
         )
         .unwrap();
 
@@ -661,8 +714,14 @@ mod tests {
 
         let mut vt = Transcript::new(b"block_tamper_ln1");
         let result = verify_transformer_block(
-            &proof, &x_in_com, &x_out_com,
-            &pk.block_pks[0], &inst_attn, &inst_ffn, &mut vt, &lp,
+            &proof,
+            &x_in_com,
+            &x_out_com,
+            &pk.block_pks[0],
+            &inst_attn,
+            &inst_ffn,
+            &mut vt,
+            &lp,
         );
         assert!(result.is_err(), "Should reject tampered LN1 proof");
     }
@@ -678,15 +737,24 @@ mod tests {
 
         let mut pt = Transcript::new(b"block_tamper_xnorm1");
         let mut proof = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut pt, &lp,
+            &witness,
+            &x_in_com,
+            &pk.block_pks[0],
+            &inst_attn,
+            &inst_ffn,
+            &mut pt,
+            &lp,
         )
         .unwrap();
 
         // Swap x_norm1_com for a commitment to a different matrix.
         proof.x_norm1_com = commit_mat_test(
-            &vec![vec![F::from(99u64), F::from(99u64)], vec![F::from(99u64), F::from(99u64)]],
-            T, D,
+            &vec![
+                vec![F::from(99u64), F::from(99u64)],
+                vec![F::from(99u64), F::from(99u64)],
+            ],
+            T,
+            D,
         );
 
         let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
@@ -694,8 +762,14 @@ mod tests {
 
         let mut vt = Transcript::new(b"block_tamper_xnorm1");
         let result = verify_transformer_block(
-            &proof, &x_in_com, &x_out_com,
-            &pk.block_pks[0], &inst_attn, &inst_ffn, &mut vt, &lp,
+            &proof,
+            &x_in_com,
+            &x_out_com,
+            &pk.block_pks[0],
+            &inst_attn,
+            &inst_ffn,
+            &mut vt,
+            &lp,
         );
         assert!(result.is_err(), "Should reject tampered x_norm1_com");
     }
@@ -716,7 +790,11 @@ mod tests {
 
         let mut vt = Transcript::new(b"model_e2e");
         let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
-        assert!(result.is_ok(), "Model verification failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Model verification failed: {:?}",
+            result.err()
+        );
     }
 
     /// Tampering with a block sub-proof must propagate up to the model verifier.
@@ -787,8 +865,12 @@ mod tests {
 
         // Replace x_in_com with a commitment to a different matrix.
         proof.x_in_com = commit_mat_test(
-            &vec![vec![F::from(1u64), F::from(1u64)], vec![F::from(1u64), F::from(1u64)]],
-            T, D,
+            &vec![
+                vec![F::from(1u64), F::from(1u64)],
+                vec![F::from(1u64), F::from(1u64)],
+            ],
+            T,
+            D,
         );
 
         let mut vt = Transcript::new(b"model_tamper_xin");
@@ -805,13 +887,13 @@ mod tests {
     fn test_add_commitments_is_homomorphic() {
         use crate::pcs::params_from_vars;
 
-        let a   = vec![F::from(3u64), F::from(5u64), F::from(7u64), F::from(11u64)];
-        let b   = vec![F::from(1u64), F::from(2u64), F::from(3u64), F::from(4u64)];
+        let a = vec![F::from(3u64), F::from(5u64), F::from(7u64), F::from(11u64)];
+        let b = vec![F::from(1u64), F::from(2u64), F::from(3u64), F::from(4u64)];
         let apb: Vec<F> = a.iter().zip(b.iter()).map(|(&x, &y)| x + y).collect();
 
         let (nu, _sigma, params) = params_from_vars(2);
-        let com_a   = hyrax_commit(&a,   nu, &params);
-        let com_b   = hyrax_commit(&b,   nu, &params);
+        let com_a = hyrax_commit(&a, nu, &params);
+        let com_b = hyrax_commit(&b, nu, &params);
         let com_apb = hyrax_commit(&apb, nu, &params);
         let com_sum = add_commitments(&com_a, &com_b);
 
@@ -826,13 +908,13 @@ mod tests {
     fn test_add_commitments_with_zero_is_identity() {
         use crate::pcs::params_from_vars;
 
-        let a    = vec![F::from(5u64), F::from(9u64), F::from(2u64), F::from(14u64)];
+        let a = vec![F::from(5u64), F::from(9u64), F::from(2u64), F::from(14u64)];
         let zero = vec![F::ZERO; 4];
 
         let (nu, _sigma, params) = params_from_vars(2);
-        let com_a    = hyrax_commit(&a,    nu, &params);
+        let com_a = hyrax_commit(&a, nu, &params);
         let com_zero = hyrax_commit(&zero, nu, &params);
-        let com_sum  = add_commitments(&com_a, &com_zero);
+        let com_sum = add_commitments(&com_a, &com_zero);
 
         assert_eq!(
             com_sum.row_coms, com_a.row_coms,

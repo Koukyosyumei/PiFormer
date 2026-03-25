@@ -5,6 +5,7 @@
 //!   tr.append_field(b"claim", &val);
 //!   let r: F = tr.challenge_field(b"round_0");
 
+use crate::field::F;
 use ark_ff::PrimeField;
 use sha3::{Digest, Sha3_256};
 
@@ -54,6 +55,12 @@ impl Transcript {
     }
 }
 
+pub fn challenge_vec(transcript: &mut Transcript, len: usize, label: &[u8]) -> Vec<F> {
+    (0..len)
+        .map(|_| transcript.challenge_field::<F>(label))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,7 +77,10 @@ mod tests {
         t2.append_field(b"x", &F::from(42u64));
         let c2 = t2.challenge_field::<F>(b"chall");
 
-        assert_eq!(c1, c2, "same transcript state must yield the same challenge");
+        assert_eq!(
+            c1, c2,
+            "same transcript state must yield the same challenge"
+        );
     }
 
     #[test]
@@ -81,7 +91,10 @@ mod tests {
         let mut t2 = Transcript::new(b"proto_b");
         let c2 = t2.challenge_field::<F>(b"chall");
 
-        assert_ne!(c1, c2, "different init labels must produce different challenges");
+        assert_ne!(
+            c1, c2,
+            "different init labels must produce different challenges"
+        );
     }
 
     #[test]
@@ -92,7 +105,10 @@ mod tests {
         let mut t2 = Transcript::new(b"test");
         let c2 = t2.challenge_field::<F>(b"label_b");
 
-        assert_ne!(c1, c2, "different challenge labels must produce different results");
+        assert_ne!(
+            c1, c2,
+            "different challenge labels must produce different results"
+        );
     }
 
     #[test]
@@ -105,7 +121,10 @@ mod tests {
         t2.append_field(b"x", &F::from(2u64));
         let c2 = t2.challenge_field::<F>(b"chall");
 
-        assert_ne!(c1, c2, "different appended values must change the challenge");
+        assert_ne!(
+            c1, c2,
+            "different appended values must change the challenge"
+        );
     }
 
     #[test]
@@ -130,7 +149,10 @@ mod tests {
         t2.append_bytes(b"data", b"world");
         let c2 = t2.challenge_field::<F>(b"chall");
 
-        assert_ne!(c1, c2, "different byte payloads must yield different challenges");
+        assert_ne!(
+            c1, c2,
+            "different byte payloads must yield different challenges"
+        );
     }
 
     #[test]
@@ -146,7 +168,10 @@ mod tests {
         t2.append_field_vec(b"vec", &v2);
         let c2 = t2.challenge_field::<F>(b"chall");
 
-        assert_ne!(c1, c2, "different field vec contents must change the challenge");
+        assert_ne!(
+            c1, c2,
+            "different field vec contents must change the challenge"
+        );
     }
 
     #[test]
