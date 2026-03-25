@@ -21,7 +21,6 @@ use crate::poly::utils::{combine, eval_cols, eval_rows, mat_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::{challenge_vec, Transcript};
-use ark_ff::Field;
 
 // ---------------------------------------------------------------------------
 // Pipeline Interfaces & Keys
