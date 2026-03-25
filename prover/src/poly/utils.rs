@@ -2,6 +2,28 @@ use crate::field::F;
 use crate::poly::DenseMLPoly; // DenseMLPolyのパスはご自身の構成に合わせてください
 use ark_ff::Field;
 use ark_ff::Zero;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum TernaryValue {
+    ONE,
+    MINUSONE,
+    ZERO,
+}
+
+pub fn convert_tm_to_fm(tm: &[Vec<TernaryValue>]) -> Vec<Vec<F>> {
+    tm.iter()
+        .map(|row| {
+            row.iter()
+                .map(|v| match v {
+                    TernaryValue::ONE => F::ONE,
+                    TernaryValue::MINUSONE => F::ZERO - F::ONE,
+                    TernaryValue::ZERO => F::ZERO,
+                })
+                .collect()
+        })
+        .collect()
+}
 
 /// 2次元の行列（VecのVec）を DenseMLPoly (多線形延長) に変換します。
 ///
@@ -76,7 +98,12 @@ pub fn eval_cols(poly: &DenseMLPoly, n_row_vars: usize, r_col: &[F]) -> Vec<F> {
         .collect()
 }
 
-pub fn eval_cols_ternary(w_raw: &[Vec<F>], r_out: &[F], d_in: usize, d_out: usize) -> Vec<F> {
+pub fn eval_cols_ternary(
+    w_raw: &[Vec<TernaryValue>],
+    r_out: &[F],
+    d_in: usize,
+    d_out: usize,
+) -> Vec<F> {
     // 1. eq(j, r_out) を事前計算 (O(d_out))
     // 後のループで使い回すことで、計算量を劇的に減らす
     let eq_evals = compute_eq_evals(r_out, d_out);
@@ -88,12 +115,10 @@ pub fn eval_cols_ternary(w_raw: &[Vec<F>], r_out: &[F], d_in: usize, d_out: usiz
         let mut sum = F::ZERO;
         for j in 0..d_out {
             // 重みが 0 の場合はメモリアクセスと計算を完全にスキップ (Sparsityの活用)
-            if w_raw[k][j] == F::ONE {
-                sum += eq_evals[j];
-            } else if w_raw[k][j] == F::ZERO - F::ONE {
-                sum -= eq_evals[j]
-            } else if w_raw[k][j] != F::ZERO {
-                unreachable!("Weight must be ternary [-1, 0, 1]")
+            match w_raw[k][j] {
+                TernaryValue::ONE => sum += eq_evals[j],
+                TernaryValue::MINUSONE => sum -= eq_evals[j],
+                TernaryValue::ZERO => {}
             }
         }
         res[k] = sum;

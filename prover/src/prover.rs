@@ -346,7 +346,7 @@ mod tests {
     use crate::ffn::ffn::{FFNInstance, FFNWitness};
     use crate::lookup::lasso::LassoInstance;
     use crate::pcs::{hyrax_commit, HyraxParams};
-    use crate::poly::utils::mat_to_mle;
+    use crate::poly::utils::{mat_to_mle, TernaryValue};
     use crate::setup::{
         preprocess_transformer_model, TransformerBlockWeights, TransformerModelWeights,
     };
@@ -372,6 +372,10 @@ mod tests {
         vec![vec![F::ZERO; cols]; rows]
     }
 
+    fn zero_ternary_mat(rows: usize, cols: usize) -> Vec<Vec<TernaryValue>> {
+        vec![vec![TernaryValue::ZERO; cols]; rows]
+    }
+
     /// Build a single-block model where all projection/FFN weights are zero.
     /// With zero weights every matmul output is zero, so the only non-trivial
     /// path is through the two LayerNorm layers.
@@ -379,10 +383,10 @@ mod tests {
         let block = TransformerBlockWeights {
             ln1_gamma: vec![F::from(2u64); D],
             ln1_beta: vec![F::from(5u64); D],
-            q_w: zero_mat(D, D),
-            k_w: zero_mat(D, D),
-            v_w: zero_mat(D, D),
-            o_w: zero_mat(D, D),
+            q_w: zero_ternary_mat(D, D),
+            k_w: zero_ternary_mat(D, D),
+            v_w: zero_ternary_mat(D, D),
+            o_w: zero_ternary_mat(D, D),
             ln2_gamma: vec![F::from(2u64); D],
             ln2_beta: vec![F::from(5u64); D],
             ffn_w1: zero_mat(D, D_FF),
@@ -396,7 +400,7 @@ mod tests {
             blocks: vec![block],
             final_ln_gamma: vec![F::from(2u64); D],
             final_ln_beta: vec![F::from(5u64); D],
-            lm_head_w: zero_mat(D, V),
+            lm_head_w: zero_ternary_mat(D, V),
         }
     }
 

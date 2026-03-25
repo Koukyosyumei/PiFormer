@@ -16,6 +16,7 @@ use piformer_prover::{
     },
     ffn::ffn::{FFNInstance, FFNWitness},
     lookup::lasso::LassoInstance,
+    poly::utils::TernaryValue,
     prover::{
         TransformerBlockWitness, TransformerModelWitness,
     },
@@ -72,6 +73,37 @@ fn mat_from_json(json: Vec<Vec<String>>) -> Result<Vec<Vec<F>>, String> {
         .collect()
 }
 
+fn ternary_mat_to_json(mat: &[Vec<TernaryValue>]) -> Vec<Vec<i8>> {
+    mat.iter()
+        .map(|row| {
+            row.iter()
+                .map(|v| match v {
+                    TernaryValue::ONE => 1i8,
+                    TernaryValue::ZERO => 0i8,
+                    TernaryValue::MINUSONE => -1i8,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn ternary_mat_from_json(json: Vec<Vec<i8>>) -> Result<Vec<Vec<TernaryValue>>, String> {
+    json.into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            row.into_iter()
+                .enumerate()
+                .map(|(j, v)| match v {
+                    1 => Ok(TernaryValue::ONE),
+                    0 => Ok(TernaryValue::ZERO),
+                    -1 => Ok(TernaryValue::MINUSONE),
+                    other => Err(format!("mat[{i}][{j}]: invalid ternary value {other}")),
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn vec_to_json(v: &[F]) -> Vec<String> {
     v.iter().map(f_to_hex).collect()
 }
@@ -95,10 +127,10 @@ fn io_err(msg: impl ToString) -> io::Error {
 pub struct JsonBlockWeights {
     pub ln1_gamma: Vec<String>,
     pub ln1_beta: Vec<String>,
-    pub q_w: Vec<Vec<String>>,
-    pub k_w: Vec<Vec<String>>,
-    pub v_w: Vec<Vec<String>>,
-    pub o_w: Vec<Vec<String>>,
+    pub q_w: Vec<Vec<i8>>,
+    pub k_w: Vec<Vec<i8>>,
+    pub v_w: Vec<Vec<i8>>,
+    pub o_w: Vec<Vec<i8>>,
     pub ln2_gamma: Vec<String>,
     pub ln2_beta: Vec<String>,
     pub ffn_w1: Vec<Vec<String>>,
@@ -114,7 +146,7 @@ pub struct JsonWeights {
     pub blocks: Vec<JsonBlockWeights>,
     pub final_ln_gamma: Vec<String>,
     pub final_ln_beta: Vec<String>,
-    pub lm_head_w: Vec<Vec<String>>,
+    pub lm_head_w: Vec<Vec<i8>>,
 }
 
 pub fn weights_to_json(w: &TransformerModelWeights) -> JsonWeights {
@@ -124,10 +156,10 @@ pub fn weights_to_json(w: &TransformerModelWeights) -> JsonWeights {
         .map(|b| JsonBlockWeights {
             ln1_gamma: vec_to_json(&b.ln1_gamma),
             ln1_beta: vec_to_json(&b.ln1_beta),
-            q_w: mat_to_json(&b.q_w),
-            k_w: mat_to_json(&b.k_w),
-            v_w: mat_to_json(&b.v_w),
-            o_w: mat_to_json(&b.o_w),
+            q_w: ternary_mat_to_json(&b.q_w),
+            k_w: ternary_mat_to_json(&b.k_w),
+            v_w: ternary_mat_to_json(&b.v_w),
+            o_w: ternary_mat_to_json(&b.o_w),
             ln2_gamma: vec_to_json(&b.ln2_gamma),
             ln2_beta: vec_to_json(&b.ln2_beta),
             ffn_w1: mat_to_json(&b.ffn_w1),
@@ -142,7 +174,7 @@ pub fn weights_to_json(w: &TransformerModelWeights) -> JsonWeights {
         blocks,
         final_ln_gamma: vec_to_json(&w.final_ln_gamma),
         final_ln_beta: vec_to_json(&w.final_ln_beta),
-        lm_head_w: mat_to_json(&w.lm_head_w),
+        lm_head_w: ternary_mat_to_json(&w.lm_head_w),
     }
 }
 
@@ -154,10 +186,10 @@ pub fn weights_from_json(j: JsonWeights) -> Result<TransformerModelWeights, Stri
             Ok(TransformerBlockWeights {
                 ln1_gamma: vec_from_json(b.ln1_gamma)?,
                 ln1_beta: vec_from_json(b.ln1_beta)?,
-                q_w: mat_from_json(b.q_w)?,
-                k_w: mat_from_json(b.k_w)?,
-                v_w: mat_from_json(b.v_w)?,
-                o_w: mat_from_json(b.o_w)?,
+                q_w: ternary_mat_from_json(b.q_w)?,
+                k_w: ternary_mat_from_json(b.k_w)?,
+                v_w: ternary_mat_from_json(b.v_w)?,
+                o_w: ternary_mat_from_json(b.o_w)?,
                 ln2_gamma: vec_from_json(b.ln2_gamma)?,
                 ln2_beta: vec_from_json(b.ln2_beta)?,
                 ffn_w1: mat_from_json(b.ffn_w1)?,
@@ -173,7 +205,7 @@ pub fn weights_from_json(j: JsonWeights) -> Result<TransformerModelWeights, Stri
         blocks: blocks?,
         final_ln_gamma: vec_from_json(j.final_ln_gamma)?,
         final_ln_beta: vec_from_json(j.final_ln_beta)?,
-        lm_head_w: mat_from_json(j.lm_head_w)?,
+        lm_head_w: ternary_mat_from_json(j.lm_head_w)?,
     })
 }
 

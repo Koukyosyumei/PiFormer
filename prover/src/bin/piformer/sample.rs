@@ -14,6 +14,7 @@ use piformer_prover::{
     },
     ffn::ffn::{FFNInstance, FFNWitness},
     lookup::lasso::LassoInstance,
+    poly::utils::TernaryValue,
     prover::{TransformerBlockWitness, TransformerModelWitness},
     setup::{TransformerBlockWeights, TransformerModelWeights},
     F,
@@ -21,6 +22,10 @@ use piformer_prover::{
 
 fn zero_mat(rows: usize, cols: usize) -> Vec<Vec<F>> {
     vec![vec![F::ZERO; cols]; rows]
+}
+
+fn zero_ternary_mat(rows: usize, cols: usize) -> Vec<Vec<TernaryValue>> {
+    vec![vec![TernaryValue::ZERO; cols]; rows]
 }
 
 fn ones_vec(n: usize) -> Vec<F> {
@@ -35,10 +40,10 @@ fn make_block(d_model: usize, d_ff: usize) -> TransformerBlockWeights {
     TransformerBlockWeights {
         ln1_gamma: vec![F::from(2u64); d_model],
         ln1_beta: vec![F::from(5u64); d_model],
-        q_w: zero_mat(d_model, d_model),
-        k_w: zero_mat(d_model, d_model),
-        v_w: zero_mat(d_model, d_model),
-        o_w: zero_mat(d_model, d_model),
+        q_w: zero_ternary_mat(d_model, d_model),
+        k_w: zero_ternary_mat(d_model, d_model),
+        v_w: zero_ternary_mat(d_model, d_model),
+        o_w: zero_ternary_mat(d_model, d_model),
         ln2_gamma: vec![F::from(2u64); d_model],
         ln2_beta: vec![F::from(5u64); d_model],
         ffn_w1: zero_mat(d_model, d_ff),
@@ -61,7 +66,7 @@ pub fn build_zero_weights(
         blocks: (0..num_blocks).map(|_| make_block(d_model, d_ff)).collect(),
         final_ln_gamma: vec![F::from(2u64); d_model],
         final_ln_beta: vec![F::from(5u64); d_model],
-        lm_head_w: zero_mat(d_model, vocab_size),
+        lm_head_w: zero_ternary_mat(d_model, vocab_size),
     }
 }
 

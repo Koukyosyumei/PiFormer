@@ -17,6 +17,8 @@ use crate::pcs::absorb_com;
 use crate::pcs::{
     hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment, HyraxProof,
 };
+use crate::poly::utils::convert_tm_to_fm;
+use crate::poly::utils::TernaryValue;
 use crate::poly::utils::{combine, eval_cols_ternary, eval_rows, mat_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
@@ -47,7 +49,7 @@ pub struct ProjectionVerifyingKey {
 #[derive(Clone)]
 pub struct ProjectionProvingKey {
     pub vk: ProjectionVerifyingKey,
-    pub w: Vec<Vec<F>>,
+    pub w: Vec<Vec<TernaryValue>>,
 }
 
 /// Private witness data (dynamic activations). ONLY the Prover holds this.
@@ -65,9 +67,9 @@ pub fn preprocess_projection(
     seq_len: usize,
     d_in: usize,
     d_out: usize,
-    w: Vec<Vec<F>>,
+    w: Vec<Vec<TernaryValue>>,
 ) -> ProjectionProvingKey {
-    let w_mle = mat_to_mle(&w, d_in, d_out);
+    let w_mle = mat_to_mle(&convert_tm_to_fm(&w), d_in, d_out);
     let (nu_w, _sigma_w, params_w) = params_from_vars(
         d_in.next_power_of_two().trailing_zeros() as usize
             + d_out.next_power_of_two().trailing_zeros() as usize,
@@ -123,7 +125,7 @@ pub fn prove_projection(
 
     let x_mle = mat_to_mle(&witness.x, t, d_in);
     let y_mle = mat_to_mle(&witness.y, t, d_out);
-    let w_mle = mat_to_mle(&pk.w, d_in, d_out);
+    let w_mle = mat_to_mle(&convert_tm_to_fm(&pk.w), d_in, d_out);
 
     let (nu_x, sigma_x, _params_x) = params_from_vars(t_bits + in_bits);
     let (nu_y, sigma_y, _params_y) = params_from_vars(t_bits + out_bits);
@@ -274,7 +276,7 @@ mod projection_tests {
         ProjectionIOCommitments,
     ) {
         let mut x = vec![vec![F::zero(); d_in]; t];
-        let mut w = vec![vec![F::zero(); d_out]; d_in];
+        let mut w = vec![vec![TernaryValue::ZERO; d_out]; d_in];
 
         // Fill with some deterministic dummy values
         for i in 0..t {
@@ -285,11 +287,11 @@ mod projection_tests {
         for i in 0..d_in {
             for j in 0..d_out {
                 if i % 3 == 0 {
-                    w[i][j] = F::ONE;
+                    w[i][j] = TernaryValue::ONE;
                 } else if i % 3 == 1 {
-                    w[i][j] = F::ZERO;
+                    w[i][j] = TernaryValue::ZERO;
                 } else {
-                    w[i][j] = F::ZERO - F::ONE;
+                    w[i][j] = TernaryValue::MINUSONE;
                 }
             }
         }
@@ -299,7 +301,11 @@ mod projection_tests {
         for i in 0..t {
             for j in 0..d_out {
                 for k in 0..d_in {
-                    y[i][j] += x[i][k] * w[k][j];
+                    match w[k][j] {
+                        TernaryValue::ONE => y[i][j] += x[i][k],
+                        TernaryValue::MINUSONE => y[i][j] -= x[i][k],
+                        TernaryValue::ZERO => {}
+                    }
                 }
             }
         }
@@ -378,7 +384,7 @@ mod projection_tests {
 
         // Malicious prover tries to use different weights (W) internally
         // to pass the Sumcheck math relationship.
-        pk.w[0][1] = F::zero();
+        pk.w[0][1] = TernaryValue::ZERO;
 
         let mut pt = Transcript::new(b"proj_test");
         let proof = prove_projection(&pk, &witness, &io_coms, &mut pt).unwrap();
