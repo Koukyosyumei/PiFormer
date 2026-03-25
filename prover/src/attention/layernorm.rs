@@ -13,7 +13,8 @@
 use crate::field::F;
 use crate::lookup::range::{prove_range, verify_range, RangeProof, RangeProofWitness};
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_n, poly_hyrax, HyraxCommitment, HyraxProof,
+    absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_n, poly_hyrax, HyraxCommitment,
+    HyraxProof,
 };
 use crate::poly::utils::{combine, eval_rows, mat_to_mle, vec_to_mle};
 use crate::poly::DenseMLPoly;
@@ -322,7 +323,8 @@ pub fn verify_layernorm(
         proof.openings.sum_x_at_rt,
         d_bits,
         transcript,
-    )?;
+    )
+    .map_err(|e| format!("LN Mean Sumcheck: {e}"))?;
     if final_mean != proof.openings.x_at_rt_rmean {
         return Err("Mean sumcheck mismatch".into());
     }
@@ -332,7 +334,8 @@ pub fn verify_layernorm(
         proof.openings.var_x_at_rt,
         d_bits,
         transcript,
-    )?;
+    )
+    .map_err(|e| format!("LN Variance Sumcheck: {e}"))?;
     let h_eval = d_f * proof.openings.x_at_rt_rvar - proof.openings.sum_x_at_rt;
     if final_var != h_eval * h_eval {
         return Err("Variance sumcheck mismatch".into());
