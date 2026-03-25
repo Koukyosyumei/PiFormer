@@ -83,7 +83,11 @@ pub fn build_zero_witness(
     d_ff: usize,
     vocab_size: usize,
     m_bits: usize,
-) -> (TransformerModelWitness, LinearAttentionInstance, FFNInstance) {
+) -> (
+    TransformerModelWitness,
+    LinearAttentionInstance,
+    FFNInstance,
+) {
     let x_in: Vec<Vec<F>> = if seq_len == 2 && d_model == 2 {
         vec![
             vec![F::from(10u64), F::from(20u64)],
@@ -91,7 +95,11 @@ pub fn build_zero_witness(
         ]
     } else {
         (0..seq_len)
-            .map(|i| (0..d_model).map(|j| F::from(((i + 1) * 10 + j) as u64)).collect())
+            .map(|i| {
+                (0..d_model)
+                    .map(|j| F::from(((i + 1) * 10 + j) as u64))
+                    .collect()
+            })
             .collect()
     };
 
@@ -106,9 +114,18 @@ pub fn build_zero_witness(
     let block_wit = TransformerBlockWitness {
         x_in: x_in.clone(),
         ln1_wit: make_ln_wit(),
-        q_proj_wit: ProjectionWitness { x: ln_y.clone(), y: zero_td.clone() },
-        k_proj_wit: ProjectionWitness { x: ln_y.clone(), y: zero_td.clone() },
-        v_proj_wit: ProjectionWitness { x: ln_y.clone(), y: zero_td.clone() },
+        q_proj_wit: ProjectionWitness {
+            x: ln_y.clone(),
+            y: zero_td.clone(),
+        },
+        k_proj_wit: ProjectionWitness {
+            x: ln_y.clone(),
+            y: zero_td.clone(),
+        },
+        v_proj_wit: ProjectionWitness {
+            x: ln_y.clone(),
+            y: zero_td.clone(),
+        },
         attn_wit: LinearAttentionWitness {
             q: zero_td.clone(),
             k: zero_td.clone(),
@@ -118,7 +135,10 @@ pub fn build_zero_witness(
             context: zero_dd,
             out: zero_td.clone(),
         },
-        o_proj_wit: ProjectionWitness { x: zero_td.clone(), y: zero_td.clone() },
+        o_proj_wit: ProjectionWitness {
+            x: zero_td.clone(),
+            y: zero_td.clone(),
+        },
         x_mid: x_in.clone(),
         ln2_wit: make_ln_wit(),
         ffn_wit: FFNWitness {
@@ -156,7 +176,10 @@ pub fn build_zero_witness(
         x_in: x_in.clone(),
         block_witnesses: vec![block_wit],
         final_ln_wit: make_ln_wit(),
-        lm_head_wit: ProjectionWitness { x: ln_y, y: zero_tv },
+        lm_head_wit: ProjectionWitness {
+            x: ln_y,
+            y: zero_tv,
+        },
     };
 
     (witness, inst_attn, inst_ffn)
@@ -182,8 +205,8 @@ fn build_ln_witness(x: &[Vec<F>], d_model: usize) -> LayerNormWitness {
                     vec![F::from(4u64), F::from(6u64)],
                 ],
                 sum_x: vec![F::from(30u64), F::from(70u64)],
-                var_x: vec![F::from(200u64), F::from(200u64)],
                 sigma: vec![F::from(7u64), F::from(7u64)],
+                sq_sum_x: todo!(),
             };
         }
     }
@@ -191,7 +214,7 @@ fn build_ln_witness(x: &[Vec<F>], d_model: usize) -> LayerNormWitness {
         x: x.to_vec(),
         y: vec![vec![F::ZERO; d_model]; t],
         sum_x: vec![F::ZERO; t],
-        var_x: vec![F::ZERO; t],
         sigma: vec![F::ZERO; t],
+        sq_sum_x: todo!(),
     }
 }

@@ -325,8 +325,8 @@ fn ln_wit_to_json(w: &LayerNormWitness) -> JsonLayerNormWitness {
         x: mat_to_json(&w.x),
         y: mat_to_json(&w.y),
         sum_x: vec_to_json(&w.sum_x),
-        var_x: vec_to_json(&w.var_x),
         sigma: vec_to_json(&w.sigma),
+        var_x: todo!(),
     }
 }
 
@@ -335,8 +335,8 @@ fn ln_wit_from_json(j: JsonLayerNormWitness) -> Result<LayerNormWitness, String>
         x: mat_from_json(j.x)?,
         y: mat_from_json(j.y)?,
         sum_x: vec_from_json(j.sum_x)?,
-        var_x: vec_from_json(j.var_x)?,
         sigma: vec_from_json(j.sigma)?,
+        sq_sum_x: todo!(),
     })
 }
 

@@ -452,8 +452,8 @@ mod tests {
                 vec![F::from(4u64), F::from(6u64)],
             ],
             sum_x: vec![F::from(30u64), F::from(70u64)],
-            var_x: vec![F::from(200u64), F::from(200u64)],
             sigma: vec![F::from(7u64), F::from(7u64)],
+            sq_sum_x: todo!(),
         }
     }
 
@@ -470,8 +470,8 @@ mod tests {
                 vec![F::from(6u64), F::from(4u64)],
             ],
             sum_x: vec![F::from(158u64), F::from(198u64)],
-            var_x: vec![F::from(27848u64), F::from(27848u64)],
             sigma: vec![F::from(83u64), F::from(83u64)],
+            sq_sum_x: todo!(),
         }
     }
 
@@ -488,8 +488,8 @@ mod tests {
                 vec![F::from(6u64), F::from(4u64)],
             ],
             sum_x: vec![F::from(164u64), F::from(204u64)],
-            var_x: vec![F::from(30752u64), F::from(30752u64)],
             sigma: vec![F::from(87u64), F::from(87u64)],
+            sq_sum_x: todo!(),
         }
     }
 
@@ -538,9 +538,18 @@ mod tests {
             vec![F::from(4u64), F::from(0u64)],
             vec![F::from(4u64), F::from(0u64)],
         ];
-        let q_proj_wit = ProjectionWitness { x: y_norm1.clone(), y: proj_out.clone() };
-        let k_proj_wit = ProjectionWitness { x: y_norm1.clone(), y: proj_out.clone() };
-        let v_proj_wit = ProjectionWitness { x: y_norm1.clone(), y: proj_out.clone() };
+        let q_proj_wit = ProjectionWitness {
+            x: y_norm1.clone(),
+            y: proj_out.clone(),
+        };
+        let k_proj_wit = ProjectionWitness {
+            x: y_norm1.clone(),
+            y: proj_out.clone(),
+        };
+        let v_proj_wit = ProjectionWitness {
+            x: y_norm1.clone(),
+            y: proj_out.clone(),
+        };
 
         // phi is identity on [0,15]: phi_q = phi_k = [[4,0],[4,0]]
         // context = phi_k^T @ v = [[4,4],[0,0]] @ [[4,0],[4,0]] = [[32,0],[0,0]]
@@ -566,7 +575,10 @@ mod tests {
 
         // O projection: attn_inner @ W where W[0][0]=1 → [[128,0],[128,0]]
         let out_attn = attn_inner.clone();
-        let o_proj_wit = ProjectionWitness { x: attn_inner.clone(), y: out_attn.clone() };
+        let o_proj_wit = ProjectionWitness {
+            x: attn_inner.clone(),
+            y: out_attn.clone(),
+        };
 
         // Residual 1: x_mid = x_in + out_attn = [[138,20],[158,40]]
         let x_mid = vec![
