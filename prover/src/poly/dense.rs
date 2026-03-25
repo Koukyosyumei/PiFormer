@@ -45,6 +45,7 @@ impl DenseMLPoly {
         assert_eq!(r.len(), self.num_vars);
         let mut evals = self.evaluations.clone();
         let mut half = evals.len() >> 1;
+        // P(x_0, ..., x_i, ..., x_{n-1}) = (1 - x_i) \cdot P(x_0, ... , 0, ... , x_{n-1}) + x_i \cdot P(x_0, ... , 1, ... , x_{n-1})
         for &ri in r {
             for i in 0..half {
                 evals[i] = evals[i] * (F::ONE - ri) + evals[i + half] * ri;

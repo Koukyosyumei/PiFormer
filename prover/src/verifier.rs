@@ -7,12 +7,11 @@
 //! 3. Commitment Chaining: Intermediate IO commitments passed from the Prover
 //!    are cryptographically bound across adjacent sub-verifiers.
 
-use crate::field::F;
-use crate::pcs::{HyraxCommitment, HyraxParams};
+use crate::pcs::{absorb_com, HyraxCommitment, HyraxParams};
 use crate::transcript::Transcript;
 
 // Sub-module keys and verifiers
-use crate::attention::attention::{absorb_com, verify_linear_attention, LinearAttentionInstance};
+use crate::attention::attention::{verify_linear_attention, LinearAttentionInstance};
 use crate::attention::layernorm::{
     verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey,
 };

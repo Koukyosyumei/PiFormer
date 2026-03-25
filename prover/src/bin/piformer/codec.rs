@@ -8,9 +8,7 @@
 use std::io::{self, Read, Write};
 
 use ark_bn254::G1Affine;
-use ark_serialize::{
-    CanonicalDeserialize, CanonicalSerialize, Compress, Validate,
-};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 
 use piformer_prover::{
     attention::{
@@ -19,22 +17,21 @@ use piformer_prover::{
             LinearAttentionProof,
         },
         layernorm::{
-            LayerNormInternalCommitments, LayerNormOpenings, LayerNormProof,
-            LayerNormVerifyingKey,
+            LayerNormInternalCommitments, LayerNormOpenings, LayerNormProof, LayerNormVerifyingKey,
         },
         projection::{
             ProjectionOpenings, ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey,
         },
     },
     ffn::ffn::{
-        FFNInternalCommitments, FFNInstance, FFNOpenings, FFNProof, FFNProvingKey,
-        FFNVerifyingKey,
+        FFNInstance, FFNInternalCommitments, FFNOpenings, FFNProof, FFNProvingKey, FFNVerifyingKey,
     },
     lookup::{
         lasso::{LassoInstance, LassoProof},
         range::RangeProof,
     },
-    pcs::{HyraxCommitment, HyraxParams, HyraxProof},
+    pcs::{HyraxCommitment, HyraxProof},
+    poly::utils::TernaryValue,
     prover::{
         TransformerBlockProof, TransformerModelProof, TransformerModelProvingKey,
         TransformerModelVerifyingKey,
@@ -76,7 +73,29 @@ fn ark_err(e: ark_serialize::SerializationError) -> io::Error {
 }
 
 fn write_f<W: Write>(w: &mut W, f: &F) -> io::Result<()> {
-    f.serialize_with_mode(&mut *w, Compress::No).map_err(ark_err)
+    f.serialize_with_mode(&mut *w, Compress::No)
+        .map_err(ark_err)
+}
+fn write_t<W: Write>(w: &mut W, t: &TernaryValue) -> io::Result<()> {
+    let byte: u8 = match t {
+        TernaryValue::ZERO => 0,
+        TernaryValue::ONE => 1,
+        TernaryValue::MINUSONE => 2,
+    };
+    w.write_all(&[byte])
+}
+fn read_t<R: Read>(r: &mut R) -> io::Result<TernaryValue> {
+    let mut buf = [0u8; 1];
+    r.read_exact(&mut buf)?;
+    match buf[0] {
+        0 => Ok(TernaryValue::ZERO),
+        1 => Ok(TernaryValue::ONE),
+        2 => Ok(TernaryValue::MINUSONE),
+        b => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid ternary byte: {b}"),
+        )),
+    }
 }
 fn read_f<R: Read>(r: &mut R) -> io::Result<F> {
     F::deserialize_with_mode(&mut *r, Compress::No, Validate::No).map_err(ark_err)
@@ -99,16 +118,16 @@ fn write_vec<T, W: Write, F2: Fn(&mut W, &T) -> io::Result<()>>(
     }
     Ok(())
 }
-fn read_vec<T, R: Read, F2: Fn(&mut R) -> io::Result<T>>(
-    r: &mut R,
-    f: F2,
-) -> io::Result<Vec<T>> {
+fn read_vec<T, R: Read, F2: Fn(&mut R) -> io::Result<T>>(r: &mut R, f: F2) -> io::Result<Vec<T>> {
     let n = read_u64(r)? as usize;
     (0..n).map(|_| f(r)).collect()
 }
 
 fn write_vec_f<W: Write>(w: &mut W, v: &[F]) -> io::Result<()> {
     write_vec(w, v, write_f)
+}
+fn write_vec_t<W: Write>(w: &mut W, v: &[TernaryValue]) -> io::Result<()> {
+    write_vec(w, v, write_t)
 }
 fn read_vec_f<R: Read>(r: &mut R) -> io::Result<Vec<F>> {
     read_vec(r, read_f)
@@ -121,6 +140,15 @@ fn read_vec_g1<R: Read>(r: &mut R) -> io::Result<Vec<G1Affine>> {
 }
 fn write_vec_vec_f<W: Write>(w: &mut W, v: &[Vec<F>]) -> io::Result<()> {
     write_vec(w, v, |w2, row| write_vec_f(w2, row))
+}
+fn write_vec_vec_t<W: Write>(w: &mut W, v: &[Vec<TernaryValue>]) -> io::Result<()> {
+    write_vec(w, v, |w2, row| write_vec_t(w2, row))
+}
+fn read_vec_t<R: Read>(r: &mut R) -> io::Result<Vec<TernaryValue>> {
+    read_vec(r, read_t)
+}
+fn read_vec_vec_t<R: Read>(r: &mut R) -> io::Result<Vec<Vec<TernaryValue>>> {
+    read_vec(r, read_vec_t)
 }
 fn read_vec_vec_f<R: Read>(r: &mut R) -> io::Result<Vec<Vec<F>>> {
     read_vec(r, read_vec_f)
@@ -293,16 +321,26 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
     let (sum_x_at_ryt, sum_x_ryt_proof) = read_ep!(r);
     let (sigma_at_ryt, sigma_ryt_proof) = read_ep!(r);
     Ok(LayerNormOpenings {
-        sum_x_at_rt, sum_x_rt_proof,
-        var_x_at_rt, var_x_rt_proof,
-        x_at_rt_rmean, x_rt_rmean_proof,
-        x_at_rt_rvar, x_rt_rvar_proof,
-        var_x_at_rsig, var_x_rsig_proof,
-        sigma_at_rsig, sigma_rsig_proof,
-        x_at_ry, x_ry_proof,
-        y_at_ry, y_ry_proof,
-        sum_x_at_ryt, sum_x_ryt_proof,
-        sigma_at_ryt, sigma_ryt_proof,
+        sum_x_at_rt,
+        sum_x_rt_proof,
+        var_x_at_rt,
+        var_x_rt_proof,
+        x_at_rt_rmean,
+        x_rt_rmean_proof,
+        x_at_rt_rvar,
+        x_rt_rvar_proof,
+        var_x_at_rsig,
+        var_x_rsig_proof,
+        sigma_at_rsig,
+        sigma_rsig_proof,
+        x_at_ry,
+        x_ry_proof,
+        y_at_ry,
+        y_ry_proof,
+        sum_x_at_ryt,
+        sum_x_ryt_proof,
+        sigma_at_ryt,
+        sigma_ryt_proof,
     })
 }
 
@@ -339,7 +377,14 @@ fn read_proj_openings<R: Read>(r: &mut R) -> io::Result<ProjectionOpenings> {
     let (y_eval, y_open) = read_ep!(r);
     let (x_eval, x_open) = read_ep!(r);
     let (w_eval, w_open) = read_ep!(r);
-    Ok(ProjectionOpenings { y_eval, y_open, x_eval, x_open, w_eval, w_open })
+    Ok(ProjectionOpenings {
+        y_eval,
+        y_open,
+        x_eval,
+        x_open,
+        w_eval,
+        w_open,
+    })
 }
 
 fn write_proj_proof<W: Write>(w: &mut W, p: &ProjectionProof) -> io::Result<()> {
@@ -357,7 +402,10 @@ fn read_proj_proof<R: Read>(r: &mut R) -> io::Result<ProjectionProof> {
 // Attention proof
 // ---------------------------------------------------------------------------
 
-fn write_attn_internal_coms<W: Write>(w: &mut W, c: &AttentionInternalCommitments) -> io::Result<()> {
+fn write_attn_internal_coms<W: Write>(
+    w: &mut W,
+    c: &AttentionInternalCommitments,
+) -> io::Result<()> {
     write_hyrax_commitment(w, &c.phi_q_com)?;
     write_hyrax_commitment(w, &c.phi_k_com)?;
     write_hyrax_commitment(w, &c.context_com)
@@ -384,7 +432,18 @@ fn read_attn_openings<R: Read>(r: &mut R) -> io::Result<AttentionOpenings> {
     let (ctx_eval, ctx_open) = read_ep!(r);
     let (phi_k_eval, phi_k_open) = read_ep!(r);
     let (v_eval, v_open) = read_ep!(r);
-    Ok(AttentionOpenings { out_eval, out_open, phi_q_eval, phi_q_open, ctx_eval, ctx_open, phi_k_eval, phi_k_open, v_eval, v_open })
+    Ok(AttentionOpenings {
+        out_eval,
+        out_open,
+        phi_q_eval,
+        phi_q_open,
+        ctx_eval,
+        ctx_open,
+        phi_k_eval,
+        phi_k_open,
+        v_eval,
+        v_open,
+    })
 }
 
 fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result<()> {
@@ -437,7 +496,20 @@ fn read_ffn_openings<R: Read>(r: &mut R) -> io::Result<FFNOpenings> {
     let (m_eval, m_open) = read_ep!(r);
     let (x_eval, x_open) = read_ep!(r);
     let (w1_eval, w1_open) = read_ep!(r);
-    Ok(FFNOpenings { y_eval, y_open, a_eval, a_open, w2_eval, w2_open, m_eval, m_open, x_eval, x_open, w1_eval, w1_open })
+    Ok(FFNOpenings {
+        y_eval,
+        y_open,
+        a_eval,
+        a_open,
+        w2_eval,
+        w2_open,
+        m_eval,
+        m_open,
+        x_eval,
+        x_open,
+        w1_eval,
+        w1_open,
+    })
 }
 
 fn write_ffn_proof<W: Write>(w: &mut W, p: &FFNProof) -> io::Result<()> {
@@ -602,12 +674,12 @@ fn read_proj_vk<R: Read>(r: &mut R) -> io::Result<ProjectionVerifyingKey> {
 
 fn write_proj_pk<W: Write>(w: &mut W, pk: &ProjectionProvingKey) -> io::Result<()> {
     write_proj_vk(w, &pk.vk)?;
-    write_vec_vec_f(w, &pk.w)
+    write_vec_vec_t(w, &pk.w)
 }
 fn read_proj_pk<R: Read>(r: &mut R) -> io::Result<ProjectionProvingKey> {
     Ok(ProjectionProvingKey {
         vk: read_proj_vk(r)?,
-        w: read_vec_vec_f(r)?,
+        w: read_vec_vec_t(r)?,
     })
 }
 
@@ -630,14 +702,14 @@ fn read_ffn_vk<R: Read>(r: &mut R) -> io::Result<FFNVerifyingKey> {
 
 fn write_ffn_pk<W: Write>(w: &mut W, pk: &FFNProvingKey) -> io::Result<()> {
     write_ffn_vk(w, &pk.vk)?;
-    write_vec_vec_f(w, &pk.w1)?;
-    write_vec_vec_f(w, &pk.w2)
+    write_vec_vec_t(w, &pk.w1)?;
+    write_vec_vec_t(w, &pk.w2)
 }
 fn read_ffn_pk<R: Read>(r: &mut R) -> io::Result<FFNProvingKey> {
     Ok(FFNProvingKey {
         vk: read_ffn_vk(r)?,
-        w1: read_vec_vec_f(r)?,
-        w2: read_vec_vec_f(r)?,
+        w1: read_vec_vec_t(r)?,
+        w2: read_vec_vec_t(r)?,
     })
 }
 
@@ -687,15 +759,38 @@ fn read_block_vk<R: Read>(r: &mut R) -> io::Result<TransformerBlockVerifyingKey>
         )
     } else {
         // Stub PKs sufficient for verification (verifier never reads .w fields)
-        let stub_proj = |vk: &ProjectionVerifyingKey| ProjectionProvingKey { vk: vk.clone(), w: vec![] };
-        let stub_ffn = |vk: &FFNVerifyingKey| FFNProvingKey { vk: vk.clone(), w1: vec![], w2: vec![] };
-        (stub_proj(&q_vk), stub_proj(&k_vk), stub_proj(&v_vk), stub_proj(&o_vk), stub_ffn(&ffn_vk))
+        let stub_proj = |vk: &ProjectionVerifyingKey| ProjectionProvingKey {
+            vk: vk.clone(),
+            w: vec![],
+        };
+        let stub_ffn = |vk: &FFNVerifyingKey| FFNProvingKey {
+            vk: vk.clone(),
+            w1: vec![],
+            w2: vec![],
+        };
+        (
+            stub_proj(&q_vk),
+            stub_proj(&k_vk),
+            stub_proj(&v_vk),
+            stub_proj(&o_vk),
+            stub_ffn(&ffn_vk),
+        )
     };
     Ok(TransformerBlockVerifyingKey {
-        seq_len, d_model,
-        ln1_vk, ln2_vk,
-        q_vk, k_vk, v_vk, o_vk, ffn_vk,
-        q_pk, k_pk, v_pk, o_pk, ffn_pk,
+        seq_len,
+        d_model,
+        ln1_vk,
+        ln2_vk,
+        q_vk,
+        k_vk,
+        v_vk,
+        o_vk,
+        ffn_vk,
+        q_pk,
+        k_pk,
+        v_pk,
+        o_pk,
+        ffn_pk,
     })
 }
 
@@ -746,7 +841,10 @@ pub fn decode_pk(bytes: &[u8]) -> io::Result<TransformerModelProvingKey> {
     let lm_head_pk = read_proj_pk(&mut r)?;
     Ok(TransformerModelProvingKey {
         vk: TransformerModelVerifyingKey {
-            num_blocks, seq_len, d_model, vocab_size,
+            num_blocks,
+            seq_len,
+            d_model,
+            vocab_size,
             block_vks,
             final_ln_vk,
             lm_head_vk,
@@ -793,7 +891,10 @@ pub fn decode_vk(bytes: &[u8]) -> io::Result<TransformerModelVerifyingKey> {
         block_vks.push(read_block_vk(&mut r)?);
     }
     Ok(TransformerModelVerifyingKey {
-        num_blocks, seq_len, d_model, vocab_size,
+        num_blocks,
+        seq_len,
+        d_model,
+        vocab_size,
         block_vks,
         final_ln_vk,
         lm_head_vk,
@@ -820,7 +921,12 @@ pub fn encode_proof_bundle(
 /// Decode a proof bundle.
 pub fn decode_proof_bundle(
     bytes: &[u8],
-) -> io::Result<(TransformerModelProof, LinearAttentionInstance, FFNInstance, usize)> {
+) -> io::Result<(
+    TransformerModelProof,
+    LinearAttentionInstance,
+    FFNInstance,
+    usize,
+)> {
     let mut r = bytes;
     check_magic(&mut r, PROOF_MAGIC)?;
     let _version = {

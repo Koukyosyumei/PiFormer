@@ -1,5 +1,5 @@
 from .activation import StructuredLookupActivation
-from .projection import PowerOfTwoLinear
+from .projection import TernaryLinear
 from .attention import LinearAttentionLayer
 from .model import PiFormerBlock, PiFormerFFN, PiFormerModel
 from .export import export_model, export_weights_rust, export_witness_rust, export_all
@@ -18,7 +18,7 @@ from .quant import (
 
 __all__ = [
     "StructuredLookupActivation",
-    "PowerOfTwoLinear",
+    "TernaryLinear",
     "LinearAttentionLayer",
     "PiFormerBlock",
     "PiFormerFFN",

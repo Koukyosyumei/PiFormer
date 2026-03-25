@@ -13,14 +13,16 @@
 //!   Y[i][j] = Σ_k X[i][k] · W[k][j]
 
 use crate::field::F;
+use crate::pcs::absorb_com;
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment, HyraxParams,
-    HyraxProof,
+    hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment, HyraxProof,
 };
+use crate::poly::utils::convert_tm_to_fm;
+use crate::poly::utils::TernaryValue;
+use crate::poly::utils::{combine, eval_cols_ternary, eval_rows, mat_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
-use crate::transcript::Transcript;
-use ark_ff::Field;
+use crate::transcript::{challenge_vec, Transcript};
 
 // ---------------------------------------------------------------------------
 // Pipeline Interfaces & Keys
@@ -47,7 +49,7 @@ pub struct ProjectionVerifyingKey {
 #[derive(Clone)]
 pub struct ProjectionProvingKey {
     pub vk: ProjectionVerifyingKey,
-    pub w: Vec<Vec<F>>,
+    pub w: Vec<Vec<TernaryValue>>,
 }
 
 /// Private witness data (dynamic activations). ONLY the Prover holds this.
@@ -65,9 +67,9 @@ pub fn preprocess_projection(
     seq_len: usize,
     d_in: usize,
     d_out: usize,
-    w: Vec<Vec<F>>,
+    w: Vec<Vec<TernaryValue>>,
 ) -> ProjectionProvingKey {
-    let w_mle = mat_to_mle(&w, d_in, d_out);
+    let w_mle = mat_to_mle(&convert_tm_to_fm(&w), d_in, d_out);
     let (nu_w, _sigma_w, params_w) = params_from_vars(
         d_in.next_power_of_two().trailing_zeros() as usize
             + d_out.next_power_of_two().trailing_zeros() as usize,
@@ -123,7 +125,7 @@ pub fn prove_projection(
 
     let x_mle = mat_to_mle(&witness.x, t, d_in);
     let y_mle = mat_to_mle(&witness.y, t, d_out);
-    let w_mle = mat_to_mle(&pk.w, d_in, d_out);
+    let w_mle = mat_to_mle(&convert_tm_to_fm(&pk.w), d_in, d_out);
 
     let (nu_x, sigma_x, _params_x) = params_from_vars(t_bits + in_bits);
     let (nu_y, sigma_y, _params_y) = params_from_vars(t_bits + out_bits);
@@ -144,7 +146,10 @@ pub fn prove_projection(
 
     // 3. Sumcheck: Y(r_t, r_out) = Σ_k X(r_t, k) * W(k, r_out)
     let f_x = DenseMLPoly::from_vec_padded(eval_rows(&x_mle, t_bits, &r_t));
-    let g_w = DenseMLPoly::from_vec_padded(eval_cols(&w_mle, in_bits, &r_out));
+    //let g_w = DenseMLPoly::from_vec_padded(eval_cols(&w_mle, in_bits, &r_out));
+
+    let g_w_evals = eval_cols_ternary(&pk.w, &r_out, d_in, d_out);
+    let g_w = DenseMLPoly::from_vec_padded(g_w_evals);
 
     let (sumcheck, r_k) = prove_sumcheck(&f_x, &g_w, y_eval, transcript);
 
@@ -251,68 +256,13 @@ pub fn verify_projection_succinct(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn mat_to_mle(mat: &[Vec<F>], rows: usize, cols: usize) -> DenseMLPoly {
-    let r_p2 = rows.next_power_of_two().max(1);
-    let c_p2 = cols.next_power_of_two().max(1);
-    let mut evals = vec![F::ZERO; r_p2 * c_p2];
-    for (i, row) in mat.iter().enumerate() {
-        for (j, &v) in row.iter().enumerate() {
-            evals[i * c_p2 + j] = v;
-        }
-    }
-    DenseMLPoly::new(evals)
-}
-
-fn eval_rows(poly: &DenseMLPoly, n_row_vars: usize, r_row: &[F]) -> Vec<F> {
-    let mut p = poly.clone();
-    for &r in r_row {
-        p = p.fix_first_variable(r);
-    }
-    p.evaluations
-}
-
-fn eval_cols(poly: &DenseMLPoly, n_row_vars: usize, r_col: &[F]) -> Vec<F> {
-    let n_p2_rows = 1 << n_row_vars;
-    let n_p2_cols = poly.evaluations.len() / n_p2_rows;
-    (0..n_p2_rows)
-        .map(|i| {
-            DenseMLPoly::new(poly.evaluations[i * n_p2_cols..(i + 1) * n_p2_cols].to_vec())
-                .evaluate(r_col)
-        })
-        .collect()
-}
-
-fn combine(a: &[F], b: &[F]) -> Vec<F> {
-    let mut res = a.to_vec();
-    res.extend_from_slice(b);
-    res
-}
-
-fn challenge_vec(transcript: &mut Transcript, len: usize, label: &[u8]) -> Vec<F> {
-    (0..len)
-        .map(|_| transcript.challenge_field::<F>(label))
-        .collect()
-}
-
-fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) {
-    use ark_serialize::CanonicalSerialize;
-    for pt in &com.row_coms {
-        let mut buf = Vec::new();
-        pt.serialize_compressed(&mut buf).unwrap();
-        transcript.append_bytes(label, &buf);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod projection_tests {
     use super::*;
+    use ark_ff::Field;
     use ark_ff::{One, Zero};
 
     /// Simulates the Pipeline Setup + Forward Pass
@@ -326,7 +276,7 @@ mod projection_tests {
         ProjectionIOCommitments,
     ) {
         let mut x = vec![vec![F::zero(); d_in]; t];
-        let mut w = vec![vec![F::zero(); d_out]; d_in];
+        let mut w = vec![vec![TernaryValue::ZERO; d_out]; d_in];
 
         // Fill with some deterministic dummy values
         for i in 0..t {
@@ -336,7 +286,13 @@ mod projection_tests {
         }
         for i in 0..d_in {
             for j in 0..d_out {
-                w[i][j] = F::from((i * j + 2) as u64);
+                if i % 3 == 0 {
+                    w[i][j] = TernaryValue::ONE;
+                } else if i % 3 == 1 {
+                    w[i][j] = TernaryValue::ZERO;
+                } else {
+                    w[i][j] = TernaryValue::MINUSONE;
+                }
             }
         }
 
@@ -345,7 +301,11 @@ mod projection_tests {
         for i in 0..t {
             for j in 0..d_out {
                 for k in 0..d_in {
-                    y[i][j] += x[i][k] * w[k][j];
+                    match w[k][j] {
+                        TernaryValue::ONE => y[i][j] += x[i][k],
+                        TernaryValue::MINUSONE => y[i][j] -= x[i][k],
+                        TernaryValue::ZERO => {}
+                    }
                 }
             }
         }
@@ -424,7 +384,7 @@ mod projection_tests {
 
         // Malicious prover tries to use different weights (W) internally
         // to pass the Sumcheck math relationship.
-        pk.w[0][1] += F::one();
+        pk.w[0][1] = TernaryValue::ZERO;
 
         let mut pt = Transcript::new(b"proj_test");
         let proof = prove_projection(&pk, &witness, &io_coms, &mut pt).unwrap();

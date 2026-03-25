@@ -5,11 +5,10 @@
 //! 生成された `VerifyingKey` は非常に小さく、スマートコントラクトやスマホに配布されます。
 
 use crate::attention::layernorm::LayerNormVerifyingKey;
-use crate::attention::projection::{
-    preprocess_projection, ProjectionProvingKey, ProjectionVerifyingKey,
-};
-use crate::ffn::ffn::{preprocess_ffn, FFNProvingKey, FFNVerifyingKey};
+use crate::attention::projection::preprocess_projection;
+use crate::ffn::ffn::preprocess_ffn;
 use crate::field::F;
+use crate::poly::utils::TernaryValue;
 use crate::prover::{TransformerModelProvingKey, TransformerModelVerifyingKey};
 use crate::verifier::TransformerBlockVerifyingKey;
 
@@ -23,16 +22,16 @@ pub struct TransformerBlockWeights {
     pub ln1_gamma: Vec<F>,
     pub ln1_beta: Vec<F>,
     // Linear Projections (Attention)
-    pub q_w: Vec<Vec<F>>, // d_model × d_model
-    pub k_w: Vec<Vec<F>>, // d_model × d_model
-    pub v_w: Vec<Vec<F>>, // d_model × d_model
-    pub o_w: Vec<Vec<F>>, // d_model × d_model
+    pub q_w: Vec<Vec<TernaryValue>>, // d_model × d_model
+    pub k_w: Vec<Vec<TernaryValue>>, // d_model × d_model
+    pub v_w: Vec<Vec<TernaryValue>>, // d_model × d_model
+    pub o_w: Vec<Vec<TernaryValue>>, // d_model × d_model
     // LayerNorm 2
     pub ln2_gamma: Vec<F>,
     pub ln2_beta: Vec<F>,
     // FFN
-    pub ffn_w1: Vec<Vec<F>>, // d_model × d_ff
-    pub ffn_w2: Vec<Vec<F>>, // d_ff × d_model
+    pub ffn_w1: Vec<Vec<TernaryValue>>, // d_model × d_ff
+    pub ffn_w2: Vec<Vec<TernaryValue>>, // d_ff × d_model
 }
 
 /// モデル全体の生の重み
@@ -47,7 +46,7 @@ pub struct TransformerModelWeights {
     // 最終LayerNorm と 言語モデルヘッド
     pub final_ln_gamma: Vec<F>,
     pub final_ln_beta: Vec<F>,
-    pub lm_head_w: Vec<Vec<F>>, // d_model × vocab_size
+    pub lm_head_w: Vec<Vec<TernaryValue>>, // d_model × vocab_size
 }
 
 // ---------------------------------------------------------------------------

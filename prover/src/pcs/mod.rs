@@ -21,7 +21,7 @@ use ark_ec::{Group, VariableBaseMSM};
 use ark_ff::{Field, PrimeField};
 use sha3::{Digest, Sha3_256};
 
-use crate::{field::F, poly::DenseMLPoly};
+use crate::{field::F, poly::DenseMLPoly, transcript::Transcript};
 
 // ---------------------------------------------------------------------------
 // Public parameters
@@ -241,6 +241,15 @@ pub fn params_from_n(n: usize) -> (usize, usize, HyraxParams) {
     params_from_vars(total_vars)
 }
 
+pub fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) {
+    use ark_serialize::CanonicalSerialize;
+    for pt in &com.row_coms {
+        let mut buf = Vec::new();
+        pt.serialize_compressed(&mut buf).unwrap();
+        transcript.append_bytes(label, &buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,7 +339,13 @@ mod tests {
         let n = 3;
         for idx in 0..(1usize << n) {
             let point: Vec<Fr> = (0..n)
-                .map(|k| if (idx >> k) & 1 == 1 { Fr::ONE } else { Fr::ZERO })
+                .map(|k| {
+                    if (idx >> k) & 1 == 1 {
+                        Fr::ONE
+                    } else {
+                        Fr::ZERO
+                    }
+                })
                 .collect();
             let basis = lagrange_basis(&point);
             for (i, &b) in basis.iter().enumerate() {
@@ -357,7 +372,11 @@ mod tests {
         let point: Vec<Fr> = (0..(nu + sigma)).map(|_| Fr::rand(&mut rng)).collect();
         let proof = hyrax_open(&evals, &point, nu, sigma);
         let result = hyrax_verify(&commitment, Fr::ZERO, &point, &proof, &params);
-        assert!(result.is_ok(), "Zero polynomial should verify: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Zero polynomial should verify: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -370,7 +389,11 @@ mod tests {
         let evals: Vec<Fr> = (0..(1 << sigma)).map(|_| Fr::rand(&mut rng)).collect();
 
         let commitment = hyrax_commit(&evals, nu, &params);
-        assert_eq!(commitment.row_coms.len(), 1, "nu=0 should give a single row commitment");
+        assert_eq!(
+            commitment.row_coms.len(),
+            1,
+            "nu=0 should give a single row commitment"
+        );
 
         let point: Vec<Fr> = (0..sigma).map(|_| Fr::rand(&mut rng)).collect();
         let proof = hyrax_open(&evals, &point, nu, sigma);
@@ -380,7 +403,11 @@ mod tests {
         let expected: Fr = evals.iter().zip(basis.iter()).map(|(e, l)| *e * l).sum();
 
         let result = hyrax_verify(&commitment, expected, &point, &proof, &params);
-        assert!(result.is_ok(), "nu=0 verify should pass: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "nu=0 verify should pass: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -391,7 +418,9 @@ mod tests {
         let sigma = 2;
         let params = HyraxParams::new(sigma);
         let mut rng = test_rng();
-        let evals: Vec<Fr> = (0..(1 << (nu + sigma))).map(|_| Fr::rand(&mut rng)).collect();
+        let evals: Vec<Fr> = (0..(1 << (nu + sigma)))
+            .map(|_| Fr::rand(&mut rng))
+            .collect();
 
         let poly = DenseMLPoly::new(evals.clone());
         let point: Vec<Fr> = (0..(nu + sigma)).map(|_| Fr::rand(&mut rng)).collect();
@@ -401,7 +430,11 @@ mod tests {
         let commitment = hyrax_commit(&evals, nu, &params);
 
         let result = hyrax_verify(&commitment, expected, &point, &proof, &params);
-        assert!(result.is_ok(), "Hyrax eval should match DenseMLPoly eval: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Hyrax eval should match DenseMLPoly eval: {:?}",
+            result.err()
+        );
     }
 
     #[test]
