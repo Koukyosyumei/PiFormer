@@ -51,6 +51,7 @@ pub struct LayerNormWitness {
     pub sq_sum_x: Vec<F>,
     pub sum_x_sq: Vec<F>,
     pub sigma: Vec<F>,
+    pub sigma_sq_scaled: Vec<F>,
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +63,7 @@ pub struct LayerNormInternalCommitments {
     pub sq_sum_x_com: HyraxCommitment,
     pub sum_x_sq_com: HyraxCommitment,
     pub sigma_com: HyraxCommitment,
+    pub sigma_sq_com: HyraxCommitment,
 }
 
 pub struct LayerNormOpenings {
@@ -82,6 +84,8 @@ pub struct LayerNormOpenings {
     pub sq_sum_x_rsig_proof: HyraxProof,
     pub sigma_at_rsig: F,
     pub sigma_rsig_proof: HyraxProof,
+    pub sigma_sq_at_rsig: F,             // 【追加】
+    pub sigma_sq_rsig_proof: HyraxProof, // 【追加】
 
     // Constraint Fusion points for Y: (r_y_t, r_y_d)
     pub x_at_ry: F,
@@ -118,6 +122,11 @@ pub fn prove_layernorm(
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
     let d_f = F::from(d as u64);
     let sum_x_sq: Vec<F> = witness.sum_x.iter().map(|&s| s * s).collect();
+    let sigma_sq_scaled: Vec<F> = witness
+        .sigma
+        .iter()
+        .map(|&s| (d_f * s) * (d_f * s))
+        .collect();
 
     let x_mle = mat_to_mle(&witness.x, t, d);
     let y_mle = mat_to_mle(&witness.y, t, d);
@@ -125,6 +134,7 @@ pub fn prove_layernorm(
     let sq_sum_x_mle = vec_to_mle(&witness.sq_sum_x, t);
     let sum_x_sq_mle = vec_to_mle(&sum_x_sq, t);
     let sigma_mle = vec_to_mle(&witness.sigma, t);
+    let sigma_sq_mle = vec_to_mle(&sigma_sq_scaled, t);
 
     let (nu_td, sigma_td, _params_td) = poly_hyrax(&x_mle);
     let (nu_t, sigma_t, params_t) = poly_hyrax(&sum_x_mle);
@@ -138,19 +148,19 @@ pub fn prove_layernorm(
     let sq_sum_x_com = hyrax_commit(&sq_sum_x_mle.evaluations, nu_t, &params_t);
     let sum_x_sq_com = hyrax_commit(&sum_x_sq_mle.evaluations, nu_t, &params_t);
     let sigma_com = hyrax_commit(&sigma_mle.evaluations, nu_t, &params_t);
+    let sigma_sq_com = hyrax_commit(&sigma_sq_mle.evaluations, nu_t, &params_t);
 
     absorb_com(transcript, b"sum_x_com", &sum_x_com);
     absorb_com(transcript, b"sq_sum_x_com", &sq_sum_x_com);
     absorb_com(transcript, b"sigma_com", &sigma_com);
     absorb_com(transcript, b"sum_x_sq_com", &sum_x_sq_com);
+    absorb_com(transcript, b"sigma_sq_com", &sigma_sq_com);
 
     // 3. Row audit challenge
     let r_t = challenge_vec(transcript, t_bits, b"layernorm_rt");
-    let alpha = transcript.challenge_field::<F>(b"batch_alpha");
 
     let claim_s = sum_x_mle.evaluate(&r_t);
     let claim_q = sq_sum_x_mle.evaluate(&r_t);
-    let claim_batch = alpha * claim_s + claim_q;
 
     transcript.append_field(b"claimed_s", &claim_s);
     transcript.append_field(b"claimed_q", &claim_q);
@@ -211,6 +221,7 @@ pub fn prove_layernorm(
             sq_sum_x_com,
             sigma_com,
             sum_x_sq_com,
+            sigma_sq_com,
         },
         mean_sumcheck,
         sigma_range_proof,
@@ -233,6 +244,8 @@ pub fn prove_layernorm(
             sq_sum_x_rsig_proof: hyrax_open(&sq_sum_x_mle.evaluations, &r_sig_t, nu_t, sigma_t),
             sigma_at_rsig: sigma_mle.evaluate(&r_sig_t),
             sigma_rsig_proof: hyrax_open(&sigma_mle.evaluations, &r_sig_t, nu_t, sigma_t),
+            sigma_sq_at_rsig: sigma_sq_mle.evaluate(&r_sig_t),
+            sigma_sq_rsig_proof: hyrax_open(&sigma_sq_mle.evaluations, &r_sig_t, nu_t, sigma_t),
             x_at_ry: x_mle.evaluate(&combine(&r_y_t, &r_y_d)),
             x_ry_proof: hyrax_open(
                 &x_mle.evaluations,
@@ -302,11 +315,15 @@ pub fn verify_layernorm(
         b"sum_x_sq_com",
         &proof.internal_coms.sum_x_sq_com,
     );
+    absorb_com(
+        transcript,
+        b"sigma_sq_com",
+        &proof.internal_coms.sigma_sq_com,
+    );
 
     // 2. Sumchecks
     let r_t = challenge_vec(transcript, t_bits, b"layernorm_rt");
-    let alpha = transcript.challenge_field::<F>(b"batch_alpha");
-    let claim_batch = alpha * proof.openings.sum_x_at_rt + proof.openings.sq_sum_x_at_rt;
+
     transcript.append_field(b"claimed_s", &proof.openings.sum_x_at_rt);
     transcript.append_field(b"claimed_q", &proof.openings.sq_sum_x_at_rt);
 
@@ -327,11 +344,13 @@ pub fn verify_layernorm(
     let r_sig_b = r_sig[t_bits];
 
     let v_ev = d_f * (d_f * proof.openings.sq_sum_x_at_rsig - proof.openings.sum_x_sq_at_rsig);
-    let dsi = d_f * proof.openings.sigma_at_rsig;
-    let lo_sig = v_ev - dsi * dsi;
-    let hi_sig = (dsi + d_f) * (dsi + d_f) - F::ONE - v_ev;
-    if sig_eval != (F::ONE - r_sig_b) * lo_sig + r_sig_b * hi_sig {
-        return Err("Sigma fusion mismatch".into());
+    let z_ev = proof.openings.sigma_sq_at_rsig;
+    let s_ev = proof.openings.sigma_at_rsig;
+    let lo_sig = v_ev - z_ev;
+    let hi_sig = z_ev + F::from(2u64) * d_f * d_f * s_ev + d_f * d_f - F::ONE - v_ev;
+    let expected = (F::ONE - r_sig_b) * lo_sig + r_sig_b * hi_sig;
+    if sig_eval != expected {
+        return Err("Chunk fusion mismatch: Sigma logic".into());
     }
 
     // 4. Y Constraint Fusion (O(D) to eval public weights, O(1) for residual)
@@ -444,7 +463,7 @@ mod layernorm_tests {
         let d_f = F::from(d as u64);
         let x = vec![
             vec![F::from(10u64), F::from(20u64)],
-            vec![F::from(30u64), F::from(40u64)],
+            vec![F::from(25u64), F::from(40u64)],
         ];
         let gamma = vec![F::from(2u64); d];
         let beta = vec![F::from(5u64); d];
@@ -467,11 +486,15 @@ mod layernorm_tests {
                 })
                 .sum();
         }
-        let sigma = vec![F::from(7u64); t];
+        let sigma = vec![F::from(7u64), F::from(10u64)];
         let y = vec![
             vec![F::from(4u64), F::from(6u64)],
-            vec![F::from(4u64), F::from(6u64)],
+            vec![F::from(4u64), F::from(7u64)],
         ];
+        let sigma_sq_scaled = sigma
+            .iter()
+            .map(|&s| (d_f * s) * (d_f * s))
+            .collect::<Vec<F>>();
 
         let witness = LayerNormWitness {
             x: x.clone(),
@@ -480,6 +503,7 @@ mod layernorm_tests {
             sq_sum_x,
             sigma,
             sum_x_sq,
+            sigma_sq_scaled,
         };
         let vk = LayerNormVerifyingKey {
             seq_len: t,

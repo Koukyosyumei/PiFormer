@@ -208,6 +208,7 @@ fn build_ln_witness(x: &[Vec<F>], d_model: usize) -> LayerNormWitness {
                 sigma: vec![F::from(7u64), F::from(7u64)],
                 sq_sum_x: todo!(),
                 sum_x_sq: todo!(),
+                sigma_sq_scaled: todo!(),
             };
         }
     }
@@ -218,5 +219,6 @@ fn build_ln_witness(x: &[Vec<F>], d_model: usize) -> LayerNormWitness {
         sigma: vec![F::ZERO; t],
         sq_sum_x: todo!(),
         sum_x_sq: todo!(),
+        sigma_sq_scaled: todo!(),
     }
 }
