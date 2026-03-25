@@ -15,8 +15,7 @@
 use crate::field::F;
 use crate::pcs::absorb_com;
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment,
-    HyraxProof,
+    hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment, HyraxProof,
 };
 use crate::poly::utils::{combine, eval_cols_ternary, eval_rows, mat_to_mle};
 use crate::poly::DenseMLPoly;
@@ -261,6 +260,7 @@ pub fn verify_projection_succinct(
 #[cfg(test)]
 mod projection_tests {
     use super::*;
+    use ark_ff::Field;
     use ark_ff::{One, Zero};
 
     /// Simulates the Pipeline Setup + Forward Pass

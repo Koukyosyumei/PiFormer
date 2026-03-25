@@ -397,7 +397,9 @@ fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) 
 #[cfg(test)]
 mod ffn_tests {
     use super::*;
+    use ark_ff::Field;
     use ark_ff::One;
+    use ark_ff::PrimeField;
 
     fn setup_test_pipeline() -> (FFNProvingKey, FFNWitness, FFNInstance, FFNIOCommitments) {
         let t = 2usize;
