@@ -397,14 +397,14 @@ fn write_proj_openings<W: Write>(w: &mut W, o: &ProjectionOpenings) -> io::Resul
     write_ep!(w, &o.y_eval, &o.y_open);
     write_ep!(w, &o.x_eval, &o.x_open);
     write_ep!(w, &o.w_eval, &o.w_open);
+    write_ep!(w, &o.bias_at_rj, &o.bias_opening_proof);
     Ok(())
 }
 fn read_proj_openings<R: Read>(r: &mut R) -> io::Result<ProjectionOpenings> {
     let (y_eval, y_open) = read_ep!(r);
     let (x_eval, x_open) = read_ep!(r);
     let (w_eval, w_open) = read_ep!(r);
-    todo!()
-    /*
+    let (bias_at_rj, bias_opening_proof) = read_ep!(r);
     Ok(ProjectionOpenings {
         y_eval,
         y_open,
@@ -412,7 +412,9 @@ fn read_proj_openings<R: Read>(r: &mut R) -> io::Result<ProjectionOpenings> {
         x_open,
         w_eval,
         w_open,
-    })*/
+        bias_at_rj,
+        bias_opening_proof,
+    })
 }
 
 fn write_proj_proof<W: Write>(w: &mut W, p: &ProjectionProof) -> io::Result<()> {
@@ -689,30 +691,32 @@ fn write_proj_vk<W: Write>(w: &mut W, vk: &ProjectionVerifyingKey) -> io::Result
     write_usize(w, vk.seq_len)?;
     write_usize(w, vk.d_in)?;
     write_usize(w, vk.d_out)?;
-    write_hyrax_commitment(w, &vk.w_com)
+    write_hyrax_commitment(w, &vk.w_com)?;
+    write_f(w, &vk.alpha)?;
+    write_hyrax_commitment(w, &vk.bias_com)
 }
 fn read_proj_vk<R: Read>(r: &mut R) -> io::Result<ProjectionVerifyingKey> {
-    /*
     Ok(ProjectionVerifyingKey {
         seq_len: read_usize(r)?,
         d_in: read_usize(r)?,
         d_out: read_usize(r)?,
         w_com: read_hyrax_commitment(r)?,
-    })*/
-    todo!()
+        alpha: read_f(r)?,
+        bias_com: read_hyrax_commitment(r)?,
+    })
 }
 
 fn write_proj_pk<W: Write>(w: &mut W, pk: &ProjectionProvingKey) -> io::Result<()> {
     write_proj_vk(w, &pk.vk)?;
-    write_vec_vec_t(w, &pk.w)
+    write_vec_vec_t(w, &pk.w)?;
+    write_vec_f(w, &pk.bias)
 }
 fn read_proj_pk<R: Read>(r: &mut R) -> io::Result<ProjectionProvingKey> {
-    /*
     Ok(ProjectionProvingKey {
         vk: read_proj_vk(r)?,
         w: read_vec_vec_t(r)?,
-    })*/
-    todo!()
+        bias: read_vec_f(r)?,
+    })
 }
 
 fn write_ffn_vk<W: Write>(w: &mut W, vk: &FFNVerifyingKey) -> io::Result<()> {
@@ -791,11 +795,11 @@ fn read_block_vk<R: Read>(r: &mut R) -> io::Result<TransformerBlockVerifyingKey>
         )
     } else {
         // Stub PKs sufficient for verification (verifier never reads .w fields)
-        let stub_proj = |vk: &ProjectionVerifyingKey| /*ProjectionProvingKey {
+        let stub_proj = |vk: &ProjectionVerifyingKey| ProjectionProvingKey {
             vk: vk.clone(),
             w: vec![],
-        };*/
-        todo!();
+            bias: vec![],
+        };
         let stub_ffn = |vk: &FFNVerifyingKey| FFNProvingKey {
             vk: vk.clone(),
             w1: vec![],

@@ -41,9 +41,17 @@ fn make_block(d_model: usize, d_ff: usize) -> TransformerBlockWeights {
         ln1_gamma: vec![F::from(2u64); d_model],
         ln1_beta: vec![F::from(5u64); d_model],
         q_w: zero_ternary_mat(d_model, d_model),
+        q_alpha: F::ONE,
+        q_bias: vec![F::ZERO; d_model],
         k_w: zero_ternary_mat(d_model, d_model),
+        k_alpha: F::ONE,
+        k_bias: vec![F::ZERO; d_model],
         v_w: zero_ternary_mat(d_model, d_model),
+        v_alpha: F::ONE,
+        v_bias: vec![F::ZERO; d_model],
         o_w: zero_ternary_mat(d_model, d_model),
+        o_alpha: F::ONE,
+        o_bias: vec![F::ZERO; d_model],
         ln2_gamma: vec![F::from(2u64); d_model],
         ln2_beta: vec![F::from(5u64); d_model],
         ffn_w1: zero_ternary_mat(d_model, d_ff),
@@ -67,6 +75,8 @@ pub fn build_zero_weights(
         final_ln_gamma: vec![F::from(2u64); d_model],
         final_ln_beta: vec![F::from(5u64); d_model],
         lm_head_w: zero_ternary_mat(d_model, vocab_size),
+        lm_head_alpha: F::ONE,
+        lm_head_bias: vec![F::ZERO; vocab_size],
     }
 }
 

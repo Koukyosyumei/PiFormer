@@ -171,7 +171,9 @@ pub fn prove_projection(
     let g_w = DenseMLPoly::from_vec_padded(g_w_evals);
 
     // Sumcheck の和の期待値は Y(r_t, r_out) - bias(r_out) と一致するはず
-    let y_eval = y_mle.evaluate(&combine(&r_out, &r_t));
+    // mat_to_mle layout: evals[i*c_p2+j], rows=MSB → evaluate([r_row, r_col])
+    // Y is (t × d_out): evaluate([r_t, r_out]) = combine(&r_t, &r_out)
+    let y_eval = y_mle.evaluate(&combine(&r_t, &r_out));
     let bias_eval = bias_mle.evaluate(&r_out);
     let target_z = y_eval - bias_eval;
 
@@ -182,11 +184,14 @@ pub fn prove_projection(
         sumcheck,
         openings: ProjectionOpenings {
             y_eval,
-            y_open: hyrax_open(&y_mle.evaluations, &combine(&r_out, &r_t), nu_y, sigma_y),
-            x_eval: x_mle.evaluate(&combine(&r_k, &r_t)), // 生の X を開示
-            x_open: hyrax_open(&x_mle.evaluations, &combine(&r_k, &r_t), nu_x, sigma_x),
-            w_eval: w_mle.evaluate(&combine(&r_out, &r_k)), // 生の W を開示
-            w_open: hyrax_open(&w_mle.evaluations, &combine(&r_out, &r_k), nu_w, sigma_w),
+            // Y is (t × d_out): combine(&r_t, &r_out)
+            y_open: hyrax_open(&y_mle.evaluations, &combine(&r_t, &r_out), nu_y, sigma_y),
+            // X is (t × d_in): evaluate([r_t, r_k]) = combine(&r_t, &r_k)
+            x_eval: x_mle.evaluate(&combine(&r_t, &r_k)),
+            x_open: hyrax_open(&x_mle.evaluations, &combine(&r_t, &r_k), nu_x, sigma_x),
+            // W is (d_in × d_out): evaluate([r_k, r_out]) = combine(&r_k, &r_out)
+            w_eval: w_mle.evaluate(&combine(&r_k, &r_out)),
+            w_open: hyrax_open(&w_mle.evaluations, &combine(&r_k, &r_out), nu_w, sigma_w),
             bias_at_rj: bias_eval,
             bias_opening_proof: hyrax_open(&bias_mle.evaluations, &r_out, nu_b, sigma_b),
         },
@@ -207,9 +212,9 @@ pub fn verify_projection(
     io_coms: &ProjectionIOCommitments,
     transcript: &mut Transcript,
 ) -> Result<(), String> {
-    let t_bits = vk.seq_len.trailing_zeros() as usize;
-    let in_bits = vk.d_in.trailing_zeros() as usize;
-    let out_bits = vk.d_out.trailing_zeros() as usize;
+    let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
+    let in_bits = vk.d_in.next_power_of_two().trailing_zeros() as usize;
+    let out_bits = vk.d_out.next_power_of_two().trailing_zeros() as usize;
 
     // 1. Absorb (Proverと完全一致)
     absorb_com(transcript, b"w_com", &vk.w_com);
@@ -235,29 +240,32 @@ pub fn verify_projection(
     }
 
     // 4. PCS Binding Verification
+    // X is (t × d_in): combine(&r_t, &r_k)
     let p_x = params_from_vars(t_bits + in_bits).2;
     hyrax_verify(
         &io_coms.x_com,
         proof.openings.x_eval,
-        &combine(&r_k, &r_t),
+        &combine(&r_t, &r_k),
         &proof.openings.x_open,
         &p_x,
     )?;
 
+    // W is (d_in × d_out): combine(&r_k, &r_out)
     let p_w = params_from_vars(in_bits + out_bits).2;
     hyrax_verify(
         &vk.w_com,
         proof.openings.w_eval,
-        &combine(&r_out, &r_k),
+        &combine(&r_k, &r_out),
         &proof.openings.w_open,
         &p_w,
     )?;
 
+    // Y is (t × d_out): combine(&r_t, &r_out)
     let p_y = params_from_vars(t_bits + out_bits).2;
     hyrax_verify(
         &io_coms.y_com,
         proof.openings.y_eval,
-        &combine(&r_out, &r_t),
+        &combine(&r_t, &r_out),
         &proof.openings.y_open,
         &p_y,
     )?;

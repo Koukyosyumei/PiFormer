@@ -404,9 +404,17 @@ mod tests {
             ln1_gamma: vec![F::from(2u64); D],
             ln1_beta: vec![F::from(5u64); D],
             q_w,
+            q_alpha: F::ONE,
+            q_bias: vec![F::ZERO; D],
             k_w,
+            k_alpha: F::ONE,
+            k_bias: vec![F::ZERO; D],
             v_w,
+            v_alpha: F::ONE,
+            v_bias: vec![F::ZERO; D],
             o_w,
+            o_alpha: F::ONE,
+            o_bias: vec![F::ZERO; D],
             ln2_gamma: vec![F::from(2u64); D],
             ln2_beta: vec![F::from(5u64); D],
             ffn_w1,
@@ -422,6 +430,8 @@ mod tests {
             final_ln_gamma: vec![F::from(2u64); D],
             final_ln_beta: vec![F::from(5u64); D],
             lm_head_w,
+            lm_head_alpha: F::ONE,
+            lm_head_bias: vec![F::ZERO; V],
         }
     }
 

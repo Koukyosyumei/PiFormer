@@ -23,9 +23,17 @@ pub struct TransformerBlockWeights {
     pub ln1_beta: Vec<F>,
     // Linear Projections (Attention)
     pub q_w: Vec<Vec<TernaryValue>>, // d_model × d_model
+    pub q_alpha: F,
+    pub q_bias: Vec<F>,
     pub k_w: Vec<Vec<TernaryValue>>, // d_model × d_model
+    pub k_alpha: F,
+    pub k_bias: Vec<F>,
     pub v_w: Vec<Vec<TernaryValue>>, // d_model × d_model
+    pub v_alpha: F,
+    pub v_bias: Vec<F>,
     pub o_w: Vec<Vec<TernaryValue>>, // d_model × d_model
+    pub o_alpha: F,
+    pub o_bias: Vec<F>,
     // LayerNorm 2
     pub ln2_gamma: Vec<F>,
     pub ln2_beta: Vec<F>,
@@ -47,6 +55,8 @@ pub struct TransformerModelWeights {
     pub final_ln_gamma: Vec<F>,
     pub final_ln_beta: Vec<F>,
     pub lm_head_w: Vec<Vec<TernaryValue>>, // d_model × vocab_size
+    pub lm_head_alpha: F,
+    pub lm_head_bias: Vec<F>,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,10 +101,10 @@ pub fn preprocess_transformer_model(
         };
 
         // --- Projectionの事前計算 (ここで重い O(N) の hyrax_commit が走る) ---
-        let q_pk: ProjectionProvingKey = todo!(); //preprocess_projection(t, d, d, bw.q_w.clone());
-        let k_pk: ProjectionProvingKey = todo!(); //preprocess_projection(t, d, d, bw.k_w.clone());
-        let v_pk: ProjectionProvingKey = todo!(); //preprocess_projection(t, d, d, bw.v_w.clone());
-        let o_pk: ProjectionProvingKey = todo!(); //preprocess_projection(t, d, d, bw.o_w.clone());
+        let q_pk = preprocess_projection(t, d, d, bw.q_w.clone(), bw.q_alpha, bw.q_bias.clone());
+        let k_pk = preprocess_projection(t, d, d, bw.k_w.clone(), bw.k_alpha, bw.k_bias.clone());
+        let v_pk = preprocess_projection(t, d, d, bw.v_w.clone(), bw.v_alpha, bw.v_bias.clone());
+        let o_pk = preprocess_projection(t, d, d, bw.o_w.clone(), bw.o_alpha, bw.o_bias.clone());
 
         // --- FFNの事前計算 ---
         let ffn_pk = preprocess_ffn(t, d, f_dim, bw.ffn_w1.clone(), bw.ffn_w2.clone());
@@ -133,7 +143,14 @@ pub fn preprocess_transformer_model(
     };
 
     // --- LM Head (Vocabulary Projection) ---
-    let lm_head_pk: ProjectionProvingKey = todo!(); //preprocess_projection(t, d, v, weights.lm_head_w.clone());
+    let lm_head_pk = preprocess_projection(
+        t,
+        d,
+        v,
+        weights.lm_head_w.clone(),
+        weights.lm_head_alpha,
+        weights.lm_head_bias.clone(),
+    );
 
     // --- 全体のVerifying Key ---
     let model_vk = TransformerModelVerifyingKey {
