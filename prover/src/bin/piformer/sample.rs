@@ -206,19 +206,31 @@ fn build_ln_witness(x: &[Vec<F>], d_model: usize) -> LayerNormWitness {
                 ],
                 sum_x: vec![F::from(30u64), F::from(70u64)],
                 sigma: vec![F::from(7u64), F::from(7u64)],
-                sq_sum_x: todo!(),
-                sum_x_sq: todo!(),
-                sigma_sq_scaled: todo!(),
+                // sq_sum_x[i] = sum_j x[i][j]^2: [10^2+20^2=500, 30^2+40^2=2500]
+                sq_sum_x: vec![F::from(500u64), F::from(2500u64)],
+                // sum_x_sq[i] = sum_x[i]^2: [30^2=900, 70^2=4900]
+                sum_x_sq: vec![F::from(900u64), F::from(4900u64)],
+                // sigma_sq_scaled[i] = (d*sigma[i])^2 = (2*7)^2=196
+                sigma_sq_scaled: vec![F::from(196u64), F::from(196u64)],
             };
         }
     }
+    // Generic fallback: sigma=0, sum_x=0 (placeholder, not valid for real proving)
+    let d_f = F::from(d_model as u64);
+    let sq_sum_x: Vec<F> = x
+        .iter()
+        .map(|row| row.iter().copied().map(|v| v * v).sum())
+        .collect();
+    let sum_x_sq = vec![F::ZERO; t];
+    let sigma_sq_scaled = vec![F::ZERO; t];
+    let _ = d_f; // d_f not needed when sigma=0
     LayerNormWitness {
         x: x.to_vec(),
         y: vec![vec![F::ZERO; d_model]; t],
         sum_x: vec![F::ZERO; t],
         sigma: vec![F::ZERO; t],
-        sq_sum_x: todo!(),
-        sum_x_sq: todo!(),
-        sigma_sq_scaled: todo!(),
+        sq_sum_x,
+        sum_x_sq,
+        sigma_sq_scaled,
     }
 }

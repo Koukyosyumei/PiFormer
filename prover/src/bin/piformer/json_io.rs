@@ -326,19 +326,31 @@ fn ln_wit_to_json(w: &LayerNormWitness) -> JsonLayerNormWitness {
         y: mat_to_json(&w.y),
         sum_x: vec_to_json(&w.sum_x),
         sigma: vec_to_json(&w.sigma),
-        var_x: todo!(),
+        // var_x stores sq_sum_x (sum of squares per row)
+        var_x: vec_to_json(&w.sq_sum_x),
     }
 }
 
 fn ln_wit_from_json(j: JsonLayerNormWitness) -> Result<LayerNormWitness, String> {
+    let x = mat_from_json(j.x)?;
+    let y = mat_from_json(j.y)?;
+    let sum_x = vec_from_json(j.sum_x)?;
+    let sigma = vec_from_json(j.sigma)?;
+    // var_x in JSON encodes sq_sum_x (sum of squares per row)
+    let sq_sum_x = vec_from_json(j.var_x)?;
+    // sum_x_sq and sigma_sq_scaled are derived quantities
+    let d = x.first().map(|r| r.len()).unwrap_or(0);
+    let d_f = F::from(d as u64);
+    let sum_x_sq: Vec<F> = sum_x.iter().map(|&s| s * s).collect();
+    let sigma_sq_scaled: Vec<F> = sigma.iter().map(|&s| (d_f * s) * (d_f * s)).collect();
     Ok(LayerNormWitness {
-        x: mat_from_json(j.x)?,
-        y: mat_from_json(j.y)?,
-        sum_x: vec_from_json(j.sum_x)?,
-        sigma: vec_from_json(j.sigma)?,
-        sq_sum_x: todo!(),
-        sum_x_sq: todo!(),
-        sigma_sq_scaled: todo!(),
+        x,
+        y,
+        sum_x,
+        sigma,
+        sq_sum_x,
+        sum_x_sq,
+        sigma_sq_scaled,
     })
 }
 

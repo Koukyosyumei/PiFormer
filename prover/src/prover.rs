@@ -453,9 +453,12 @@ mod tests {
             ],
             sum_x: vec![F::from(30u64), F::from(70u64)],
             sigma: vec![F::from(7u64), F::from(7u64)],
-            sq_sum_x: todo!(),
-            sum_x_sq: todo!(),
-            sigma_sq_scaled: todo!(),
+            // sq_sum_x[i] = sum_j x[i][j]^2: row0=10^2+20^2=500, row1=30^2+40^2=2500
+            sq_sum_x: vec![F::from(500u64), F::from(2500u64)],
+            // sum_x_sq[i] = sum_x[i]^2: 30^2=900, 70^2=4900
+            sum_x_sq: vec![F::from(900u64), F::from(4900u64)],
+            // sigma_sq_scaled[i] = (d*sigma[i])^2 = (2*7)^2=196
+            sigma_sq_scaled: vec![F::from(196u64), F::from(196u64)],
         }
     }
 
@@ -473,9 +476,12 @@ mod tests {
             ],
             sum_x: vec![F::from(158u64), F::from(198u64)],
             sigma: vec![F::from(83u64), F::from(83u64)],
-            sq_sum_x: todo!(),
-            sum_x_sq: todo!(),
-            sigma_sq_scaled: todo!(),
+            // sq_sum_x[i] = sum_j x[i][j]^2: row0=138^2+20^2=19444, row1=158^2+40^2=26564
+            sq_sum_x: vec![F::from(19444u64), F::from(26564u64)],
+            // sum_x_sq[i] = sum_x[i]^2: 158^2=24964, 198^2=39204
+            sum_x_sq: vec![F::from(24964u64), F::from(39204u64)],
+            // sigma_sq_scaled[i] = (d*sigma[i])^2 = (2*83)^2=27556
+            sigma_sq_scaled: vec![F::from(27556u64), F::from(27556u64)],
         }
     }
 
@@ -493,9 +499,12 @@ mod tests {
             ],
             sum_x: vec![F::from(164u64), F::from(204u64)],
             sigma: vec![F::from(87u64), F::from(87u64)],
-            sq_sum_x: todo!(),
-            sum_x_sq: todo!(),
-            sigma_sq_scaled: todo!(),
+            // sq_sum_x[i] = sum_j x[i][j]^2: row0=144^2+20^2=21136, row1=164^2+40^2=28496
+            sq_sum_x: vec![F::from(21136u64), F::from(28496u64)],
+            // sum_x_sq[i] = sum_x[i]^2: 164^2=26896, 204^2=41616
+            sum_x_sq: vec![F::from(26896u64), F::from(41616u64)],
+            // sigma_sq_scaled[i] = (d*sigma[i])^2 = (2*87)^2=30276
+            sigma_sq_scaled: vec![F::from(30276u64), F::from(30276u64)],
         }
     }
 
