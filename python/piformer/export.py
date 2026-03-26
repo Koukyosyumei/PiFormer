@@ -93,11 +93,22 @@ def _proj_weight_int(
     expects (d_in × d_out), so we transpose.
     """
     weight_float = linear.weight.detach().tolist()  # out × in
-    alpha = float(linear.alpha)
-    # Pass alpha=1.0 so entries are exactly {-1, 0, 1}; the Rust prover
-    # expects the raw sign matrix, not values scaled by alpha.
+    # Pass alpha=1.0 so entries are exactly {-1, 0, 1}; alpha is exported
+    # separately as the q_alpha/k_alpha/... field in the JSON.
     w_out_in = extract_ternary_weight_matrix(weight_float, 1.0)
     return mat_transpose(w_out_in)  # → in × out
+
+
+def _proj_alpha_int(linear: "TernaryLinear") -> int:  # noqa: F821
+    """Return the integer alpha for a TernaryLinear (matches witness computation)."""
+    return max(1, round(float(linear.alpha)))
+
+
+def _proj_bias_ints(linear: "TernaryLinear") -> List[int]:  # noqa: F821
+    """Return the integer bias list for a TernaryLinear (empty if no bias)."""
+    if not hasattr(linear, "bias") or linear.bias is None:
+        return []
+    return [round(b) for b in linear.bias.detach().tolist()]
 
 
 # ---------------------------------------------------------------------------
@@ -167,10 +178,17 @@ def export_weights_rust(
         blocks_json.append({
             "ln1_gamma": vec_to_json(ln1_gamma),
             "ln1_beta":  vec_to_json(ln1_beta),
+            # q/k/v: witness does not apply bias, so export empty bias
             "q_w":  q_w,
+            "q_alpha": int_to_field_hex(_proj_alpha_int(attn.q_proj)),
             "k_w":  k_w,
+            "k_alpha": int_to_field_hex(_proj_alpha_int(attn.k_proj)),
             "v_w":  v_w,
+            "v_alpha": int_to_field_hex(_proj_alpha_int(attn.v_proj)),
+            # o_proj: witness applies bias, so export it
             "o_w":  o_w,
+            "o_alpha": int_to_field_hex(_proj_alpha_int(attn.out_proj)),
+            "o_bias": vec_to_json(_proj_bias_ints(attn.out_proj)),
             "ln2_gamma": vec_to_json(ln2_gamma),
             "ln2_beta":  vec_to_json(ln2_beta),
             "ffn_w1": ffn_w1,
@@ -192,6 +210,8 @@ def export_weights_rust(
         "final_ln_gamma":   vec_to_json(final_ln_gamma),
         "final_ln_beta":    vec_to_json(final_ln_beta),
         "lm_head_w":        lm_head_w,
+        "lm_head_alpha":    int_to_field_hex(_proj_alpha_int(model.head)),
+        # lm_head: witness does not apply bias, so export empty bias (omitted = default [])
     }
 
     Path(out_path).write_text(json.dumps(payload, indent=2))

@@ -229,8 +229,8 @@ pub fn verify_projection(
     // 2. Sumcheck 検証
     // ターゲットは Y - bias (alpha.inv を使わない)
     let target_z = proof.openings.y_eval - proof.openings.bias_at_rj;
-    let (r_k, final_sumcheck_val) =
-        verify_sumcheck(&proof.sumcheck, target_z, in_bits, transcript)?;
+    let (r_k, final_sumcheck_val) = verify_sumcheck(&proof.sumcheck, target_z, in_bits, transcript)
+        .map_err(|e| format!("Projection Sumcheck: {e}"))?;
     transcript.append_field(b"claimed_y", &proof.openings.y_eval);
 
     // 3. 代数関係のチェック

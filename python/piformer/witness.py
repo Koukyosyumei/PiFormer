@@ -278,18 +278,15 @@ def _gen_block_witness(
     )
 
     # ---- FFN ----
+    # FFN: Rust circuit proves M = X @ W1_ternary and Y = A @ W2_ternary
+    # with no alpha scaling and no bias.  Use alpha=1.0 and skip bias here.
     w1 = extract_ternary_weight_matrix(
         ffn.fc1.weight.detach().tolist(),
-        float(ffn.fc1.alpha.detach()),
+        1.0,
         quant_scale=1,
     )
     w1_T = mat_transpose(w1)  # (d_model, d_ff)
-    w1_bias = (
-        [round(b) for b in ffn.fc1.bias.detach().tolist()]
-        if ffn.fc1.bias is not None
-        else None
-    )
-    ffn_m = _add_bias_int(_project(ln2_y, w1_T), w1_bias)
+    ffn_m = _project(ln2_y, w1_T)
 
     ffn_a, ffn_q_indices, ffn_q_outputs = _phi_mat(
         ffn_m, ffn_tables_int, ffn_num_bits, ffn_c, ffn_phi_scale, quant_scale
@@ -297,16 +294,11 @@ def _gen_block_witness(
 
     w2 = extract_ternary_weight_matrix(
         ffn.fc2.weight.detach().tolist(),
-        float(ffn.fc2.alpha.detach()),
+        1.0,
         quant_scale=1,
     )
     w2_T = mat_transpose(w2)  # (d_ff, d_model)
-    w2_bias = (
-        [round(b) for b in ffn.fc2.bias.detach().tolist()]
-        if ffn.fc2.bias is not None
-        else None
-    )
-    ffn_y = _add_bias_int(_project(ffn_a, w2_T), w2_bias)
+    ffn_y = _project(ffn_a, w2_T)
 
     # ---- Residual 2 ----
     x_out = mat_add_int(x_mid, ffn_y)
