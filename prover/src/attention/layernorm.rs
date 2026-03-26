@@ -236,8 +236,7 @@ pub fn prove_layernorm(
     let (y_range_proof, r_y) = prove_range(&RangeProofWitness { values: y_res }, 32, transcript)?;
     let r_y_t = r_y[0..t_bits].to_vec();
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
-    let r_y_b = r_y[t_bits + d_bits];
-    println!("{:?} {:?} {}", r_y_t, r_y_d, r_y_b);
+    let _r_y_b = r_y[t_bits + d_bits];
 
     // 7. Openings
 
@@ -404,7 +403,6 @@ pub fn verify_layernorm(
     let r_y_t = r_y[0..t_bits].to_vec();
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
     let r_y_b = r_y[t_bits + d_bits];
-    println!("{:?} {:?} {}", r_y_t, r_y_d, r_y_b);
 
     let gamma_r = vec_to_mle(&vk.gamma, d).evaluate(&r_y_d);
     let beta_r = vec_to_mle(&vk.beta, d).evaluate(&r_y_d);
@@ -421,10 +419,8 @@ pub fn verify_layernorm(
     let expr2 = two * expr;
     let lo_y = expr2 - (two * d_f * sigma_y - sig_d);
     let hi_y = (two * d_f * sigma_y + sig_d) - F::ONE - expr2;
-
     let expected_y_res = (F::ONE - r_y_b) * lo_y + r_y_b * hi_y;
 
-    println!("aaaaaaaaa {} {}", y_eval, expected_y_res);
     if y_eval != expected_y_res {
         return Err("Y constraint fusion mismatch".into());
     }
