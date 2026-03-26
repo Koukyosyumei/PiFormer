@@ -5,7 +5,7 @@
 //! 生成された `VerifyingKey` は非常に小さく、スマートコントラクトやスマホに配布されます。
 
 use crate::attention::layernorm::LayerNormVerifyingKey;
-use crate::attention::projection::preprocess_projection;
+use crate::attention::projection::{preprocess_projection, ProjectionProvingKey};
 use crate::ffn::ffn::preprocess_ffn;
 use crate::field::F;
 use crate::poly::utils::TernaryValue;
@@ -91,10 +91,10 @@ pub fn preprocess_transformer_model(
         };
 
         // --- Projectionの事前計算 (ここで重い O(N) の hyrax_commit が走る) ---
-        let q_pk = preprocess_projection(t, d, d, bw.q_w.clone());
-        let k_pk = preprocess_projection(t, d, d, bw.k_w.clone());
-        let v_pk = preprocess_projection(t, d, d, bw.v_w.clone());
-        let o_pk = preprocess_projection(t, d, d, bw.o_w.clone());
+        let q_pk: ProjectionProvingKey = todo!(); //preprocess_projection(t, d, d, bw.q_w.clone());
+        let k_pk: ProjectionProvingKey = todo!(); //preprocess_projection(t, d, d, bw.k_w.clone());
+        let v_pk: ProjectionProvingKey = todo!(); //preprocess_projection(t, d, d, bw.v_w.clone());
+        let o_pk: ProjectionProvingKey = todo!(); //preprocess_projection(t, d, d, bw.o_w.clone());
 
         // --- FFNの事前計算 ---
         let ffn_pk = preprocess_ffn(t, d, f_dim, bw.ffn_w1.clone(), bw.ffn_w2.clone());
@@ -133,7 +133,7 @@ pub fn preprocess_transformer_model(
     };
 
     // --- LM Head (Vocabulary Projection) ---
-    let lm_head_pk = preprocess_projection(t, d, v, weights.lm_head_w.clone());
+    let lm_head_pk: ProjectionProvingKey = todo!(); //preprocess_projection(t, d, v, weights.lm_head_w.clone());
 
     // --- 全体のVerifying Key ---
     let model_vk = TransformerModelVerifyingKey {
