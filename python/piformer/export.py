@@ -71,7 +71,7 @@ def _ln_weights_int(
     ``beta_floor`` is computed adaptively from ``x_rows`` if provided,
     otherwise ``extra_beta_floor`` is used as a conservative default.
     """
-    gamma_int = [max(1, round(float(w) * ln_scale)) for w in ln.weight]
+    gamma_int = [max(1, round(abs(float(w)) * ln_scale)) for w in ln.weight]
     beta_raw = [round(float(b) * ln_scale) for b in ln.bias]
 
     if x_rows is not None:
@@ -93,9 +93,22 @@ def _proj_weight_int(
     expects (d_in × d_out), so we transpose.
     """
     weight_float = linear.weight.detach().tolist()  # out × in
-    alpha = float(linear.alpha)
-    w_out_in = extract_ternary_weight_matrix(weight_float, alpha, quant_scale)
+    # Pass alpha=1.0 so entries are exactly {-1, 0, 1}; alpha is exported
+    # separately as the q_alpha/k_alpha/... field in the JSON.
+    w_out_in = extract_ternary_weight_matrix(weight_float, 1.0)
     return mat_transpose(w_out_in)  # → in × out
+
+
+def _proj_alpha_int(linear: "TernaryLinear") -> int:  # noqa: F821
+    """Return the integer alpha for a TernaryLinear (matches witness computation)."""
+    return max(1, round(float(linear.alpha)))
+
+
+def _proj_bias_ints(linear: "TernaryLinear") -> List[int]:  # noqa: F821
+    """Return the integer bias list for a TernaryLinear (empty if no bias)."""
+    if not hasattr(linear, "bias") or linear.bias is None:
+        return []
+    return [round(b) for b in linear.bias.detach().tolist()]
 
 
 # ---------------------------------------------------------------------------
@@ -110,16 +123,21 @@ def export_weights_rust(
     quant_scale: int = 64,
     ln_scale: int = 4,
     extra_beta_floor: int = 8,
+    block_ln_weights: Optional[List] = None,
+    final_ln_weights: Optional[tuple] = None,
 ) -> None:
     """Write ``weights.json`` in the format expected by the Rust prover.
 
     Args:
-        model:             Trained PiFormerModel (eval mode recommended).
-        out_path:          Destination file path.
-        quant_scale:       Integer scale applied to TernaryLinear alpha values.
-        ln_scale:          Integer scale applied to LayerNorm gamma/beta.
-        extra_beta_floor:  Extra margin added to the auto-computed beta_floor
-                           for safety.
+        model:              Trained PiFormerModel (eval mode recommended).
+        out_path:           Destination file path.
+        quant_scale:        Integer scale applied to TernaryLinear alpha values.
+        ln_scale:           Integer scale applied to LayerNorm gamma/beta.
+        extra_beta_floor:   Extra margin added to the auto-computed beta_floor.
+        block_ln_weights:   Pre-computed list of (ln1_gamma, ln1_beta,
+                            ln2_gamma, ln2_beta) per block.  When provided,
+                            these are used directly instead of recomputing.
+        final_ln_weights:   Pre-computed (gamma, beta) for the final LN layer.
 
     Raises:
         ValueError: if model.blocks[0].attn.n_heads != 1.
@@ -138,17 +156,17 @@ def export_weights_rust(
     vocab_size = model.embedding.num_embeddings
     d_ff = model.blocks[0].ffn.fc1.out_features if n_layers > 0 else 0
 
-    # We don't have runtime x_rows at export time, so use extra_beta_floor
-    # conservatively.  The witness exporter (export_witness_rust) will use
-    # actual activations for tighter bounds.
     def _ln(ln: nn.LayerNorm) -> tuple[List[int], List[int]]:
         return _ln_weights_int(ln, None, d, ln_scale, extra_beta_floor)
 
     blocks_json = []
-    for blk in model.blocks:
+    for i, blk in enumerate(model.blocks):
         attn = blk.attn
-        ln1_gamma, ln1_beta = _ln(blk.norm1)
-        ln2_gamma, ln2_beta = _ln(blk.norm2)
+        if block_ln_weights and i < len(block_ln_weights):
+            ln1_gamma, ln1_beta, ln2_gamma, ln2_beta = block_ln_weights[i]
+        else:
+            ln1_gamma, ln1_beta = _ln(blk.norm1)
+            ln2_gamma, ln2_beta = _ln(blk.norm2)
 
         q_w = _proj_weight_int(attn.q_proj, quant_scale)   # d × d
         k_w = _proj_weight_int(attn.k_proj, quant_scale)
@@ -160,17 +178,27 @@ def export_weights_rust(
         blocks_json.append({
             "ln1_gamma": vec_to_json(ln1_gamma),
             "ln1_beta":  vec_to_json(ln1_beta),
-            "q_w":  mat_to_json(q_w),
-            "k_w":  mat_to_json(k_w),
-            "v_w":  mat_to_json(v_w),
-            "o_w":  mat_to_json(o_w),
+            # q/k/v: witness does not apply bias, so export empty bias
+            "q_w":  q_w,
+            "q_alpha": int_to_field_hex(_proj_alpha_int(attn.q_proj)),
+            "k_w":  k_w,
+            "k_alpha": int_to_field_hex(_proj_alpha_int(attn.k_proj)),
+            "v_w":  v_w,
+            "v_alpha": int_to_field_hex(_proj_alpha_int(attn.v_proj)),
+            # o_proj: witness applies bias, so export it
+            "o_w":  o_w,
+            "o_alpha": int_to_field_hex(_proj_alpha_int(attn.out_proj)),
+            "o_bias": vec_to_json(_proj_bias_ints(attn.out_proj)),
             "ln2_gamma": vec_to_json(ln2_gamma),
             "ln2_beta":  vec_to_json(ln2_beta),
-            "ffn_w1": mat_to_json(ffn_w1),
-            "ffn_w2": mat_to_json(ffn_w2),
+            "ffn_w1": ffn_w1,
+            "ffn_w2": ffn_w2,
         })
 
-    final_ln_gamma, final_ln_beta = _ln(model.norm)
+    if final_ln_weights is not None:
+        final_ln_gamma, final_ln_beta = final_ln_weights
+    else:
+        final_ln_gamma, final_ln_beta = _ln(model.norm)
     lm_head_w = _proj_weight_int(model.head, quant_scale)  # d × vocab_size
 
     payload = {
@@ -181,7 +209,9 @@ def export_weights_rust(
         "blocks":           blocks_json,
         "final_ln_gamma":   vec_to_json(final_ln_gamma),
         "final_ln_beta":    vec_to_json(final_ln_beta),
-        "lm_head_w":        mat_to_json(lm_head_w),
+        "lm_head_w":        lm_head_w,
+        "lm_head_alpha":    int_to_field_hex(_proj_alpha_int(model.head)),
+        # lm_head: witness does not apply bias, so export empty bias (omitted = default [])
     }
 
     Path(out_path).write_text(json.dumps(payload, indent=2))
@@ -246,22 +276,36 @@ def export_all(
 ) -> None:
     """Export both weights and witness in a single call.
 
+    Generates the witness first (which computes actual LN gamma/beta from
+    real activations), then exports weights using those same gamma/beta values
+    so the verifying key is guaranteed to match the witness.
+
     Writes:
         ``weights_path``  — JSON weights for ``piformer setup``
         ``witness_path``  — JSON witness for ``piformer prove``
     """
+    # Step 1: Generate the witness, capturing the per-layer LN weights used.
+    gen = WitnessGenerator(
+        quant_scale=quant_scale,
+        ln_scale=ln_scale,
+        extra_beta_floor=extra_beta_floor,
+        lasso_sigma=lasso_sigma,
+    )
+    witness_dict = gen.generate(model, token_ids)
+    Path(witness_path).write_text(json.dumps(witness_dict, indent=2))
+    seq_len = len(token_ids)
+    print(f"[export] witness.json → {witness_path}  "
+          f"(seq_len={seq_len}, lasso_sigma={lasso_sigma})")
+
+    # Step 2: Export weights using the same per-layer gamma/beta that the
+    # witness used, so the verifying key is consistent with the witness.
     export_weights_rust(
         model, weights_path,
         quant_scale=quant_scale,
         ln_scale=ln_scale,
         extra_beta_floor=extra_beta_floor,
-    )
-    export_witness_rust(
-        model, token_ids, witness_path,
-        quant_scale=quant_scale,
-        ln_scale=ln_scale,
-        extra_beta_floor=extra_beta_floor,
-        lasso_sigma=lasso_sigma,
+        block_ln_weights=gen.block_ln_weights,
+        final_ln_weights=gen.final_ln_weights,
     )
 
 

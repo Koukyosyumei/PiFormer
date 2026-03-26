@@ -243,7 +243,8 @@ pub fn verify_linear_attention(
     let claimed_out = proof.openings.out_eval;
     transcript.append_field(b"claimed_out", &claimed_out);
 
-    let (r_i, final_out) = verify_sumcheck(&proof.out_sumcheck, claimed_out, d_bits, transcript)?;
+    let (r_i, final_out) = verify_sumcheck(&proof.out_sumcheck, claimed_out, d_bits, transcript)
+        .map_err(|e| format!("Attn Out Sumcheck: {e}"))?;
     if final_out != proof.openings.phi_q_eval * proof.openings.ctx_eval {
         return Err("Out sumcheck mismatch".into());
     }
@@ -253,7 +254,8 @@ pub fn verify_linear_attention(
     transcript.append_field(b"claimed_ctx", &claimed_ctx);
 
     let (r_t, final_ctx) =
-        verify_sumcheck(&proof.context_sumcheck, claimed_ctx, t_bits, transcript)?;
+        verify_sumcheck(&proof.context_sumcheck, claimed_ctx, t_bits, transcript)
+            .map_err(|e| format!("Attn Context Sumcheck: {e}"))?;
     if final_ctx != proof.openings.phi_k_eval * proof.openings.v_eval {
         return Err("Context sumcheck mismatch".into());
     }

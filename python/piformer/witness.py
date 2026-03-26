@@ -278,18 +278,15 @@ def _gen_block_witness(
     )
 
     # ---- FFN ----
+    # FFN: Rust circuit proves M = X @ W1_ternary and Y = A @ W2_ternary
+    # with no alpha scaling and no bias.  Use alpha=1.0 and skip bias here.
     w1 = extract_ternary_weight_matrix(
         ffn.fc1.weight.detach().tolist(),
-        float(ffn.fc1.alpha.detach()),
+        1.0,
         quant_scale=1,
     )
     w1_T = mat_transpose(w1)  # (d_model, d_ff)
-    w1_bias = (
-        [round(b) for b in ffn.fc1.bias.detach().tolist()]
-        if ffn.fc1.bias is not None
-        else None
-    )
-    ffn_m = _add_bias_int(_project(ln2_y, w1_T), w1_bias)
+    ffn_m = _project(ln2_y, w1_T)
 
     ffn_a, ffn_q_indices, ffn_q_outputs = _phi_mat(
         ffn_m, ffn_tables_int, ffn_num_bits, ffn_c, ffn_phi_scale, quant_scale
@@ -297,16 +294,11 @@ def _gen_block_witness(
 
     w2 = extract_ternary_weight_matrix(
         ffn.fc2.weight.detach().tolist(),
-        float(ffn.fc2.alpha.detach()),
+        1.0,
         quant_scale=1,
     )
     w2_T = mat_transpose(w2)  # (d_ff, d_model)
-    w2_bias = (
-        [round(b) for b in ffn.fc2.bias.detach().tolist()]
-        if ffn.fc2.bias is not None
-        else None
-    )
-    ffn_y = _add_bias_int(_project(ffn_a, w2_T), w2_bias)
+    ffn_y = _project(ffn_a, w2_T)
 
     # ---- Residual 2 ----
     x_out = mat_add_int(x_mid, ffn_y)
@@ -457,14 +449,16 @@ class WitnessGenerator:
         q_lasso_last = k_lasso_last = ffn_lasso_last = None
         x_cur = x_in_int
 
+        block_ln_weights = []
         for blk in model.blocks:
             bwit, x_cur = _gen_block_witness(
                 x_cur, blk, self.quant_scale, self.ln_scale, self.extra_beta_floor
             )
             q_lasso_last, k_lasso_last = bwit.pop("_attn_lasso")
             ffn_lasso_last = bwit.pop("_ffn_lasso")
-            bwit.pop("_ln1_weights")
-            bwit.pop("_ln2_weights")
+            ln1_gamma, ln1_beta = bwit.pop("_ln1_weights")
+            ln2_gamma, ln2_beta = bwit.pop("_ln2_weights")
+            block_ln_weights.append((ln1_gamma, ln1_beta, ln2_gamma, ln2_beta))
             block_witnesses.append(bwit)
 
         # ---- Final LayerNorm ----
@@ -494,8 +488,18 @@ class WitnessGenerator:
         if q_lasso_last is None:
             raise RuntimeError("Model must have at least one block.")
 
+        # Derive lasso_sigma from bits_per_chunk to match lasso.rs:
+        #   nu = m // 2;  sigma = m - nu
+        m = model.blocks[0].attn.phi.bits_per_chunk
+        lasso_sigma = m - m // 2
+
+        # Expose per-layer LN weights for use by the weight exporter, so the
+        # verifying key gamma/beta matches what was used to compute witness y.
+        self.block_ln_weights = block_ln_weights
+        self.final_ln_weights = (final_gamma_int, final_beta_int)
+
         witness = {
-            "lasso_sigma": self.lasso_sigma,
+            "lasso_sigma": lasso_sigma,
             "x_in": mat_to_json(x_in_int),
             "inst_attn": {
                 "seq_len": seq_len,

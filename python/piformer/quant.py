@@ -143,10 +143,11 @@ def compute_ln_witness(
     protocol in ``attention/layernorm.rs``.
 
     Protocol:
-      sum_x[i]  = Σ_j x[i][j]
-      var_x[i]  = Σ_j (d · x[i][j] − sum_x[i])²
-      sigma[i]  = floor(√var_x[i] / d)
-                  i.e. largest s such that (d·s)² ≤ var_x[i]
+      sum_x[i]   = Σ_j x[i][j]
+      sq_sum_x[i]= Σ_j x[i][j]²  (sum of squares; matches Rust sq_sum_x field)
+      actual_var[i] = Σ_j (d·x[i][j] − sum_x[i])²  = d·(d·sq_sum_x − sum_x²)
+      sigma[i]  = floor(√actual_var[i] / d)
+                  i.e. largest s such that (d·s)² ≤ actual_var[i]
       sig_d     = d · sigma[i]
       expr[i,j] = gamma[j]·(d·x[i][j] − sum_x[i]) + beta[j]·sig_d
       y[i][j]   = floor((2·expr + sig_d) / (2·sig_d))
@@ -154,7 +155,7 @@ def compute_ln_witness(
     All arguments and return values are Python ints (no field reduction).
 
     Returns:
-        (y, sum_x, var_x, sigma)
+        (y, sum_x, sq_sum_x, sigma)
 
     Raises:
         ValueError if any y value is negative (beta_floor is too small).
@@ -163,14 +164,17 @@ def compute_ln_witness(
 
     sum_x = [sum(row) for row in x_rows]
 
-    var_x: List[int] = []
+    # sq_sum_x[i] = Σ_j x[i][j]² — what the Rust prover reads via the "var_x" JSON key
+    sq_sum_x: List[int] = []
+    # actual_var[i] = Σ_j (d·x[i][j] − sum_x[i])² — used only for sigma computation
+    actual_var: List[int] = []
     for i in range(t):
-        v = sum((d * x_rows[i][j] - sum_x[i]) ** 2 for j in range(d))
-        var_x.append(v)
+        sq_sum_x.append(sum(x_rows[i][j] ** 2 for j in range(d)))
+        actual_var.append(sum((d * x_rows[i][j] - sum_x[i]) ** 2 for j in range(d)))
 
-    # sigma[i] = largest int s.t. (d·s)² ≤ var_x[i]
+    # sigma[i] = largest int s.t. (d·s)² ≤ actual_var[i]
     sigma: List[int] = []
-    for v in var_x:
+    for v in actual_var:
         s = math.isqrt(v) // d
         # Correct for potential off-by-one from integer square root
         while (d * (s + 1)) ** 2 <= v:
@@ -198,7 +202,7 @@ def compute_ln_witness(
             row_y.append(yij)
         y.append(row_y)
 
-    return y, sum_x, var_x, sigma
+    return y, sum_x, sq_sum_x, sigma
 
 
 def min_beta_floor(

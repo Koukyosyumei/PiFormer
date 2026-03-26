@@ -376,22 +376,51 @@ mod tests {
         vec![vec![TernaryValue::ZERO; cols]; rows]
     }
 
-    /// Build a single-block model where all projection/FFN weights are zero.
-    /// With zero weights every matmul output is zero, so the only non-trivial
-    /// path is through the two LayerNorm layers.
+    /// Build a single-block model with simple non-zero weights.
+    /// Each D×D attention matrix has only W[0][0]=+1; D×D_FF and D_FF×D FFN
+    /// matrices likewise have only W[0][0]=+1.  The lm_head is the D×V identity.
+    /// This keeps all intermediate activations non-negative and within the 4-bit
+    /// Lasso table range [0, 15], making the witness easy to verify by hand.
     fn build_test_weights() -> TransformerModelWeights {
+        let mut q_w = zero_ternary_mat(D, D);
+        let mut k_w = zero_ternary_mat(D, D);
+        let mut v_w = zero_ternary_mat(D, D);
+        let mut o_w = zero_ternary_mat(D, D);
+        let mut ffn_w1 = zero_ternary_mat(D, D_FF);
+        let mut ffn_w2 = zero_ternary_mat(D_FF, D);
+        let mut lm_head_w = zero_ternary_mat(D, V);
+
+        q_w[0][0] = TernaryValue::ONE;
+        k_w[0][0] = TernaryValue::ONE;
+        v_w[0][0] = TernaryValue::ONE;
+        o_w[0][0] = TernaryValue::ONE;
+        ffn_w1[0][0] = TernaryValue::ONE;
+        ffn_w2[0][0] = TernaryValue::ONE;
+        for i in 0..D.min(V) {
+            lm_head_w[i][i] = TernaryValue::ONE;
+        }
+
         let block = TransformerBlockWeights {
             ln1_gamma: vec![F::from(2u64); D],
             ln1_beta: vec![F::from(5u64); D],
-            q_w: zero_ternary_mat(D, D),
-            k_w: zero_ternary_mat(D, D),
-            v_w: zero_ternary_mat(D, D),
-            o_w: zero_ternary_mat(D, D),
+            q_w,
+            q_alpha: F::ONE,
+            q_bias: vec![F::ZERO; D],
+            k_w,
+            k_alpha: F::ONE,
+            k_bias: vec![F::ZERO; D],
+            v_w,
+            v_alpha: F::ONE,
+            v_bias: vec![F::ZERO; D],
+            o_w,
+            o_alpha: F::ONE,
+            o_bias: vec![F::ZERO; D],
             ln2_gamma: vec![F::from(2u64); D],
             ln2_beta: vec![F::from(5u64); D],
-            ffn_w1: zero_ternary_mat(D, D_FF),
-            ffn_w2: zero_ternary_mat(D_FF, D),
+            ffn_w1,
+            ffn_w2,
         };
+
         TransformerModelWeights {
             num_blocks: 1,
             d_model: D,
@@ -400,7 +429,9 @@ mod tests {
             blocks: vec![block],
             final_ln_gamma: vec![F::from(2u64); D],
             final_ln_beta: vec![F::from(5u64); D],
-            lm_head_w: zero_ternary_mat(D, V),
+            lm_head_w,
+            lm_head_alpha: F::ONE,
+            lm_head_bias: vec![F::ZERO; V],
         }
     }
 
@@ -418,53 +449,89 @@ mod tests {
         hyrax_commit(&mle.evaluations, nu, &HyraxParams::new(sigma))
     }
 
-    /// Build a validated LayerNorm witness for x = [[10,20],[30,40]] with
-    /// gamma=[2,2], beta=[5,5].  The sigma and y values below have been
-    /// cross-checked against the LayerNorm constraint system:
-    ///
-    ///   var_x[i] = 200  →  d·sigma = 14  →  sigma = 7
-    ///   y[i] = [4, 6]  satisfies both the lo and hi range constraints.
-    fn build_ln_witness_for_x(x: Vec<Vec<F>>) -> LayerNormWitness {
-        let d_f = F::from(D as u64);
-        let t = x.len();
-        let mut sum_x = vec![F::ZERO; t];
-        let mut var_x = vec![F::ZERO; t];
-        for i in 0..t {
-            let s: F = x[i].iter().copied().sum();
-            sum_x[i] = s;
-            var_x[i] = x[i]
-                .iter()
-                .map(|&xij| {
-                    let diff = d_f * xij - s;
-                    diff * diff
-                })
-                .sum();
-        }
-        // d·sigma = floor(sqrt(var_x)) = 14  →  sigma = 7
-        let sigma = vec![F::from(7u64); t];
-        // y verified in the dedicated layernorm tests
-        let y = vec![
-            vec![F::from(4u64), F::from(6u64)],
-            vec![F::from(4u64), F::from(6u64)],
-        ];
+    /// LN witness for x_in = [[10,20],[30,40]], gamma=[2,2], beta=[5,5].
+    /// var=200, d·sigma=14, sigma=7, y=[[4,6],[4,6]].
+    fn build_ln1_witness() -> LayerNormWitness {
         LayerNormWitness {
-            x,
-            y,
-            sum_x,
-            var_x,
-            sigma,
+            x: vec![
+                vec![F::from(10u64), F::from(20u64)],
+                vec![F::from(30u64), F::from(40u64)],
+            ],
+            y: vec![
+                vec![F::from(4u64), F::from(6u64)],
+                vec![F::from(4u64), F::from(6u64)],
+            ],
+            sum_x: vec![F::from(30u64), F::from(70u64)],
+            sigma: vec![F::from(7u64), F::from(7u64)],
+            // sq_sum_x[i] = sum_j x[i][j]^2: row0=10^2+20^2=500, row1=30^2+40^2=2500
+            sq_sum_x: vec![F::from(500u64), F::from(2500u64)],
+            // sum_x_sq[i] = sum_x[i]^2: 30^2=900, 70^2=4900
+            sum_x_sq: vec![F::from(900u64), F::from(4900u64)],
+            // sigma_sq_scaled[i] = (d*sigma[i])^2 = (2*7)^2=196
+            sigma_sq_scaled: vec![F::from(196u64), F::from(196u64)],
+        }
+    }
+
+    /// LN witness for x_mid = [[138,20],[158,40]], gamma=[2,2], beta=[5,5].
+    /// var=27848, d·sigma=166, sigma=83, y=[[6,4],[6,4]].
+    fn build_ln2_witness() -> LayerNormWitness {
+        LayerNormWitness {
+            x: vec![
+                vec![F::from(138u64), F::from(20u64)],
+                vec![F::from(158u64), F::from(40u64)],
+            ],
+            y: vec![
+                vec![F::from(6u64), F::from(4u64)],
+                vec![F::from(6u64), F::from(4u64)],
+            ],
+            sum_x: vec![F::from(158u64), F::from(198u64)],
+            sigma: vec![F::from(83u64), F::from(83u64)],
+            // sq_sum_x[i] = sum_j x[i][j]^2: row0=138^2+20^2=19444, row1=158^2+40^2=26564
+            sq_sum_x: vec![F::from(19444u64), F::from(26564u64)],
+            // sum_x_sq[i] = sum_x[i]^2: 158^2=24964, 198^2=39204
+            sum_x_sq: vec![F::from(24964u64), F::from(39204u64)],
+            // sigma_sq_scaled[i] = (d*sigma[i])^2 = (2*83)^2=27556
+            sigma_sq_scaled: vec![F::from(27556u64), F::from(27556u64)],
+        }
+    }
+
+    /// LN witness for x_out = [[144,20],[164,40]], gamma=[2,2], beta=[5,5].
+    /// var=30752, d·sigma=174, sigma=87, y=[[6,4],[6,4]].
+    fn build_ln_final_witness() -> LayerNormWitness {
+        LayerNormWitness {
+            x: vec![
+                vec![F::from(144u64), F::from(20u64)],
+                vec![F::from(164u64), F::from(40u64)],
+            ],
+            y: vec![
+                vec![F::from(6u64), F::from(4u64)],
+                vec![F::from(6u64), F::from(4u64)],
+            ],
+            sum_x: vec![F::from(164u64), F::from(204u64)],
+            sigma: vec![F::from(87u64), F::from(87u64)],
+            // sq_sum_x[i] = sum_j x[i][j]^2: row0=144^2+20^2=21136, row1=164^2+40^2=28496
+            sq_sum_x: vec![F::from(21136u64), F::from(28496u64)],
+            // sum_x_sq[i] = sum_x[i]^2: 164^2=26896, 204^2=41616
+            sum_x_sq: vec![F::from(26896u64), F::from(41616u64)],
+            // sigma_sq_scaled[i] = (d*sigma[i])^2 = (2*87)^2=30276
+            sigma_sq_scaled: vec![F::from(30276u64), F::from(30276u64)],
+        }
+    }
+
+    /// Build a Lasso instance from explicit query indices and outputs.
+    fn build_lasso(indices: Vec<usize>, outputs: Vec<u64>) -> LassoInstance {
+        let table: Vec<F> = (0u64..1 << M_BITS).map(F::from).collect();
+        LassoInstance {
+            tables: vec![table],
+            query_indices: indices,
+            outputs: outputs.into_iter().map(F::from).collect(),
+            bits_per_chunk: M_BITS,
         }
     }
 
     /// Build a Lasso instance whose every query indexes slot 0 (output = 0).
     fn build_zero_lasso(num_queries: usize) -> LassoInstance {
-        let table: Vec<F> = (0u64..1 << M_BITS).map(F::from).collect();
-        LassoInstance {
-            tables: vec![table],
-            query_indices: vec![0usize; num_queries],
-            outputs: vec![F::ZERO; num_queries],
-            bits_per_chunk: M_BITS,
-        }
+        build_lasso(vec![0usize; num_queries], vec![0u64; num_queries])
     }
 
     /// Shared HyraxParams for the 4-bit Lasso table (sigma = m - m/2 = 2).
@@ -481,67 +548,95 @@ mod tests {
         LinearAttentionInstance,
         FFNInstance,
     ) {
+        // x_in = [[10,20],[30,40]]
         let x_in = vec![
             vec![F::from(10u64), F::from(20u64)],
             vec![F::from(30u64), F::from(40u64)],
         ];
 
-        let zeros_td = vec![vec![F::ZERO; D]; T];
-        let zeros_dd = vec![vec![F::ZERO; D]; D];
-        let zeros_tdf = vec![vec![F::ZERO; D_FF]; T];
-
-        // LayerNorm 1 on x_in
-        let ln1_wit = build_ln_witness_for_x(x_in.clone());
+        // LN1: y_norm1 = [[4,6],[4,6]]
+        let ln1_wit = build_ln1_witness();
         let y_norm1 = ln1_wit.y.clone();
 
-        // Q / K / V projections: y_norm1 × 0 = 0
+        // Q/K/V projections: y_norm1 @ W where W[0][0]=1 → [[4,0],[4,0]]
+        let proj_out = vec![
+            vec![F::from(4u64), F::from(0u64)],
+            vec![F::from(4u64), F::from(0u64)],
+        ];
         let q_proj_wit = ProjectionWitness {
             x: y_norm1.clone(),
-            y: zeros_td.clone(),
+            y: proj_out.clone(),
         };
         let k_proj_wit = ProjectionWitness {
             x: y_norm1.clone(),
-            y: zeros_td.clone(),
+            y: proj_out.clone(),
         };
         let v_proj_wit = ProjectionWitness {
             x: y_norm1.clone(),
-            y: zeros_td.clone(),
+            y: proj_out.clone(),
         };
 
-        // Linear attention: all zero activations and products
+        // phi is identity on [0,15]: phi_q = phi_k = [[4,0],[4,0]]
+        // context = phi_k^T @ v = [[4,4],[0,0]] @ [[4,0],[4,0]] = [[32,0],[0,0]]
+        let context = vec![
+            vec![F::from(32u64), F::from(0u64)],
+            vec![F::from(0u64), F::from(0u64)],
+        ];
+        // attn inner = phi_q @ context = [[4,0],[4,0]] @ [[32,0],[0,0]] = [[128,0],[128,0]]
+        let attn_inner = vec![
+            vec![F::from(128u64), F::from(0u64)],
+            vec![F::from(128u64), F::from(0u64)],
+        ];
+
         let attn_wit = LinearAttentionWitness {
-            q: zeros_td.clone(),
-            k: zeros_td.clone(),
-            v: zeros_td.clone(),
-            phi_q: zeros_td.clone(),
-            phi_k: zeros_td.clone(),
-            context: zeros_dd.clone(),
-            out: zeros_td.clone(),
+            q: proj_out.clone(),
+            k: proj_out.clone(),
+            v: proj_out.clone(),
+            phi_q: proj_out.clone(),
+            phi_k: proj_out.clone(),
+            context: context.clone(),
+            out: attn_inner.clone(),
         };
 
-        // Output projection: 0 × 0 = 0
+        // O projection: attn_inner @ W where W[0][0]=1 → [[128,0],[128,0]]
+        let out_attn = attn_inner.clone();
         let o_proj_wit = ProjectionWitness {
-            x: zeros_td.clone(),
-            y: zeros_td.clone(),
+            x: attn_inner.clone(),
+            y: out_attn.clone(),
         };
 
-        // Residual 1: x_mid = x_in + out_attn = x_in + 0 = x_in
-        let x_mid = x_in.clone();
+        // Residual 1: x_mid = x_in + out_attn = [[138,20],[158,40]]
+        let x_mid = vec![
+            vec![F::from(138u64), F::from(20u64)],
+            vec![F::from(158u64), F::from(40u64)],
+        ];
 
-        // LayerNorm 2: same input → same witness
-        let ln2_wit = build_ln_witness_for_x(x_mid.clone());
+        // LN2: y_norm2 = [[6,4],[6,4]]
+        let ln2_wit = build_ln2_witness();
         let y_norm2 = ln2_wit.y.clone();
 
-        // FFN: y_norm2 × 0 = 0
+        // FFN: W1[0][0]=1 → m=[[6,0,0,0],[6,0,0,0]], phi identity → a=m
+        let m_ffn = vec![
+            vec![F::from(6u64), F::from(0u64), F::from(0u64), F::from(0u64)],
+            vec![F::from(6u64), F::from(0u64), F::from(0u64), F::from(0u64)],
+        ];
+        // W2[0][0]=1 → out_ffn=[[6,0],[6,0]]
+        let out_ffn = vec![
+            vec![F::from(6u64), F::from(0u64)],
+            vec![F::from(6u64), F::from(0u64)],
+        ];
         let ffn_wit = FFNWitness {
             x: y_norm2,
-            m: zeros_tdf.clone(),
-            a: zeros_tdf.clone(),
-            y: zeros_td.clone(),
+            m: m_ffn.clone(),
+            a: m_ffn.clone(),
+            y: out_ffn.clone(),
         };
 
-        // Residual 2: x_out = x_mid + 0 = x_mid = x_in
-        let x_out = x_mid.clone();
+        // Residual 2: x_out = x_mid + out_ffn = [[144,20],[164,40]]
+        let x_out = vec![
+            vec![F::from(144u64), F::from(20u64)],
+            vec![F::from(164u64), F::from(40u64)],
+        ];
 
         let witness = TransformerBlockWitness {
             x_in: x_in.clone(),
@@ -557,15 +652,20 @@ mod tests {
             x_out,
         };
 
+        // Lasso for phi(q) and phi(k): indices [4,0,4,0], outputs [4,0,4,0]
         let inst_attn = LinearAttentionInstance {
             seq_len: T,
             d_head: D,
-            q_lasso: build_zero_lasso(T * D),
-            k_lasso: build_zero_lasso(T * D),
+            q_lasso: build_lasso(vec![4, 0, 4, 0], vec![4, 0, 4, 0]),
+            k_lasso: build_lasso(vec![4, 0, 4, 0], vec![4, 0, 4, 0]),
         };
 
+        // Lasso for FFN phi(m): indices [6,0,0,0,6,0,0,0], outputs same
         let inst_ffn = FFNInstance {
-            activation_lasso: build_zero_lasso(T * D_FF),
+            activation_lasso: build_lasso(
+                vec![6, 0, 0, 0, 6, 0, 0, 0],
+                vec![6, 0, 0, 0, 6, 0, 0, 0],
+            ),
         };
 
         (witness, inst_attn, inst_ffn)
@@ -577,16 +677,15 @@ mod tests {
 
     fn build_model_witness(block_wit: TransformerBlockWitness) -> TransformerModelWitness {
         let x_in = block_wit.x_in.clone();
-        let x_out = block_wit.x_out.clone();
 
-        // Final LayerNorm: x_out = x_in (zero residuals), so same witness
-        let final_ln_wit = build_ln_witness_for_x(x_out.clone());
+        // Final LN: x_out = [[144,20],[164,40]] → y_final = [[6,4],[6,4]]
+        let final_ln_wit = build_ln_final_witness();
         let y_final = final_ln_wit.y.clone();
 
-        // LM head: y_final × 0 = 0  →  logits = 0
+        // LM head diagonal: y_final @ I = [[6,4],[6,4]]
         let lm_head_wit = ProjectionWitness {
-            x: y_final,
-            y: vec![vec![F::ZERO; V]; T],
+            x: y_final.clone(),
+            y: y_final,
         };
 
         TransformerModelWitness {

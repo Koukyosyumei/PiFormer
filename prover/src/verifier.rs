@@ -16,8 +16,7 @@ use crate::attention::layernorm::{
     verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey,
 };
 use crate::attention::projection::{
-    verify_projection_succinct, ProjectionIOCommitments, ProjectionProvingKey,
-    ProjectionVerifyingKey,
+    verify_projection, ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
 };
 use crate::ffn::ffn::{verify_ffn, FFNInstance, FFNProvingKey, FFNVerifyingKey};
 use ark_ec::{AffineRepr, CurveGroup}; // Arkworks 0.4.0+ の正しいトレイト
@@ -83,19 +82,19 @@ pub fn verify_transformer_block(
         x_com: proof.x_norm1_com.clone(),
         y_com: proof.q_com.clone(),
     };
-    verify_projection_succinct(&proof.q_proj_proof, &vk.q_vk, &q_io, transcript)?;
+    verify_projection(&proof.q_proj_proof, &vk.q_vk, &q_io, transcript)?;
 
     let k_io = ProjectionIOCommitments {
         x_com: proof.x_norm1_com.clone(),
         y_com: proof.k_com.clone(),
     };
-    verify_projection_succinct(&proof.k_proj_proof, &vk.k_vk, &k_io, transcript)?;
+    verify_projection(&proof.k_proj_proof, &vk.k_vk, &k_io, transcript)?;
 
     let v_io = ProjectionIOCommitments {
         x_com: proof.x_norm1_com.clone(),
         y_com: proof.v_com.clone(),
     };
-    verify_projection_succinct(&proof.v_proj_proof, &vk.v_vk, &v_io, transcript)?;
+    verify_projection(&proof.v_proj_proof, &vk.v_vk, &v_io, transcript)?;
 
     // --- 3. Linear Attention ---
     let attn_io = crate::attention::attention::AttentionIOCommitments {
@@ -117,7 +116,7 @@ pub fn verify_transformer_block(
         x_com: proof.out_inner_com.clone(),
         y_com: proof.out_attn_com.clone(),
     };
-    verify_projection_succinct(&proof.o_proj_proof, &vk.o_vk, &o_io, transcript)?;
+    verify_projection(&proof.o_proj_proof, &vk.o_vk, &o_io, transcript)?;
 
     // =========================================================================
     // Residual Connection 1: X_mid = X_in + Out_attn
@@ -252,7 +251,7 @@ pub fn verify(
         x_com: proof.final_ln_out_com.clone(),
         y_com: proof.logits_com.clone(),
     };
-    verify_projection_succinct(&proof.lm_head_proof, &vk.lm_head_vk, &lm_io, transcript)
+    verify_projection(&proof.lm_head_proof, &vk.lm_head_vk, &lm_io, transcript)
         .map_err(|e| format!("LM Head failed: {}", e))?;
 
     Ok(())

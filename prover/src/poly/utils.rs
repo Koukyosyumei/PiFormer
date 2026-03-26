@@ -105,8 +105,11 @@ pub fn eval_cols_ternary(
     d_out: usize,
 ) -> Vec<F> {
     // 1. eq(j, r_out) を事前計算 (O(d_out))
-    // 後のループで使い回すことで、計算量を劇的に減らす
-    let eq_evals = compute_eq_evals(r_out, d_out);
+    // DenseMLPoly::evaluate processes r[0] as the MSB (big-endian/halving order),
+    // but compute_eq_evals assigns r[k] to bit_k(j) (little-endian/LSB-first).
+    // Reverse r_out so that compute_eq_evals matches the MSB-first convention.
+    let r_out_rev: Vec<F> = r_out.iter().rev().cloned().collect();
+    let eq_evals = compute_eq_evals(&r_out_rev, d_out);
 
     let mut res = vec![F::ZERO; d_in.next_power_of_two()];
 

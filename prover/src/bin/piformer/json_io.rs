@@ -5,7 +5,7 @@
 
 use std::io;
 
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::{BigInteger, Field, PrimeField};
 use serde::{Deserialize, Serialize};
 
 use piformer_prover::{
@@ -126,9 +126,25 @@ pub struct JsonBlockWeights {
     pub ln1_gamma: Vec<String>,
     pub ln1_beta: Vec<String>,
     pub q_w: Vec<Vec<i8>>,
+    #[serde(default)]
+    pub q_alpha: String,
+    #[serde(default)]
+    pub q_bias: Vec<String>,
     pub k_w: Vec<Vec<i8>>,
+    #[serde(default)]
+    pub k_alpha: String,
+    #[serde(default)]
+    pub k_bias: Vec<String>,
     pub v_w: Vec<Vec<i8>>,
+    #[serde(default)]
+    pub v_alpha: String,
+    #[serde(default)]
+    pub v_bias: Vec<String>,
     pub o_w: Vec<Vec<i8>>,
+    #[serde(default)]
+    pub o_alpha: String,
+    #[serde(default)]
+    pub o_bias: Vec<String>,
     pub ln2_gamma: Vec<String>,
     pub ln2_beta: Vec<String>,
     pub ffn_w1: Vec<Vec<i8>>,
@@ -145,6 +161,26 @@ pub struct JsonWeights {
     pub final_ln_gamma: Vec<String>,
     pub final_ln_beta: Vec<String>,
     pub lm_head_w: Vec<Vec<i8>>,
+    #[serde(default)]
+    pub lm_head_alpha: String,
+    #[serde(default)]
+    pub lm_head_bias: Vec<String>,
+}
+
+fn f_from_hex_or_one(s: &str) -> Result<F, String> {
+    if s.is_empty() {
+        Ok(F::ONE)
+    } else {
+        f_from_hex(s)
+    }
+}
+
+fn vec_from_json_or_empty(json: Vec<String>) -> Result<Vec<F>, String> {
+    if json.is_empty() {
+        Ok(vec![])
+    } else {
+        vec_from_json(json)
+    }
 }
 
 pub fn weights_to_json(w: &TransformerModelWeights) -> JsonWeights {
@@ -155,9 +191,17 @@ pub fn weights_to_json(w: &TransformerModelWeights) -> JsonWeights {
             ln1_gamma: vec_to_json(&b.ln1_gamma),
             ln1_beta: vec_to_json(&b.ln1_beta),
             q_w: ternary_mat_to_json(&b.q_w),
+            q_alpha: f_to_hex(&b.q_alpha),
+            q_bias: vec_to_json(&b.q_bias),
             k_w: ternary_mat_to_json(&b.k_w),
+            k_alpha: f_to_hex(&b.k_alpha),
+            k_bias: vec_to_json(&b.k_bias),
             v_w: ternary_mat_to_json(&b.v_w),
+            v_alpha: f_to_hex(&b.v_alpha),
+            v_bias: vec_to_json(&b.v_bias),
             o_w: ternary_mat_to_json(&b.o_w),
+            o_alpha: f_to_hex(&b.o_alpha),
+            o_bias: vec_to_json(&b.o_bias),
             ln2_gamma: vec_to_json(&b.ln2_gamma),
             ln2_beta: vec_to_json(&b.ln2_beta),
             ffn_w1: ternary_mat_to_json(&b.ffn_w1),
@@ -173,6 +217,8 @@ pub fn weights_to_json(w: &TransformerModelWeights) -> JsonWeights {
         final_ln_gamma: vec_to_json(&w.final_ln_gamma),
         final_ln_beta: vec_to_json(&w.final_ln_beta),
         lm_head_w: ternary_mat_to_json(&w.lm_head_w),
+        lm_head_alpha: f_to_hex(&w.lm_head_alpha),
+        lm_head_bias: vec_to_json(&w.lm_head_bias),
     }
 }
 
@@ -185,9 +231,17 @@ pub fn weights_from_json(j: JsonWeights) -> Result<TransformerModelWeights, Stri
                 ln1_gamma: vec_from_json(b.ln1_gamma)?,
                 ln1_beta: vec_from_json(b.ln1_beta)?,
                 q_w: ternary_mat_from_json(b.q_w)?,
+                q_alpha: f_from_hex_or_one(&b.q_alpha)?,
+                q_bias: vec_from_json_or_empty(b.q_bias)?,
                 k_w: ternary_mat_from_json(b.k_w)?,
+                k_alpha: f_from_hex_or_one(&b.k_alpha)?,
+                k_bias: vec_from_json_or_empty(b.k_bias)?,
                 v_w: ternary_mat_from_json(b.v_w)?,
+                v_alpha: f_from_hex_or_one(&b.v_alpha)?,
+                v_bias: vec_from_json_or_empty(b.v_bias)?,
                 o_w: ternary_mat_from_json(b.o_w)?,
+                o_alpha: f_from_hex_or_one(&b.o_alpha)?,
+                o_bias: vec_from_json_or_empty(b.o_bias)?,
                 ln2_gamma: vec_from_json(b.ln2_gamma)?,
                 ln2_beta: vec_from_json(b.ln2_beta)?,
                 ffn_w1: ternary_mat_from_json(b.ffn_w1)?,
@@ -204,6 +258,8 @@ pub fn weights_from_json(j: JsonWeights) -> Result<TransformerModelWeights, Stri
         final_ln_gamma: vec_from_json(j.final_ln_gamma)?,
         final_ln_beta: vec_from_json(j.final_ln_beta)?,
         lm_head_w: ternary_mat_from_json(j.lm_head_w)?,
+        lm_head_alpha: f_from_hex_or_one(&j.lm_head_alpha)?,
+        lm_head_bias: vec_from_json_or_empty(j.lm_head_bias)?,
     })
 }
 
@@ -325,18 +381,32 @@ fn ln_wit_to_json(w: &LayerNormWitness) -> JsonLayerNormWitness {
         x: mat_to_json(&w.x),
         y: mat_to_json(&w.y),
         sum_x: vec_to_json(&w.sum_x),
-        var_x: vec_to_json(&w.var_x),
         sigma: vec_to_json(&w.sigma),
+        // var_x stores sq_sum_x (sum of squares per row)
+        var_x: vec_to_json(&w.sq_sum_x),
     }
 }
 
 fn ln_wit_from_json(j: JsonLayerNormWitness) -> Result<LayerNormWitness, String> {
+    let x = mat_from_json(j.x)?;
+    let y = mat_from_json(j.y)?;
+    let sum_x = vec_from_json(j.sum_x)?;
+    let sigma = vec_from_json(j.sigma)?;
+    // var_x in JSON encodes sq_sum_x (sum of squares per row)
+    let sq_sum_x = vec_from_json(j.var_x)?;
+    // sum_x_sq and sigma_sq_scaled are derived quantities
+    let d = x.first().map(|r| r.len()).unwrap_or(0);
+    let d_f = F::from(d as u64);
+    let sum_x_sq: Vec<F> = sum_x.iter().map(|&s| s * s).collect();
+    let sigma_sq_scaled: Vec<F> = sigma.iter().map(|&s| (d_f * s) * (d_f * s)).collect();
     Ok(LayerNormWitness {
-        x: mat_from_json(j.x)?,
-        y: mat_from_json(j.y)?,
-        sum_x: vec_from_json(j.sum_x)?,
-        var_x: vec_from_json(j.var_x)?,
-        sigma: vec_from_json(j.sigma)?,
+        x,
+        y,
+        sum_x,
+        sigma,
+        sq_sum_x,
+        sum_x_sq,
+        sigma_sq_scaled,
     })
 }
 
