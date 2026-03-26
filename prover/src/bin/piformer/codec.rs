@@ -285,58 +285,78 @@ fn read_range_proof<R: Read>(r: &mut R) -> io::Result<RangeProof> {
 
 fn write_ln_internal_coms<W: Write>(w: &mut W, c: &LayerNormInternalCommitments) -> io::Result<()> {
     write_hyrax_commitment(w, &c.sum_x_com)?;
-    //write_hyrax_commitment(w, &c.var_x_com)?;
-    write_hyrax_commitment(w, &c.sigma_com)
+    write_hyrax_commitment(w, &c.sq_sum_x_com)?;
+    write_hyrax_commitment(w, &c.sum_x_sq_com)?;
+    write_hyrax_commitment(w, &c.sigma_com)?;
+    write_hyrax_commitment(w, &c.sigma_sq_com)?;
+    write_hyrax_commitment(w, &c.sigma_y_com)?;
+    write_hyrax_commitment(w, &c.gamma_x_com)
 }
 fn read_ln_internal_coms<R: Read>(r: &mut R) -> io::Result<LayerNormInternalCommitments> {
-    todo!() /*
-            Ok(LayerNormInternalCommitments {
-                sum_x_com: read_hyrax_commitment(r)?,
-                var_x_com: read_hyrax_commitment(r)?,
-                sigma_com: read_hyrax_commitment(r)?,
-            })*/
+    Ok(LayerNormInternalCommitments {
+        sum_x_com: read_hyrax_commitment(r)?,
+        sq_sum_x_com: read_hyrax_commitment(r)?,
+        sum_x_sq_com: read_hyrax_commitment(r)?,
+        sigma_com: read_hyrax_commitment(r)?,
+        sigma_sq_com: read_hyrax_commitment(r)?,
+        sigma_y_com: read_hyrax_commitment(r)?,
+        gamma_x_com: read_hyrax_commitment(r)?,
+    })
 }
 
 fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<()> {
-    write_ep!(w, &o.sum_x_at_rt, &o.sum_x_rt_proof);
-    /*
-    write_ep!(w, &o.var_x_at_rt, &o.var_x_rt_proof);
+    write_f(w, &o.sum_x_at_rt)?;
+    write_f(w, &o.sq_sum_x_at_rt)?;
+    write_hyrax_proof(w, &o.sum_x_rt_proof)?;
+    write_hyrax_proof(w, &o.sq_sum_x_rt_proof)?;
+    write_ep!(w, &o.sum_x_sq_at_rsig, &o.sum_x_sq_rsig_proof);
     write_ep!(w, &o.x_at_rt_rmean, &o.x_rt_rmean_proof);
-    write_ep!(w, &o.x_at_rt_rvar, &o.x_rt_rvar_proof);
-    write_ep!(w, &o.var_x_at_rsig, &o.var_x_rsig_proof);*/
+    write_ep!(w, &o.sum_x_at_rsig, &o.sum_x_rsig_proof);
+    write_ep!(w, &o.sq_sum_x_at_rsig, &o.sq_sum_x_rsig_proof);
     write_ep!(w, &o.sigma_at_rsig, &o.sigma_rsig_proof);
+    write_ep!(w, &o.sigma_sq_at_rsig, &o.sigma_sq_rsig_proof);
     write_ep!(w, &o.x_at_ry, &o.x_ry_proof);
     write_ep!(w, &o.y_at_ry, &o.y_ry_proof);
     write_ep!(w, &o.sum_x_at_ryt, &o.sum_x_ryt_proof);
     write_ep!(w, &o.sigma_at_ryt, &o.sigma_ryt_proof);
+    write_ep!(w, &o.sigma_y_at_ry, &o.sigma_y_ry_proof);
+    write_ep!(w, &o.gamma_x_at_ry, &o.gamma_x_ry_proof);
     Ok(())
 }
 fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
-    let (sum_x_at_rt, sum_x_rt_proof) = read_ep!(r);
-    let (var_x_at_rt, var_x_rt_proof) = read_ep!(r);
+    let sum_x_at_rt = read_f(r)?;
+    let sq_sum_x_at_rt = read_f(r)?;
+    let sum_x_rt_proof = read_hyrax_proof(r)?;
+    let sq_sum_x_rt_proof = read_hyrax_proof(r)?;
+    let (sum_x_sq_at_rsig, sum_x_sq_rsig_proof) = read_ep!(r);
     let (x_at_rt_rmean, x_rt_rmean_proof) = read_ep!(r);
-    let (x_at_rt_rvar, x_rt_rvar_proof) = read_ep!(r);
-    let (var_x_at_rsig, var_x_rsig_proof) = read_ep!(r);
+    let (sum_x_at_rsig, sum_x_rsig_proof) = read_ep!(r);
+    let (sq_sum_x_at_rsig, sq_sum_x_rsig_proof) = read_ep!(r);
     let (sigma_at_rsig, sigma_rsig_proof) = read_ep!(r);
+    let (sigma_sq_at_rsig, sigma_sq_rsig_proof) = read_ep!(r);
     let (x_at_ry, x_ry_proof) = read_ep!(r);
     let (y_at_ry, y_ry_proof) = read_ep!(r);
     let (sum_x_at_ryt, sum_x_ryt_proof) = read_ep!(r);
     let (sigma_at_ryt, sigma_ryt_proof) = read_ep!(r);
-    todo!()
-    /*
+    let (sigma_y_at_ry, sigma_y_ry_proof) = read_ep!(r);
+    let (gamma_x_at_ry, gamma_x_ry_proof) = read_ep!(r);
     Ok(LayerNormOpenings {
         sum_x_at_rt,
+        sq_sum_x_at_rt,
         sum_x_rt_proof,
-        var_x_at_rt,
-        var_x_rt_proof,
+        sq_sum_x_rt_proof,
+        sum_x_sq_at_rsig,
+        sum_x_sq_rsig_proof,
         x_at_rt_rmean,
         x_rt_rmean_proof,
-        x_at_rt_rvar,
-        x_rt_rvar_proof,
-        var_x_at_rsig,
-        var_x_rsig_proof,
+        sum_x_at_rsig,
+        sum_x_rsig_proof,
+        sq_sum_x_at_rsig,
+        sq_sum_x_rsig_proof,
         sigma_at_rsig,
         sigma_rsig_proof,
+        sigma_sq_at_rsig,
+        sigma_sq_rsig_proof,
         x_at_ry,
         x_ry_proof,
         y_at_ry,
@@ -345,29 +365,28 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
         sum_x_ryt_proof,
         sigma_at_ryt,
         sigma_ryt_proof,
-    })*/
+        sigma_y_at_ry,
+        sigma_y_ry_proof,
+        gamma_x_at_ry,
+        gamma_x_ry_proof,
+    })
 }
 
 fn write_ln_proof<W: Write>(w: &mut W, p: &LayerNormProof) -> io::Result<()> {
     write_ln_internal_coms(w, &p.internal_coms)?;
-    /*
     write_sumcheck_proof(w, &p.mean_sumcheck)?;
-    write_sumcheck_proof(w, &p.variance_sumcheck)?;*/
     write_range_proof(w, &p.sigma_range_proof)?;
     write_range_proof(w, &p.y_range_proof)?;
     write_ln_openings(w, &p.openings)
 }
 fn read_ln_proof<R: Read>(r: &mut R) -> io::Result<LayerNormProof> {
-    todo!()
-    /*
     Ok(LayerNormProof {
         internal_coms: read_ln_internal_coms(r)?,
         mean_sumcheck: read_sumcheck_proof(r)?,
-        variance_sumcheck: read_sumcheck_proof(r)?,
         sigma_range_proof: read_range_proof(r)?,
         y_range_proof: read_range_proof(r)?,
         openings: read_ln_openings(r)?,
-    })*/
+    })
 }
 
 // ---------------------------------------------------------------------------
