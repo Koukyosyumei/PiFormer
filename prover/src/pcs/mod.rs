@@ -94,7 +94,7 @@ pub fn hyrax_commit(evals: &[F], nu: usize, params: &HyraxParams) -> HyraxCommit
 // ---------------------------------------------------------------------------
 
 /// An opening proof: the intermediate vector w' of length 2^sigma.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct HyraxProof {
     pub w_prime: Vec<F>,
 }

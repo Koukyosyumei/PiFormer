@@ -40,7 +40,10 @@ use piformer_prover::{
         TransformerBlockProof, TransformerModelProof, TransformerModelProvingKey,
         TransformerModelVerifyingKey,
     },
-    subprotocols::sumcheck::{RoundPoly, SumcheckProof, SumcheckProofMulti},
+    subprotocols::{
+        combine::CombineProof,
+        sumcheck::{RoundPoly, SumcheckProof, SumcheckProofMulti},
+    },
     verifier::TransformerBlockVerifyingKey,
     F,
 };
@@ -428,22 +431,20 @@ fn read_ln_proof<R: Read>(r: &mut R) -> io::Result<LayerNormProof> {
 // ---------------------------------------------------------------------------
 
 fn write_proj_openings<W: Write>(w: &mut W, o: &ProjectionOpenings) -> io::Result<()> {
-    write_ep!(w, &o.y_eval, &o.y_open);
-    write_ep!(w, &o.x_eval, &o.x_open);
+    write_f(w, &o.y_eval)?;
+    write_f(w, &o.x_eval)?;
     write_ep!(w, &o.w_eval, &o.w_open);
     write_ep!(w, &o.bias_at_rj, &o.bias_opening_proof);
     Ok(())
 }
 fn read_proj_openings<R: Read>(r: &mut R) -> io::Result<ProjectionOpenings> {
-    let (y_eval, y_open) = read_ep!(r);
-    let (x_eval, x_open) = read_ep!(r);
+    let y_eval = read_f(r)?;
+    let x_eval = read_f(r)?;
     let (w_eval, w_open) = read_ep!(r);
     let (bias_at_rj, bias_opening_proof) = read_ep!(r);
     Ok(ProjectionOpenings {
         y_eval,
-        y_open,
         x_eval,
-        x_open,
         w_eval,
         w_open,
         bias_at_rj,
@@ -483,26 +484,24 @@ fn read_attn_internal_coms<R: Read>(r: &mut R) -> io::Result<AttentionInternalCo
 }
 
 fn write_attn_openings<W: Write>(w: &mut W, o: &AttentionOpenings) -> io::Result<()> {
-    write_ep!(w, &o.out_eval, &o.out_open);
+    write_f(w, &o.out_eval)?;
     write_ep!(w, &o.phi_q_eval, &o.phi_q_open);
     write_ep!(w, &o.phi_k_eval, &o.phi_k_open);
-    write_ep!(w, &o.v_eval, &o.v_open);
+    write_f(w, &o.v_eval)?;
     Ok(())
 }
 fn read_attn_openings<R: Read>(r: &mut R) -> io::Result<AttentionOpenings> {
-    let (out_eval, out_open) = read_ep!(r);
+    let out_eval = read_f(r)?;
     let (phi_q_eval, phi_q_open) = read_ep!(r);
     let (phi_k_eval, phi_k_open) = read_ep!(r);
-    let (v_eval, v_open) = read_ep!(r);
+    let v_eval = read_f(r)?;
     Ok(AttentionOpenings {
         out_eval,
-        out_open,
         phi_q_eval,
         phi_q_open,
         phi_k_eval,
         phi_k_open,
         v_eval,
-        v_open,
     })
 }
 
@@ -617,6 +616,23 @@ fn read_ffn_proof<R: Read>(r: &mut R) -> io::Result<FFNProof> {
 // ---------------------------------------------------------------------------
 // Block proof
 // ---------------------------------------------------------------------------
+// Combine proof
+// ---------------------------------------------------------------------------
+
+fn write_combine_proof<W: Write>(w: &mut W, p: &CombineProof) -> io::Result<()> {
+    write_sumcheck_proof(w, &p.sumcheck)?;
+    write_hyrax_proof(w, &p.hyrax_proof)
+}
+fn read_combine_proof<R: Read>(r: &mut R) -> io::Result<CombineProof> {
+    Ok(CombineProof {
+        sumcheck: read_sumcheck_proof(r)?,
+        hyrax_proof: read_hyrax_proof(r)?,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Block proof
+// ---------------------------------------------------------------------------
 
 fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Result<()> {
     write_ln_proof(w, &p.ln1_proof)?;
@@ -634,7 +650,13 @@ fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Resu
     write_hyrax_commitment(w, &p.out_inner_com)?;
     write_hyrax_commitment(w, &p.out_attn_com)?;
     write_hyrax_commitment(w, &p.x_norm2_com)?;
-    write_hyrax_commitment(w, &p.out_ffn_com)
+    write_hyrax_commitment(w, &p.out_ffn_com)?;
+    write_combine_proof(w, &p.q_combine)?;
+    write_combine_proof(w, &p.k_combine)?;
+    write_combine_proof(w, &p.v_combine)?;
+    write_combine_proof(w, &p.out_inner_combine)?;
+    write_combine_proof(w, &p.x_norm1_combine)?;
+    write_combine_proof(w, &p.out_attn_combine)
 }
 fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
     Ok(TransformerBlockProof {
@@ -654,6 +676,12 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
         out_attn_com: read_hyrax_commitment(r)?,
         x_norm2_com: read_hyrax_commitment(r)?,
         out_ffn_com: read_hyrax_commitment(r)?,
+        q_combine: read_combine_proof(r)?,
+        k_combine: read_combine_proof(r)?,
+        v_combine: read_combine_proof(r)?,
+        out_inner_combine: read_combine_proof(r)?,
+        x_norm1_combine: read_combine_proof(r)?,
+        out_attn_combine: read_combine_proof(r)?,
     })
 }
 

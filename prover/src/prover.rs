@@ -16,8 +16,9 @@
 //!   X_out = X_mid + Out_ffn   <-- Residual 2
 
 use crate::field::F;
-use crate::pcs::{absorb_com, hyrax_commit, HyraxCommitment, HyraxParams};
+use crate::pcs::{absorb_com, hyrax_commit, params_from_vars, HyraxCommitment, HyraxParams};
 use crate::poly::utils::mat_to_mle;
+use crate::subprotocols::{prove_combine, CombineProof};
 use crate::transcript::Transcript;
 
 // Sub-module imports (Assuming the interfaces we built previously)
@@ -64,6 +65,21 @@ pub struct TransformerBlockProof {
     pub out_attn_com: HyraxCommitment,
     pub x_norm2_com: HyraxCommitment,
     pub out_ffn_com: HyraxCommitment,
+
+    // GKR combine proofs — each bundles multiple eval claims on the same
+    // intermediate commitment into a single Hyrax opening.
+    /// Verifies q_com: 1 claim from Q-projection y_claim.
+    pub q_combine: CombineProof,
+    /// Verifies k_com: 1 claim from K-projection y_claim.
+    pub k_combine: CombineProof,
+    /// Verifies v_com: 2 claims — V-projection y_claim + attention v_claim.
+    pub v_combine: CombineProof,
+    /// Verifies out_inner_com: 2 claims — attention out_claim + O-projection x_claim.
+    pub out_inner_combine: CombineProof,
+    /// Verifies x_norm1_com: 3 claims — Q/K/V-projection x_claims.
+    pub x_norm1_combine: CombineProof,
+    /// Verifies out_attn_com: 1 claim from O-projection y_claim.
+    pub out_attn_combine: CombineProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +136,11 @@ pub fn prove_transformer_block(
     let x_norm2_com = commit_mat(&witness.ln2_wit.y, t, d);
     let out_ffn_com = commit_mat(&witness.ffn_wit.y, t, d);
 
+    // Helper: variables for t×d matrices
+    let t_bits = t.next_power_of_two().trailing_zeros() as usize;
+    let d_bits = d.next_power_of_two().trailing_zeros() as usize;
+    let td_num_vars = t_bits + d_bits;
+
     // 2. Execute Sub-Provers with strictly bound IO Commitments
     // --- LayerNorm 1 ---
     let ln1_io = LayerNormIOCommitments {
@@ -128,33 +149,27 @@ pub fn prove_transformer_block(
     };
     let ln1_proof = prove_layernorm(&witness.ln1_wit, &ln1_io, &pk.ln1_vk, transcript)?;
 
-    // --- Q, K, V Projections ---
-    let q_io = ProjectionIOCommitments {
-        x_com: x_norm1_com.clone(),
-        y_com: q_com.clone(),
-    };
-    let q_proj_proof = prove_projection(&pk.q_pk, &witness.q_proj_wit, &q_io, transcript)?;
+    // --- Q, K, V Projections — return (proof, y_claim, x_claim) ---
+    let q_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
+    let (q_proj_proof, q_y_claim, q_x_claim) =
+        prove_projection(&pk.q_pk, &witness.q_proj_wit, &q_io, transcript)?;
 
-    let k_io = ProjectionIOCommitments {
-        x_com: x_norm1_com.clone(),
-        y_com: k_com.clone(),
-    };
-    let k_proj_proof = prove_projection(&pk.k_pk, &witness.k_proj_wit, &k_io, transcript)?;
+    let k_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
+    let (k_proj_proof, k_y_claim, k_x_claim) =
+        prove_projection(&pk.k_pk, &witness.k_proj_wit, &k_io, transcript)?;
 
-    let v_io = ProjectionIOCommitments {
-        x_com: x_norm1_com.clone(),
-        y_com: v_com.clone(),
-    };
-    let v_proj_proof = prove_projection(&pk.v_pk, &witness.v_proj_wit, &v_io, transcript)?;
+    let v_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
+    let (v_proj_proof, v_y_claim, v_x_claim) =
+        prove_projection(&pk.v_pk, &witness.v_proj_wit, &v_io, transcript)?;
 
-    // --- Linear Attention ---
+    // --- Linear Attention — returns (proof, out_claim, v_claim) ---
     let attn_io = AttentionIOCommitments {
         q_com: q_com.clone(),
         k_com: k_com.clone(),
         v_com: v_com.clone(),
         out_com: out_inner_com.clone(),
     };
-    let attn_proof = prove_linear_attention(
+    let (attn_proof, attn_out_claim, attn_v_claim) = prove_linear_attention(
         &witness.attn_wit,
         inst_attn,
         &pk.attn_pk,
@@ -163,16 +178,12 @@ pub fn prove_transformer_block(
         lasso_params,
     );
 
-    // --- Output Projection ---
-    let o_io = ProjectionIOCommitments {
-        x_com: out_inner_com.clone(),
-        y_com: out_attn_com.clone(),
-    };
-    let o_proj_proof = prove_projection(&pk.o_pk, &witness.o_proj_wit, &o_io, transcript)?;
+    // --- Output Projection — returns (proof, y_claim, x_claim) ---
+    let o_io = ProjectionIOCommitments { x_com: out_inner_com.clone() };
+    let (o_proj_proof, o_y_claim, o_x_claim) =
+        prove_projection(&pk.o_pk, &witness.o_proj_wit, &o_io, transcript)?;
 
     // --- LayerNorm 2 ---
-    // Note: The input to LN2 is X_mid = X_in + Out_attn.
-    // We compute the commitment homomorphically!
     let x_mid_com = add_commitments(x_in_com, &out_attn_com);
     let ln2_io = LayerNormIOCommitments {
         x_com: x_mid_com.clone(),
@@ -194,7 +205,55 @@ pub fn prove_transformer_block(
         lasso_params,
     )?;
 
-    // Return the bundled proof and intermediate commitments
+    // --- GKR Combine Proofs ---
+    // Build flat MLE evaluations for each intermediate commitment.
+    let mat_evals = |mat: &[Vec<F>], rows: usize, cols: usize| -> Vec<F> {
+        mat_to_mle(mat, rows, cols).evaluations
+    };
+
+    let (nu_td, sigma_td, _) = params_from_vars(td_num_vars);
+    let _ = (nu_td, sigma_td); // used implicitly by prove_combine
+
+    // q_com: 1 claim (Q-proj y_claim)
+    let q_evals = mat_evals(&witness.attn_wit.q, t, d);
+    let (q_combine, _) =
+        prove_combine(&q_evals, &q_com, &[q_y_claim], td_num_vars, transcript);
+
+    // k_com: 1 claim (K-proj y_claim)
+    let k_evals = mat_evals(&witness.attn_wit.k, t, d);
+    let (k_combine, _) =
+        prove_combine(&k_evals, &k_com, &[k_y_claim], td_num_vars, transcript);
+
+    // v_com: 2 claims — V-proj y_claim + attention v_claim
+    let v_evals = mat_evals(&witness.attn_wit.v, t, d);
+    let (v_combine, _) =
+        prove_combine(&v_evals, &v_com, &[v_y_claim, attn_v_claim], td_num_vars, transcript);
+
+    // out_inner_com: 2 claims — attention out_claim + O-proj x_claim
+    let out_inner_evals = mat_evals(&witness.attn_wit.out, t, d);
+    let (out_inner_combine, _) = prove_combine(
+        &out_inner_evals,
+        &out_inner_com,
+        &[attn_out_claim, o_x_claim],
+        td_num_vars,
+        transcript,
+    );
+
+    // x_norm1_com: 3 claims — Q/K/V-proj x_claims
+    let x_norm1_evals = mat_evals(&witness.ln1_wit.y, t, d);
+    let (x_norm1_combine, _) = prove_combine(
+        &x_norm1_evals,
+        &x_norm1_com,
+        &[q_x_claim, k_x_claim, v_x_claim],
+        td_num_vars,
+        transcript,
+    );
+
+    // out_attn_com: 1 claim (O-proj y_claim)
+    let out_attn_evals = mat_evals(&witness.o_proj_wit.y, t, d);
+    let (out_attn_combine, _) =
+        prove_combine(&out_attn_evals, &out_attn_com, &[o_y_claim], td_num_vars, transcript);
+
     Ok(TransformerBlockProof {
         ln1_proof,
         q_proj_proof,
@@ -212,6 +271,12 @@ pub fn prove_transformer_block(
         out_attn_com,
         x_norm2_com,
         out_ffn_com,
+        q_combine,
+        k_combine,
+        v_combine,
+        out_inner_combine,
+        x_norm1_combine,
+        out_attn_combine,
     })
 }
 
@@ -325,11 +390,9 @@ pub fn prove(
 
     // 4. LM Head (Final Projection to Vocab Size)
     let logits_com = commit_mat(&witness.lm_head_wit.y, t, v);
-    let lm_io = ProjectionIOCommitments {
-        x_com: final_ln_out_com.clone(),
-        y_com: logits_com.clone(),
-    };
-    let lm_head_proof = prove_projection(&pk.lm_head_pk, &witness.lm_head_wit, &lm_io, transcript)?;
+    let lm_io = ProjectionIOCommitments { x_com: final_ln_out_com.clone() };
+    let (lm_head_proof, _, _) =
+        prove_projection(&pk.lm_head_pk, &witness.lm_head_wit, &lm_io, transcript)?;
 
     // 5. Global batched Lasso: one proof for all activation lookups across all layers.
     // Instance order per block: [FFN_i, Q_i, K_i].

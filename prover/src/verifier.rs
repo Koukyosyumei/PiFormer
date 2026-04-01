@@ -8,7 +8,8 @@
 //!    are cryptographically bound across adjacent sub-verifiers.
 
 use crate::lookup::lasso::{verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey};
-use crate::pcs::{absorb_com, HyraxCommitment, HyraxParams};
+use crate::pcs::{absorb_com, params_from_vars, HyraxCommitment, HyraxParams};
+use crate::subprotocols::verify_combine;
 use crate::transcript::Transcript;
 
 // Sub-module keys and verifiers
@@ -74,6 +75,11 @@ pub fn verify_transformer_block(
     // Pipeline Stitching (The Binding of IO Commitments)
     // =========================================================================
 
+    let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
+    let d_bits = vk.d_model.next_power_of_two().trailing_zeros() as usize;
+    let td_num_vars = t_bits + d_bits;
+    let (_, _, td_params) = params_from_vars(td_num_vars);
+
     // --- 1. LayerNorm 1 ---
     let ln1_io = LayerNormIOCommitments {
         x_com: x_in_com.clone(),
@@ -81,44 +87,34 @@ pub fn verify_transformer_block(
     };
     verify_layernorm(&proof.ln1_proof, &ln1_io, &vk.ln1_vk, transcript)?;
 
-    // --- 2. Projections (Q, K, V) ---
-    let q_io = ProjectionIOCommitments {
-        x_com: proof.x_norm1_com.clone(),
-        y_com: proof.q_com.clone(),
-    };
-    verify_projection(&proof.q_proj_proof, &vk.q_vk, &q_io, transcript)?;
+    let _ = td_params; // ensure td_params isn't flagged unused
 
-    let k_io = ProjectionIOCommitments {
-        x_com: proof.x_norm1_com.clone(),
-        y_com: proof.k_com.clone(),
-    };
-    verify_projection(&proof.k_proj_proof, &vk.k_vk, &k_io, transcript)?;
+    // --- 2. Projections (Q, K, V) — returns (y_claim, x_claim) for combine ---
+    let q_io = ProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
+    let (q_y_claim, q_x_claim) = verify_projection(&proof.q_proj_proof, &vk.q_vk, &q_io, transcript)?;
 
-    let v_io = ProjectionIOCommitments {
-        x_com: proof.x_norm1_com.clone(),
-        y_com: proof.v_com.clone(),
-    };
-    verify_projection(&proof.v_proj_proof, &vk.v_vk, &v_io, transcript)?;
+    let k_io = ProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
+    let (k_y_claim, k_x_claim) = verify_projection(&proof.k_proj_proof, &vk.k_vk, &k_io, transcript)?;
 
-    // --- 3. Linear Attention ---
+    let v_io = ProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
+    let (v_y_claim, v_x_claim) = verify_projection(&proof.v_proj_proof, &vk.v_vk, &v_io, transcript)?;
+
+    // --- 3. Linear Attention — returns (out_claim, v_claim) for combine ---
     let attn_io = crate::attention::attention::AttentionIOCommitments {
         q_com: proof.q_com.clone(),
         k_com: proof.k_com.clone(),
         v_com: proof.v_com.clone(),
         out_com: proof.out_inner_com.clone(),
     };
-    verify_linear_attention(&proof.attn_proof, inst_attn, &attn_io, transcript)?;
+    let (attn_out_claim, attn_v_claim) =
+        verify_linear_attention(&proof.attn_proof, inst_attn, &attn_io, transcript)?;
 
     // --- 4. Output Projection ---
-    let o_io = ProjectionIOCommitments {
-        x_com: proof.out_inner_com.clone(),
-        y_com: proof.out_attn_com.clone(),
-    };
-    verify_projection(&proof.o_proj_proof, &vk.o_vk, &o_io, transcript)?;
+    let o_io = ProjectionIOCommitments { x_com: proof.out_inner_com.clone() };
+    let (o_y_claim, o_x_claim) = verify_projection(&proof.o_proj_proof, &vk.o_vk, &o_io, transcript)?;
 
     // =========================================================================
-    // Residual Connection 1: X_mid = X_in + Out_attn
-    // Homomorphic Addition guarantees mathematical equality in O(√N)!
+    // Residual Connection 1: X_mid = X_in + Out_attn (homomorphic, no transcript)
     // =========================================================================
     let x_mid_com = add_commitments(x_in_com, &proof.out_attn_com);
 
@@ -143,13 +139,29 @@ pub fn verify_transformer_block(
         lasso_params,
     )?;
 
+    // --- 7. GKR Combine Proofs — MUST be after all sub-module verifications to match prover transcript ---
+    verify_combine(&proof.q_combine, &proof.q_com, &[q_y_claim], td_num_vars, transcript)
+        .map_err(|e| format!("q_combine: {e}"))?;
+    verify_combine(&proof.k_combine, &proof.k_com, &[k_y_claim], td_num_vars, transcript)
+        .map_err(|e| format!("k_combine: {e}"))?;
+    verify_combine(&proof.v_combine, &proof.v_com, &[v_y_claim, attn_v_claim], td_num_vars, transcript)
+        .map_err(|e| format!("v_combine: {e}"))?;
+    verify_combine(
+        &proof.out_inner_combine, &proof.out_inner_com,
+        &[attn_out_claim, o_x_claim], td_num_vars, transcript,
+    ).map_err(|e| format!("out_inner_combine: {e}"))?;
+    verify_combine(
+        &proof.x_norm1_combine, &proof.x_norm1_com,
+        &[q_x_claim, k_x_claim, v_x_claim], td_num_vars, transcript,
+    ).map_err(|e| format!("x_norm1_combine: {e}"))?;
+    verify_combine(&proof.out_attn_combine, &proof.out_attn_com, &[o_y_claim], td_num_vars, transcript)
+        .map_err(|e| format!("out_attn_combine: {e}"))?;
+
     // =========================================================================
     // Residual Connection 2: X_out = X_mid + Out_ffn
     // =========================================================================
     let expected_x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
 
-    // FINAL BINDING: Ensure the computation yields the expected output commitment
-    // passed to the NEXT block in the pipeline.
     if expected_x_out_com.row_coms != x_out_com.row_coms {
         return Err("Transformer Block Output Commitment (Residual) Mismatch!".into());
     }
@@ -244,11 +256,8 @@ pub fn verify(
     verify_layernorm(&proof.final_ln_proof, &ln_io, &vk.final_ln_vk, transcript)
         .map_err(|e| format!("Final LN failed: {}", e))?;
 
-    // 4. LM Head Verification
-    let lm_io = ProjectionIOCommitments {
-        x_com: proof.final_ln_out_com.clone(),
-        y_com: proof.logits_com.clone(),
-    };
+    // 4. LM Head Verification (single projection at model output — y_claim not combined further)
+    let lm_io = ProjectionIOCommitments { x_com: proof.final_ln_out_com.clone() };
     verify_projection(&proof.lm_head_proof, &vk.lm_head_vk, &lm_io, transcript)
         .map_err(|e| format!("LM Head failed: {}", e))?;
 

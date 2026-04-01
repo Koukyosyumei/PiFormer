@@ -21,17 +21,17 @@ use crate::poly::utils::TernaryValue;
 use crate::poly::utils::{combine, eval_cols_ternary, eval_rows, mat_to_mle};
 use crate::poly::utils::{convert_tm_to_fm, vec_to_mle};
 use crate::poly::DenseMLPoly;
-use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
+use crate::subprotocols::{prove_sumcheck, verify_sumcheck, EvalClaim, SumcheckProof};
 use crate::transcript::{challenge_vec, Transcript};
 
 // ---------------------------------------------------------------------------
 // Pipeline Interfaces & Keys
 // ---------------------------------------------------------------------------
 
-/// Trusted IO Commitments provided by the Global Pipeline Verifier.
+/// IO Commitments for the projection layer.
+/// Only x_com is needed — y is verified via GKR claim threading.
 pub struct ProjectionIOCommitments {
     pub x_com: HyraxCommitment,
-    pub y_com: HyraxCommitment,
 }
 
 /// Preprocessing Key for the Verifier.
@@ -107,10 +107,11 @@ pub fn preprocess_projection(
 // ---------------------------------------------------------------------------
 
 pub struct ProjectionOpenings {
+    /// Prover's claimed value of y at (r_t, r_out). Verified via combine proof.
     pub y_eval: F,
-    pub y_open: HyraxProof,
+    /// Prover's claimed value of x at (r_t, r_k). Returned as EvalClaim for combine.
     pub x_eval: F,
-    pub x_open: HyraxProof,
+    /// Static weight opening — verified directly.
     pub w_eval: F,
     pub w_open: HyraxProof,
     pub bias_at_rj: F,
@@ -126,12 +127,16 @@ pub struct ProjectionProof {
 // Prover (Online Phase)
 // ---------------------------------------------------------------------------
 
+/// Returns (proof, y_claim, x_claim).
+///
+/// `y_claim` = EvalClaim on the output y at (r_t, r_out) — deferred to combine proof.
+/// `x_claim` = EvalClaim on the input x at (r_t, r_k) — propagated backward for combine.
 pub fn prove_projection(
     pk: &ProjectionProvingKey,
     witness: &ProjectionWitness,
     io_coms: &ProjectionIOCommitments,
     transcript: &mut Transcript,
-) -> Result<ProjectionProof, String> {
+) -> Result<(ProjectionProof, EvalClaim, EvalClaim), String> {
     let t = pk.vk.seq_len;
     let d_in = pk.vk.d_in;
     let d_out = pk.vk.d_out;
@@ -145,15 +150,12 @@ pub fn prove_projection(
     let w_mle = mat_to_mle(&convert_tm_to_fm(&pk.w), d_in, d_out);
     let bias_mle = vec_to_mle(&pk.bias, d_out);
 
-    let (nu_x, sigma_x, _) = params_from_vars(t_bits + in_bits);
-    let (nu_y, sigma_y, _) = params_from_vars(t_bits + out_bits);
     let (nu_w, sigma_w, _) = params_from_vars(in_bits + out_bits);
     let (nu_b, sigma_b, _) = params_from_vars(out_bits);
 
-    // 1. Absorb
+    // 1. Absorb (y_com removed — y is verified via combine)
     absorb_com(transcript, b"w_com", &pk.vk.w_com);
     absorb_com(transcript, b"x_com", &io_coms.x_com);
-    absorb_com(transcript, b"y_com", &io_coms.y_com);
     transcript.append_field(b"alpha", &pk.vk.alpha);
     absorb_com(transcript, b"bias_com", &pk.vk.bias_com);
 
@@ -163,16 +165,12 @@ pub fn prove_projection(
 
     // 3. Sumcheck: Z = alpha * Σ X * W
     let f_x_evals = eval_rows(&x_mle, t_bits, &r_t);
-    // 【変更】多項式 f にあらかじめ alpha を掛けておく (alpha * X)
     let f_x_scaled =
         DenseMLPoly::from_vec_padded(f_x_evals.iter().map(|val| *val * pk.vk.alpha).collect());
 
     let g_w_evals = eval_cols_ternary(&pk.w, &r_out, d_in, d_out);
     let g_w = DenseMLPoly::from_vec_padded(g_w_evals);
 
-    // Sumcheck の和の期待値は Y(r_t, r_out) - bias(r_out) と一致するはず
-    // mat_to_mle layout: evals[i*c_p2+j], rows=MSB → evaluate([r_row, r_col])
-    // Y is (t × d_out): evaluate([r_t, r_out]) = combine(&r_t, &r_out)
     let y_eval = y_mle.evaluate(&combine(&r_t, &r_out));
     let bias_eval = bias_mle.evaluate(&r_out);
     let target_z = y_eval - bias_eval;
@@ -180,77 +178,66 @@ pub fn prove_projection(
     let (sumcheck, r_k) = prove_sumcheck(&f_x_scaled, &g_w, target_z, transcript);
     transcript.append_field(b"claimed_y", &y_eval);
 
-    Ok(ProjectionProof {
+    let x_eval = x_mle.evaluate(&combine(&r_t, &r_k));
+
+    let proof = ProjectionProof {
         sumcheck,
         openings: ProjectionOpenings {
             y_eval,
-            // Y is (t × d_out): combine(&r_t, &r_out)
-            y_open: hyrax_open(&y_mle.evaluations, &combine(&r_t, &r_out), nu_y, sigma_y),
-            // X is (t × d_in): evaluate([r_t, r_k]) = combine(&r_t, &r_k)
-            x_eval: x_mle.evaluate(&combine(&r_t, &r_k)),
-            x_open: hyrax_open(&x_mle.evaluations, &combine(&r_t, &r_k), nu_x, sigma_x),
+            x_eval,
             // W is (d_in × d_out): evaluate([r_k, r_out]) = combine(&r_k, &r_out)
             w_eval: w_mle.evaluate(&combine(&r_k, &r_out)),
             w_open: hyrax_open(&w_mle.evaluations, &combine(&r_k, &r_out), nu_w, sigma_w),
             bias_at_rj: bias_eval,
             bias_opening_proof: hyrax_open(&bias_mle.evaluations, &r_out, nu_b, sigma_b),
         },
-    })
+    };
+
+    let y_claim = EvalClaim { point: combine(&r_t, &r_out), value: y_eval };
+    let x_claim = EvalClaim { point: combine(&r_t, &r_k), value: x_eval };
+
+    Ok((proof, y_claim, x_claim))
 }
 
 // ---------------------------------------------------------------------------
 // Verifier (Online Phase)
 // ---------------------------------------------------------------------------
 
-/// **Production-Grade Succinct Verifier**
+/// GKR-style succinct verifier.
 ///
-/// Ensures strict O(log N) or O(√N) execution. Binds the computation entirely
-/// to the offline static `vk` and the online dynamic `io_coms`.
+/// Does NOT open y_com or x_com — deferred to block-level combine proof.
+/// Returns (y_claim, x_claim) so the caller can feed them into verify_combine.
 pub fn verify_projection(
     proof: &ProjectionProof,
     vk: &ProjectionVerifyingKey,
     io_coms: &ProjectionIOCommitments,
     transcript: &mut Transcript,
-) -> Result<(), String> {
+) -> Result<(EvalClaim, EvalClaim), String> {
     let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
     let in_bits = vk.d_in.next_power_of_two().trailing_zeros() as usize;
     let out_bits = vk.d_out.next_power_of_two().trailing_zeros() as usize;
 
-    // 1. Absorb (Proverと完全一致)
+    // 1. Absorb (mirrors prover — y_com removed)
     absorb_com(transcript, b"w_com", &vk.w_com);
     absorb_com(transcript, b"x_com", &io_coms.x_com);
-    absorb_com(transcript, b"y_com", &io_coms.y_com);
     transcript.append_field(b"alpha", &vk.alpha);
     absorb_com(transcript, b"bias_com", &vk.bias_com);
 
     let r_t = challenge_vec(transcript, t_bits, b"proj_rt");
     let r_out = challenge_vec(transcript, out_bits, b"proj_rout");
 
-    // 2. Sumcheck 検証
-    // ターゲットは Y - bias (alpha.inv を使わない)
+    // 2. Sumcheck — target is y_eval - bias (y_eval trusted; verified by combine proof)
     let target_z = proof.openings.y_eval - proof.openings.bias_at_rj;
     let (r_k, final_sumcheck_val) = verify_sumcheck(&proof.sumcheck, target_z, in_bits, transcript)
         .map_err(|e| format!("Projection Sumcheck: {e}"))?;
     transcript.append_field(b"claimed_y", &proof.openings.y_eval);
 
-    // 3. 代数関係のチェック
-    // final_sumcheck_val は alpha * X(r_t, r_k) * W(r_k, r_out) であるべき
+    // 3. Algebraic relation: sumcheck final = alpha * X(r_t,r_k) * W(r_k,r_out)
     if final_sumcheck_val != vk.alpha * proof.openings.x_eval * proof.openings.w_eval {
         return Err("Algebraic relation: alpha * X * W != sumcheck_final".into());
     }
 
-    // 4. PCS Binding Verification
-    // X is (t × d_in): combine(&r_t, &r_k)
-    let p_x = params_from_vars(t_bits + in_bits).2;
-    hyrax_verify(
-        &io_coms.x_com,
-        proof.openings.x_eval,
-        &combine(&r_t, &r_k),
-        &proof.openings.x_open,
-        &p_x,
-    )?;
-
-    // W is (d_in × d_out): combine(&r_k, &r_out)
+    // 4. Open static weight commitments (weight and bias are not intermediate activations)
     let p_w = params_from_vars(in_bits + out_bits).2;
     hyrax_verify(
         &vk.w_com,
@@ -258,16 +245,6 @@ pub fn verify_projection(
         &combine(&r_k, &r_out),
         &proof.openings.w_open,
         &p_w,
-    )?;
-
-    // Y is (t × d_out): combine(&r_t, &r_out)
-    let p_y = params_from_vars(t_bits + out_bits).2;
-    hyrax_verify(
-        &io_coms.y_com,
-        proof.openings.y_eval,
-        &combine(&r_t, &r_out),
-        &proof.openings.y_open,
-        &p_y,
     )?;
 
     let p_b = params_from_vars(out_bits).2;
@@ -279,7 +256,10 @@ pub fn verify_projection(
         &p_b,
     )?;
 
-    Ok(())
+    // Return both claims for block-level combine verification
+    let y_claim = EvalClaim { point: combine(&r_t, &r_out), value: proof.openings.y_eval };
+    let x_claim = EvalClaim { point: combine(&r_t, &r_k), value: proof.openings.x_eval };
+    Ok((y_claim, x_claim))
 }
 // ---------------------------------------------------------------------------
 // Tests
@@ -340,11 +320,6 @@ mod projection_full_tests {
                     params_from_vars(x_mle.num_vars).0,
                     &params_from_vars(x_mle.num_vars).2,
                 ),
-                y_com: hyrax_commit(
-                    &y_mle.evaluations,
-                    params_from_vars(y_mle.num_vars).0,
-                    &params_from_vars(y_mle.num_vars).2,
-                ),
             },
         )
     }
@@ -353,7 +328,8 @@ mod projection_full_tests {
     fn test_projection_scaled_no_inv_success() {
         let (pk, witness, io) = setup_mock_projection(2, 4, 2);
         let mut transcript = Transcript::new(b"test");
-        let proof = prove_projection(&pk, &witness, &io, &mut transcript).unwrap();
+        let (proof, _y_claim, _x_claim) =
+            prove_projection(&pk, &witness, &io, &mut transcript).unwrap();
 
         let mut v_transcript = Transcript::new(b"test");
         assert!(verify_projection(&proof, &pk.vk, &io, &mut v_transcript).is_ok());
@@ -363,7 +339,8 @@ mod projection_full_tests {
     fn test_rejects_incorrect_alpha() {
         let (pk, witness, io) = setup_mock_projection(2, 4, 2);
         let mut transcript = Transcript::new(b"test");
-        let proof = prove_projection(&pk, &witness, &io, &mut transcript).unwrap();
+        let (proof, _y_claim, _x_claim) =
+            prove_projection(&pk, &witness, &io, &mut transcript).unwrap();
 
         let mut vk_bad = pk.vk;
         vk_bad.alpha = F::one(); // 正解は3
@@ -375,7 +352,8 @@ mod projection_full_tests {
     fn test_rejects_incorrect_y_eval() {
         let (pk, witness, io) = setup_mock_projection(2, 4, 2);
         let mut transcript = Transcript::new(b"test");
-        let mut proof = prove_projection(&pk, &witness, &io, &mut transcript).unwrap();
+        let (mut proof, _y_claim, _x_claim) =
+            prove_projection(&pk, &witness, &io, &mut transcript).unwrap();
 
         proof.openings.y_eval += F::one(); // Yの値を改ざん
 
