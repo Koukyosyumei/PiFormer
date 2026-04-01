@@ -7,9 +7,7 @@
 //! 3. Commitment Chaining: Intermediate IO commitments passed from the Prover
 //!    are cryptographically bound across adjacent sub-verifiers.
 
-use crate::lookup::lasso::{
-    verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey,
-};
+use crate::lookup::lasso::{verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey};
 use crate::pcs::{absorb_com, HyraxCommitment, HyraxParams};
 use crate::transcript::Transcript;
 
@@ -109,14 +107,7 @@ pub fn verify_transformer_block(
         v_com: proof.v_com.clone(),
         out_com: proof.out_inner_com.clone(),
     };
-    verify_linear_attention(
-        &proof.attn_proof,
-        inst_attn,
-        &vk.attn_pk.vk(),
-        &attn_io,
-        transcript,
-        lasso_params,
-    )?;
+    verify_linear_attention(&proof.attn_proof, inst_attn, &attn_io, transcript)?;
 
     // --- 4. Output Projection ---
     let o_io = ProjectionIOCommitments {
@@ -274,8 +265,12 @@ pub fn verify(
         all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
         all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
     }
-    let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
-    let global_lasso_vk = LassoMultiVerifyingKey { instance_table_coms: all_instance_coms };
+    let global_multi_inst = LassoMultiInstance {
+        instances: all_lasso_instances,
+    };
+    let global_lasso_vk = LassoMultiVerifyingKey {
+        instance_table_coms: all_instance_coms,
+    };
     verify_lasso_multi(
         &proof.all_lasso_proof,
         &global_multi_inst,

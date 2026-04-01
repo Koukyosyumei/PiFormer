@@ -470,21 +470,21 @@ fn write_attn_internal_coms<W: Write>(
     c: &AttentionInternalCommitments,
 ) -> io::Result<()> {
     write_hyrax_commitment(w, &c.phi_q_com)?;
-    write_hyrax_commitment(w, &c.phi_k_com)?;
-    write_hyrax_commitment(w, &c.context_com)
+    write_hyrax_commitment(w, &c.phi_k_com)
+    //write_hyrax_commitment(w, &c.context_com)
 }
 fn read_attn_internal_coms<R: Read>(r: &mut R) -> io::Result<AttentionInternalCommitments> {
     Ok(AttentionInternalCommitments {
         phi_q_com: read_hyrax_commitment(r)?,
         phi_k_com: read_hyrax_commitment(r)?,
-        context_com: read_hyrax_commitment(r)?,
+        //context_com: read_hyrax_commitment(r)?,
     })
 }
 
 fn write_attn_openings<W: Write>(w: &mut W, o: &AttentionOpenings) -> io::Result<()> {
     write_ep!(w, &o.out_eval, &o.out_open);
     write_ep!(w, &o.phi_q_eval, &o.phi_q_open);
-    write_ep!(w, &o.ctx_eval, &o.ctx_open);
+    //write_ep!(w, &o.ctx_eval, &o.ctx_open);
     write_ep!(w, &o.phi_k_eval, &o.phi_k_open);
     write_ep!(w, &o.v_eval, &o.v_open);
     Ok(())
@@ -492,7 +492,7 @@ fn write_attn_openings<W: Write>(w: &mut W, o: &AttentionOpenings) -> io::Result
 fn read_attn_openings<R: Read>(r: &mut R) -> io::Result<AttentionOpenings> {
     let (out_eval, out_open) = read_ep!(r);
     let (phi_q_eval, phi_q_open) = read_ep!(r);
-    let (ctx_eval, ctx_open) = read_ep!(r);
+    //let (ctx_eval, ctx_open) = read_ep!(r);
     let (phi_k_eval, phi_k_open) = read_ep!(r);
     let (v_eval, v_open) = read_ep!(r);
     Ok(AttentionOpenings {
@@ -500,8 +500,6 @@ fn read_attn_openings<R: Read>(r: &mut R) -> io::Result<AttentionOpenings> {
         out_open,
         phi_q_eval,
         phi_q_open,
-        ctx_eval,
-        ctx_open,
         phi_k_eval,
         phi_k_open,
         v_eval,
@@ -897,7 +895,10 @@ fn read_block_vk<R: Read>(r: &mut R) -> io::Result<TransformerBlockVerifyingKey>
             w1: vec![],
             w2: vec![],
             // activation_lasso_pk not needed for verification (verifier uses vk.activation_lasso_vk)
-            activation_lasso_pk: LassoProvingKey { table_coms: vec![], nu: 0 },
+            activation_lasso_pk: LassoProvingKey {
+                table_coms: vec![],
+                nu: 0,
+            },
         };
         (
             stub_proj(&q_vk),
