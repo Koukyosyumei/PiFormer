@@ -20,7 +20,6 @@
 //! over BN254 G1, with O(√N) proof size and O(√N) verifier work.
 
 use crate::field::{eq_eval, index_to_bits, F};
-use rayon::prelude::*;
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch,
     HyraxCommitment, HyraxParams, HyraxProof,
@@ -32,6 +31,7 @@ use crate::subprotocols::sumcheck::{
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
 use ark_ff::Field;
+use rayon::prelude::*;
 
 /// Precomputed table commitments — computed once at setup, not per proof.
 #[derive(Clone)]
@@ -42,7 +42,9 @@ pub struct LassoProvingKey {
 
 impl LassoProvingKey {
     pub fn vk(&self) -> LassoVerifyingKey {
-        LassoVerifyingKey { table_coms: self.table_coms.clone() }
+        LassoVerifyingKey {
+            table_coms: self.table_coms.clone(),
+        }
     }
 }
 
@@ -102,7 +104,11 @@ pub fn prove_lasso(
     // Step 1: absorb precommitted table commitments into transcript
     let nu = pk.nu;
     let sigma = params.sigma;
-    assert_eq!(nu + sigma, instance.bits_per_chunk, "LassoProvingKey nu/sigma mismatch with bits_per_chunk");
+    assert_eq!(
+        nu + sigma,
+        instance.bits_per_chunk,
+        "LassoProvingKey nu/sigma mismatch with bits_per_chunk"
+    );
     for k in 0..c {
         absorb_com(transcript, b"hyrax_com", &pk.table_coms[k]);
     }
@@ -128,7 +134,7 @@ pub fn prove_lasso(
         // Each x ∈ [size] is independent — compute in parallel over x.
         let size = 1usize << m;
         let l_evals: Vec<F> = (0..size)
-            .into_par_iter()
+            .into_iter()
             .map(|x| {
                 (0..n)
                     .map(|j| {
@@ -278,7 +284,9 @@ pub struct LassoMultiProvingKey {
 
 impl LassoMultiProvingKey {
     pub fn vk(&self) -> LassoMultiVerifyingKey {
-        LassoMultiVerifyingKey { instance_table_coms: self.instance_table_coms.clone() }
+        LassoMultiVerifyingKey {
+            instance_table_coms: self.instance_table_coms.clone(),
+        }
     }
 }
 
@@ -295,10 +303,20 @@ pub fn precommit_lasso_multi_tables(
     params: &HyraxParams,
 ) -> LassoMultiProvingKey {
     let nu = bits_per_chunk / 2;
-    let instance_table_coms = multi_instance.instances.iter().map(|inst| {
-        inst.tables.iter().map(|t| hyrax_commit(t, nu, params)).collect()
-    }).collect();
-    LassoMultiProvingKey { instance_table_coms, nu }
+    let instance_table_coms = multi_instance
+        .instances
+        .iter()
+        .map(|inst| {
+            inst.tables
+                .iter()
+                .map(|t| hyrax_commit(t, nu, params))
+                .collect()
+        })
+        .collect();
+    LassoMultiProvingKey {
+        instance_table_coms,
+        nu,
+    }
 }
 
 /// 複数のLassoルックアップ要求をまとめたもの
@@ -851,7 +869,13 @@ mod lasso_multi_tests {
 
         // Verifier
         let mut verifier_transcript = Transcript::new(b"multi-lasso-test");
-        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &mut verifier_transcript, &params);
+        let result = verify_lasso_multi(
+            &proof,
+            &multi_instance,
+            &vk,
+            &mut verifier_transcript,
+            &params,
+        );
 
         assert!(
             result.is_ok(),

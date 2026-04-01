@@ -64,7 +64,7 @@ impl DenseMLPoly {
         let half = self.evaluations.len() >> 1;
         let r_inv = F::ONE - r;
         let new_evals: Vec<F> = (0..half)
-            .into_par_iter()
+            .into_iter()
             .map(|i| self.evaluations[i] * r_inv + self.evaluations[i + half] * r)
             .collect();
         Self::new(new_evals)

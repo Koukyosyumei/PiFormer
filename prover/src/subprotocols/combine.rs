@@ -76,7 +76,7 @@ pub fn prove_combine(
         })
         .collect();
     let g_evals: Vec<F> = (0..n)
-        .into_par_iter()
+        .into_iter()
         .map(|j| {
             eq_arrays
                 .iter()
@@ -94,7 +94,13 @@ pub fn prove_combine(
     let (nu, sigma, _) = params_from_vars(num_vars);
     let hyrax_proof = hyrax_open(f_evals, &r_final, nu, sigma);
 
-    (CombineProof { sumcheck, hyrax_proof }, r_final)
+    (
+        CombineProof {
+            sumcheck,
+            hyrax_proof,
+        },
+        r_final,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -120,8 +126,7 @@ pub fn verify_combine(
         .sum();
 
     // Verify sumcheck
-    let (r_final, leaf) =
-        verify_sumcheck(&proof.sumcheck, combined_claim, num_vars, transcript)?;
+    let (r_final, leaf) = verify_sumcheck(&proof.sumcheck, combined_claim, num_vars, transcript)?;
 
     // Verifier computes G(r_final) locally — no PCS opening needed for G
     let g_final: F = claims
@@ -188,8 +193,6 @@ mod combine_tests {
     use crate::transcript::Transcript;
     use ark_ff::Zero;
 
-
-
     #[test]
     fn test_combine_single_claim() {
         let num_vars = 4usize;
@@ -212,7 +215,11 @@ mod combine_tests {
 
         let mut vt = Transcript::new(b"combine_test");
         let result = verify_combine(&proof, &f_com, &claims, num_vars, &mut vt);
-        assert!(result.is_ok(), "single-claim combine failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "single-claim combine failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -263,7 +270,10 @@ mod combine_tests {
         let correct_v = f_poly.evaluate(&z);
         let wrong_v = correct_v + F::from(1u64); // tampered
 
-        let claims = vec![EvalClaim { point: z, value: wrong_v }];
+        let claims = vec![EvalClaim {
+            point: z,
+            value: wrong_v,
+        }];
 
         let mut pt = Transcript::new(b"combine_bad_test");
         let (proof, _) = prove_combine(&f_evals, &f_com, &claims, num_vars, &mut pt);

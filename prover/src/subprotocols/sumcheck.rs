@@ -77,19 +77,19 @@ pub fn prove_sumcheck(
 
         // g_i(0), g_i(1), g_i(2) are independent — compute in parallel.
         let e0: F = (0..half)
-            .into_par_iter()
+            .into_iter()
             .map(|i| f_cur.evaluations[i] * g_cur.evaluations[i])
             .sum();
 
         let e1: F = (0..half)
-            .into_par_iter()
+            .into_iter()
             .map(|i| f_cur.evaluations[i + half] * g_cur.evaluations[i + half])
             .sum();
 
         // g_i(2): extrapolate each to x=2 then multiply
         // f(2, x2,...) = 2·f(1,x2,...) - f(0,x2,...) (linear extrapolation)
         let e2: F = (0..half)
-            .into_par_iter()
+            .into_iter()
             .map(|i| {
                 let f2 = two * f_cur.evaluations[i + half] - f_cur.evaluations[i];
                 let g2 = two * g_cur.evaluations[i + half] - g_cur.evaluations[i];
