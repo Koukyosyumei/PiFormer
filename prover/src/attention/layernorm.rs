@@ -11,7 +11,9 @@
 //!     space at a single random point (r_t, r_d, r_b) in O(1) time.
 
 use crate::field::F;
-use crate::lookup::range::{prove_range, verify_range, RangeProof, RangeProofWitness};
+use crate::lookup::range::{
+    prove_range, verify_range_deferred, verify_range_m_batch, RangeProof, RangeProofWitness,
+};
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch,
     params_from_n, poly_hyrax, HyraxCommitment, HyraxProof,
@@ -233,6 +235,11 @@ pub fn prove_layernorm(
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
     let _r_y_b = r_y[t_bits + d_bits];
 
+    // Advance transcript to match verifier's verify_range_m_batch lambda challenge.
+    // (verify_range_deferred defers hyrax_verify for m_com; verify_range_m_batch
+    //  batches both openings with hyrax_verify_multi_point which adds one challenge.)
+    let _ = transcript.challenge_field::<F>(b"hyrax_mp_lambda");
+
     // 7. Openings (batched by evaluation point)
 
     // Group 1: [sum_x, sq_sum_x] at r_t
@@ -396,10 +403,11 @@ pub fn verify_layernorm(
     eprintln!("[LN]  mean_sc:       {:>8.3}ms", _tm.elapsed().as_secs_f64()*1000.0);
 
     // 3. Sigma Constraint Fusion (O(1))
-    // 【重要】Verifierも、verify_range_succinct から返された評価点を受け取る
+    // Use deferred path: hyrax_verify for m_com is batched below with y_range.
     let _ts = Instant::now();
-    let (r_sig, sig_eval) = verify_range(&proof.sigma_range_proof, t_bits + 1, 32, transcript)
-        .map_err(|e| format!("Sigam Range: {e}"))?;
+    let (r_sig, sig_eval, r_m_sig) =
+        verify_range_deferred(&proof.sigma_range_proof, t_bits + 1, 32, transcript)
+            .map_err(|e| format!("Sigma Range: {e}"))?;
     eprintln!("[LN]  sigma_range:   {:>8.3}ms", _ts.elapsed().as_secs_f64()*1000.0);
     let r_sig_t = r_sig[0..t_bits].to_vec();
     let r_sig_b = r_sig[t_bits];
@@ -414,10 +422,11 @@ pub fn verify_layernorm(
         return Err("Chunk fusion mismatch: Sigma logic".into());
     }
 
-    // 4. Y Constraint Fusion (O(D) to eval public weights, O(1) for residual)
+    // 4. Y Constraint Fusion — deferred m_com, batched below.
     let _ty = Instant::now();
-    let (r_y, y_eval) = verify_range(&proof.y_range_proof, t_bits + d_bits + 1, 32, transcript)
-        .map_err(|e| format!("Y Range: {e}"))?;
+    let (r_y, y_eval, r_m_y) =
+        verify_range_deferred(&proof.y_range_proof, t_bits + d_bits + 1, 32, transcript)
+            .map_err(|e| format!("Y Range: {e}"))?;
     eprintln!("[LN]  y_range:       {:>8.3}ms", _ty.elapsed().as_secs_f64()*1000.0);
     let r_y_t = r_y[0..t_bits].to_vec();
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
@@ -443,6 +452,18 @@ pub fn verify_layernorm(
     if y_eval != expected_y_res {
         return Err("Y constraint fusion mismatch".into());
     }
+
+    // Batch-verify both m_com openings (sigma + y) in 2 MSMs instead of 4.
+    let _tmb = Instant::now();
+    verify_range_m_batch(
+        &[
+            (&proof.sigma_range_proof, &r_m_sig),
+            (&proof.y_range_proof, &r_m_y),
+        ],
+        transcript,
+    )
+    .map_err(|e| format!("LN range m_batch: {e}"))?;
+    eprintln!("[LN]  m_batch:        {:>8.3}ms", _tmb.elapsed().as_secs_f64()*1000.0);
 
     // 5. Batched openings (same order as prover's hyrax_open_batch calls)
 

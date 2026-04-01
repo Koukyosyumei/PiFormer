@@ -9,8 +9,8 @@
 
 use crate::field::F;
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch, params_from_vars,
-    HyraxCommitment, HyraxProof,
+    hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch,
+    hyrax_verify_multi_point, params_from_vars, HyraxCommitment, HyraxParams, HyraxProof,
 };
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
@@ -194,6 +194,119 @@ pub fn verify_range(
 
     // Return the coordinate and the evaluated value to the parent layer (e.g. LayerNorm)
     Ok((r_v, v_eval))
+}
+
+// ---------------------------------------------------------------------------
+// Batch Range Proof (shared multiplicity across multiple witnesses)
+// ---------------------------------------------------------------------------
+
+/// Prove that ALL values across every witness are in [0, 2^bits).
+///
+/// Concatenates all witnesses into one combined MLE and runs a single
+/// `prove_range`.  The multiplicity table counts chunks from every witness
+/// together, so the proof is ~K× smaller than K independent proofs.
+///
+/// Returns `(proof, r_v)` where `r_v` is over the combined (larger) MLE space.
+/// If you need per-witness evaluation points for constraint-fusion, call
+/// `prove_range` individually and use `verify_range_m_batch` to amortise the
+/// multiplicity-opening MSMs instead.
+pub fn prove_range_batch(
+    witnesses: &[RangeProofWitness],
+    bits: usize,
+    transcript: &mut Transcript,
+) -> Result<(RangeProof, Vec<F>), String> {
+    let all_values: Vec<F> = witnesses
+        .iter()
+        .flat_map(|w| w.values.iter().copied())
+        .collect();
+    prove_range(&RangeProofWitness { values: all_values }, bits, transcript)
+}
+
+/// Run all verification steps of a range proof **except** the final
+/// multiplicity-opening `hyrax_verify(m_com, …)`.
+///
+/// Returns `(r_v, v_eval, r_m)`.  The caller must later verify the
+/// multiplicity commitment by passing the returned `r_m` (along with
+/// `proof.m_com`, `proof.m_eval`, `proof.m_open`) to `verify_range_m_batch`.
+///
+/// Because `hyrax_verify` is transcript-free, deferring it does **not**
+/// change the transcript state — `r_m` is still derived correctly.
+pub fn verify_range_deferred(
+    proof: &RangeProof,
+    num_vars: usize,
+    bits: usize,
+    transcript: &mut Transcript,
+) -> Result<(Vec<F>, F, Vec<F>), String> {
+    let num_chunks = (bits + CHUNK_BITS - 1) / CHUNK_BITS;
+    let (_, _, params_c) = params_from_vars(num_vars);
+
+    // 1. Absorb commitments
+    for com in &proof.chunk_coms {
+        absorb_com(transcript, b"chunk_com", com);
+    }
+    absorb_com(transcript, b"logup_m_com", &proof.m_com);
+
+    // 2. Sumcheck
+    transcript.append_field(b"claim_v", &proof.claim_v);
+    let (r_v, final_val) = verify_sumcheck(&proof.sumcheck, proof.claim_v, num_vars, transcript)
+        .map_err(|e| format!("Range Sumcheck: {e}"))?;
+    let v_eval = final_val;
+
+    // 3. Chunk batch opening
+    hyrax_verify_batch(
+        &proof.chunk_coms,
+        &proof.chunk_evals,
+        &r_v,
+        &proof.chunk_batch_proof,
+        &params_c,
+        transcript,
+    )
+    .map_err(|e| format!("Chunk batch opening failed: {e}"))?;
+
+    // Chunk fusion check
+    let mut expected_v_eval = F::ZERO;
+    let mut shift = F::ONE;
+    let shift_multiplier = F::from(1u64 << CHUNK_BITS);
+    for c in 0..num_chunks {
+        expected_v_eval += proof.chunk_evals[c] * shift;
+        shift *= shift_multiplier;
+    }
+    if v_eval != expected_v_eval {
+        return Err("Chunk fusion mismatch: V(r) != sum V_c(r) * 2^{16c}".into());
+    }
+
+    // 4. Derive r_m (advances transcript identically to verify_range) but do NOT call hyrax_verify
+    let r_m = challenge_vec(transcript, CHUNK_BITS, b"logup_rm");
+
+    Ok((r_v, v_eval, r_m))
+}
+
+/// Batch-verify K multiplicity openings from K range proofs at (potentially
+/// different) evaluation points `r_m`, using a single pair of MSMs.
+///
+/// All range-proof multiplicity commitments share the same `params_m` (derived
+/// from `CHUNK_BITS`), so the batch uses `hyrax_verify_multi_point` for
+/// K × 2 MSMs → 2 MSMs total.
+///
+/// `entries`: slice of `(proof, r_m)` pairs where each `r_m` was returned by
+/// a prior call to `verify_range_deferred`.
+pub fn verify_range_m_batch(
+    entries: &[(&RangeProof, &[F])],
+    transcript: &mut Transcript,
+) -> Result<(), String> {
+    let (_, _, params_m) = params_from_vars(CHUNK_BITS);
+    let mp_entries: Vec<(&HyraxCommitment, F, &[F], &HyraxProof)> = entries
+        .iter()
+        .map(|(proof, r_m)| (&proof.m_com, proof.m_eval, *r_m, &proof.m_open))
+        .collect();
+    hyrax_verify_multi_point(&mp_entries, &params_m, transcript)
+        .map_err(|e| format!("Range multiplicity batch: {e}"))
+}
+
+/// Shared `HyraxParams` for multiplicity commitments (always uses `CHUNK_BITS`).
+/// Useful when callers need to pre-fetch the params once rather than on every call.
+pub fn range_m_params() -> HyraxParams {
+    params_from_vars(CHUNK_BITS).2
 }
 
 // ---------------------------------------------------------------------------
