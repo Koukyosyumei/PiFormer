@@ -34,6 +34,9 @@ use crate::attention::projection::{
     ProjectionVerifyingKey, ProjectionWitness,
 };
 use crate::ffn::ffn::{prove_ffn, FFNIOCommitments, FFNInstance, FFNProof, FFNWitness};
+use crate::lookup::lasso::{
+    prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
+};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey}; // Imported from verifier.rs
 
 // ---------------------------------------------------------------------------
@@ -249,6 +252,10 @@ pub struct TransformerModelProof {
     // パイプライン接続用の中間コミットメント
     pub final_ln_out_com: HyraxCommitment,
     pub logits_com: HyraxCommitment, // 最終出力（Logits）のコミットメント
+
+    /// Single batched Lasso proof covering all activation lookups across all layers.
+    /// Order per block: [FFN_i, Q_i, K_i].
+    pub all_lasso_proof: LassoMultiProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +331,25 @@ pub fn prove(
     };
     let lm_head_proof = prove_projection(&pk.lm_head_pk, &witness.lm_head_wit, &lm_io, transcript)?;
 
+    // 5. Global batched Lasso: one proof for all activation lookups across all layers.
+    // Instance order per block: [FFN_i, Q_i, K_i].
+    let mut all_lasso_instances: Vec<_> = Vec::new();
+    let mut all_instance_coms = Vec::new();
+    let mut global_nu = 0usize;
+    for i in 0..pk.vk.num_blocks {
+        let bpk = &pk.block_pks[i];
+        all_lasso_instances.push(inst_ffn.activation_lasso.clone());
+        all_lasso_instances.push(inst_attn.q_lasso.clone());
+        all_lasso_instances.push(inst_attn.k_lasso.clone());
+        all_instance_coms.push(bpk.ffn_pk.activation_lasso_pk.table_coms.clone());
+        all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
+        all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
+        global_nu = bpk.ffn_pk.activation_lasso_pk.nu;
+    }
+    let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
+    let global_lasso_pk = LassoMultiProvingKey { instance_table_coms: all_instance_coms, nu: global_nu };
+    let all_lasso_proof = prove_lasso_multi(&global_multi_inst, &global_lasso_pk, transcript, lasso_params);
+
     Ok(TransformerModelProof {
         x_in_com,
         block_proofs,
@@ -331,6 +357,7 @@ pub fn prove(
         lm_head_proof,
         final_ln_out_com,
         logits_com,
+        all_lasso_proof,
     })
 }
 

@@ -15,8 +15,8 @@
 
 use crate::field::F;
 use crate::lookup::lasso::{
-    precommit_lasso_multi_tables, prove_lasso_multi, verify_lasso_multi,
-    LassoInstance, LassoMultiInstance, LassoMultiProof,
+    precommit_lasso_multi_tables,
+    LassoInstance, LassoMultiInstance,
     LassoMultiProvingKey, LassoMultiVerifyingKey,
 };
 use crate::pcs::{
@@ -125,8 +125,6 @@ pub struct AttentionOpenings {
 
 pub struct LinearAttentionProof {
     pub internal_coms: AttentionInternalCommitments,
-    /// Batched Lasso proof for phi_q and phi_k activations.
-    pub qk_lasso: LassoMultiProof,
     pub out_sumcheck: SumcheckProof,
     pub context_sumcheck: SumcheckProof,
     pub openings: AttentionOpenings,
@@ -139,10 +137,10 @@ pub struct LinearAttentionProof {
 pub fn prove_linear_attention(
     witness: &LinearAttentionWitness,
     inst: &LinearAttentionInstance,
-    pk: &AttentionProvingKey,
+    _pk: &AttentionProvingKey,
     io_coms: &AttentionIOCommitments,
     transcript: &mut Transcript,
-    lasso_params: &HyraxParams,
+    _lasso_params: &HyraxParams,
 ) -> LinearAttentionProof {
     let t = inst.seq_len;
     let d = inst.d_head;
@@ -172,13 +170,7 @@ pub fn prove_linear_attention(
     absorb_com(transcript, b"phi_k_com", &phi_k_com);
     absorb_com(transcript, b"context_com", &context_com);
 
-    // 2. Batched Lasso for phi_q and phi_k activations
-    let qk_multi = LassoMultiInstance {
-        instances: vec![inst.q_lasso.clone(), inst.k_lasso.clone()],
-    };
-    let qk_lasso = prove_lasso_multi(&qk_multi, &pk.qk_lasso_pk, transcript, lasso_params);
-
-    // 3. Sumcheck for OUT
+    // 2. Sumcheck for OUT
     let rx = challenge_vec(transcript, t_bits, b"rx_out");
     let ry = challenge_vec(transcript, d_bits, b"ry_out");
 
@@ -218,7 +210,6 @@ pub fn prove_linear_attention(
             phi_k_com,
             context_com,
         },
-        qk_lasso,
         out_sumcheck,
         context_sumcheck,
         openings: AttentionOpenings {
@@ -248,10 +239,10 @@ pub fn prove_linear_attention(
 pub fn verify_linear_attention(
     proof: &LinearAttentionProof,
     inst: &LinearAttentionInstance,
-    vk: &AttentionVerifyingKey,
+    _vk: &AttentionVerifyingKey,
     io_coms: &AttentionIOCommitments, // Trusted inputs from pipeline!
     transcript: &mut Transcript,
-    lasso_params: &HyraxParams,
+    _lasso_params: &HyraxParams,
 ) -> Result<(), String> {
     let t = inst.seq_len;
     let d = inst.d_head;
@@ -273,14 +264,7 @@ pub fn verify_linear_attention(
     absorb_com(transcript, b"phi_k_com", &proof.internal_coms.phi_k_com);
     absorb_com(transcript, b"context_com", &proof.internal_coms.context_com);
 
-    // 2. Batched Lasso Verification for phi_q and phi_k
-    let qk_multi = LassoMultiInstance {
-        instances: vec![inst.q_lasso.clone(), inst.k_lasso.clone()],
-    };
-    verify_lasso_multi(&proof.qk_lasso, &qk_multi, &vk.qk_lasso_vk, transcript, lasso_params)
-        .map_err(|e| format!("qk batched lasso: {e}"))?;
-
-    // 3. Replay challenges
+    // 2. Replay challenges
     let rx = challenge_vec(transcript, t_bits, b"rx_out");
     let ry = challenge_vec(transcript, d_bits, b"ry_out");
 

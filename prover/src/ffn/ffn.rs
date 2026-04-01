@@ -13,8 +13,8 @@
 
 use crate::field::F;
 use crate::lookup::lasso::{
-    precommit_lasso_tables, prove_lasso, verify_lasso,
-    LassoInstance, LassoProof, LassoProvingKey, LassoVerifyingKey,
+    precommit_lasso_tables,
+    LassoInstance, LassoProvingKey, LassoVerifyingKey,
 };
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment,
@@ -134,7 +134,6 @@ pub struct FFNOpenings {
 
 pub struct FFNProof {
     pub internal_coms: FFNInternalCommitments,
-    pub activation_proof: LassoProof,
     pub y_sumcheck: SumcheckProof,
     pub m_sumcheck: SumcheckProof,
     pub openings: FFNOpenings,
@@ -147,10 +146,10 @@ pub struct FFNProof {
 pub fn prove_ffn(
     pk: &FFNProvingKey,
     witness: &FFNWitness,
-    inst: &FFNInstance,
+    _inst: &FFNInstance,
     io_coms: &FFNIOCommitments,
     transcript: &mut Transcript,
-    lasso_params: &HyraxParams,
+    _lasso_params: &HyraxParams,
 ) -> Result<FFNProof, String> {
     let t = pk.vk.seq_len;
     let d = pk.vk.d_model;
@@ -184,10 +183,7 @@ pub fn prove_ffn(
     absorb_com(transcript, b"m_com", &m_com);
     absorb_com(transcript, b"a_com", &a_com);
 
-    // 3. Lasso for A = φ(M)
-    let activation_proof = prove_lasso(&inst.activation_lasso, &pk.activation_lasso_pk, transcript, lasso_params);
-
-    // 4. Sumcheck 1: Y = A · W2
+    // 3. Sumcheck 1: Y = A · W2
     let rx_y = challenge_vec(transcript, t_bits, b"ffn_rx_y");
     let ry_y = challenge_vec(transcript, d_bits, b"ffn_ry_y");
     let y_eval = y_mle.evaluate(&combine(&rx_y, &ry_y));
@@ -224,7 +220,6 @@ pub fn prove_ffn(
 
     Ok(FFNProof {
         internal_coms: FFNInternalCommitments { m_com, a_com },
-        activation_proof,
         y_sumcheck,
         m_sumcheck,
         openings: FFNOpenings {
@@ -250,11 +245,11 @@ pub fn prove_ffn(
 
 pub fn verify_ffn(
     proof: &FFNProof,
-    inst: &FFNInstance,
+    _inst: &FFNInstance,
     vk: &FFNVerifyingKey,
     io_coms: &FFNIOCommitments,
     transcript: &mut Transcript,
-    lasso_params: &HyraxParams,
+    _lasso_params: &HyraxParams,
 ) -> Result<(), String> {
     let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
     let d_bits = vk.d_model.next_power_of_two().trailing_zeros() as usize;
@@ -273,17 +268,7 @@ pub fn verify_ffn(
     absorb_com(transcript, b"m_com", &proof.internal_coms.m_com);
     absorb_com(transcript, b"a_com", &proof.internal_coms.a_com);
 
-    // 2. Verify Lasso (Binds A to M)
-    verify_lasso(
-        &proof.activation_proof,
-        &inst.activation_lasso,
-        &vk.activation_lasso_vk,
-        transcript,
-        lasso_params,
-    )
-    .map_err(|e| format!("FFN Lasso failed: {}", e))?;
-
-    // 3. Verify Y Sumcheck
+    // 2. Verify Y Sumcheck
     let rx_y = challenge_vec(transcript, t_bits, b"ffn_rx_y");
     let ry_y = challenge_vec(transcript, d_bits, b"ffn_ry_y");
     transcript.append_field(b"claim_y", &proof.openings.y_eval);

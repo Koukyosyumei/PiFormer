@@ -507,7 +507,6 @@ fn read_attn_openings<R: Read>(r: &mut R) -> io::Result<AttentionOpenings> {
 
 fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result<()> {
     write_attn_internal_coms(w, &p.internal_coms)?;
-    write_lasso_multi_proof(w, &p.qk_lasso)?;
     write_sumcheck_proof(w, &p.out_sumcheck)?;
     write_sumcheck_proof(w, &p.context_sumcheck)?;
     write_attn_openings(w, &p.openings)
@@ -515,7 +514,6 @@ fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result
 fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
     Ok(LinearAttentionProof {
         internal_coms: read_attn_internal_coms(r)?,
-        qk_lasso: read_lasso_multi_proof(r)?,
         out_sumcheck: read_sumcheck_proof(r)?,
         context_sumcheck: read_sumcheck_proof(r)?,
         openings: read_attn_openings(r)?,
@@ -571,7 +569,6 @@ fn read_ffn_openings<R: Read>(r: &mut R) -> io::Result<FFNOpenings> {
 
 fn write_ffn_proof<W: Write>(w: &mut W, p: &FFNProof) -> io::Result<()> {
     write_ffn_internal_coms(w, &p.internal_coms)?;
-    write_lasso_proof(w, &p.activation_proof)?;
     write_sumcheck_proof(w, &p.y_sumcheck)?;
     write_sumcheck_proof(w, &p.m_sumcheck)?;
     write_ffn_openings(w, &p.openings)
@@ -579,7 +576,6 @@ fn write_ffn_proof<W: Write>(w: &mut W, p: &FFNProof) -> io::Result<()> {
 fn read_ffn_proof<R: Read>(r: &mut R) -> io::Result<FFNProof> {
     Ok(FFNProof {
         internal_coms: read_ffn_internal_coms(r)?,
-        activation_proof: read_lasso_proof(r)?,
         y_sumcheck: read_sumcheck_proof(r)?,
         m_sumcheck: read_sumcheck_proof(r)?,
         openings: read_ffn_openings(r)?,
@@ -635,7 +631,8 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_ln_proof(w, &p.final_ln_proof)?;
     write_proj_proof(w, &p.lm_head_proof)?;
     write_hyrax_commitment(w, &p.final_ln_out_com)?;
-    write_hyrax_commitment(w, &p.logits_com)
+    write_hyrax_commitment(w, &p.logits_com)?;
+    write_lasso_multi_proof(w, &p.all_lasso_proof)
 }
 fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
     Ok(TransformerModelProof {
@@ -645,6 +642,7 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         lm_head_proof: read_proj_proof(r)?,
         final_ln_out_com: read_hyrax_commitment(r)?,
         logits_com: read_hyrax_commitment(r)?,
+        all_lasso_proof: read_lasso_multi_proof(r)?,
     })
 }
 

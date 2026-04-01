@@ -7,6 +7,9 @@
 //! 3. Commitment Chaining: Intermediate IO commitments passed from the Prover
 //!    are cryptographically bound across adjacent sub-verifiers.
 
+use crate::lookup::lasso::{
+    verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey,
+};
 use crate::pcs::{absorb_com, HyraxCommitment, HyraxParams};
 use crate::transcript::Transcript;
 
@@ -257,6 +260,30 @@ pub fn verify(
     };
     verify_projection(&proof.lm_head_proof, &vk.lm_head_vk, &lm_io, transcript)
         .map_err(|e| format!("LM Head failed: {}", e))?;
+
+    // 5. Global batched Lasso: verify all activation lookups across all layers.
+    // Instance order per block: [FFN_i, Q_i, K_i].
+    let mut all_lasso_instances = Vec::new();
+    let mut all_instance_coms = Vec::new();
+    for i in 0..vk.num_blocks {
+        let bvk = &vk.block_vks[i];
+        all_lasso_instances.push(inst_ffn.activation_lasso.clone());
+        all_lasso_instances.push(inst_attn.q_lasso.clone());
+        all_lasso_instances.push(inst_attn.k_lasso.clone());
+        all_instance_coms.push(bvk.ffn_vk.activation_lasso_vk.table_coms.clone());
+        all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
+        all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
+    }
+    let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
+    let global_lasso_vk = LassoMultiVerifyingKey { instance_table_coms: all_instance_coms };
+    verify_lasso_multi(
+        &proof.all_lasso_proof,
+        &global_multi_inst,
+        &global_lasso_vk,
+        transcript,
+        lasso_params,
+    )
+    .map_err(|e| format!("Global batched Lasso failed: {}", e))?;
 
     Ok(())
 }
