@@ -334,70 +334,74 @@ fn read_ln_internal_coms<R: Read>(r: &mut R) -> io::Result<LayerNormInternalComm
 }
 
 fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<()> {
+    // Group 1: at r_t
     write_f(w, &o.sum_x_at_rt)?;
     write_f(w, &o.sq_sum_x_at_rt)?;
-    write_hyrax_proof(w, &o.sum_x_rt_proof)?;
-    write_hyrax_proof(w, &o.sq_sum_x_rt_proof)?;
-    write_ep!(w, &o.sum_x_sq_at_rsig, &o.sum_x_sq_rsig_proof);
+    write_hyrax_proof(w, &o.rt_batch_proof)?;
+    // Individual: x at combine(r_t, r_d_mean)
     write_ep!(w, &o.x_at_rt_rmean, &o.x_rt_rmean_proof);
-    write_ep!(w, &o.sum_x_at_rsig, &o.sum_x_rsig_proof);
-    write_ep!(w, &o.sq_sum_x_at_rsig, &o.sq_sum_x_rsig_proof);
-    write_ep!(w, &o.sigma_at_rsig, &o.sigma_rsig_proof);
-    write_ep!(w, &o.sigma_sq_at_rsig, &o.sigma_sq_rsig_proof);
-    write_ep!(w, &o.x_at_ry, &o.x_ry_proof);
-    write_ep!(w, &o.y_at_ry, &o.y_ry_proof);
-    write_ep!(w, &o.sum_x_at_ryt, &o.sum_x_ryt_proof);
-    write_ep!(w, &o.sigma_at_ryt, &o.sigma_ryt_proof);
-    write_ep!(w, &o.sigma_y_at_ry, &o.sigma_y_ry_proof);
-    write_ep!(w, &o.gamma_x_at_ry, &o.gamma_x_ry_proof);
-    Ok(())
+    // Group 2: at r_sig_t
+    write_f(w, &o.sum_x_at_rsig)?;
+    write_f(w, &o.sq_sum_x_at_rsig)?;
+    write_f(w, &o.sigma_at_rsig)?;
+    write_f(w, &o.sigma_sq_at_rsig)?;
+    write_f(w, &o.sum_x_sq_at_rsig)?;
+    write_hyrax_proof(w, &o.rsig_batch_proof)?;
+    // Group 3: at combine(r_y_t, r_y_d)
+    write_f(w, &o.x_at_ry)?;
+    write_f(w, &o.y_at_ry)?;
+    write_f(w, &o.gamma_x_at_ry)?;
+    write_f(w, &o.sigma_y_at_ry)?;
+    write_hyrax_proof(w, &o.ry_td_batch_proof)?;
+    // Group 4: at r_y_t
+    write_f(w, &o.sum_x_at_ryt)?;
+    write_f(w, &o.sigma_at_ryt)?;
+    write_hyrax_proof(w, &o.ryt_batch_proof)
 }
 fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
+    // Group 1: at r_t
     let sum_x_at_rt = read_f(r)?;
     let sq_sum_x_at_rt = read_f(r)?;
-    let sum_x_rt_proof = read_hyrax_proof(r)?;
-    let sq_sum_x_rt_proof = read_hyrax_proof(r)?;
-    let (sum_x_sq_at_rsig, sum_x_sq_rsig_proof) = read_ep!(r);
+    let rt_batch_proof = read_hyrax_proof(r)?;
+    // Individual: x at combine(r_t, r_d_mean)
     let (x_at_rt_rmean, x_rt_rmean_proof) = read_ep!(r);
-    let (sum_x_at_rsig, sum_x_rsig_proof) = read_ep!(r);
-    let (sq_sum_x_at_rsig, sq_sum_x_rsig_proof) = read_ep!(r);
-    let (sigma_at_rsig, sigma_rsig_proof) = read_ep!(r);
-    let (sigma_sq_at_rsig, sigma_sq_rsig_proof) = read_ep!(r);
-    let (x_at_ry, x_ry_proof) = read_ep!(r);
-    let (y_at_ry, y_ry_proof) = read_ep!(r);
-    let (sum_x_at_ryt, sum_x_ryt_proof) = read_ep!(r);
-    let (sigma_at_ryt, sigma_ryt_proof) = read_ep!(r);
-    let (sigma_y_at_ry, sigma_y_ry_proof) = read_ep!(r);
-    let (gamma_x_at_ry, gamma_x_ry_proof) = read_ep!(r);
+    // Group 2: at r_sig_t
+    let sum_x_at_rsig = read_f(r)?;
+    let sq_sum_x_at_rsig = read_f(r)?;
+    let sigma_at_rsig = read_f(r)?;
+    let sigma_sq_at_rsig = read_f(r)?;
+    let sum_x_sq_at_rsig = read_f(r)?;
+    let rsig_batch_proof = read_hyrax_proof(r)?;
+    // Group 3: at combine(r_y_t, r_y_d)
+    let x_at_ry = read_f(r)?;
+    let y_at_ry = read_f(r)?;
+    let gamma_x_at_ry = read_f(r)?;
+    let sigma_y_at_ry = read_f(r)?;
+    let ry_td_batch_proof = read_hyrax_proof(r)?;
+    // Group 4: at r_y_t
+    let sum_x_at_ryt = read_f(r)?;
+    let sigma_at_ryt = read_f(r)?;
+    let ryt_batch_proof = read_hyrax_proof(r)?;
     Ok(LayerNormOpenings {
         sum_x_at_rt,
         sq_sum_x_at_rt,
-        sum_x_rt_proof,
-        sq_sum_x_rt_proof,
-        sum_x_sq_at_rsig,
-        sum_x_sq_rsig_proof,
+        rt_batch_proof,
         x_at_rt_rmean,
         x_rt_rmean_proof,
         sum_x_at_rsig,
-        sum_x_rsig_proof,
         sq_sum_x_at_rsig,
-        sq_sum_x_rsig_proof,
         sigma_at_rsig,
-        sigma_rsig_proof,
         sigma_sq_at_rsig,
-        sigma_sq_rsig_proof,
+        sum_x_sq_at_rsig,
+        rsig_batch_proof,
         x_at_ry,
-        x_ry_proof,
         y_at_ry,
-        y_ry_proof,
-        sum_x_at_ryt,
-        sum_x_ryt_proof,
-        sigma_at_ryt,
-        sigma_ryt_proof,
-        sigma_y_at_ry,
-        sigma_y_ry_proof,
         gamma_x_at_ry,
-        gamma_x_ry_proof,
+        sigma_y_at_ry,
+        ry_td_batch_proof,
+        sum_x_at_ryt,
+        sigma_at_ryt,
+        ryt_batch_proof,
     })
 }
 
