@@ -264,18 +264,22 @@ pub fn hyrax_verify_batch(
     let l_vec = lagrange_basis(&r_l_rev);
     let r_vec = lagrange_basis(&r_r_rev);
 
-    // 3. コミットメントのホモモーフィックな統合
-    // 各多項式の行コミットメントを η で重み付けして合算し、それを L で集約する
-    let mut combined_rows = vec![G1Projective::zero(); 1 << nu];
+    // 3. Check 1: Σ_k Σ_i (η^k · L_i) · C_{k,i} == MSM(gens, w'_batch)
+    //
+    // Old approach: K×num_rows full G1 scalar muls (254-bit each, ~60 µs each).
+    // New approach: K×num_rows cheap *field* multiplications, then ONE big MSM.
+    //   scalar(k,i) = η^k · L_i  (field mul, ~50 ns)
+    //   lhs = MSM over all K×num_rows row_coms with these scalars
+    let num_rows = 1usize << nu;
+    let mut all_row_points: Vec<G1Affine> = Vec::with_capacity(count * num_rows);
+    let mut all_row_scalars: Vec<F> = Vec::with_capacity(count * num_rows);
     for (k, com) in commitments.iter().enumerate() {
         for (i, &row_com) in com.row_coms.iter().enumerate() {
-            combined_rows[i] += G1Projective::from(row_com) * eta_pows[k];
+            all_row_points.push(row_com);
+            all_row_scalars.push(eta_pows[k] * l_vec[i]);
         }
     }
-    let combined_rows_affine: Vec<G1Affine> = combined_rows.iter().map(|p| (*p).into()).collect();
-
-    // Check 1: Σ_i L_i * (Σ_k η^k * C_{k,i}) == MSM(gens, w'_batch)
-    let lhs = msm_g1(&combined_rows_affine, &l_vec);
+    let lhs = msm(&all_row_points, &all_row_scalars);
     let rhs = msm(&params.gens, &proof.w_prime);
     if lhs != rhs {
         return Err("Hyrax Batch: commitment check failed".to_string());
