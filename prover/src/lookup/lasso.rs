@@ -21,9 +21,13 @@
 
 use crate::field::{eq_eval, index_to_bits, F};
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_verify, HyraxCommitment, HyraxParams, HyraxProof,
+    absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch,
+    HyraxCommitment, HyraxParams, HyraxProof,
 };
 use crate::poly::DenseMLPoly;
+use crate::subprotocols::sumcheck::{
+    prove_sumcheck_multi_batched, verify_sumcheck_multi_batched, SumcheckProofMulti,
+};
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
 use ark_ff::Field;
@@ -249,6 +253,241 @@ pub fn verify_lasso(
     Ok(())
 }
 
+/// 複数のLassoルックアップ要求をまとめたもの
+pub struct LassoMultiInstance {
+    pub instances: Vec<LassoInstance>,
+}
+
+/// 集約されたLasso証明
+pub struct LassoMultiProof {
+    /// 全インスタンスの重み付き合計: Σ_t α^t · (Σ_j ρ^j · output_{t,j})
+    pub combined_grand_sum: F,
+    /// 全インスタンス・全サブテーブルを統合した単一のSumcheck証明
+    pub combined_sumcheck_proof: SumcheckProofMulti,
+    /// 各サブテーブル T_{t,k}(r) の評価値
+    pub table_openings: Vec<Vec<F>>,
+    /// インスタンスごとのHyraxコミットメント
+    pub hyrax_commitments: Vec<Vec<HyraxCommitment>>,
+    /// 全評価値を一括で証明するバッチHyrax証明
+    pub hyrax_proof: HyraxProof,
+}
+
+pub fn prove_lasso_multi(
+    multi_instance: &LassoMultiInstance,
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> LassoMultiProof {
+    let t_count = multi_instance.instances.len();
+    let m = multi_instance.instances[0].bits_per_chunk;
+    let mask = (1usize << m) - 1;
+
+    // インスタンスリストが空でないことを確認
+    assert!(
+        !multi_instance.instances.is_empty(),
+        "Multi-instance must contain at least one LassoInstance"
+    );
+    // すべてのインスタンスの bits_per_chunk が一致するかチェック
+    for (i, inst) in multi_instance.instances.iter().enumerate() {
+        assert_eq!(
+            inst.bits_per_chunk, m,
+            "LassoInstance at index {} has inconsistent bits_per_chunk: expected {}, found {}",
+            i, m, inst.bits_per_chunk
+        );
+    }
+
+    // --- STEP 1: コミットメントの吸収 ---
+    let mut hyrax_commitments = Vec::new();
+    for instance in &multi_instance.instances {
+        let mut inst_coms = Vec::new();
+        for table in &instance.tables {
+            let com = hyrax_commit(table, m / 2, params);
+            // コミットメントを吸収 (Lasso論文のプロトコルに準拠)
+            absorb_com(transcript, b"hyrax_com", &com);
+            inst_coms.push(com);
+        }
+        hyrax_commitments.push(inst_coms);
+    }
+
+    // --- STEP 2: 公開出力の吸収 ---
+    for instance in &multi_instance.instances {
+        for out in &instance.outputs {
+            transcript.append_field(b"lasso_out", out);
+        }
+    }
+
+    // --- STEP 3: チャレンジの生成 ---
+    let alpha = transcript.challenge_field::<F>(b"instance_batch_alpha");
+    let rho = transcript.challenge_field::<F>(b"lookup_batch_rho");
+    // 注: gammaはサブテーブルを個別に扱う場合に必要ですが、
+    // 合計出力(output = ΣT_k)と照合する場合は不要です。
+
+    let alpha_pows = powers_of(alpha, t_count);
+    let mut combined_grand_sum = F::ZERO;
+    let mut all_t_polys = Vec::new();
+    let mut all_l_polys = Vec::new();
+    let mut flatten_tables = Vec::new();
+
+    for (t, instance) in multi_instance.instances.iter().enumerate() {
+        let n = instance.query_indices.len();
+        let rho_pows = powers_of(rho, n);
+
+        for (k, table_evals) in instance.tables.iter().enumerate() {
+            let t_poly = DenseMLPoly::new(table_evals.clone());
+            let mut l_evals = vec![F::ZERO; 1 << m];
+            for j in 0..n {
+                let ch = chunk(instance.query_indices[j], k, m, mask);
+                // 重みは α^t * ρ^j のみ (Σ_k T_k = output に対応させるため)
+                l_evals[ch] += alpha_pows[t] * rho_pows[j];
+            }
+            all_t_polys.push(t_poly);
+            all_l_polys.push(DenseMLPoly::new(l_evals));
+            flatten_tables.push(table_evals);
+        }
+
+        let instance_out_sum: F = (0..n).map(|j| rho_pows[j] * instance.outputs[j]).sum();
+        combined_grand_sum += alpha_pows[t] * instance_out_sum;
+    }
+
+    // --- STEP 4: Sumcheckの実行 ---
+    let (combined_sumcheck_proof, r_vec) = prove_sumcheck_multi_batched(
+        &all_t_polys,
+        &all_l_polys,
+        &vec![F::ONE; all_t_polys.len()],
+        combined_grand_sum,
+        transcript,
+    );
+
+    let mut table_openings = Vec::new();
+    for (t, instance) in multi_instance.instances.iter().enumerate() {
+        let mut inst_openings = Vec::new();
+        for k in 0..instance.tables.len() {
+            let eval = all_t_polys[t * instance.tables.len() + k].evaluate(&r_vec);
+            inst_openings.push(eval);
+        }
+        table_openings.push(inst_openings);
+    }
+
+    // 型の不一致を修正: Vec<&Vec<F>> から Vec<&[F]> への変換
+    let flatten_tables_slices: Vec<&[F]> = flatten_tables.iter().map(|v| v.as_slice()).collect();
+
+    // 引数を5つに修正
+    let hyrax_proof = hyrax_open_batch(
+        &flatten_tables_slices,
+        &r_vec,
+        m / 2,      // nu
+        m - m / 2,  // sigma
+        transcript, // 5th argument
+    );
+
+    LassoMultiProof {
+        combined_grand_sum,
+        combined_sumcheck_proof,
+        table_openings,
+        hyrax_commitments,
+        hyrax_proof,
+    }
+}
+
+pub fn verify_lasso_multi(
+    proof: &LassoMultiProof,
+    multi_instance: &LassoMultiInstance,
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> Result<(), String> {
+    let t_count = multi_instance.instances.len();
+    let m = multi_instance.instances[0].bits_per_chunk;
+    let mask = (1usize << m) - 1;
+
+    // --- STEP 1: 再現のための吸収 (Proverと完全に一致させる) ---
+    for (t, instance) in multi_instance.instances.iter().enumerate() {
+        for k in 0..instance.tables.len() {
+            absorb_com(transcript, b"hyrax_com", &proof.hyrax_commitments[t][k]);
+        }
+    }
+    for instance in &multi_instance.instances {
+        for out in &instance.outputs {
+            transcript.append_field(b"lasso_out", out);
+        }
+    }
+
+    // チャレンジ生成
+    let alpha = transcript.challenge_field::<F>(b"instance_batch_alpha");
+    let rho = transcript.challenge_field::<F>(b"lookup_batch_rho");
+    let alpha_pows = powers_of(alpha, t_count);
+
+    // --- STEP 2: Sumcheckの検証 ---
+    let total_tables: usize = multi_instance
+        .instances
+        .iter()
+        .map(|i| i.tables.len())
+        .sum();
+    let (r_vec, sumcheck_final_val) = verify_sumcheck_multi_batched(
+        &proof.combined_sumcheck_proof,
+        &vec![F::ONE; total_tables],
+        proof.combined_grand_sum,
+        m,
+        transcript,
+    )?;
+
+    let r_rev: Vec<F> = r_vec.iter().copied().rev().collect();
+    let mut expected_final_eval = F::ZERO;
+    let mut table_idx = 0;
+
+    for (t, instance) in multi_instance.instances.iter().enumerate() {
+        let n = instance.query_indices.len();
+        let rho_pows = powers_of(rho, n);
+        //let gamma_pows = powers_of(gamma, instance.tables.len());
+
+        for k in 0..instance.tables.len() {
+            // 公開情報から L_{t,k}(r) を直接計算
+            let l_tk_at_r: F = (0..n)
+                .map(|j| {
+                    let ch = chunk(instance.query_indices[j], k, m, mask);
+                    rho_pows[j] * eq_eval(&index_to_bits(ch, m), &r_rev)
+                })
+                .sum();
+
+            // 重み付けされたセレクタ評価値
+            let weighted_l = alpha_pows[t] * l_tk_at_r;
+
+            // 重要: Sumcheck内の個別の評価値が、検証者の計算およびOpeningと一致するか確認
+            if proof.table_openings[t][k] != proof.combined_sumcheck_proof.final_evals_f[table_idx]
+            {
+                return Err(format!("Table opening mismatch at index {table_idx}"));
+            }
+            if weighted_l != proof.combined_sumcheck_proof.final_evals_g[table_idx] {
+                return Err(format!(
+                    "Weighted selector evaluation mismatch at index {table_idx}"
+                ));
+            }
+
+            expected_final_eval += proof.table_openings[t][k] * weighted_l;
+            table_idx += 1;
+        }
+    }
+
+    // 2. Sumcheckの最終評価値との一貫性チェック
+    if expected_final_eval != sumcheck_final_val {
+        return Err(
+            "Multi-Lasso Sumcheck final check failed: expected sum does not match sumcheck claim"
+                .into(),
+        );
+    }
+
+    let flatten_commitments: Vec<_> = proof.hyrax_commitments.iter().flatten().cloned().collect();
+    let flatten_openings: Vec<_> = proof.table_openings.iter().flatten().copied().collect();
+
+    // 検証側も transcript を含めた引数構成に修正
+    hyrax_verify_batch(
+        &flatten_commitments,
+        &flatten_openings,
+        &r_vec,
+        &proof.hyrax_proof,
+        params,
+        transcript,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -398,10 +637,7 @@ mod lasso_tests {
             .collect();
 
         let query_indices = vec![0, 1, 3, 7, 15];
-        let outputs: Vec<F> = query_indices
-            .iter()
-            .map(|&idx| t0[idx])
-            .collect();
+        let outputs: Vec<F> = query_indices.iter().map(|&idx| t0[idx]).collect();
 
         let instance = LassoInstance {
             tables: vec![t0],
@@ -417,7 +653,11 @@ mod lasso_tests {
 
         let mut vt = Transcript::new(b"single-table");
         let result = verify_lasso(&proof, &instance, &mut vt, &params);
-        assert!(result.is_ok(), "single-table lasso failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "single-table lasso failed: {:?}",
+            result.err()
+        );
     }
 
     /// Single-query Lasso: only one lookup entry to prove.
@@ -444,7 +684,11 @@ mod lasso_tests {
 
         let mut vt = Transcript::new(b"single-query");
         let result = verify_lasso(&proof, &instance, &mut vt, &params);
-        assert!(result.is_ok(), "single-query lasso failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "single-query lasso failed: {:?}",
+            result.err()
+        );
     }
 
     /// Verify the internal `chunk` helper function correctness.
@@ -473,5 +717,182 @@ mod lasso_tests {
         assert_eq!(pows[2], F::from(9u64));
         assert_eq!(pows[3], F::from(27u64));
         assert_eq!(pows[4], F::from(81u64));
+    }
+}
+
+#[cfg(test)]
+mod lasso_multi_tests {
+    use super::*;
+    use crate::transcript::Transcript;
+    use crate::{field::F, pcs::setup_hyrax_params};
+    use ark_ff::{One, Zero};
+
+    // --- テスト用ヘルパー関数 ---
+
+    /// インスタンス A: 2つのサブテーブルを持つルックアップ
+    fn setup_instance_a() -> LassoInstance {
+        let m = 4;
+        let table_size = 1 << m;
+        // Table 0: T[i] = i, Table 1: T[i] = i * 10
+        let t0: Vec<F> = (0..table_size).map(|i| F::from(i as u64)).collect();
+        let t1: Vec<F> = (0..table_size).map(|i| F::from((i * 10) as u64)).collect();
+
+        // Index 0x12 -> T0[2] + T1[1] = 2 + 10 = 12
+        // Index 0x34 -> T0[4] + T1[3] = 4 + 30 = 34
+        LassoInstance {
+            tables: vec![t0, t1],
+            query_indices: vec![0x12, 0x34],
+            outputs: vec![F::from(12), F::from(34)],
+            bits_per_chunk: m,
+        }
+    }
+
+    /// インスタンス B: 1つのサブテーブル（二乗テーブル）を持つルックアップ
+    fn setup_instance_b() -> LassoInstance {
+        let m = 4;
+        let table_size = 1 << m;
+        // T[i] = i * i
+        let t0: Vec<F> = (0..table_size).map(|i| F::from((i * i) as u64)).collect();
+        let t1: Vec<F> = (0..table_size)
+            .map(|i| F::from((i * i * i) as u64))
+            .collect();
+
+        // Index 5 -> 25, Index 1 -> 1
+        LassoInstance {
+            tables: vec![t0, t1],
+            query_indices: vec![5, 1],
+            outputs: vec![F::from(25), F::from(1)],
+            bits_per_chunk: m,
+        }
+    }
+
+    /// 複数のインスタンスを統合した MultiInstance を作成
+    fn setup_multi_instance() -> LassoMultiInstance {
+        LassoMultiInstance {
+            instances: vec![setup_instance_a(), setup_instance_b()],
+        }
+    }
+
+    // --- テストケース ---
+
+    /// 正常系: 複数のインスタンスを単一の証明で一括検証
+    #[test]
+    fn test_lasso_multi_e2e_success() {
+        let multi_instance = setup_multi_instance();
+        let m = multi_instance.instances[0].bits_per_chunk;
+        let params = setup_hyrax_params(m);
+
+        // Prover
+        let mut prover_transcript = Transcript::new(b"multi-lasso-test");
+        let proof = prove_lasso_multi(&multi_instance, &mut prover_transcript, &params);
+
+        // Verifier
+        let mut verifier_transcript = Transcript::new(b"multi-lasso-test");
+        let result = verify_lasso_multi(&proof, &multi_instance, &mut verifier_transcript, &params);
+
+        assert!(
+            result.is_ok(),
+            "Multi-Lasso verification failed: {:?}",
+            result.err()
+        );
+    }
+
+    /// 異常系: 特定のインスタンスの公開出力値が改ざんされた場合
+    #[test]
+    fn test_lasso_multi_rejects_wrong_output() {
+        let mut multi_instance = setup_multi_instance();
+        let m = multi_instance.instances[0].bits_per_chunk;
+        let params = setup_hyrax_params(m);
+
+        // インスタンスBの出力を不正な値に変更
+        multi_instance.instances[1].outputs[0] = F::from(999u64);
+
+        let mut pt = Transcript::new(b"multi-lasso-test");
+        let proof = prove_lasso_multi(&multi_instance, &mut pt, &params);
+
+        let mut vt = Transcript::new(b"multi-lasso-test");
+        let result = verify_lasso_multi(&proof, &multi_instance, &mut vt, &params);
+
+        // 検証側で expected_final_eval と sumcheck の主張が一致しなくなるため失敗する
+        assert!(result.is_err(), "Should reject due to wrong public output");
+    }
+
+    /// 異常系: 統合されたSumcheck証明の一部が改ざんされた場合
+    #[test]
+    fn test_lasso_multi_tampered_sumcheck() {
+        let multi_instance = setup_multi_instance();
+        let m = multi_instance.instances[0].bits_per_chunk;
+        let params = setup_hyrax_params(m);
+
+        let mut pt = Transcript::new(b"multi-lasso-test");
+        let mut proof = prove_lasso_multi(&multi_instance, &mut pt, &params);
+
+        // 統合Sumcheckのラウンド多項式を改ざん
+        proof.combined_sumcheck_proof.round_polys[0].evals[0] += F::one();
+
+        let mut vt = Transcript::new(b"multi-lasso-test");
+        let result = verify_lasso_multi(&proof, &multi_instance, &mut vt, &params);
+
+        assert!(result.is_err(), "Should reject tampered sumcheck proof");
+    }
+
+    /// 異常系: トランスクリプト（コンテキスト）が不一致の場合
+    #[test]
+    fn test_lasso_multi_transcript_mismatch() {
+        let multi_instance = setup_multi_instance();
+        let m = multi_instance.instances[0].bits_per_chunk;
+        let params = setup_hyrax_params(m);
+
+        let mut pt = Transcript::new(b"domain-A");
+        let proof = prove_lasso_multi(&multi_instance, &mut pt, &params);
+
+        let mut vt = Transcript::new(b"domain-B"); // ラベルが異なる
+        let result = verify_lasso_multi(&proof, &multi_instance, &mut vt, &params);
+
+        assert!(
+            result.is_err(),
+            "Should reject due to transcript domain mismatch"
+        );
+    }
+
+    /// 異常系: プロverから送られた個別のテーブル評価値が改ざんされた場合
+    #[test]
+    fn test_lasso_multi_tampered_opening() {
+        let multi_instance = setup_multi_instance();
+        let m = multi_instance.instances[0].bits_per_chunk;
+        let params = setup_hyrax_params(m);
+
+        let mut pt = Transcript::new(b"multi-lasso-test");
+        let mut proof = prove_lasso_multi(&multi_instance, &mut pt, &params);
+
+        // 個別の評価値 table_openings を改ざん
+        proof.table_openings[0][0] += F::one();
+
+        let mut vt = Transcript::new(b"multi-lasso-test");
+        let result = verify_lasso_multi(&proof, &multi_instance, &mut vt, &params);
+
+        // expected_final_eval の計算に不整合が生じるか、Hyraxのバッチ検証で失敗する
+        assert!(result.is_err(), "Should reject tampered table opening");
+    }
+
+    /// 境界値: 1つのインスタンスのみが含まれる場合の動作確認
+    #[test]
+    fn test_lasso_multi_with_single_instance() {
+        let multi_instance = LassoMultiInstance {
+            instances: vec![setup_instance_a()],
+        };
+        let m = multi_instance.instances[0].bits_per_chunk;
+        let params = setup_hyrax_params(m);
+
+        let mut pt = Transcript::new(b"single-in-multi");
+        let proof = prove_lasso_multi(&multi_instance, &mut pt, &params);
+
+        let mut vt = Transcript::new(b"single-in-multi");
+        let result = verify_lasso_multi(&proof, &multi_instance, &mut vt, &params);
+
+        assert!(
+            result.is_ok(),
+            "Single instance within multi-lasso should work"
+        );
     }
 }

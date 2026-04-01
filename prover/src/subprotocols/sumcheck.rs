@@ -178,12 +178,164 @@ pub fn verify_sumcheck(
     Ok((challenges, final_claim))
 }
 
+/// バッチ化されたSumcheck証明
+#[derive(Clone, Debug)]
+pub struct SumcheckProofMulti {
+    pub round_polys: Vec<RoundPoly>,
+    /// 点 r における各 f_i の評価値
+    pub final_evals_f: Vec<F>,
+    /// 点 r における各 g_i の評価値
+    pub final_evals_g: Vec<F>,
+}
+
+/// Σ_k weights[k] · (Σ_{x ∈ {0,1}^n} f_k(x)·g_k(x)) = `claim` を証明する。
+pub fn prove_sumcheck_multi_batched(
+    fs: &[DenseMLPoly],
+    gs: &[DenseMLPoly],
+    weights: &[F],
+    claim: F,
+    transcript: &mut Transcript,
+) -> (SumcheckProofMulti, Vec<F>) {
+    let num_pairs = fs.len();
+    assert_eq!(gs.len(), num_pairs);
+    assert_eq!(weights.len(), num_pairs);
+
+    let n = fs[0].num_vars;
+    for k in 1..num_pairs {
+        assert_eq!(
+            fs[k].num_vars, n,
+            "All polynomials must have the same number of variables"
+        );
+        assert_eq!(gs[k].num_vars, n);
+    }
+
+    transcript.append_field(b"sc_claim", &claim);
+
+    let mut fs_cur: Vec<DenseMLPoly> = fs.to_vec();
+    let mut gs_cur: Vec<DenseMLPoly> = gs.to_vec();
+    let mut round_polys = Vec::with_capacity(n);
+    let mut challenges = Vec::with_capacity(n);
+
+    for _ in 0..n {
+        let half = fs_cur[0].evaluations.len() >> 1;
+        let two = F::from(2u64);
+
+        // --- ラウンド多項式 g_i(X) = Σ_k weights[k] * Σ_{x2...} f_k(X, x2...) * g_k(X, x2...) ---
+
+        // g_i(0) の計算
+        let mut e0 = F::ZERO;
+        for k in 0..num_pairs {
+            let sum_k: F = (0..half)
+                .map(|i| fs_cur[k].evaluations[i] * gs_cur[k].evaluations[i])
+                .sum();
+            e0 += weights[k] * sum_k;
+        }
+
+        // g_i(1) の計算
+        let mut e1 = F::ZERO;
+        for k in 0..num_pairs {
+            let sum_k: F = (0..half)
+                .map(|i| fs_cur[k].evaluations[i + half] * gs_cur[k].evaluations[i + half])
+                .sum();
+            e1 += weights[k] * sum_k;
+        }
+
+        // g_i(2) の計算 (線形外挿を用いて評価)
+        let mut e2 = F::ZERO;
+        for k in 0..num_pairs {
+            let sum_k: F = (0..half)
+                .map(|i| {
+                    let f2 = two * fs_cur[k].evaluations[i + half] - fs_cur[k].evaluations[i];
+                    let g2 = two * gs_cur[k].evaluations[i + half] - gs_cur[k].evaluations[i];
+                    f2 * g2
+                })
+                .sum();
+            e2 += weights[k] * sum_k;
+        }
+
+        let rp = RoundPoly {
+            evals: [e0, e1, e2],
+        };
+
+        // トランスクリプトへの吸収とチャレンジ生成
+        for e in &rp.evals {
+            transcript.append_field(b"sc_round", e);
+        }
+        let r_i = transcript.challenge_field::<F>(b"sc_challenge");
+        challenges.push(r_i);
+
+        // 次のラウンドに向けて全多項式の最初の変数を r_i に固定
+        for k in 0..num_pairs {
+            fs_cur[k] = fs_cur[k].fix_first_variable(r_i);
+            gs_cur[k] = gs_cur[k].fix_first_variable(r_i);
+        }
+        round_polys.push(rp);
+    }
+
+    // 各多項式の最終的な評価値を取得
+    let final_evals_f = fs_cur.iter().map(|p| p.evaluations[0]).collect();
+    let final_evals_g = gs_cur.iter().map(|p| p.evaluations[0]).collect();
+
+    (
+        SumcheckProofMulti {
+            round_polys,
+            final_evals_f,
+            final_evals_g,
+        },
+        challenges,
+    )
+}
+
+/// バッチ版 Sumcheck プロトコルの検証
+pub fn verify_sumcheck_multi_batched(
+    proof: &SumcheckProofMulti,
+    weights: &[F],
+    claim: F,
+    num_vars: usize,
+    transcript: &mut Transcript,
+) -> Result<(Vec<F>, F), String> {
+    if proof.round_polys.len() != num_vars {
+        return Err("Wrong number of round polys".into());
+    }
+
+    transcript.append_field(b"sc_claim", &claim);
+    let mut current = claim;
+    let mut challenges = Vec::with_capacity(num_vars);
+
+    for (i, rp) in proof.round_polys.iter().enumerate() {
+        // 各ラウンドの整合性チェック: g_i(0) + g_i(1) == current_claim
+        if rp.evals[0] + rp.evals[1] != current {
+            return Err(format!("Round {i} consistency failed"));
+        }
+        for e in &rp.evals {
+            transcript.append_field(b"sc_round", e);
+        }
+        let r_i = transcript.challenge_field::<F>(b"sc_challenge");
+        challenges.push(r_i);
+        current = rp.evaluate(r_i);
+    }
+
+    // 最終チェック: Σ weights[k] * f_k(r) * g_k(r) == current_claim
+    let mut final_combination = F::ZERO;
+    for k in 0..proof.final_evals_f.len() {
+        final_combination += weights[k] * proof.final_evals_f[k] * proof.final_evals_g[k];
+    }
+
+    if final_combination != current {
+        return Err("Final batched check failed".into());
+    }
+
+    Ok((challenges, current))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::poly::DenseMLPoly;
     use crate::transcript::Transcript;
+    use ark_ff::UniformRand;
     use ark_ff::{One, Zero};
+    use ark_std::test_rng;
 
     /// Helper to compute the brute-force sum of f(x) * g(x) over {0,1}^n
     fn compute_brute_force_sum(f: &DenseMLPoly, g: &DenseMLPoly) -> F {
@@ -363,5 +515,279 @@ mod tests {
         let mut vt = Transcript::new(b"mismatch");
         let result = verify_sumcheck(&proof, claim, 3, &mut vt);
         assert!(result.is_err());
+    }
+
+    /// ランダムな多項式ペアを生成する
+    fn random_polys(num_vars: usize) -> (DenseMLPoly, DenseMLPoly) {
+        let mut rng = test_rng();
+        let size = 1 << num_vars;
+        let f_evals = (0..size).map(|_| F::rand(&mut rng)).collect();
+        let g_evals = (0..size).map(|_| F::rand(&mut rng)).collect();
+        (DenseMLPoly::new(f_evals), DenseMLPoly::new(g_evals))
+    }
+
+    // --- テストケース ---
+
+    #[test]
+    fn test_sumcheck_random_trials() {
+        // 異なる変数個数で複数回のランダム試行を行い、一貫性を検証する
+        let mut rng = test_rng();
+        for num_vars in 1..8 {
+            for _ in 0..10 {
+                let (f, g) = random_polys(num_vars);
+                let claim = compute_brute_force_sum(&f, &g);
+
+                let mut prover_transcript = Transcript::new(b"comp_test");
+                let (proof, challenges) = prove_sumcheck(&f, &g, claim, &mut prover_transcript);
+
+                let mut verifier_transcript = Transcript::new(b"comp_test");
+                let result = verify_sumcheck(&proof, claim, num_vars, &mut verifier_transcript);
+
+                assert!(result.is_ok(), "Random trial failed for {} vars", num_vars);
+                let (v_challenges, _) = result.unwrap();
+                assert_eq!(challenges, v_challenges);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sumcheck_tamper_final_evaluations() {
+        // ラウンド多項式は正しいが、最終的な f(r) や g(r) を偽った場合に検知できるか
+        let num_vars = 3;
+        let (f, g) = random_polys(num_vars);
+        let claim = compute_brute_force_sum(&f, &g);
+
+        let mut pt = Transcript::new(b"tamper_final");
+        let (mut proof, _) = prove_sumcheck(&f, &g, claim, &mut pt);
+
+        // f(r) を改ざん
+        proof.final_eval_f += F::from(1u64);
+
+        let mut vt = Transcript::new(b"tamper_final");
+        let result = verify_sumcheck(&proof, claim, num_vars, &mut vt);
+
+        // 最終チェック: f(r)*g(r) == current_claim で失敗するはず
+        assert!(result.is_err(), "Should have caught tampered final_eval_f");
+    }
+
+    #[test]
+    fn test_sumcheck_transcript_mismatch() {
+        // プロverと検証者のラベル（コンテキスト）が異なる場合に失敗するか（Fiat-Shamirの安全性）
+        let num_vars = 2;
+        let (f, g) = random_polys(num_vars);
+        let claim = compute_brute_force_sum(&f, &g);
+
+        let mut pt = Transcript::new(b"context_A");
+        let (proof, _) = prove_sumcheck(&f, &g, claim, &mut pt);
+
+        let mut vt = Transcript::new(b"context_B"); // ラベルが異なる
+        let result = verify_sumcheck(&proof, claim, num_vars, &mut vt);
+
+        // チャレンジの値が変わるため、整合性チェックのどこかで失敗する
+        assert!(
+            result.is_err(),
+            "Should fail due to transcript label mismatch"
+        );
+    }
+
+    #[test]
+    fn test_sumcheck_high_variable_count() {
+        // 変数が多い（例: 12変数 = 4096エントリ）場合のパフォーマンスと再帰の深さを確認
+        let num_vars = 12;
+        let (f, g) = random_polys(num_vars);
+        let claim = compute_brute_force_sum(&f, &g);
+
+        let mut pt = Transcript::new(b"high_vars");
+        let (proof, _) = prove_sumcheck(&f, &g, claim, &mut pt);
+
+        let mut vt = Transcript::new(b"high_vars");
+        let result = verify_sumcheck(&proof, claim, num_vars, &mut vt);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sumcheck_tamper_middle_round() {
+        // 最初ではなく、中間（例: 第2ラウンド）の多項式評価を改ざんした場合
+        let num_vars = 4;
+        let (f, g) = random_polys(num_vars);
+        let claim = compute_brute_force_sum(&f, &g);
+
+        let mut pt = Transcript::new(b"tamper_middle");
+        let (mut proof, _) = prove_sumcheck(&f, &g, claim, &mut pt);
+
+        // 第2ラウンドの g_1(2) を改ざん
+        proof.round_polys[1].evals[2] *= F::from(2u64);
+
+        let mut vt = Transcript::new(b"tamper_middle");
+        let result = verify_sumcheck(&proof, claim, num_vars, &mut vt);
+
+        // 改ざんされたラウンドの次のラウンドの整合性チェックで失敗するはず
+        assert!(
+            result.is_err(),
+            "Should fail at the round following the tampered one"
+        );
+    }
+
+    #[test]
+    fn test_sumcheck_constant_polynomials() {
+        // 多項式が定数の場合（次数が低いケースの境界値テスト）
+        let num_vars = 3;
+        let f = DenseMLPoly::new(vec![F::from(5u64); 1 << num_vars]);
+        let g = DenseMLPoly::new(vec![F::from(10u64); 1 << num_vars]);
+        let claim = F::from((5 * 10 * (1 << num_vars)) as u64);
+
+        let mut pt = Transcript::new(b"const");
+        let (proof, _) = prove_sumcheck(&f, &g, claim, &mut pt);
+
+        let mut vt = Transcript::new(b"const");
+        let result = verify_sumcheck(&proof, claim, num_vars, &mut vt);
+        assert!(result.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod multi_sumcheck_tests {
+    use super::*;
+    use crate::poly::DenseMLPoly;
+    use crate::transcript::Transcript;
+    use ark_ff::{One, UniformRand, Zero};
+    use ark_std::test_rng;
+
+    /// 複数の多項式ペアの積の総和を計算するヘルパー
+    fn compute_brute_force_sum_multi(fs: &[DenseMLPoly], gs: &[DenseMLPoly], weights: &[F]) -> F {
+        let mut total = F::ZERO;
+        for k in 0..fs.len() {
+            let pair_sum: F = fs[k]
+                .evaluations
+                .iter()
+                .zip(gs[k].evaluations.iter())
+                .map(|(&fa, &ga)| fa * ga)
+                .sum();
+            total += weights[k] * pair_sum;
+        }
+        total
+    }
+
+    /// 正常系: 2つの多項式ペア、3変数のケース
+    #[test]
+    fn test_multi_sumcheck_happy_path() {
+        let mut rng = test_rng();
+        let n = 3;
+        let num_pairs = 2;
+
+        let fs = vec![
+            DenseMLPoly::new((0..1 << n).map(|_| F::rand(&mut rng)).collect()),
+            DenseMLPoly::new((0..1 << n).map(|_| F::rand(&mut rng)).collect()),
+        ];
+        let gs = vec![
+            DenseMLPoly::new((0..1 << n).map(|_| F::rand(&mut rng)).collect()),
+            DenseMLPoly::new((0..1 << n).map(|_| F::rand(&mut rng)).collect()),
+        ];
+        let weights = vec![F::rand(&mut rng), F::rand(&mut rng)];
+
+        let claim = compute_brute_force_sum_multi(&fs, &gs, &weights);
+
+        // Prover
+        let mut p_transcript = Transcript::new(b"multi_test");
+        let (proof, challenges) =
+            prove_sumcheck_multi_batched(&fs, &gs, &weights, claim, &mut p_transcript);
+
+        // Verifier
+        let mut v_transcript = Transcript::new(b"multi_test");
+        let result = verify_sumcheck_multi_batched(&proof, &weights, claim, n, &mut v_transcript);
+
+        assert!(result.is_ok(), "Verification failed: {:?}", result.err());
+        let (v_challenges, _) = result.unwrap();
+        assert_eq!(challenges, v_challenges);
+
+        // 各多項式の最終評価値の正当性確認
+        for k in 0..num_pairs {
+            assert_eq!(proof.final_evals_f[k], fs[k].evaluate(&challenges));
+            assert_eq!(proof.final_evals_g[k], gs[k].evaluate(&challenges));
+        }
+    }
+
+    /// 異常系: プロverが偽った最終評価値を送った場合
+    #[test]
+    fn test_multi_sumcheck_tampered_final_eval() {
+        let mut rng = test_rng();
+        let n = 2;
+        let (fs, gs) = (
+            vec![DenseMLPoly::new(vec![F::rand(&mut rng); 4])],
+            vec![DenseMLPoly::new(vec![F::rand(&mut rng); 4])],
+        );
+        let weights = vec![F::one()];
+        let claim = compute_brute_force_sum_multi(&fs, &gs, &weights);
+
+        let mut p_pt = Transcript::new(b"tamper");
+        let (mut proof, _) = prove_sumcheck_multi_batched(&fs, &gs, &weights, claim, &mut p_pt);
+
+        // 最終評価値の一つを改ざん
+        proof.final_evals_f[0] += F::one();
+
+        let mut v_vt = Transcript::new(b"tamper");
+        let result = verify_sumcheck_multi_batched(&proof, &weights, claim, n, &mut v_vt);
+        assert!(result.is_err(), "Should catch tampered final evaluation");
+    }
+
+    /// 異常系: 重み(weights)がプロverと検証者で異なる場合
+    #[test]
+    fn test_multi_sumcheck_weight_mismatch() {
+        let mut rng = test_rng();
+        let n = 2;
+        let fs = vec![
+            DenseMLPoly::new(vec![F::one(); 4]),
+            DenseMLPoly::new(vec![F::one(); 4]),
+        ];
+        let gs = vec![
+            DenseMLPoly::new(vec![F::one(); 4]),
+            DenseMLPoly::new(vec![F::one(); 4]),
+        ];
+
+        let p_weights = vec![F::from(2), F::from(3)];
+        let v_weights = vec![F::from(2), F::from(4)]; // 重みが異なる
+
+        let claim = compute_brute_force_sum_multi(&fs, &gs, &p_weights);
+
+        let mut pt = Transcript::new(b"weight_test");
+        let (proof, _) = prove_sumcheck_multi_batched(&fs, &gs, &p_weights, claim, &mut pt);
+
+        let mut vt = Transcript::new(b"weight_test");
+        let result = verify_sumcheck_multi_batched(&proof, &v_weights, claim, n, &mut vt);
+        assert!(result.is_err(), "Should fail due to weight mismatch");
+    }
+
+    /// 境界値: 多項式が1組のみの場合 (単一Sumcheckと等価な動作を確認)
+    #[test]
+    fn test_multi_sumcheck_single_pair_edge_case() {
+        let n = 2;
+        let f = DenseMLPoly::new(vec![F::from(1), F::from(2), F::from(3), F::from(4)]);
+        let g = DenseMLPoly::new(vec![F::from(1), F::from(1), F::from(1), F::from(1)]);
+        let weights = vec![F::one()];
+        let claim = F::from(10); // 1+2+3+4
+
+        let mut pt = Transcript::new(b"edge");
+        let (proof, _) = prove_sumcheck_multi_batched(&[f], &[g], &weights, claim, &mut pt);
+
+        let mut vt = Transcript::new(b"edge");
+        let result = verify_sumcheck_multi_batched(&proof, &weights, claim, n, &mut vt);
+        assert!(result.is_ok());
+    }
+
+    /// 境界値: 全てがゼロ多項式のケース
+    #[test]
+    fn test_multi_sumcheck_zero_polynomials() {
+        let n = 2;
+        let fs = vec![DenseMLPoly::zero(n), DenseMLPoly::zero(n)];
+        let gs = vec![DenseMLPoly::zero(n), DenseMLPoly::zero(n)];
+        let weights = vec![F::rand(&mut test_rng()), F::rand(&mut test_rng())];
+        let claim = F::zero();
+
+        let mut pt = Transcript::new(b"zero");
+        let (proof, _) = prove_sumcheck_multi_batched(&fs, &gs, &weights, claim, &mut pt);
+
+        let mut vt = Transcript::new(b"zero");
+        let result = verify_sumcheck_multi_batched(&proof, &weights, claim, n, &mut vt);
+        assert!(result.is_ok());
     }
 }

@@ -18,7 +18,7 @@
 
 use ark_bn254::{Fr, G1Affine, G1Projective};
 use ark_ec::{Group, VariableBaseMSM};
-use ark_ff::{Field, PrimeField};
+use ark_ff::{Field, PrimeField, Zero};
 use sha3::{Digest, Sha3_256};
 
 use crate::{field::F, poly::DenseMLPoly, transcript::Transcript};
@@ -177,8 +177,129 @@ pub fn hyrax_verify(
 }
 
 // ---------------------------------------------------------------------------
+// Batching (Multiple polynomials at the same point)
+// ---------------------------------------------------------------------------
+
+/// 複数のコミットメントを同一の点 `point` で一括して証明する。
+///
+/// `evals_list`: 各多項式の評価ベクトル（長さ 2^(nu+sigma)）のリスト
+pub fn hyrax_open_batch(
+    evals_list: &[&[F]],
+    point: &[F],
+    nu: usize,
+    sigma: usize,
+    transcript: &mut Transcript,
+) -> HyraxProof {
+    let count = evals_list.len();
+    let num_cols = 1 << sigma;
+
+    // 1. バッチ化用のチャレンジ η を生成
+    let eta = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let eta_pows = powers_of(eta, count);
+
+    // 2. ラグランジュ基底の計算 (row部分)
+    let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
+    let l_vec = lagrange_basis(&r_l_rev);
+
+    // 3. 統合された w' ベクトルを計算: w'_batch = Σ_k η^k * (Σ_i L_i * Row_{k,i})
+    let mut w_prime_batched = vec![F::ZERO; num_cols];
+    for (k, evals) in evals_list.iter().enumerate() {
+        let eta_k = eta_pows[k];
+        for (i, &l_i) in l_vec.iter().enumerate() {
+            let row = &evals[i * num_cols..(i + 1) * num_cols];
+            let coeff = eta_k * l_i;
+            for (j, &m_ij) in row.iter().enumerate() {
+                w_prime_batched[j] += coeff * m_ij;
+            }
+        }
+    }
+
+    HyraxProof {
+        w_prime: w_prime_batched,
+    }
+}
+
+/// 複数の Hyrax 証明を一括で検証する。
+pub fn hyrax_verify_batch(
+    commitments: &[HyraxCommitment],
+    evals: &[F],
+    point: &[F],
+    proof: &HyraxProof,
+    params: &HyraxParams,
+    transcript: &mut Transcript,
+) -> Result<(), String> {
+    let count = commitments.len();
+    assert_eq!(evals.len(), count);
+    let nu = commitments[0].nu;
+    let sigma = commitments[0].sigma;
+
+    // 1. チャレンジ η の再現
+    let eta = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let eta_pows = powers_of(eta, count);
+
+    // 2. ラグランジュ基底の計算
+    let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
+    let r_r_rev: Vec<F> = point[nu..].iter().rev().copied().collect();
+    let l_vec = lagrange_basis(&r_l_rev);
+    let r_vec = lagrange_basis(&r_r_rev);
+
+    // 3. コミットメントのホモモーフィックな統合
+    // 各多項式の行コミットメントを η で重み付けして合算し、それを L で集約する
+    let mut combined_rows = vec![G1Projective::zero(); 1 << nu];
+    for (k, com) in commitments.iter().enumerate() {
+        for (i, &row_com) in com.row_coms.iter().enumerate() {
+            combined_rows[i] += G1Projective::from(row_com) * eta_pows[k];
+        }
+    }
+    let combined_rows_affine: Vec<G1Affine> = combined_rows.iter().map(|p| (*p).into()).collect();
+
+    // Check 1: Σ_i L_i * (Σ_k η^k * C_{k,i}) == MSM(gens, w'_batch)
+    let lhs = msm_g1(&combined_rows_affine, &l_vec);
+    let rhs = msm(&params.gens, &proof.w_prime);
+    if lhs != rhs {
+        return Err("Hyrax Batch: commitment check failed".to_string());
+    }
+
+    // 4. 内積の検証 (統合された評価値との比較)
+    // Check 2: <R, w'_batch> == Σ_k η^k * eval_k
+    let inner: F = r_vec
+        .iter()
+        .zip(proof.w_prime.iter())
+        .map(|(&r, &w)| r * w)
+        .sum();
+    let expected_inner: F = evals
+        .iter()
+        .zip(eta_pows.iter())
+        .map(|(&v, &e)| v * e)
+        .sum();
+
+    if inner != expected_inner {
+        return Err(format!(
+            "Hyrax Batch: inner product check failed: got {inner:?}, expected {expected_inner:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Additional Helpers
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// 指定された要素の累乗 [1, x, x^2, ..., x^{n-1}] を計算する。
+pub fn powers_of(x: F, n: usize) -> Vec<F> {
+    let mut res = Vec::with_capacity(n);
+    let mut cur = F::ONE;
+    for _ in 0..n {
+        res.push(cur);
+        cur *= x;
+    }
+    res
+}
 
 /// Compute the 2^n multilinear Lagrange basis evaluations for a given point.
 ///
@@ -462,5 +583,218 @@ mod tests {
             assert_eq!(params.sigma, expected_sigma, "bits_per_chunk={bpc}");
             assert_eq!(params.gens.len(), 1 << expected_sigma);
         }
+    }
+}
+
+#[cfg(test)]
+mod batched_hyrax_tests {
+    use super::*;
+    use crate::transcript::Transcript;
+    use ark_std::{test_rng, UniformRand};
+
+    /// 正常系: 複数のランダムな多項式を同一の点で一括検証する
+    #[test]
+    fn test_hyrax_batch_verify_success() {
+        let mut rng = test_rng();
+        let nu = 2;
+        let sigma = 3;
+        let num_polys = 5; // 5つの多項式を同時に証明
+        let params = HyraxParams::new(sigma);
+        let point: Vec<Fr> = (0..(nu + sigma)).map(|_| Fr::rand(&mut rng)).collect();
+
+        let mut evals_list = Vec::new();
+        let mut commitments = Vec::new();
+        let mut claimed_evals = Vec::new();
+
+        // 1. 各多項式の生成、コミット、および個別評価値の計算
+        for _ in 0..num_polys {
+            let num_evals = 1 << (nu + sigma);
+            let evals: Vec<Fr> = (0..num_evals).map(|_| Fr::rand(&mut rng)).collect();
+            let commitment = hyrax_commit(&evals, nu, &params);
+
+            // 地点 point における真の評価値を計算 (MLE)
+            let poly = DenseMLPoly::new(evals.clone());
+            let eval = poly.evaluate(&point);
+
+            evals_list.push(evals);
+            commitments.push(commitment);
+            claimed_evals.push(eval);
+        }
+
+        // 借用のための変換
+        let evals_refs: Vec<&[Fr]> = evals_list.iter().map(|v| v.as_slice()).collect();
+
+        // 2. プロver: バッチ証明の生成
+        let mut prover_transcript = Transcript::new(b"test_hyrax_batch");
+        let proof = hyrax_open_batch(&evals_refs, &point, nu, sigma, &mut prover_transcript);
+
+        // 3. 検証者: バッチ証明の検証
+        let mut verifier_transcript = Transcript::new(b"test_hyrax_batch");
+        let result = hyrax_verify_batch(
+            &commitments,
+            &claimed_evals,
+            &point,
+            &proof,
+            &params,
+            &mut verifier_transcript,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Batch verification should pass: {:?}",
+            result.err()
+        );
+    }
+
+    /// 異常系: 1つの評価値が間違っている場合に拒否されるか
+    #[test]
+    fn test_hyrax_batch_verify_tampered_eval() {
+        let mut rng = test_rng();
+        let (nu, sigma) = (2, 2);
+        let params = HyraxParams::new(sigma);
+        let num_polys = 3;
+        let point: Vec<Fr> = (0..(nu + sigma)).map(|_| Fr::rand(&mut rng)).collect();
+
+        let mut evals_list = Vec::new();
+        let mut commitments = Vec::new();
+        let mut claimed_evals = Vec::new();
+
+        for _ in 0..num_polys {
+            let evals: Vec<Fr> = (0..(1 << (nu + sigma)))
+                .map(|_| Fr::rand(&mut rng))
+                .collect();
+            commitments.push(hyrax_commit(&evals, nu, &params));
+            claimed_evals.push(DenseMLPoly::new(evals.clone()).evaluate(&point));
+            evals_list.push(evals);
+        }
+
+        let evals_refs: Vec<&[Fr]> = evals_list.iter().map(|v| v.as_slice()).collect();
+        let mut pt = Transcript::new(b"tamper_eval");
+        let proof = hyrax_open_batch(&evals_refs, &point, nu, sigma, &mut pt);
+
+        // 2番目の評価値を改ざん
+        claimed_evals[1] += Fr::from(1u64);
+
+        let mut vt = Transcript::new(b"tamper_eval");
+        let result = hyrax_verify_batch(
+            &commitments,
+            &claimed_evals,
+            &point,
+            &proof,
+            &params,
+            &mut vt,
+        );
+
+        assert!(
+            result.is_err(),
+            "Should fail because one evaluation is incorrect"
+        );
+    }
+
+    /// 異常系: フィアット・シャミールのチャレンジ (eta) が不一致の場合
+    #[test]
+    fn test_hyrax_batch_transcript_mismatch() {
+        let mut rng = test_rng();
+        let (nu, sigma) = (2, 2);
+        let params = HyraxParams::new(sigma);
+
+        // 2つの多項式を用意する
+        let evals_0 = vec![Fr::rand(&mut rng); 16];
+        let evals_1 = vec![Fr::rand(&mut rng); 16];
+        let point = vec![Fr::rand(&mut rng); 4];
+
+        let com_0 = hyrax_commit(&evals_0, nu, &params);
+        let com_1 = hyrax_commit(&evals_1, nu, &params);
+
+        let eval_0 = DenseMLPoly::new(evals_0.clone()).evaluate(&point);
+        let eval_1 = DenseMLPoly::new(evals_1.clone()).evaluate(&point);
+
+        // Proverはラベル "label_A" で証明生成
+        let mut pt = Transcript::new(b"label_A");
+        let proof = hyrax_open_batch(&[&evals_0, &evals_1], &point, nu, sigma, &mut pt);
+
+        // Verifierは異なるラベル "label_B" で検証
+        let mut vt = Transcript::new(b"label_B");
+        let result = hyrax_verify_batch(
+            &[com_0, com_1],
+            &[eval_0, eval_1],
+            &point,
+            &proof,
+            &params,
+            &mut vt,
+        );
+
+        // チャレンジ η の値が異なるため、検証は失敗するはず
+        assert!(
+            result.is_err(),
+            "Should fail due to transcript label mismatch"
+        );
+    }
+
+    /// 境界値: 1つの多項式のみをバッチで扱う場合 (通常のHyraxと等価)
+    #[test]
+    fn test_hyrax_batch_single_poly() {
+        let mut rng = test_rng();
+        let (nu, sigma) = (2, 2);
+        let params = HyraxParams::new(sigma);
+        let evals = vec![Fr::rand(&mut rng); 16];
+        let point = vec![Fr::rand(&mut rng); 4];
+        let commitment = hyrax_commit(&evals, nu, &params);
+        let eval = DenseMLPoly::new(evals.clone()).evaluate(&point);
+
+        let mut pt = Transcript::new(b"single");
+        let proof = hyrax_open_batch(&[&evals], &point, nu, sigma, &mut pt);
+
+        let mut vt = Transcript::new(b"single");
+        let result = hyrax_verify_batch(&[commitment], &[eval], &point, &proof, &params, &mut vt);
+
+        assert!(result.is_ok(), "Single polynomial batch should work");
+    }
+
+    /// 異常系: コミットメントのリストが改ざん（順序入れ替え）された場合
+    #[test]
+    fn test_hyrax_batch_shuffled_commitments() {
+        let mut rng = test_rng();
+        let (nu, sigma) = (2, 2);
+        let params = HyraxParams::new(sigma);
+        let mut evals_list = vec![vec![Fr::rand(&mut rng); 16], vec![Fr::rand(&mut rng); 16]];
+        let point = vec![Fr::rand(&mut rng); 4];
+
+        let mut commitments: Vec<_> = evals_list
+            .iter()
+            .map(|e| hyrax_commit(e, nu, &params))
+            .collect();
+        let mut claimed_evals: Vec<_> = evals_list
+            .iter()
+            .map(|e| DenseMLPoly::new(e.clone()).evaluate(&point))
+            .collect();
+
+        let mut pt = Transcript::new(b"shuffle");
+        let proof = hyrax_open_batch(
+            &[&evals_list[0], &evals_list[1]],
+            &point,
+            nu,
+            sigma,
+            &mut pt,
+        );
+
+        // 検証時にコミットメントと評価値の順序を入れ替える
+        commitments.reverse();
+        claimed_evals.reverse();
+
+        let mut vt = Transcript::new(b"shuffle");
+        let result = hyrax_verify_batch(
+            &commitments,
+            &claimed_evals,
+            &point,
+            &proof,
+            &params,
+            &mut vt,
+        );
+
+        assert!(
+            result.is_err(),
+            "Should fail when order of commitments is inconsistent"
+        );
     }
 }
