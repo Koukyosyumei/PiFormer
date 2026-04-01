@@ -414,6 +414,14 @@ pub fn prove(
     let (lm_head_proof, _, _) =
         prove_projection(&pk.lm_head_pk, &witness.lm_head_wit, &lm_io, transcript)?;
 
+    // Advance transcript to match verifier's 6 accumulator finalizations.
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // ln_acc_t
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // ln_acc_td
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // proj_acc_w (QKVO)
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // proj_acc_b (QKVO)
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // lmh_acc_w
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // lmh_acc_b
+
     // 5. Global batched Lasso: one proof for all activation lookups across all layers.
     // Instance order per block: [FFN_i, Q_i, K_i].
     let mut all_lasso_instances: Vec<_> = Vec::new();
@@ -842,6 +850,10 @@ mod tests {
         let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
 
         let mut vt = Transcript::new(b"block_e2e");
+        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -851,6 +863,10 @@ mod tests {
             &inst_ffn,
             &mut vt,
             &lp,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
+            &mut proj_acc_w,
+            &mut proj_acc_b,
         );
         assert!(
             result.is_ok(),
@@ -891,6 +907,10 @@ mod tests {
         );
 
         let mut vt = Transcript::new(b"block_wrong_out");
+        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -900,6 +920,10 @@ mod tests {
             &inst_ffn,
             &mut vt,
             &lp,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
+            &mut proj_acc_w,
+            &mut proj_acc_b,
         );
         assert!(result.is_err(), "Should reject wrong x_out_com");
     }
@@ -932,6 +956,10 @@ mod tests {
         let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
 
         let mut vt = Transcript::new(b"block_tamper_ln1");
+        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -941,6 +969,10 @@ mod tests {
             &inst_ffn,
             &mut vt,
             &lp,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
+            &mut proj_acc_w,
+            &mut proj_acc_b,
         );
         assert!(result.is_err(), "Should reject tampered LN1 proof");
     }
@@ -980,6 +1012,10 @@ mod tests {
         let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
 
         let mut vt = Transcript::new(b"block_tamper_xnorm1");
+        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -989,6 +1025,10 @@ mod tests {
             &inst_ffn,
             &mut vt,
             &lp,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
+            &mut proj_acc_w,
+            &mut proj_acc_b,
         );
         assert!(result.is_err(), "Should reject tampered x_norm1_com");
     }

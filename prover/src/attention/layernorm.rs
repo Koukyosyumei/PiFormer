@@ -294,11 +294,6 @@ pub fn prove_layernorm(
         transcript,
     );
 
-    // Advance transcript to match verifier's HyraxBatchAccumulator::finalize calls.
-    // acc_t finalizes first (groups 1+2+4 at params_t), then acc_td (group3 + x_indiv).
-    let _ = transcript.challenge_field::<F>(b"hyrax_group_mu"); // acc_t
-    let _ = transcript.challenge_field::<F>(b"hyrax_group_mu"); // acc_td
-
     Ok(LayerNormProof {
         internal_coms: LayerNormInternalCommitments {
             sum_x_com,
@@ -349,6 +344,8 @@ pub fn verify_layernorm(
     io_coms: &LayerNormIOCommitments,
     vk: &LayerNormVerifyingKey,
     transcript: &mut Transcript,
+    acc_t: &mut HyraxBatchAccumulator,
+    acc_td: &mut HyraxBatchAccumulator,
 ) -> Result<(), String> {
     let t = vk.seq_len;
     let d = vk.d_head;
@@ -356,12 +353,8 @@ pub fn verify_layernorm(
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
     let d_f = F::from(d as u64);
 
-    let n_td = t.next_power_of_two().max(1) * d.next_power_of_two().max(1);
-    let n_t = t.next_power_of_two().max(1);
-    let (_nu_td, _sigma_td, params_td) = params_from_n(n_td);
-    let (_nu_t, _sigma_t, params_t) = params_from_n(n_t);
-
     use std::time::Instant;
+
 
     // 1. Absorb IO & Internal Commitments
     let _ta = Instant::now();
@@ -476,10 +469,6 @@ pub fn verify_layernorm(
     //
     //    Order must match prover's hyrax_open_batch call order (transcript sync).
 
-    let _tg = Instant::now();
-    let mut acc_t = HyraxBatchAccumulator::new();
-    let mut acc_td = HyraxBatchAccumulator::new();
-
     // Group 1: [sum_x, sq_sum_x] at r_t  → acc_t
     acc_t.add_verify_batch(
         &[
@@ -552,11 +541,6 @@ pub fn verify_layernorm(
         &proof.openings.ryt_batch_proof,
         transcript,
     )?;
-
-    // Finalize: 1 lhs MSM + 1 rhs MSM per accumulator (2 MSMs total, down from 10).
-    acc_t.finalize(&params_t, transcript)?;
-    acc_td.finalize(&params_td, transcript)?;
-    eprintln!("[LN]  groups(acc):   {:>8.3}ms", _tg.elapsed().as_secs_f64()*1000.0);
 
     Ok(())
 }
@@ -645,9 +629,22 @@ mod layernorm_tests {
         let (witness, io_coms, vk) = setup_test_pipeline();
         let mut pt = Transcript::new(b"layernorm_test");
         let proof = prove_layernorm(&witness, &io_coms, &vk, &mut pt).unwrap();
+        // Advance transcript to match verifier's 2 finalize calls.
+        let _ = pt.challenge_field::<F>(b"hyrax_group_mu");
+        let _ = pt.challenge_field::<F>(b"hyrax_group_mu");
 
         let mut vt = Transcript::new(b"layernorm_test");
-        let result = verify_layernorm(&proof, &io_coms, &vk, &mut vt);
+        let mut ln_acc_t = HyraxBatchAccumulator::new();
+        let mut ln_acc_td = HyraxBatchAccumulator::new();
+        let result = verify_layernorm(&proof, &io_coms, &vk, &mut vt, &mut ln_acc_t, &mut ln_acc_td);
+        if result.is_ok() {
+            let n_t = vk.seq_len.next_power_of_two().max(1);
+            let n_td = n_t * vk.d_head.next_power_of_two().max(1);
+            let (_, _, params_t) = params_from_n(n_t);
+            let (_, _, params_td) = params_from_n(n_td);
+            ln_acc_t.finalize(&params_t, &mut vt).expect("acc_t finalize");
+            ln_acc_td.finalize(&params_td, &mut vt).expect("acc_td finalize");
+        }
         assert!(result.is_ok(), "Verification failed: {:?}", result.err());
     }
 
@@ -658,8 +655,22 @@ mod layernorm_tests {
 
         let mut pt = Transcript::new(b"layernorm_test");
         if let Ok(proof) = prove_layernorm(&witness, &io_coms, &vk, &mut pt) {
+            // Advance transcript to match verifier's 2 finalize calls.
+            let _ = pt.challenge_field::<F>(b"hyrax_group_mu");
+            let _ = pt.challenge_field::<F>(b"hyrax_group_mu");
+
             let mut vt = Transcript::new(b"layernorm_test");
-            let result = verify_layernorm(&proof, &io_coms, &vk, &mut vt);
+            let mut ln_acc_t = HyraxBatchAccumulator::new();
+            let mut ln_acc_td = HyraxBatchAccumulator::new();
+            let result = verify_layernorm(&proof, &io_coms, &vk, &mut vt, &mut ln_acc_t, &mut ln_acc_td);
+            if result.is_ok() {
+                let n_t = vk.seq_len.next_power_of_two().max(1);
+                let n_td = n_t * vk.d_head.next_power_of_two().max(1);
+                let (_, _, params_t) = params_from_n(n_t);
+                let (_, _, params_td) = params_from_n(n_td);
+                let _ = ln_acc_t.finalize(&params_t, &mut vt);
+                let _ = ln_acc_td.finalize(&params_td, &mut vt);
+            }
             assert!(
                 result.is_err(),
                 "Should reject forged proof against trusted IO"

@@ -8,7 +8,7 @@
 //!    are cryptographically bound across adjacent sub-verifiers.
 
 use crate::lookup::lasso::{verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey};
-use crate::pcs::{absorb_com, params_from_vars, HyraxCommitment, HyraxParams};
+use crate::pcs::{absorb_com, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams};
 use crate::subprotocols::verify_combine_deferred;
 use crate::pcs::hyrax_verify_multi_point;
 use crate::transcript::Transcript;
@@ -71,6 +71,10 @@ pub fn verify_transformer_block(
     inst_ffn: &FFNInstance,
     transcript: &mut Transcript,
     lasso_params: &HyraxParams,
+    ln_acc_t: &mut HyraxBatchAccumulator,
+    ln_acc_td: &mut HyraxBatchAccumulator,
+    proj_acc_w: &mut HyraxBatchAccumulator,
+    proj_acc_b: &mut HyraxBatchAccumulator,
 ) -> Result<(), String> {
     // =========================================================================
     // Pipeline Stitching (The Binding of IO Commitments)
@@ -87,22 +91,22 @@ pub fn verify_transformer_block(
         x_com: x_in_com.clone(),
         y_com: proof.x_norm1_com.clone(),
     };
-    let _t = Instant::now(); verify_layernorm(&proof.ln1_proof, &ln1_io, &vk.ln1_vk, transcript)?;
+    let _t = Instant::now(); verify_layernorm(&proof.ln1_proof, &ln1_io, &vk.ln1_vk, transcript, ln_acc_t, ln_acc_td)?;
     eprintln!("[block] ln1:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     let _ = td_params; // ensure td_params isn't flagged unused
 
     // --- 2. Projections (Q, K, V) — returns (y_claim, x_claim) for combine ---
     let q_io = ProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
-    let _t = Instant::now(); let (q_y_claim, q_x_claim) = verify_projection(&proof.q_proj_proof, &vk.q_vk, &q_io, transcript)?;
+    let _t = Instant::now(); let (q_y_claim, q_x_claim) = verify_projection(&proof.q_proj_proof, &vk.q_vk, &q_io, transcript, proj_acc_w, proj_acc_b)?;
     eprintln!("[block] q_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     let k_io = ProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
-    let _t = Instant::now(); let (k_y_claim, k_x_claim) = verify_projection(&proof.k_proj_proof, &vk.k_vk, &k_io, transcript)?;
+    let _t = Instant::now(); let (k_y_claim, k_x_claim) = verify_projection(&proof.k_proj_proof, &vk.k_vk, &k_io, transcript, proj_acc_w, proj_acc_b)?;
     eprintln!("[block] k_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     let v_io = ProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
-    let _t = Instant::now(); let (v_y_claim, v_x_claim) = verify_projection(&proof.v_proj_proof, &vk.v_vk, &v_io, transcript)?;
+    let _t = Instant::now(); let (v_y_claim, v_x_claim) = verify_projection(&proof.v_proj_proof, &vk.v_vk, &v_io, transcript, proj_acc_w, proj_acc_b)?;
     eprintln!("[block] v_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // --- 3. Linear Attention — returns (out_claim, v_claim) for combine ---
@@ -118,7 +122,7 @@ pub fn verify_transformer_block(
 
     // --- 4. Output Projection ---
     let o_io = ProjectionIOCommitments { x_com: proof.out_inner_com.clone() };
-    let _t = Instant::now(); let (o_y_claim, o_x_claim) = verify_projection(&proof.o_proj_proof, &vk.o_vk, &o_io, transcript)?;
+    let _t = Instant::now(); let (o_y_claim, o_x_claim) = verify_projection(&proof.o_proj_proof, &vk.o_vk, &o_io, transcript, proj_acc_w, proj_acc_b)?;
     eprintln!("[block] o_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // =========================================================================
@@ -131,7 +135,7 @@ pub fn verify_transformer_block(
         x_com: x_mid_com.clone(),
         y_com: proof.x_norm2_com.clone(),
     };
-    let _t = Instant::now(); verify_layernorm(&proof.ln2_proof, &ln2_io, &vk.ln2_vk, transcript)?;
+    let _t = Instant::now(); verify_layernorm(&proof.ln2_proof, &ln2_io, &vk.ln2_vk, transcript, ln_acc_t, ln_acc_td)?;
     eprintln!("[block] ln2:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // --- 6. FFN — returns (y_claim, x_claim) deferred to combine ---
@@ -256,6 +260,31 @@ pub fn verify(
     // 1. Bind Initial Input
     absorb_com(transcript, b"x_in_com", &proof.x_in_com);
 
+    // Create cross-model batch accumulators
+    use std::time::Instant;
+    let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
+    let d_bits = vk.d_model.next_power_of_two().trailing_zeros() as usize;
+    let (_, _, params_t) = params_from_vars(t_bits);
+    let (_, _, params_td) = params_from_vars(t_bits + d_bits);
+
+    let q_vk = &vk.block_vks[0].q_vk;
+    let qkvo_in_bits = q_vk.d_in.next_power_of_two().trailing_zeros() as usize;
+    let qkvo_out_bits = q_vk.d_out.next_power_of_two().trailing_zeros() as usize;
+    let params_qkvo_w = params_from_vars(qkvo_in_bits + qkvo_out_bits).2;
+    let params_qkvo_b = params_from_vars(qkvo_out_bits).2;
+
+    let lmh_in_bits = vk.lm_head_vk.d_in.next_power_of_two().trailing_zeros() as usize;
+    let lmh_out_bits = vk.lm_head_vk.d_out.next_power_of_two().trailing_zeros() as usize;
+    let params_lmh_w = params_from_vars(lmh_in_bits + lmh_out_bits).2;
+    let params_lmh_b = params_from_vars(lmh_out_bits).2;
+
+    let mut ln_acc_t = HyraxBatchAccumulator::new();
+    let mut ln_acc_td = HyraxBatchAccumulator::new();
+    let mut proj_acc_w = HyraxBatchAccumulator::new();
+    let mut proj_acc_b = HyraxBatchAccumulator::new();
+    let mut lmh_acc_w = HyraxBatchAccumulator::new();
+    let mut lmh_acc_b = HyraxBatchAccumulator::new();
+
     // 2. Block Verification Chaining
     let mut current_x_com = proof.x_in_com.clone();
 
@@ -276,6 +305,10 @@ pub fn verify(
             inst_ffn,
             transcript,
             lasso_params,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
+            &mut proj_acc_w,
+            &mut proj_acc_b,
         )
         .map_err(|e| format!("Block {} failed: {}", i, e))?;
 
@@ -284,22 +317,31 @@ pub fn verify(
     }
 
     // 3. Final LayerNorm Verification
-    use std::time::Instant;
     let _t = Instant::now();
     let ln_io = LayerNormIOCommitments {
         x_com: current_x_com.clone(),
         y_com: proof.final_ln_out_com.clone(),
     };
-    verify_layernorm(&proof.final_ln_proof, &ln_io, &vk.final_ln_vk, transcript)
+    verify_layernorm(&proof.final_ln_proof, &ln_io, &vk.final_ln_vk, transcript, &mut ln_acc_t, &mut ln_acc_td)
         .map_err(|e| format!("Final LN failed: {}", e))?;
     eprintln!("[model] final_ln:   {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // 4. LM Head Verification
     let _t = Instant::now();
     let lm_io = ProjectionIOCommitments { x_com: proof.final_ln_out_com.clone() };
-    verify_projection(&proof.lm_head_proof, &vk.lm_head_vk, &lm_io, transcript)
+    verify_projection(&proof.lm_head_proof, &vk.lm_head_vk, &lm_io, transcript, &mut lmh_acc_w, &mut lmh_acc_b)
         .map_err(|e| format!("LM Head failed: {}", e))?;
     eprintln!("[model] lm_head:    {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
+
+    // Finalize all 6 accumulators (each adds hyrax_group_mu to transcript)
+    let _tacc = Instant::now();
+    ln_acc_t.finalize(&params_t, transcript)?;
+    ln_acc_td.finalize(&params_td, transcript)?;
+    proj_acc_w.finalize(&params_qkvo_w, transcript)?;
+    proj_acc_b.finalize(&params_qkvo_b, transcript)?;
+    lmh_acc_w.finalize(&params_lmh_w, transcript)?;
+    lmh_acc_b.finalize(&params_lmh_b, transcript)?;
+    eprintln!("[model] acc_finalize:{:>8.3}ms", _tacc.elapsed().as_secs_f64()*1000.0);
 
     // 5. Global batched Lasso
     let _t = Instant::now();

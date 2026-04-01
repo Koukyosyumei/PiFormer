@@ -15,7 +15,7 @@
 use crate::field::F;
 use crate::pcs::absorb_com;
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment, HyraxProof,
+    hyrax_commit, hyrax_open, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
 };
 use crate::poly::utils::TernaryValue;
 use crate::poly::utils::{combine, eval_cols_ternary, eval_rows, mat_to_mle};
@@ -212,6 +212,8 @@ pub fn verify_projection(
     vk: &ProjectionVerifyingKey,
     io_coms: &ProjectionIOCommitments,
     transcript: &mut Transcript,
+    acc_w: &mut HyraxBatchAccumulator,
+    acc_b: &mut HyraxBatchAccumulator,
 ) -> Result<(EvalClaim, EvalClaim), String> {
     let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
     let in_bits = vk.d_in.next_power_of_two().trailing_zeros() as usize;
@@ -237,24 +239,9 @@ pub fn verify_projection(
         return Err("Algebraic relation: alpha * X * W != sumcheck_final".into());
     }
 
-    // 4. Open static weight commitments (weight and bias are not intermediate activations)
-    let p_w = params_from_vars(in_bits + out_bits).2;
-    hyrax_verify(
-        &vk.w_com,
-        proof.openings.w_eval,
-        &combine(&r_k, &r_out),
-        &proof.openings.w_open,
-        &p_w,
-    )?;
-
-    let p_b = params_from_vars(out_bits).2;
-    hyrax_verify(
-        &vk.bias_com,
-        proof.openings.bias_at_rj,
-        &r_out,
-        &proof.openings.bias_opening_proof,
-        &p_b,
-    )?;
+    // 4. Open static weight commitments via deferred accumulators
+    acc_w.add_verify(&vk.w_com, proof.openings.w_eval, &combine(&r_k, &r_out), &proof.openings.w_open)?;
+    acc_b.add_verify(&vk.bias_com, proof.openings.bias_at_rj, &r_out, &proof.openings.bias_opening_proof)?;
 
     // Return both claims for block-level combine verification
     let y_claim = EvalClaim { point: combine(&r_t, &r_out), value: proof.openings.y_eval };
@@ -330,9 +317,23 @@ mod projection_full_tests {
         let mut transcript = Transcript::new(b"test");
         let (proof, _y_claim, _x_claim) =
             prove_projection(&pk, &witness, &io, &mut transcript).unwrap();
+        // Advance transcript to match verifier's 2 finalize calls.
+        let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
+        let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
 
         let mut v_transcript = Transcript::new(b"test");
-        assert!(verify_projection(&proof, &pk.vk, &io, &mut v_transcript).is_ok());
+        let mut acc_w = HyraxBatchAccumulator::new();
+        let mut acc_b = HyraxBatchAccumulator::new();
+        let result = verify_projection(&proof, &pk.vk, &io, &mut v_transcript, &mut acc_w, &mut acc_b);
+        if result.is_ok() {
+            let in_bits = pk.vk.d_in.next_power_of_two().trailing_zeros() as usize;
+            let out_bits = pk.vk.d_out.next_power_of_two().trailing_zeros() as usize;
+            let params_w = params_from_vars(in_bits + out_bits).2;
+            let params_b = params_from_vars(out_bits).2;
+            acc_w.finalize(&params_w, &mut v_transcript).unwrap();
+            acc_b.finalize(&params_b, &mut v_transcript).unwrap();
+        }
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -341,11 +342,17 @@ mod projection_full_tests {
         let mut transcript = Transcript::new(b"test");
         let (proof, _y_claim, _x_claim) =
             prove_projection(&pk, &witness, &io, &mut transcript).unwrap();
+        // Advance transcript to match verifier's 2 finalize calls.
+        let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
+        let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
 
         let mut vk_bad = pk.vk;
         vk_bad.alpha = F::one(); // 正解は3
         let mut v_transcript = Transcript::new(b"test");
-        assert!(verify_projection(&proof, &vk_bad, &io, &mut v_transcript).is_err());
+        let mut acc_w = HyraxBatchAccumulator::new();
+        let mut acc_b = HyraxBatchAccumulator::new();
+        let result = verify_projection(&proof, &vk_bad, &io, &mut v_transcript, &mut acc_w, &mut acc_b);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -354,10 +361,16 @@ mod projection_full_tests {
         let mut transcript = Transcript::new(b"test");
         let (mut proof, _y_claim, _x_claim) =
             prove_projection(&pk, &witness, &io, &mut transcript).unwrap();
+        // Advance transcript to match verifier's 2 finalize calls.
+        let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
+        let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
 
         proof.openings.y_eval += F::one(); // Yの値を改ざん
 
         let mut v_transcript = Transcript::new(b"test");
-        assert!(verify_projection(&proof, &pk.vk, &io, &mut v_transcript).is_err());
+        let mut acc_w = HyraxBatchAccumulator::new();
+        let mut acc_b = HyraxBatchAccumulator::new();
+        let result = verify_projection(&proof, &pk.vk, &io, &mut v_transcript, &mut acc_w, &mut acc_b);
+        assert!(result.is_err());
     }
 }

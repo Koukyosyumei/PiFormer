@@ -213,7 +213,7 @@ fn build_ln_witness(x: &[Vec<F>], d_model: usize) -> LayerNormWitness {
         let matches = x
             .iter()
             .zip(expected.iter())
-            .all(|(row, exp)| row.iter().zip(exp.iter()).all(|(a, b)| a == b));
+            .all(|(row, exp): (&Vec<F>, &[F; 2])| row.iter().zip(exp.iter()).all(|(a, b)| a == b));
         if matches {
             return LayerNormWitness {
                 x: x.to_vec(),
@@ -236,7 +236,7 @@ fn build_ln_witness(x: &[Vec<F>], d_model: usize) -> LayerNormWitness {
     let d_f = F::from(d_model as u64);
     let sq_sum_x: Vec<F> = x
         .iter()
-        .map(|row| row.iter().copied().map(|v| v * v).sum())
+        .map(|row: &Vec<F>| row.iter().copied().map(|v| v * v).sum())
         .collect();
     let sum_x_sq = vec![F::ZERO; t];
     let sigma_sq_scaled = vec![F::ZERO; t];

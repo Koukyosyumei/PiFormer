@@ -323,9 +323,9 @@ fn run_inspect(path: &Path) -> io::Result<()> {
                     "  Block[{}]: q_w={}×{}, ffn_w1={}×{}",
                     i,
                     bpk.q_pk.w.len(),
-                    bpk.q_pk.w.first().map_or(0, |r| r.len()),
+                    bpk.q_pk.w.first().map_or(0, |r: &Vec<_>| r.len()),
                     bpk.ffn_pk.w1.len(),
-                    bpk.ffn_pk.w1.first().map_or(0, |r| r.len()),
+                    bpk.ffn_pk.w1.first().map_or(0, |r: &Vec<_>| r.len()),
                 );
             }
         }
