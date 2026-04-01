@@ -19,7 +19,8 @@
 //! The Hyrax commitment is a transparent (no trusted setup) vector commitment
 //! over BN254 G1, with O(√N) proof size and O(√N) verifier work.
 
-use crate::field::{eq_eval, index_to_bits, F};
+use crate::field::F;
+use crate::poly::utils::compute_eq_evals;
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch,
     HyraxCommitment, HyraxParams, HyraxProof,
@@ -243,12 +244,17 @@ pub fn verify_lasso(
         // index_to_bits is LSB-first, and eq_eval pairs r_rev[i] with bits[i].
         // So we reverse r_vec before computing L_k(r).
         let r_rev: Vec<F> = r_vec.iter().copied().rev().collect();
-        let l_at_r: F = (0..n)
-            .map(|j| {
-                let ch = chunk(instance.query_indices[j], k, m, mask);
-                let bits = index_to_bits(ch, m);
-                rho_pows[j] * eq_eval(&bits, &r_rev)
-            })
+        // Precompute eq_table for this table's r_rev (r_rev differs per table k).
+        let eq_table_k = compute_eq_evals(&r_rev, 1 << m);
+        let mut hist_k = vec![F::ZERO; 1 << m];
+        for j in 0..n {
+            let ch = chunk(instance.query_indices[j], k, m, mask);
+            hist_k[ch] += rho_pows[j];
+        }
+        let l_at_r: F = hist_k
+            .iter()
+            .zip(eq_table_k.iter())
+            .map(|(&h, &e)| h * e)
             .sum();
 
         let expected_final = t_opening * l_at_r;
@@ -488,21 +494,29 @@ pub fn verify_lasso_multi(
     )?;
 
     let r_rev: Vec<F> = r_vec.iter().copied().rev().collect();
+    // Precompute eq_table[ch] = eq(index_to_bits(ch,m), r_rev) for ch in 0..2^m.
+    // compute_eq_evals builds the same table in O(2^m) via iterative doubling,
+    // avoiding n*m individual eq_eval calls inside the inner loop.
+    let eq_table = compute_eq_evals(&r_rev, 1 << m);
     let mut expected_final_eval = F::ZERO;
     let mut table_idx = 0;
 
     for (t, instance) in multi_instance.instances.iter().enumerate() {
         let n = instance.query_indices.len();
         let rho_pows = powers_of(rho, n);
-        //let gamma_pows = powers_of(gamma, instance.tables.len());
 
         for k in 0..instance.tables.len() {
-            // 公開情報から L_{t,k}(r) を直接計算
-            let l_tk_at_r: F = (0..n)
-                .map(|j| {
-                    let ch = chunk(instance.query_indices[j], k, m, mask);
-                    rho_pows[j] * eq_eval(&index_to_bits(ch, m), &r_rev)
-                })
+            // Build histogram: hist[ch] = Σ_{j: chunk_k(query_j)==ch} rho_pows[j]
+            // Then l_tk_at_r = <hist, eq_table>, reducing O(n*m) → O(n + 2^m).
+            let mut hist = vec![F::ZERO; 1 << m];
+            for j in 0..n {
+                let ch = chunk(instance.query_indices[j], k, m, mask);
+                hist[ch] += rho_pows[j];
+            }
+            let l_tk_at_r: F = hist
+                .iter()
+                .zip(eq_table.iter())
+                .map(|(&h, &e)| h * e)
                 .sum();
 
             // 重み付けされたセレクタ評価値

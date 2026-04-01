@@ -268,6 +268,10 @@ pub fn prove_transformer_block(
     let (out_ffn_combine, _) =
         prove_combine(&out_ffn_evals, &out_ffn_com, &[ffn_y_claim], td_num_vars, transcript);
 
+    // Advance transcript to match verifier's hyrax_verify_multi_point lambda challenge.
+    // (hyrax_open is transcript-free, so we just burn one field challenge here.)
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_mp_lambda");
+
     Ok(TransformerBlockProof {
         ln1_proof,
         q_proj_proof,

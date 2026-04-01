@@ -308,6 +308,86 @@ pub fn hyrax_verify_batch(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-point batched verification (K independent openings → 2 MSMs total)
+// ---------------------------------------------------------------------------
+
+/// Batch-verify K independent Hyrax openings at potentially different points
+/// using a single Fiat-Shamir random linear combination.
+///
+/// Instead of K×2 MSMs (one lhs + one rhs each), we do:
+///   - 1 combined lhs MSM  over all K×2^nu row_coms
+///   - 1 combined rhs MSM  over 2^sigma generators
+///   - K inner-product checks (field ops only, O(2^sigma) each)
+///
+/// `entries`: slice of (commitment, claimed_eval, point, proof) tuples.
+/// All commitments must share the same `params` (same sigma/generators).
+pub fn hyrax_verify_multi_point(
+    entries: &[(&HyraxCommitment, F, &[F], &HyraxProof)],
+    params: &HyraxParams,
+    transcript: &mut Transcript,
+) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let count = entries.len();
+    let nu = entries[0].0.nu;
+    let sigma = entries[0].0.sigma;
+    let num_rows = 1usize << nu;
+    let num_cols = 1usize << sigma;
+
+    // 1. Random linear combination challenge
+    let lambda = transcript.challenge_field::<F>(b"hyrax_mp_lambda");
+    let lambda_pows = powers_of(lambda, count);
+
+    // 2. Combined rhs scalar vector: w'_combined[j] = Σ_i λ^i * w'_i[j]
+    let mut w_prime_combined = vec![F::ZERO; num_cols];
+    for (i, &(_, _, _, proof)) in entries.iter().enumerate() {
+        let lam_i = lambda_pows[i];
+        for (j, &w) in proof.w_prime.iter().enumerate() {
+            w_prime_combined[j] += lam_i * w;
+        }
+    }
+    let rhs = msm(&params.gens, &w_prime_combined);
+
+    // 3. Combined lhs: MSM over all K*num_rows row_coms
+    //    scalar(i,j) = λ^i * l_vec_i[j]
+    let mut all_points: Vec<G1Affine> = Vec::with_capacity(count * num_rows);
+    let mut all_scalars: Vec<F> = Vec::with_capacity(count * num_rows);
+    for (i, &(com, _, point, _)) in entries.iter().enumerate() {
+        let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
+        let l_vec = lagrange_basis(&r_l_rev);
+        let lam_i = lambda_pows[i];
+        for (j, &row_com) in com.row_coms.iter().enumerate() {
+            all_points.push(row_com);
+            all_scalars.push(lam_i * l_vec[j]);
+        }
+    }
+    let lhs = msm(&all_points, &all_scalars);
+
+    if lhs != rhs {
+        return Err("Hyrax multi-point: commitment check failed".to_string());
+    }
+
+    // 4. Inner product checks (cheap field ops, no MSM)
+    for (i, &(_, eval, point, proof)) in entries.iter().enumerate() {
+        let r_r_rev: Vec<F> = point[nu..].iter().rev().copied().collect();
+        let r_vec = lagrange_basis(&r_r_rev);
+        let inner: F = r_vec
+            .iter()
+            .zip(proof.w_prime.iter())
+            .map(|(&r, &w)| r * w)
+            .sum();
+        if inner != eval {
+            return Err(format!(
+                "Hyrax multi-point: inner product check failed at entry {i}: got {inner:?}, expected {eval:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Additional Helpers
 // ---------------------------------------------------------------------------
 

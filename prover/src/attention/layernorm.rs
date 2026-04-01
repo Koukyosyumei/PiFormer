@@ -349,7 +349,10 @@ pub fn verify_layernorm(
     let (_nu_td, _sigma_td, params_td) = params_from_n(n_td);
     let (_nu_t, _sigma_t, params_t) = params_from_n(n_t);
 
+    use std::time::Instant;
+
     // 1. Absorb IO & Internal Commitments
+    let _ta = Instant::now();
     absorb_com(transcript, b"x_com", &io_coms.x_com);
     absorb_com(transcript, b"y_com", &io_coms.y_com);
     absorb_com(transcript, b"sum_x_com", &proof.internal_coms.sum_x_com);
@@ -371,6 +374,7 @@ pub fn verify_layernorm(
     );
     absorb_com(transcript, b"sigma_y_com", &proof.internal_coms.sigma_y_com);
     absorb_com(transcript, b"gamma_x_com", &proof.internal_coms.gamma_x_com);
+    eprintln!("[LN]  absorb_coms:   {:>8.3}ms", _ta.elapsed().as_secs_f64()*1000.0);
 
     // 2. Sumchecks
     let r_t = challenge_vec(transcript, t_bits, b"layernorm_rt");
@@ -378,6 +382,7 @@ pub fn verify_layernorm(
     transcript.append_field(b"claimed_s", &proof.openings.sum_x_at_rt);
     transcript.append_field(b"claimed_q", &proof.openings.sq_sum_x_at_rt);
 
+    let _tm = Instant::now();
     let (r_d_mean, final_mean) = verify_sumcheck(
         &proof.mean_sumcheck,
         proof.openings.sum_x_at_rt,
@@ -388,11 +393,14 @@ pub fn verify_layernorm(
     if final_mean != proof.openings.x_at_rt_rmean {
         return Err("Mean sumcheck mismatch".into());
     }
+    eprintln!("[LN]  mean_sc:       {:>8.3}ms", _tm.elapsed().as_secs_f64()*1000.0);
 
     // 3. Sigma Constraint Fusion (O(1))
     // 【重要】Verifierも、verify_range_succinct から返された評価点を受け取る
+    let _ts = Instant::now();
     let (r_sig, sig_eval) = verify_range(&proof.sigma_range_proof, t_bits + 1, 32, transcript)
         .map_err(|e| format!("Sigam Range: {e}"))?;
+    eprintln!("[LN]  sigma_range:   {:>8.3}ms", _ts.elapsed().as_secs_f64()*1000.0);
     let r_sig_t = r_sig[0..t_bits].to_vec();
     let r_sig_b = r_sig[t_bits];
 
@@ -407,8 +415,10 @@ pub fn verify_layernorm(
     }
 
     // 4. Y Constraint Fusion (O(D) to eval public weights, O(1) for residual)
+    let _ty = Instant::now();
     let (r_y, y_eval) = verify_range(&proof.y_range_proof, t_bits + d_bits + 1, 32, transcript)
         .map_err(|e| format!("Y Range: {e}"))?;
+    eprintln!("[LN]  y_range:       {:>8.3}ms", _ty.elapsed().as_secs_f64()*1000.0);
     let r_y_t = r_y[0..t_bits].to_vec();
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
     let r_y_b = r_y[t_bits + d_bits];
@@ -437,6 +447,7 @@ pub fn verify_layernorm(
     // 5. Batched openings (same order as prover's hyrax_open_batch calls)
 
     // Group 1: [sum_x, sq_sum_x] at r_t
+    let _tg1 = Instant::now();
     hyrax_verify_batch(
         &[
             proof.internal_coms.sum_x_com.clone(),
@@ -448,8 +459,10 @@ pub fn verify_layernorm(
         &params_t,
         transcript,
     )?;
+    eprintln!("[LN]  group1:        {:>8.3}ms", _tg1.elapsed().as_secs_f64()*1000.0);
 
     // Individual: x at combine(r_t, r_d_mean) — unique point
+    let _txi = Instant::now();
     hyrax_verify(
         &io_coms.x_com,
         proof.openings.x_at_rt_rmean,
@@ -457,8 +470,10 @@ pub fn verify_layernorm(
         &proof.openings.x_rt_rmean_proof,
         &params_td,
     )?;
+    eprintln!("[LN]  x_indiv:       {:>8.3}ms", _txi.elapsed().as_secs_f64()*1000.0);
 
     // Group 2: [sum_x, sq_sum_x, sigma, sigma_sq, sum_x_sq] at r_sig_t
+    let _tg2 = Instant::now();
     hyrax_verify_batch(
         &[
             proof.internal_coms.sum_x_com.clone(),
@@ -479,8 +494,10 @@ pub fn verify_layernorm(
         &params_t,
         transcript,
     )?;
+    eprintln!("[LN]  group2:        {:>8.3}ms", _tg2.elapsed().as_secs_f64()*1000.0);
 
     // Group 3: [x, y, gamma_x, sigma_y] at combine(r_y_t, r_y_d)
+    let _tg3 = Instant::now();
     let ry_td = combine(&r_y_t, &r_y_d);
     hyrax_verify_batch(
         &[
@@ -500,8 +517,10 @@ pub fn verify_layernorm(
         &params_td,
         transcript,
     )?;
+    eprintln!("[LN]  group3:        {:>8.3}ms", _tg3.elapsed().as_secs_f64()*1000.0);
 
     // Group 4: [sum_x, sigma] at r_y_t
+    let _tg4 = Instant::now();
     hyrax_verify_batch(
         &[
             proof.internal_coms.sum_x_com.clone(),
@@ -513,6 +532,7 @@ pub fn verify_layernorm(
         &params_t,
         transcript,
     )?;
+    eprintln!("[LN]  group4:        {:>8.3}ms", _tg4.elapsed().as_secs_f64()*1000.0);
 
     Ok(())
 }

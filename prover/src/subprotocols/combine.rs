@@ -157,6 +157,51 @@ pub fn verify_combine(
 }
 
 // ---------------------------------------------------------------------------
+// Deferred Hyrax opening (for multi-point batch)
+// ---------------------------------------------------------------------------
+
+/// Run all of `verify_combine` except the final `hyrax_verify` call.
+///
+/// Returns `(r_final, f_at_r_final)`.  The caller is responsible for
+/// verifying the Hyrax opening of `f_com` at `r_final` with value
+/// `f_at_r_final`, typically via `hyrax_verify_multi_point` over several
+/// deferred results to amortise MSM costs.
+pub fn verify_combine_deferred(
+    proof: &CombineProof,
+    _f_com: &HyraxCommitment,
+    claims: &[EvalClaim],
+    num_vars: usize,
+    transcript: &mut Transcript,
+) -> Result<(Vec<F>, F), String> {
+    let weights = derive_weights(claims, transcript);
+
+    let combined_claim: F = claims
+        .iter()
+        .zip(weights.iter())
+        .map(|(c, &w)| w * c.value)
+        .sum();
+
+    let (r_final, leaf) =
+        verify_sumcheck(&proof.sumcheck, combined_claim, num_vars, transcript)?;
+
+    let g_final: F = claims
+        .iter()
+        .zip(weights.iter())
+        .map(|(claim, &wi)| wi * eq_poly_eval(&claim.point, &r_final))
+        .sum();
+
+    if leaf != g_final * proof.sumcheck.final_eval_g {
+        return Err(format!(
+            "Combine sumcheck leaf mismatch: leaf={:?}, G*f={:?}",
+            leaf,
+            g_final * proof.sumcheck.final_eval_g
+        ));
+    }
+
+    Ok((r_final, proof.sumcheck.final_eval_g))
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

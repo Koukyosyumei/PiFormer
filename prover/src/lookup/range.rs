@@ -9,8 +9,8 @@
 
 use crate::field::F;
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment, HyraxParams,
-    HyraxProof,
+    hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch, params_from_vars,
+    HyraxCommitment, HyraxProof,
 };
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
@@ -33,10 +33,10 @@ pub struct RangeProof {
     pub sumcheck: SumcheckProof,
     pub claim_v: F,
 
-    // 2. Chunk commitments and openings
+    // 2. Chunk commitments and openings (batched into a single proof via hyrax_open_batch)
     pub chunk_coms: Vec<HyraxCommitment>,
     pub chunk_evals: Vec<F>,
-    pub chunk_opens: Vec<HyraxProof>,
+    pub chunk_batch_proof: HyraxProof,
 
     // 3. Multiplicity (LogUp) commitment
     pub m_com: HyraxCommitment,
@@ -98,15 +98,12 @@ pub fn prove_range(
 
     let (sumcheck, r_v) = prove_sumcheck(&v_mle, &ones, claim_v, transcript);
 
-    // 5. Openings at r_v for chunks
-    let mut chunk_evals = Vec::with_capacity(num_chunks);
-    let mut chunk_opens = Vec::with_capacity(num_chunks);
-    for c in 0..num_chunks {
-        let eval = chunk_mles[c].evaluate(&r_v);
-        let open = hyrax_open(&chunk_mles[c].evaluations, &r_v, nu_c, sigma_c);
-        chunk_evals.push(eval);
-        chunk_opens.push(open);
-    }
+    // 5. Batch opening for all chunks at r_v (hyrax_open_batch → 1 proof instead of num_chunks)
+    let chunk_evals: Vec<F> = (0..num_chunks).map(|c| chunk_mles[c].evaluate(&r_v)).collect();
+    let chunk_slices: Vec<&[F]> = (0..num_chunks)
+        .map(|c| chunk_mles[c].evaluations.as_slice())
+        .collect();
+    let chunk_batch_proof = hyrax_open_batch(&chunk_slices, &r_v, nu_c, sigma_c, transcript);
 
     // 6. Multiplicity opening at random challenge r_m
     let r_m = challenge_vec(transcript, CHUNK_BITS, b"logup_rm");
@@ -122,7 +119,7 @@ pub fn prove_range(
             m_open,
             chunk_coms,
             chunk_evals,
-            chunk_opens,
+            chunk_batch_proof,
         },
         r_v,
     ))
@@ -140,48 +137,60 @@ pub fn verify_range(
 ) -> Result<(Vec<F>, F), String> {
     let num_chunks = (bits + CHUNK_BITS - 1) / CHUNK_BITS;
 
+    use std::time::Instant;
+    let _t0 = Instant::now();
     let (_, _, params_m) = params_from_vars(CHUNK_BITS);
     let (_, _, params_c) = params_from_vars(num_vars);
+    eprintln!("[range({num_vars})]  params:      {:>8.3}ms", _t0.elapsed().as_secs_f64()*1000.0);
 
     // 1. Absorb commitments
+    let _ta = Instant::now();
     for com in &proof.chunk_coms {
         absorb_com(transcript, b"chunk_com", com);
     }
     absorb_com(transcript, b"logup_m_com", &proof.m_com);
+    eprintln!("[range({num_vars})]  absorb:      {:>8.3}ms", _ta.elapsed().as_secs_f64()*1000.0);
 
     // 2. Sumcheck Verification
+    let _tsc = Instant::now();
     transcript.append_field(b"claim_v", &proof.claim_v);
     let (r_v, final_val) = verify_sumcheck(&proof.sumcheck, proof.claim_v, num_vars, transcript)
         .map_err(|e| format!("Range Sumcheck: {e}"))?;
     let v_eval = final_val;
+    eprintln!("[range({num_vars})]  sumcheck:    {:>8.3}ms", _tsc.elapsed().as_secs_f64()*1000.0);
 
     // 3. Chunk Algebraic Fusion: V(r) = V_lo(r) + 2^16 * V_hi(r)
+    // Batch all chunk openings into a single hyrax_verify_batch call (saves K-1 MSMs).
+    let _tch = Instant::now();
+    hyrax_verify_batch(
+        &proof.chunk_coms,
+        &proof.chunk_evals,
+        &r_v,
+        &proof.chunk_batch_proof,
+        &params_c,
+        transcript,
+    )
+    .map_err(|e| format!("Chunk batch opening failed: {e}"))?;
+    eprintln!("[range({num_vars})]  chunk_hyrax: {:>8.3}ms", _tch.elapsed().as_secs_f64()*1000.0);
+
+    // Verify the algebraic fusion: V(r) = Σ_c chunk_eval[c] * 2^(16c)
     let mut expected_v_eval = F::ZERO;
     let mut shift = F::ONE;
     let shift_multiplier = F::from(1u64 << CHUNK_BITS);
-
     for c in 0..num_chunks {
-        hyrax_verify(
-            &proof.chunk_coms[c],
-            proof.chunk_evals[c],
-            &r_v,
-            &proof.chunk_opens[c],
-            &params_c,
-        )
-        .map_err(|e| format!("Chunk opening failed: {e}"))?;
-
         expected_v_eval += proof.chunk_evals[c] * shift;
         shift *= shift_multiplier;
     }
-
     if v_eval != expected_v_eval {
         return Err("Chunk fusion mismatch: V(r) != sum V_c(r) * 2^{16c}".into());
     }
 
     // 4. Multiplicity Verification
+    let _tm = Instant::now();
     let r_m = challenge_vec(transcript, CHUNK_BITS, b"logup_rm");
     hyrax_verify(&proof.m_com, proof.m_eval, &r_m, &proof.m_open, &params_m)
         .map_err(|e| format!("Range Multiplicity Opening: {e}"))?;
+    eprintln!("[range({num_vars})]  m_hyrax:     {:>8.3}ms", _tm.elapsed().as_secs_f64()*1000.0);
 
     // Return the coordinate and the evaluated value to the parent layer (e.g. LayerNorm)
     Ok((r_v, v_eval))
@@ -354,7 +363,7 @@ mod range_tests {
         assert!(result.is_ok(), "all-zeros range proof failed: {:?}", result.err());
     }
 
-    /// Tampered chunk opening (proof.chunk_opens[0]) should be caught.
+    /// Tampered chunk batch proof (proof.chunk_batch_proof) should be caught.
     #[test]
     fn test_rejects_tampered_chunk_opening_vector() {
         let witness = setup_witness();
@@ -363,8 +372,8 @@ mod range_tests {
         let mut pt = Transcript::new(b"range_test");
         let (mut proof, _) = prove_range(&witness, 32, &mut pt).unwrap();
 
-        // Corrupt the w_prime inside the first chunk opening proof
-        proof.chunk_opens[0].w_prime[0] += F::one();
+        // Corrupt the w_prime inside the batched chunk opening proof
+        proof.chunk_batch_proof.w_prime[0] += F::one();
 
         let mut vt = Transcript::new(b"range_test");
         let result = verify_range(&proof, num_vars, 32, &mut vt);

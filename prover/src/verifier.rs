@@ -9,7 +9,8 @@
 
 use crate::lookup::lasso::{verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey};
 use crate::pcs::{absorb_com, params_from_vars, HyraxCommitment, HyraxParams};
-use crate::subprotocols::verify_combine;
+use crate::subprotocols::verify_combine_deferred;
+use crate::pcs::hyrax_verify_multi_point;
 use crate::transcript::Transcript;
 
 // Sub-module keys and verifiers
@@ -75,6 +76,7 @@ pub fn verify_transformer_block(
     // Pipeline Stitching (The Binding of IO Commitments)
     // =========================================================================
 
+    use std::time::Instant;
     let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
     let d_bits = vk.d_model.next_power_of_two().trailing_zeros() as usize;
     let td_num_vars = t_bits + d_bits;
@@ -85,19 +87,23 @@ pub fn verify_transformer_block(
         x_com: x_in_com.clone(),
         y_com: proof.x_norm1_com.clone(),
     };
-    verify_layernorm(&proof.ln1_proof, &ln1_io, &vk.ln1_vk, transcript)?;
+    let _t = Instant::now(); verify_layernorm(&proof.ln1_proof, &ln1_io, &vk.ln1_vk, transcript)?;
+    eprintln!("[block] ln1:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     let _ = td_params; // ensure td_params isn't flagged unused
 
     // --- 2. Projections (Q, K, V) — returns (y_claim, x_claim) for combine ---
     let q_io = ProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
-    let (q_y_claim, q_x_claim) = verify_projection(&proof.q_proj_proof, &vk.q_vk, &q_io, transcript)?;
+    let _t = Instant::now(); let (q_y_claim, q_x_claim) = verify_projection(&proof.q_proj_proof, &vk.q_vk, &q_io, transcript)?;
+    eprintln!("[block] q_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     let k_io = ProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
-    let (k_y_claim, k_x_claim) = verify_projection(&proof.k_proj_proof, &vk.k_vk, &k_io, transcript)?;
+    let _t = Instant::now(); let (k_y_claim, k_x_claim) = verify_projection(&proof.k_proj_proof, &vk.k_vk, &k_io, transcript)?;
+    eprintln!("[block] k_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     let v_io = ProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
-    let (v_y_claim, v_x_claim) = verify_projection(&proof.v_proj_proof, &vk.v_vk, &v_io, transcript)?;
+    let _t = Instant::now(); let (v_y_claim, v_x_claim) = verify_projection(&proof.v_proj_proof, &vk.v_vk, &v_io, transcript)?;
+    eprintln!("[block] v_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // --- 3. Linear Attention — returns (out_claim, v_claim) for combine ---
     let attn_io = crate::attention::attention::AttentionIOCommitments {
@@ -106,12 +112,14 @@ pub fn verify_transformer_block(
         v_com: proof.v_com.clone(),
         out_com: proof.out_inner_com.clone(),
     };
-    let (attn_out_claim, attn_v_claim) =
+    let _t = Instant::now(); let (attn_out_claim, attn_v_claim) =
         verify_linear_attention(&proof.attn_proof, inst_attn, &attn_io, transcript)?;
+    eprintln!("[block] attn:       {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // --- 4. Output Projection ---
     let o_io = ProjectionIOCommitments { x_com: proof.out_inner_com.clone() };
-    let (o_y_claim, o_x_claim) = verify_projection(&proof.o_proj_proof, &vk.o_vk, &o_io, transcript)?;
+    let _t = Instant::now(); let (o_y_claim, o_x_claim) = verify_projection(&proof.o_proj_proof, &vk.o_vk, &o_io, transcript)?;
+    eprintln!("[block] o_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // =========================================================================
     // Residual Connection 1: X_mid = X_in + Out_attn (homomorphic, no transcript)
@@ -123,14 +131,15 @@ pub fn verify_transformer_block(
         x_com: x_mid_com.clone(),
         y_com: proof.x_norm2_com.clone(),
     };
-    verify_layernorm(&proof.ln2_proof, &ln2_io, &vk.ln2_vk, transcript)?;
+    let _t = Instant::now(); verify_layernorm(&proof.ln2_proof, &ln2_io, &vk.ln2_vk, transcript)?;
+    eprintln!("[block] ln2:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // --- 6. FFN — returns (y_claim, x_claim) deferred to combine ---
     let ffn_io = crate::ffn::ffn::FFNIOCommitments {
         x_com: proof.x_norm2_com.clone(),
         y_com: proof.out_ffn_com.clone(),
     };
-    let (ffn_y_claim, ffn_x_claim) = verify_ffn(
+    let _t = Instant::now(); let (ffn_y_claim, ffn_x_claim) = verify_ffn(
         &proof.ffn_proof,
         inst_ffn,
         &vk.ffn_vk,
@@ -138,28 +147,50 @@ pub fn verify_transformer_block(
         transcript,
         lasso_params,
     )?;
+    eprintln!("[block] ffn:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
-    // --- 7. GKR Combine Proofs — MUST be after all sub-module verifications to match prover transcript ---
-    verify_combine(&proof.q_combine, &proof.q_com, &[q_y_claim], td_num_vars, transcript)
+    // --- 7. GKR Combine Proofs ---
+    // Run sumcheck + leaf-check for all 8 combines, defer Hyrax openings.
+    // Then batch all 8 openings into 2 MSMs via hyrax_verify_multi_point.
+    let _t = Instant::now();
+    let (q_r, q_f) = verify_combine_deferred(&proof.q_combine, &proof.q_com, &[q_y_claim], td_num_vars, transcript)
         .map_err(|e| format!("q_combine: {e}"))?;
-    verify_combine(&proof.k_combine, &proof.k_com, &[k_y_claim], td_num_vars, transcript)
+    let (k_r, k_f) = verify_combine_deferred(&proof.k_combine, &proof.k_com, &[k_y_claim], td_num_vars, transcript)
         .map_err(|e| format!("k_combine: {e}"))?;
-    verify_combine(&proof.v_combine, &proof.v_com, &[v_y_claim, attn_v_claim], td_num_vars, transcript)
+    let (v_r, v_f) = verify_combine_deferred(&proof.v_combine, &proof.v_com, &[v_y_claim, attn_v_claim], td_num_vars, transcript)
         .map_err(|e| format!("v_combine: {e}"))?;
-    verify_combine(
+    let (oi_r, oi_f) = verify_combine_deferred(
         &proof.out_inner_combine, &proof.out_inner_com,
         &[attn_out_claim, o_x_claim], td_num_vars, transcript,
     ).map_err(|e| format!("out_inner_combine: {e}"))?;
-    verify_combine(
+    let (n1_r, n1_f) = verify_combine_deferred(
         &proof.x_norm1_combine, &proof.x_norm1_com,
         &[q_x_claim, k_x_claim, v_x_claim], td_num_vars, transcript,
     ).map_err(|e| format!("x_norm1_combine: {e}"))?;
-    verify_combine(&proof.out_attn_combine, &proof.out_attn_com, &[o_y_claim], td_num_vars, transcript)
+    let (oa_r, oa_f) = verify_combine_deferred(&proof.out_attn_combine, &proof.out_attn_com, &[o_y_claim], td_num_vars, transcript)
         .map_err(|e| format!("out_attn_combine: {e}"))?;
-    verify_combine(&proof.x_norm2_combine, &proof.x_norm2_com, &[ffn_x_claim], td_num_vars, transcript)
+    let (n2_r, n2_f) = verify_combine_deferred(&proof.x_norm2_combine, &proof.x_norm2_com, &[ffn_x_claim], td_num_vars, transcript)
         .map_err(|e| format!("x_norm2_combine: {e}"))?;
-    verify_combine(&proof.out_ffn_combine, &proof.out_ffn_com, &[ffn_y_claim], td_num_vars, transcript)
+    let (of_r, of_f) = verify_combine_deferred(&proof.out_ffn_combine, &proof.out_ffn_com, &[ffn_y_claim], td_num_vars, transcript)
         .map_err(|e| format!("out_ffn_combine: {e}"))?;
+
+    // Batch all 8 Hyrax openings: 2 MSMs instead of 16
+    let (_, _, combine_params) = params_from_vars(td_num_vars);
+    hyrax_verify_multi_point(
+        &[
+            (&proof.q_com,          q_f,  &q_r,  &proof.q_combine.hyrax_proof),
+            (&proof.k_com,          k_f,  &k_r,  &proof.k_combine.hyrax_proof),
+            (&proof.v_com,          v_f,  &v_r,  &proof.v_combine.hyrax_proof),
+            (&proof.out_inner_com,  oi_f, &oi_r, &proof.out_inner_combine.hyrax_proof),
+            (&proof.x_norm1_com,    n1_f, &n1_r, &proof.x_norm1_combine.hyrax_proof),
+            (&proof.out_attn_com,   oa_f, &oa_r, &proof.out_attn_combine.hyrax_proof),
+            (&proof.x_norm2_com,    n2_f, &n2_r, &proof.x_norm2_combine.hyrax_proof),
+            (&proof.out_ffn_com,    of_f, &of_r, &proof.out_ffn_combine.hyrax_proof),
+        ],
+        &combine_params,
+        transcript,
+    ).map_err(|e| format!("combine batch: {e}"))?;
+    eprintln!("[block] combines:   {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // =========================================================================
     // Residual Connection 2: X_out = X_mid + Out_ffn
@@ -253,20 +284,25 @@ pub fn verify(
     }
 
     // 3. Final LayerNorm Verification
+    use std::time::Instant;
+    let _t = Instant::now();
     let ln_io = LayerNormIOCommitments {
         x_com: current_x_com.clone(),
         y_com: proof.final_ln_out_com.clone(),
     };
     verify_layernorm(&proof.final_ln_proof, &ln_io, &vk.final_ln_vk, transcript)
         .map_err(|e| format!("Final LN failed: {}", e))?;
+    eprintln!("[model] final_ln:   {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
-    // 4. LM Head Verification (single projection at model output — y_claim not combined further)
+    // 4. LM Head Verification
+    let _t = Instant::now();
     let lm_io = ProjectionIOCommitments { x_com: proof.final_ln_out_com.clone() };
     verify_projection(&proof.lm_head_proof, &vk.lm_head_vk, &lm_io, transcript)
         .map_err(|e| format!("LM Head failed: {}", e))?;
+    eprintln!("[model] lm_head:    {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
-    // 5. Global batched Lasso: verify all activation lookups across all layers.
-    // Instance order per block: [FFN_i, Q_i, K_i].
+    // 5. Global batched Lasso
+    let _t = Instant::now();
     let mut all_lasso_instances = Vec::new();
     let mut all_instance_coms = Vec::new();
     for i in 0..vk.num_blocks {
@@ -292,6 +328,7 @@ pub fn verify(
         lasso_params,
     )
     .map_err(|e| format!("Global batched Lasso failed: {}", e))?;
+    eprintln!("[model] lasso:      {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     Ok(())
 }

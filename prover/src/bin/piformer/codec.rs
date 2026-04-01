@@ -294,7 +294,7 @@ fn write_range_proof<W: Write>(w: &mut W, p: &RangeProof) -> io::Result<()> {
     write_f(w, &p.claim_v)?;
     write_vec(w, &p.chunk_coms, write_hyrax_commitment)?;
     write_vec_f(w, &p.chunk_evals)?;
-    write_vec(w, &p.chunk_opens, write_hyrax_proof)?;
+    write_hyrax_proof(w, &p.chunk_batch_proof)?;
     write_hyrax_commitment(w, &p.m_com)?;
     write_f(w, &p.m_eval)?;
     write_hyrax_proof(w, &p.m_open)
@@ -305,7 +305,7 @@ fn read_range_proof<R: Read>(r: &mut R) -> io::Result<RangeProof> {
         claim_v: read_f(r)?,
         chunk_coms: read_vec(r, read_hyrax_commitment)?,
         chunk_evals: read_vec_f(r)?,
-        chunk_opens: read_vec(r, read_hyrax_proof)?,
+        chunk_batch_proof: read_hyrax_proof(r)?,
         m_com: read_hyrax_commitment(r)?,
         m_eval: read_f(r)?,
         m_open: read_hyrax_proof(r)?,
