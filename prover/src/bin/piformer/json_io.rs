@@ -55,7 +55,7 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
 
 fn mat_to_json(mat: &[Vec<F>]) -> Vec<Vec<String>> {
     mat.iter()
-        .map(|row| row.iter().map(f_to_hex).collect())
+        .map(|row: &Vec<F>| row.iter().map(f_to_hex).collect())
         .collect()
 }
 
@@ -73,7 +73,7 @@ fn mat_from_json(json: Vec<Vec<String>>) -> Result<Vec<Vec<F>>, String> {
 
 fn ternary_mat_to_json(mat: &[Vec<TernaryValue>]) -> Vec<Vec<i8>> {
     mat.iter()
-        .map(|row| {
+        .map(|row: &Vec<TernaryValue>| {
             row.iter()
                 .map(|v| match v {
                     TernaryValue::ONE => 1i8,
@@ -149,6 +149,17 @@ pub struct JsonBlockWeights {
     pub ln2_beta: Vec<String>,
     pub ffn_w1: Vec<Vec<i8>>,
     pub ffn_w2: Vec<Vec<i8>>,
+    // Activation tables for Lasso precommitment at setup time
+    #[serde(default)]
+    pub ffn_activation_tables: Vec<Vec<String>>,
+    #[serde(default)]
+    pub ffn_activation_bits_per_chunk: usize,
+    #[serde(default)]
+    pub q_activation_tables: Vec<Vec<String>>,
+    #[serde(default)]
+    pub k_activation_tables: Vec<Vec<String>>,
+    #[serde(default)]
+    pub qk_activation_bits_per_chunk: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -206,6 +217,11 @@ pub fn weights_to_json(w: &TransformerModelWeights) -> JsonWeights {
             ln2_beta: vec_to_json(&b.ln2_beta),
             ffn_w1: ternary_mat_to_json(&b.ffn_w1),
             ffn_w2: ternary_mat_to_json(&b.ffn_w2),
+            ffn_activation_tables: mat_to_json(&b.ffn_activation_tables),
+            ffn_activation_bits_per_chunk: b.ffn_activation_bits_per_chunk,
+            q_activation_tables: mat_to_json(&b.q_activation_tables),
+            k_activation_tables: mat_to_json(&b.k_activation_tables),
+            qk_activation_bits_per_chunk: b.qk_activation_bits_per_chunk,
         })
         .collect();
     JsonWeights {
@@ -246,6 +262,11 @@ pub fn weights_from_json(j: JsonWeights) -> Result<TransformerModelWeights, Stri
                 ln2_beta: vec_from_json(b.ln2_beta)?,
                 ffn_w1: ternary_mat_from_json(b.ffn_w1)?,
                 ffn_w2: ternary_mat_from_json(b.ffn_w2)?,
+                ffn_activation_tables: mat_from_json(b.ffn_activation_tables)?,
+                ffn_activation_bits_per_chunk: b.ffn_activation_bits_per_chunk,
+                q_activation_tables: mat_from_json(b.q_activation_tables)?,
+                k_activation_tables: mat_from_json(b.k_activation_tables)?,
+                qk_activation_bits_per_chunk: b.qk_activation_bits_per_chunk,
             })
         })
         .collect();
@@ -395,7 +416,7 @@ fn ln_wit_from_json(j: JsonLayerNormWitness) -> Result<LayerNormWitness, String>
     // var_x in JSON encodes sq_sum_x (sum of squares per row)
     let sq_sum_x = vec_from_json(j.var_x)?;
     // sum_x_sq and sigma_sq_scaled are derived quantities
-    let d = x.first().map(|r| r.len()).unwrap_or(0);
+    let d = x.first().map(|r: &Vec<F>| r.len()).unwrap_or(0);
     let d_f = F::from(d as u64);
     let sum_x_sq: Vec<F> = sum_x.iter().map(|&s| s * s).collect();
     let sigma_sq_scaled: Vec<F> = sigma.iter().map(|&s| (d_f * s) * (d_f * s)).collect();

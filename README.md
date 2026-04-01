@@ -12,7 +12,7 @@
                 │  PiFormerModel              │
                 │   ├─ LinearAttentionLayer   │
                 │   ├─ StructuredLookupAct    │
-                │   └─ PowerOfTwoLinear       │
+                │   └─ TernaryLinear          │
                 │          │                  │
                 │     export_model()          │
                 └──────────┬──────────────────┘
@@ -35,7 +35,7 @@ Proving transformer inference in a SNARK is expensive because:
 1. **Softmax** requires `exp`, row-wise normalization, and division — none of which are polynomial operations.
 2. **Dense activations** (GELU, SiLU) require large lookup tables when encoded naively.
 3. **Layer normalization** involves a square root and division by a running variance.
-4. **Matrix multiplications** with general weights require one multiplication gate per entry.
+4. **General weight matrices** require one multiplication gate per entry.
 
 π-Former addresses all four with co-designed training and proving:
 
@@ -43,8 +43,8 @@ Proving transformer inference in a SNARK is expensive because:
 |---------|-------------------|
 | Softmax | Linear attention: `φ(Q)(φ(K)ᵀV)` |
 | Activations | Structured lookup φ, additively decomposed for Lasso |
-| LayerNorm | Sumcheck for mean/variance + constraint-fused range proof |
-| Dense weights | Power-of-two weights → shift-and-add only |
+| LayerNorm | Sumcheck for mean + constraint-fused range proof |
+| Dense weights | Ternary weights `{−1, 0, +1}` → addition/subtraction only |
 
 See [DESIGN.md](DESIGN.md) for the full technical treatment.
 
@@ -55,7 +55,7 @@ See [DESIGN.md](DESIGN.md) for the full technical treatment.
 ├── python/                     Python training pipeline
 │   ├── piformer/
 │   │   ├── activation.py       StructuredLookupActivation
-│   │   ├── projection.py       PowerOfTwoLinear (STE training)
+│   │   ├── projection.py       TernaryLinear (STE training)
 │   │   ├── attention.py        LinearAttentionLayer
 │   │   ├── model.py            PiFormerBlock / PiFormerModel
 │   │   └── export.py           JSON weight export for Rust
@@ -69,19 +69,19 @@ See [DESIGN.md](DESIGN.md) for the full technical treatment.
 │       ├── transcript.rs       Fiat-Shamir (SHA3-256)
 │       ├── poly/
 │       │   ├── dense.rs        Dense multilinear polynomial
-│       │   └── utils.rs        MLE helper utilities
+│       │   └── utils.rs        MLE helpers + TernaryValue type
 │       ├── pcs/
-│       │   └── mod.rs          Hyrax PCS (transparent, no trusted setup)
+│       │   └── mod.rs          Hyrax PCS + HyraxBatchAccumulator
 │       ├── subprotocols/
-│       │   └── sumcheck.rs     Degree-2 sumcheck protocol
+│       │   ├── sumcheck.rs     Degree-2 / multi-poly sumcheck
+│       │   └── combine.rs      GKR combine proof (multi-claim → 1 opening)
 │       ├── lookup/
-│       │   ├── lasso.rs        Lasso lookup argument
+│       │   ├── lasso.rs        Lasso lookup argument (batched multi-instance)
 │       │   └── range.rs        32-bit range proof (chunked Lasso)
 │       ├── attention/
 │       │   ├── attention.rs    Linear attention circuit
 │       │   ├── layernorm.rs    LayerNorm with constraint fusion
-│       │   ├── projection.rs   Weight-matrix projection circuit
-│       │   └── ternary_check.rs  Ternary weight validity proof
+│       │   └── projection.rs   Ternary-weight projection circuit
 │       ├── ffn/
 │       │   └── ffn.rs          Feed-forward network circuit
 │       ├── setup.rs            Preprocessing → proving key / verifying key
@@ -99,7 +99,6 @@ See [DESIGN.md](DESIGN.md) for the full technical treatment.
 │   └── zkLLM.pdf
 ├── reference/                  Reference implementations (submodules)
 │   └── jolt/                   Jolt zkVM (Rust)
-├── IDEA.md                     Initial design sketch
 └── DESIGN.md                   Full technical specification
 ```
 
@@ -113,13 +112,14 @@ Run a full setup → prove → verify cycle on a tiny synthetic model:
 cd prover
 cargo run --release --bin piformer -- sample --output-dir /tmp/piformer_sample
 # Writes weights.json, model.pk, model.vk, witness.json, proof.bin
-# ✓ Proof is VALID.
+# ✓  Proof is VALID.
 ```
 
 ### 2. Inspect Generated Files
 
 ```bash
 cargo run --release --bin piformer -- inspect /tmp/piformer_sample/model.vk
+cargo run --release --bin piformer -- inspect /tmp/piformer_sample/model.pk
 cargo run --release --bin piformer -- inspect /tmp/piformer_sample/proof.bin
 ```
 
@@ -165,7 +165,7 @@ cd prover && cargo test
 | Extension | Contents |
 |-----------|----------|
 | `*.json`  | Human-readable weights or witness (field elements as hex strings) |
-| `*.pk`    | Proving key — Hyrax G1 commitments + raw weight vectors |
+| `*.pk`    | Proving key — Hyrax G1 commitments + raw ternary weight vectors |
 | `*.vk`    | Verifying key — Hyrax G1 commitments only (no raw weights) |
 | `*.bin`   | Proof bundle — proof + public instances (binary, magic-prefixed) |
 
@@ -185,7 +185,7 @@ where:
   C  = φ(K)ᵀ V   (context matrix, computed once in O(T d²))
 ```
 
-The context matrix `C` does not depend on any query, so it is computed once and reused across all positions. This avoids the O(T²d) cost of full attention and eliminates exponentials and row-wise divisions.
+The context matrix `C` depends only on keys and values, not on any query, so it is computed once and reused across all positions. This avoids the O(T²d) cost of full attention and eliminates exponentials and row-wise divisions.
 
 ### Structured Lookup Activation
 
@@ -200,59 +200,72 @@ The context matrix `C` does not depend on any query, so it is computed once and 
 
 This additive decomposition matches the Lasso lookup argument exactly: `c` sub-tables of size `2^m` instead of one monolithic table of size `2^B`. For `B=16, c=2`: 512 commitments instead of 65 536.
 
-### Power-of-Two Weights
+### Ternary Weights
 
-Projection matrices `W_Q, W_K, W_V, W_O` and FFN weights are constrained to entries in `{0, ±1, ±2, ±4, …, ±2^k}`. In the circuit, multiplying by `2^k` is a field constant (no multiplication gate), reducing all linear projections to additions. A straight-through estimator (STE) enables gradient flow during training.
+All projection matrices (`W_Q, W_K, W_V, W_O`) and FFN weight matrices are constrained to entries in `{−1, 0, +1}` (represented as the `TernaryValue` enum in Rust). A matrix-vector product with ternary weights requires only additions and subtractions — no multiplication gates — making all linear projections essentially free in the sumcheck constraint system. A straight-through estimator (STE) enables gradient flow during training.
+
+The prover exploits this during witness generation via `eval_cols_ternary`, which accumulates equality-polynomial evaluations with `+= / -= / skip` instead of field multiplications.
 
 ### LayerNorm via Constraint Fusion
 
 LayerNorm is proven without any division gates:
 
 1. **Mean sumcheck** — proves `sum_x[i] = Σⱼ x[i][j]` using a degree-2 sumcheck.
-2. **Variance sumcheck** — proves `var_x[i] = Σⱼ (d·x[i][j] − sum_x[i])²`.
-3. **Range proofs** — verify `σ[i]` is the integer floor-square-root of `var_x[i]` and that output `y[i][j]` lies in the correct interval, both via a chunked Lasso range proof.
+2. **Sigma range proof** — verifies `σ[i]` is the integer floor-square-root of `d·var_x[i]` by showing both residuals are non-negative, via a chunked Lasso range proof.
+3. **Y constraint fusion** — verifies each output `y[i][j]` satisfies the scaled LayerNorm formula at a single random evaluation point using another range proof over lo/hi residuals.
 
-The verifier checks all constraints at a single random evaluation point (O(1) per layer), with no O(N) loops.
+The verifier checks all constraints at a single random evaluation point — O(1) per layer, with no O(T·d) loops.
+
+## Key Implementation Features
+
+### Ternary Weight Encoding
+
+Weight matrices are stored as `Vec<Vec<TernaryValue>>` where `TernaryValue ∈ {ONE, ZERO, MINUSONE}`. The prover uses `eval_cols_ternary` to evaluate the weight MLE at a challenge point without materializing the full field matrix, and `convert_tm_to_fm` only when a full field representation is needed (e.g., for commitment).
+
+### Batched Hyrax Openings (`HyraxBatchAccumulator`)
+
+Multiple Hyrax openings at different points are accumulated into a single `HyraxBatchAccumulator`. The inner-product check is performed immediately on `add_verify` / `add_verify_batch`, but the MSM (the expensive part) is deferred to a single `finalize` call. This reduces `K` Hyrax verifications from `2K` MSMs to just `2` MSMs.
+
+The verifier uses cross-layer accumulators: all LayerNorm openings in a model share one `acc_t` and one `acc_td`; all projection weight openings share `proj_acc_w` and `proj_acc_b`. These are finalized once at the end of the entire model verification.
+
+### GKR Combine Proofs
+
+Intermediate tensors (Q, K, V, out_inner, x_norm1, etc.) are referenced by multiple sub-provers at different evaluation points. A `CombineProof` bundles all claims on the same commitment into a single Hyrax opening via a short sumcheck. Eight combine proofs per block are then batch-verified in two MSMs using `hyrax_verify_multi_point`.
+
+### Batched Global Lasso
+
+All Lasso instances across all blocks (FFN activation lookups + Q/K attention kernel lookups) are batched into a single `LassoMultiProof` via `prove_lasso_multi` / `verify_lasso_multi`. This replaces `3L` independent Lasso proofs with one combined sumcheck and one Hyrax opening.
+
+### Homomorphic Residual Connections
+
+Residual additions (`X_mid = X_in + Out_attn`, `X_out = X_mid + Out_ffn`) are verified using the homomorphic property of Hyrax (Pedersen) commitments: `Com(A) + Com(B) = Com(A+B)`. The verifier computes `add_commitments` in O(√N) group operations with no prover assistance.
 
 ## Rust Prover Components
 
-### Hyrax Polynomial Commitment Scheme (`pcs/`)
+### Hyrax PCS (`pcs/`)
 
-Transparent (no trusted setup), based on discrete-log hardness of BN254 G1:
+Transparent (no trusted setup), based on discrete-log hardness of BN254 G1. For a `2^n`-evaluation polynomial arranged as a `2^ν × 2^σ` matrix:
 
-- **Commit:** arrange the `2^n` evaluations in a `2^ν × 2^σ` matrix; commit each row with a multi-scalar multiplication (MSM).
-- **Open at r = (r_L ‖ r_R):** prover sends `w′ = L(r_L)·M` (row-collapsed vector); verifier checks `Σᵢ Lᵢ·Cᵢ = MSM(gens, w′)` and `⟨R(r_R), w′⟩ = claimed_eval`.
-- **Cost:** prover O(√N) group ops; verifier O(√N) group ops + O(log N) field ops.
+- **Commit:** one MSM per row → `2^ν` G1 points.
+- **Open at r = (r_L ‖ r_R):** prover sends row-collapsed vector `w′`; verifier checks the MSM equation and inner product.
+- **Batch:** `HyraxBatchAccumulator` defers all MSMs to a single `finalize` call.
+- **Multi-point:** `hyrax_verify_multi_point` batches openings at different points into 2 MSMs.
 
-### Dense Multilinear Polynomial (`poly/`)
+### Sumcheck (`subprotocols/sumcheck.rs`)
 
-`DenseMLPoly` stores `2^n` evaluations over `{0,1}^n` and supports:
-- `evaluate(r)` — multilinear extension at arbitrary `r ∈ Fⁿ` via repeated halving, O(2ⁿ).
-- `fix_first_variable(r)` — reduce n-variable poly to (n−1)-variable, O(2ⁿ).
-- `eq_poly(r)` — equality polynomial `eq(r, ·)`.
+Proves `H = Σ_{x ∈ {0,1}^n} f(x)·g(x)`. Each round polynomial has degree ≤ 2, represented by evaluations at `{0, 1, 2}`. Also supports `SumcheckProofMulti` for batching multiple `(f_i, g_i)` pairs with Fiat-Shamir-random linear combination.
 
-### Sumcheck Protocol (`subprotocols/`)
+### GKR Combine (`subprotocols/combine.rs`)
 
-Proves `H = Σ_{x ∈ {0,1}^n} f(x)·g(x)` for two MLEs. Each round polynomial has degree ≤ 2; represented by evaluations at `{0, 1, 2}` and verified via quadratic Lagrange interpolation. Prover cost O(n·2ⁿ); verifier cost O(n) plus two PCS openings.
+`prove_combine` / `verify_combine_deferred` reduce multiple evaluation claims on the same committed polynomial to a single Hyrax opening. The verifier defers the opening check; `hyrax_verify_multi_point` then handles all deferred openings in a batch.
 
-### Lasso Lookup Argument (`lookup/lasso.rs`)
+### Lasso (`lookup/lasso.rs`)
 
-Proves `v_j = T[idx_j]` for a batch of queries via a batched MLE sumcheck over a selector polynomial built from Fiat-Shamir–randomized equality polynomials. Sub-table decomposition keeps table commitment cost at O(c · 2^m) instead of O(2^B).
+`prove_lasso_multi` / `verify_lasso_multi` handle a vector of `LassoInstance` objects (each with its own sub-tables and query set) in a single combined sumcheck + one Hyrax opening, via Fiat-Shamir random linear combination across instances.
 
 ### Range Proof (`lookup/range.rs`)
 
-Proves field elements lie in `[0, 2^32)` by splitting each value into two 16-bit chunks, committing to them via Hyrax, and running a LogUp-style multiplicity check against the identity table `T[i] = i` of size 65 536.
-
-### Linear Attention Circuit (`attention/attention.rs`)
-
-Proves four claims for a single attention head:
-
-| Step | Statement | Protocol |
-|------|-----------|----------|
-| 1 | `Φ_Q[t][d] = φ(Q[t][d])` for all `t, d` | Lasso per chunk |
-| 2 | `Φ_K[t][d] = φ(K[t][d])` for all `t, d` | Lasso per chunk |
-| 3 | `C[i][j] = Σ_t Φ_K[t][i] · V[t][j]` | Sumcheck over `t` |
-| 4 | `out[t][j] = Σ_i Φ_Q[t][i] · C[i][j]` | Sumcheck over `i` |
+Proves field elements lie in `[0, 2^32)` by splitting into two 16-bit chunks, committing via Hyrax, and running a LogUp-style multiplicity check against the identity table `T[i] = i` of size 65 536. `verify_range_deferred` / `verify_range_m_batch` defer and batch the multiplicity-commitment opening.
 
 ## Cryptographic Parameters
 
@@ -261,7 +274,7 @@ Proves four claims for a single attention head:
 | Scalar field | BN254 Fr (~254-bit prime) |
 | Hash / transcript | SHA3-256 (Fiat-Shamir) |
 | PCS | Hyrax (transparent; DL hardness on BN254 G1) |
-| Lookup argument | Lasso (batched MLE sumcheck) |
+| Lookup argument | Lasso (batched multi-instance) |
 | Range proof | Chunked Lasso (16-bit chunks, identity table) |
 | Non-interactive | Fiat-Shamir in the random-oracle model |
 
@@ -274,6 +287,7 @@ Proves four claims for a single attention head:
 - [ ] IVC / Nova folding for streaming token-by-token proofs
 - [ ] Benchmarks against zkGPT and zkLLM baselines
 - [ ] On-chain (EVM) verifier
+- [ ] Zero-knowledge layer (blinded witness polynomials)
 
 ## References
 
@@ -284,6 +298,7 @@ Proves four claims for a single attention head:
 - **zkGPT** — see `paper/zkGPT.pdf`
 - **zkLLM** — see `paper/zkLLM.pdf`
 - **Linear Transformers** — Katharopoulos et al. *Transformers are RNNs.* ICML 2020.
+- **BitNet** — Wang et al. *BitNet: Scaling 1-bit Transformers for Large Language Models.* 2023.
 
 ## License
 

@@ -16,14 +16,15 @@
 //!   X_out = X_mid + Out_ffn   <-- Residual 2
 
 use crate::field::F;
-use crate::pcs::{absorb_com, hyrax_commit, HyraxCommitment, HyraxParams};
+use crate::pcs::{absorb_com, hyrax_commit, params_from_vars, HyraxCommitment, HyraxParams};
 use crate::poly::utils::mat_to_mle;
+use crate::subprotocols::{prove_combine, CombineProof};
 use crate::transcript::Transcript;
 
 // Sub-module imports (Assuming the interfaces we built previously)
 use crate::attention::attention::{
-    prove_linear_attention, AttentionIOCommitments, LinearAttentionInstance, LinearAttentionProof,
-    LinearAttentionWitness,
+    prove_linear_attention, AttentionIOCommitments,
+    LinearAttentionInstance, LinearAttentionProof, LinearAttentionWitness,
 };
 use crate::attention::layernorm::{
     prove_layernorm, LayerNormIOCommitments, LayerNormProof, LayerNormVerifyingKey,
@@ -34,6 +35,9 @@ use crate::attention::projection::{
     ProjectionVerifyingKey, ProjectionWitness,
 };
 use crate::ffn::ffn::{prove_ffn, FFNIOCommitments, FFNInstance, FFNProof, FFNWitness};
+use crate::lookup::lasso::{
+    prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
+};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey}; // Imported from verifier.rs
 
 // ---------------------------------------------------------------------------
@@ -61,6 +65,25 @@ pub struct TransformerBlockProof {
     pub out_attn_com: HyraxCommitment,
     pub x_norm2_com: HyraxCommitment,
     pub out_ffn_com: HyraxCommitment,
+
+    // GKR combine proofs — each bundles multiple eval claims on the same
+    // intermediate commitment into a single Hyrax opening.
+    /// Verifies q_com: 1 claim from Q-projection y_claim.
+    pub q_combine: CombineProof,
+    /// Verifies k_com: 1 claim from K-projection y_claim.
+    pub k_combine: CombineProof,
+    /// Verifies v_com: 2 claims — V-projection y_claim + attention v_claim.
+    pub v_combine: CombineProof,
+    /// Verifies out_inner_com: 2 claims — attention out_claim + O-projection x_claim.
+    pub out_inner_combine: CombineProof,
+    /// Verifies x_norm1_com: 3 claims — Q/K/V-projection x_claims.
+    pub x_norm1_combine: CombineProof,
+    /// Verifies out_attn_com: 1 claim from O-projection y_claim.
+    pub out_attn_combine: CombineProof,
+    /// Verifies x_norm2_com: 1 claim from FFN x_claim (input to FFN).
+    pub x_norm2_combine: CombineProof,
+    /// Verifies out_ffn_com: 1 claim from FFN y_claim (output of FFN).
+    pub out_ffn_combine: CombineProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +140,11 @@ pub fn prove_transformer_block(
     let x_norm2_com = commit_mat(&witness.ln2_wit.y, t, d);
     let out_ffn_com = commit_mat(&witness.ffn_wit.y, t, d);
 
+    // Helper: variables for t×d matrices
+    let t_bits = t.next_power_of_two().trailing_zeros() as usize;
+    let d_bits = d.next_power_of_two().trailing_zeros() as usize;
+    let td_num_vars = t_bits + d_bits;
+
     // 2. Execute Sub-Provers with strictly bound IO Commitments
     // --- LayerNorm 1 ---
     let ln1_io = LayerNormIOCommitments {
@@ -125,50 +153,41 @@ pub fn prove_transformer_block(
     };
     let ln1_proof = prove_layernorm(&witness.ln1_wit, &ln1_io, &pk.ln1_vk, transcript)?;
 
-    // --- Q, K, V Projections ---
-    let q_io = ProjectionIOCommitments {
-        x_com: x_norm1_com.clone(),
-        y_com: q_com.clone(),
-    };
-    let q_proj_proof = prove_projection(&pk.q_pk, &witness.q_proj_wit, &q_io, transcript)?;
+    // --- Q, K, V Projections — return (proof, y_claim, x_claim) ---
+    let q_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
+    let (q_proj_proof, q_y_claim, q_x_claim) =
+        prove_projection(&pk.q_pk, &witness.q_proj_wit, &q_io, transcript)?;
 
-    let k_io = ProjectionIOCommitments {
-        x_com: x_norm1_com.clone(),
-        y_com: k_com.clone(),
-    };
-    let k_proj_proof = prove_projection(&pk.k_pk, &witness.k_proj_wit, &k_io, transcript)?;
+    let k_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
+    let (k_proj_proof, k_y_claim, k_x_claim) =
+        prove_projection(&pk.k_pk, &witness.k_proj_wit, &k_io, transcript)?;
 
-    let v_io = ProjectionIOCommitments {
-        x_com: x_norm1_com.clone(),
-        y_com: v_com.clone(),
-    };
-    let v_proj_proof = prove_projection(&pk.v_pk, &witness.v_proj_wit, &v_io, transcript)?;
+    let v_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
+    let (v_proj_proof, v_y_claim, v_x_claim) =
+        prove_projection(&pk.v_pk, &witness.v_proj_wit, &v_io, transcript)?;
 
-    // --- Linear Attention ---
+    // --- Linear Attention — returns (proof, out_claim, v_claim) ---
     let attn_io = AttentionIOCommitments {
         q_com: q_com.clone(),
         k_com: k_com.clone(),
         v_com: v_com.clone(),
         out_com: out_inner_com.clone(),
     };
-    let attn_proof = prove_linear_attention(
+    let (attn_proof, attn_out_claim, attn_v_claim) = prove_linear_attention(
         &witness.attn_wit,
         inst_attn,
+        &pk.attn_pk,
         &attn_io,
         transcript,
         lasso_params,
     );
 
-    // --- Output Projection ---
-    let o_io = ProjectionIOCommitments {
-        x_com: out_inner_com.clone(),
-        y_com: out_attn_com.clone(),
-    };
-    let o_proj_proof = prove_projection(&pk.o_pk, &witness.o_proj_wit, &o_io, transcript)?;
+    // --- Output Projection — returns (proof, y_claim, x_claim) ---
+    let o_io = ProjectionIOCommitments { x_com: out_inner_com.clone() };
+    let (o_proj_proof, o_y_claim, o_x_claim) =
+        prove_projection(&pk.o_pk, &witness.o_proj_wit, &o_io, transcript)?;
 
     // --- LayerNorm 2 ---
-    // Note: The input to LN2 is X_mid = X_in + Out_attn.
-    // We compute the commitment homomorphically!
     let x_mid_com = add_commitments(x_in_com, &out_attn_com);
     let ln2_io = LayerNormIOCommitments {
         x_com: x_mid_com.clone(),
@@ -176,12 +195,12 @@ pub fn prove_transformer_block(
     };
     let ln2_proof = prove_layernorm(&witness.ln2_wit, &ln2_io, &pk.ln2_vk, transcript)?;
 
-    // --- FFN ---
+    // --- FFN — returns (proof, y_claim, x_claim) ---
     let ffn_io = FFNIOCommitments {
         x_com: x_norm2_com.clone(),
         y_com: out_ffn_com.clone(),
     };
-    let ffn_proof = prove_ffn(
+    let (ffn_proof, ffn_y_claim, ffn_x_claim) = prove_ffn(
         &pk.ffn_pk,
         &witness.ffn_wit,
         inst_ffn,
@@ -190,7 +209,69 @@ pub fn prove_transformer_block(
         lasso_params,
     )?;
 
-    // Return the bundled proof and intermediate commitments
+    // --- GKR Combine Proofs ---
+    // Build flat MLE evaluations for each intermediate commitment.
+    let mat_evals = |mat: &[Vec<F>], rows: usize, cols: usize| -> Vec<F> {
+        mat_to_mle(mat, rows, cols).evaluations
+    };
+
+    let (nu_td, sigma_td, _) = params_from_vars(td_num_vars);
+    let _ = (nu_td, sigma_td); // used implicitly by prove_combine
+
+    // q_com: 1 claim (Q-proj y_claim)
+    let q_evals = mat_evals(&witness.attn_wit.q, t, d);
+    let (q_combine, _) =
+        prove_combine(&q_evals, &q_com, &[q_y_claim], td_num_vars, transcript);
+
+    // k_com: 1 claim (K-proj y_claim)
+    let k_evals = mat_evals(&witness.attn_wit.k, t, d);
+    let (k_combine, _) =
+        prove_combine(&k_evals, &k_com, &[k_y_claim], td_num_vars, transcript);
+
+    // v_com: 2 claims — V-proj y_claim + attention v_claim
+    let v_evals = mat_evals(&witness.attn_wit.v, t, d);
+    let (v_combine, _) =
+        prove_combine(&v_evals, &v_com, &[v_y_claim, attn_v_claim], td_num_vars, transcript);
+
+    // out_inner_com: 2 claims — attention out_claim + O-proj x_claim
+    let out_inner_evals = mat_evals(&witness.attn_wit.out, t, d);
+    let (out_inner_combine, _) = prove_combine(
+        &out_inner_evals,
+        &out_inner_com,
+        &[attn_out_claim, o_x_claim],
+        td_num_vars,
+        transcript,
+    );
+
+    // x_norm1_com: 3 claims — Q/K/V-proj x_claims
+    let x_norm1_evals = mat_evals(&witness.ln1_wit.y, t, d);
+    let (x_norm1_combine, _) = prove_combine(
+        &x_norm1_evals,
+        &x_norm1_com,
+        &[q_x_claim, k_x_claim, v_x_claim],
+        td_num_vars,
+        transcript,
+    );
+
+    // out_attn_com: 1 claim (O-proj y_claim)
+    let out_attn_evals = mat_evals(&witness.o_proj_wit.y, t, d);
+    let (out_attn_combine, _) =
+        prove_combine(&out_attn_evals, &out_attn_com, &[o_y_claim], td_num_vars, transcript);
+
+    // x_norm2_com: 1 claim (FFN x_claim — input to FFN = output of LN2)
+    let x_norm2_evals = mat_evals(&witness.ln2_wit.y, t, d);
+    let (x_norm2_combine, _) =
+        prove_combine(&x_norm2_evals, &x_norm2_com, &[ffn_x_claim], td_num_vars, transcript);
+
+    // out_ffn_com: 1 claim (FFN y_claim — output of FFN)
+    let out_ffn_evals = mat_evals(&witness.ffn_wit.y, t, d);
+    let (out_ffn_combine, _) =
+        prove_combine(&out_ffn_evals, &out_ffn_com, &[ffn_y_claim], td_num_vars, transcript);
+
+    // Advance transcript to match verifier's hyrax_verify_multi_point lambda challenge.
+    // (hyrax_open is transcript-free, so we just burn one field challenge here.)
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_mp_lambda");
+
     Ok(TransformerBlockProof {
         ln1_proof,
         q_proj_proof,
@@ -208,6 +289,14 @@ pub fn prove_transformer_block(
         out_attn_com,
         x_norm2_com,
         out_ffn_com,
+        q_combine,
+        k_combine,
+        v_combine,
+        out_inner_combine,
+        x_norm1_combine,
+        out_attn_combine,
+        x_norm2_combine,
+        out_ffn_combine,
     })
 }
 
@@ -248,6 +337,10 @@ pub struct TransformerModelProof {
     // パイプライン接続用の中間コミットメント
     pub final_ln_out_com: HyraxCommitment,
     pub logits_com: HyraxCommitment, // 最終出力（Logits）のコミットメント
+
+    /// Single batched Lasso proof covering all activation lookups across all layers.
+    /// Order per block: [FFN_i, Q_i, K_i].
+    pub all_lasso_proof: LassoMultiProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -317,11 +410,36 @@ pub fn prove(
 
     // 4. LM Head (Final Projection to Vocab Size)
     let logits_com = commit_mat(&witness.lm_head_wit.y, t, v);
-    let lm_io = ProjectionIOCommitments {
-        x_com: final_ln_out_com.clone(),
-        y_com: logits_com.clone(),
-    };
-    let lm_head_proof = prove_projection(&pk.lm_head_pk, &witness.lm_head_wit, &lm_io, transcript)?;
+    let lm_io = ProjectionIOCommitments { x_com: final_ln_out_com.clone() };
+    let (lm_head_proof, _, _) =
+        prove_projection(&pk.lm_head_pk, &witness.lm_head_wit, &lm_io, transcript)?;
+
+    // Advance transcript to match verifier's 6 accumulator finalizations.
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // ln_acc_t
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // ln_acc_td
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // proj_acc_w (QKVO)
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // proj_acc_b (QKVO)
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // lmh_acc_w
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // lmh_acc_b
+
+    // 5. Global batched Lasso: one proof for all activation lookups across all layers.
+    // Instance order per block: [FFN_i, Q_i, K_i].
+    let mut all_lasso_instances: Vec<_> = Vec::new();
+    let mut all_instance_coms = Vec::new();
+    let mut global_nu = 0usize;
+    for i in 0..pk.vk.num_blocks {
+        let bpk = &pk.block_pks[i];
+        all_lasso_instances.push(inst_ffn.activation_lasso.clone());
+        all_lasso_instances.push(inst_attn.q_lasso.clone());
+        all_lasso_instances.push(inst_attn.k_lasso.clone());
+        all_instance_coms.push(bpk.ffn_pk.activation_lasso_pk.table_coms.clone());
+        all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
+        all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
+        global_nu = bpk.ffn_pk.activation_lasso_pk.nu;
+    }
+    let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
+    let global_lasso_pk = LassoMultiProvingKey { instance_table_coms: all_instance_coms, nu: global_nu };
+    let all_lasso_proof = prove_lasso_multi(&global_multi_inst, &global_lasso_pk, transcript, lasso_params);
 
     Ok(TransformerModelProof {
         x_in_com,
@@ -330,6 +448,7 @@ pub fn prove(
         lm_head_proof,
         final_ln_out_com,
         logits_com,
+        all_lasso_proof,
     })
 }
 
@@ -400,6 +519,7 @@ mod tests {
             lm_head_w[i][i] = TernaryValue::ONE;
         }
 
+        let identity_table: Vec<F> = (0u64..1 << M_BITS).map(F::from).collect();
         let block = TransformerBlockWeights {
             ln1_gamma: vec![F::from(2u64); D],
             ln1_beta: vec![F::from(5u64); D],
@@ -419,6 +539,11 @@ mod tests {
             ln2_beta: vec![F::from(5u64); D],
             ffn_w1,
             ffn_w2,
+            ffn_activation_tables: vec![identity_table.clone()],
+            ffn_activation_bits_per_chunk: M_BITS,
+            q_activation_tables: vec![identity_table.clone()],
+            k_activation_tables: vec![identity_table.clone()],
+            qk_activation_bits_per_chunk: M_BITS,
         };
 
         TransformerModelWeights {
@@ -703,7 +828,7 @@ mod tests {
     #[test]
     fn test_prove_verify_transformer_block_e2e() {
         let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let x_in_com = commit_mat_test(&witness.x_in, T, D);
@@ -725,6 +850,10 @@ mod tests {
         let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
 
         let mut vt = Transcript::new(b"block_e2e");
+        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -734,6 +863,10 @@ mod tests {
             &inst_ffn,
             &mut vt,
             &lp,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
+            &mut proj_acc_w,
+            &mut proj_acc_b,
         );
         assert!(
             result.is_ok(),
@@ -746,7 +879,7 @@ mod tests {
     #[test]
     fn test_block_rejects_wrong_x_out_com() {
         let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let x_in_com = commit_mat_test(&witness.x_in, T, D);
@@ -774,6 +907,10 @@ mod tests {
         );
 
         let mut vt = Transcript::new(b"block_wrong_out");
+        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -783,6 +920,10 @@ mod tests {
             &inst_ffn,
             &mut vt,
             &lp,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
+            &mut proj_acc_w,
+            &mut proj_acc_b,
         );
         assert!(result.is_err(), "Should reject wrong x_out_com");
     }
@@ -791,7 +932,7 @@ mod tests {
     #[test]
     fn test_block_rejects_tampered_ln1_opening() {
         let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let x_in_com = commit_mat_test(&witness.x_in, T, D);
@@ -815,6 +956,10 @@ mod tests {
         let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
 
         let mut vt = Transcript::new(b"block_tamper_ln1");
+        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -824,6 +969,10 @@ mod tests {
             &inst_ffn,
             &mut vt,
             &lp,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
+            &mut proj_acc_w,
+            &mut proj_acc_b,
         );
         assert!(result.is_err(), "Should reject tampered LN1 proof");
     }
@@ -832,7 +981,7 @@ mod tests {
     #[test]
     fn test_block_rejects_tampered_x_norm1_com() {
         let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let x_in_com = commit_mat_test(&witness.x_in, T, D);
@@ -863,6 +1012,10 @@ mod tests {
         let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
 
         let mut vt = Transcript::new(b"block_tamper_xnorm1");
+        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -872,6 +1025,10 @@ mod tests {
             &inst_ffn,
             &mut vt,
             &lp,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
+            &mut proj_acc_w,
+            &mut proj_acc_b,
         );
         assert!(result.is_err(), "Should reject tampered x_norm1_com");
     }
@@ -884,7 +1041,7 @@ mod tests {
     fn test_prove_verify_full_model_e2e() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let mut pt = Transcript::new(b"model_e2e");
@@ -904,7 +1061,7 @@ mod tests {
     fn test_model_rejects_tampered_block_proof() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let mut pt = Transcript::new(b"model_tamper_block");
@@ -922,7 +1079,7 @@ mod tests {
     fn test_model_rejects_tampered_final_ln_proof() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let mut pt = Transcript::new(b"model_tamper_final_ln");
@@ -940,7 +1097,7 @@ mod tests {
     fn test_model_rejects_tampered_lm_head_proof() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let mut pt = Transcript::new(b"model_tamper_lm");
@@ -959,7 +1116,7 @@ mod tests {
     fn test_model_rejects_tampered_x_in_com() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let mut pt = Transcript::new(b"model_tamper_xin");

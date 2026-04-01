@@ -19,9 +19,26 @@
 use ark_bn254::{Fr, G1Affine, G1Projective};
 use ark_ec::{Group, VariableBaseMSM};
 use ark_ff::{Field, PrimeField, Zero};
+use rayon::prelude::*;
 use sha3::{Digest, Sha3_256};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use crate::{field::F, poly::DenseMLPoly, transcript::Transcript};
+
+// ---------------------------------------------------------------------------
+// Global HyraxParams cache: HyraxParams::new(sigma) is expensive (2^sigma G1
+// scalar muls). Cache by sigma so setup runs at most once per distinct sigma.
+// ---------------------------------------------------------------------------
+static HYRAX_PARAMS_CACHE: OnceLock<Mutex<HashMap<usize, HyraxParams>>> = OnceLock::new();
+
+fn cached_hyrax_params(sigma: usize) -> HyraxParams {
+    let cache = HYRAX_PARAMS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    map.entry(sigma)
+        .or_insert_with(|| HyraxParams::new(sigma))
+        .clone()
+}
 
 // ---------------------------------------------------------------------------
 // Public parameters
@@ -79,6 +96,7 @@ pub fn hyrax_commit(evals: &[F], nu: usize, params: &HyraxParams) -> HyraxCommit
     assert_eq!(evals.len(), num_rows * num_cols, "eval length mismatch");
 
     let row_coms = (0..num_rows)
+        .into_par_iter()
         .map(|i| msm(&params.gens, &evals[i * num_cols..(i + 1) * num_cols]))
         .collect();
 
@@ -94,7 +112,7 @@ pub fn hyrax_commit(evals: &[F], nu: usize, params: &HyraxParams) -> HyraxCommit
 // ---------------------------------------------------------------------------
 
 /// An opening proof: the intermediate vector w' of length 2^sigma.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct HyraxProof {
     pub w_prime: Vec<F>,
 }
@@ -117,13 +135,16 @@ pub fn hyrax_open(evals: &[F], point: &[F], nu: usize, sigma: usize) -> HyraxPro
     let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
     let l_vec = lagrange_basis(&r_l_rev);
 
-    let mut w_prime = vec![F::ZERO; num_cols];
-    for (i, &l_i) in l_vec.iter().enumerate() {
-        let row = &evals[i * num_cols..(i + 1) * num_cols];
-        for (j, &m_ij) in row.iter().enumerate() {
-            w_prime[j] += l_i * m_ij;
-        }
-    }
+    let w_prime: Vec<F> = (0..num_cols)
+        .into_par_iter()
+        .map(|j| {
+            l_vec
+                .iter()
+                .enumerate()
+                .map(|(i, &l_i)| l_i * evals[i * num_cols + j])
+                .sum()
+        })
+        .collect();
 
     HyraxProof { w_prime }
 }
@@ -243,18 +264,22 @@ pub fn hyrax_verify_batch(
     let l_vec = lagrange_basis(&r_l_rev);
     let r_vec = lagrange_basis(&r_r_rev);
 
-    // 3. コミットメントのホモモーフィックな統合
-    // 各多項式の行コミットメントを η で重み付けして合算し、それを L で集約する
-    let mut combined_rows = vec![G1Projective::zero(); 1 << nu];
+    // 3. Check 1: Σ_k Σ_i (η^k · L_i) · C_{k,i} == MSM(gens, w'_batch)
+    //
+    // Old approach: K×num_rows full G1 scalar muls (254-bit each, ~60 µs each).
+    // New approach: K×num_rows cheap *field* multiplications, then ONE big MSM.
+    //   scalar(k,i) = η^k · L_i  (field mul, ~50 ns)
+    //   lhs = MSM over all K×num_rows row_coms with these scalars
+    let num_rows = 1usize << nu;
+    let mut all_row_points: Vec<G1Affine> = Vec::with_capacity(count * num_rows);
+    let mut all_row_scalars: Vec<F> = Vec::with_capacity(count * num_rows);
     for (k, com) in commitments.iter().enumerate() {
         for (i, &row_com) in com.row_coms.iter().enumerate() {
-            combined_rows[i] += G1Projective::from(row_com) * eta_pows[k];
+            all_row_points.push(row_com);
+            all_row_scalars.push(eta_pows[k] * l_vec[i]);
         }
     }
-    let combined_rows_affine: Vec<G1Affine> = combined_rows.iter().map(|p| (*p).into()).collect();
-
-    // Check 1: Σ_i L_i * (Σ_k η^k * C_{k,i}) == MSM(gens, w'_batch)
-    let lhs = msm_g1(&combined_rows_affine, &l_vec);
+    let lhs = msm(&all_row_points, &all_row_scalars);
     let rhs = msm(&params.gens, &proof.w_prime);
     if lhs != rhs {
         return Err("Hyrax Batch: commitment check failed".to_string());
@@ -280,6 +305,252 @@ pub fn hyrax_verify_batch(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Multi-point batched verification (K independent openings → 2 MSMs total)
+// ---------------------------------------------------------------------------
+
+/// Batch-verify K independent Hyrax openings at potentially different points
+/// using a single Fiat-Shamir random linear combination.
+///
+/// Instead of K×2 MSMs (one lhs + one rhs each), we do:
+///   - 1 combined lhs MSM  over all K×2^nu row_coms
+///   - 1 combined rhs MSM  over 2^sigma generators
+///   - K inner-product checks (field ops only, O(2^sigma) each)
+///
+/// `entries`: slice of (commitment, claimed_eval, point, proof) tuples.
+/// All commitments must share the same `params` (same sigma/generators).
+pub fn hyrax_verify_multi_point(
+    entries: &[(&HyraxCommitment, F, &[F], &HyraxProof)],
+    params: &HyraxParams,
+    transcript: &mut Transcript,
+) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let count = entries.len();
+    let nu = entries[0].0.nu;
+    let sigma = entries[0].0.sigma;
+    let num_rows = 1usize << nu;
+    let num_cols = 1usize << sigma;
+
+    // 1. Random linear combination challenge
+    let lambda = transcript.challenge_field::<F>(b"hyrax_mp_lambda");
+    let lambda_pows = powers_of(lambda, count);
+
+    // 2. Combined rhs scalar vector: w'_combined[j] = Σ_i λ^i * w'_i[j]
+    let mut w_prime_combined = vec![F::ZERO; num_cols];
+    for (i, &(_, _, _, proof)) in entries.iter().enumerate() {
+        let lam_i = lambda_pows[i];
+        for (j, &w) in proof.w_prime.iter().enumerate() {
+            w_prime_combined[j] += lam_i * w;
+        }
+    }
+    let rhs = msm(&params.gens, &w_prime_combined);
+
+    // 3. Combined lhs: MSM over all K*num_rows row_coms
+    //    scalar(i,j) = λ^i * l_vec_i[j]
+    let mut all_points: Vec<G1Affine> = Vec::with_capacity(count * num_rows);
+    let mut all_scalars: Vec<F> = Vec::with_capacity(count * num_rows);
+    for (i, &(com, _, point, _)) in entries.iter().enumerate() {
+        let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
+        let l_vec = lagrange_basis(&r_l_rev);
+        let lam_i = lambda_pows[i];
+        for (j, &row_com) in com.row_coms.iter().enumerate() {
+            all_points.push(row_com);
+            all_scalars.push(lam_i * l_vec[j]);
+        }
+    }
+    let lhs = msm(&all_points, &all_scalars);
+
+    if lhs != rhs {
+        return Err("Hyrax multi-point: commitment check failed".to_string());
+    }
+
+    // 4. Inner product checks (cheap field ops, no MSM)
+    for (i, &(_, eval, point, proof)) in entries.iter().enumerate() {
+        let r_r_rev: Vec<F> = point[nu..].iter().rev().copied().collect();
+        let r_vec = lagrange_basis(&r_r_rev);
+        let inner: F = r_vec
+            .iter()
+            .zip(proof.w_prime.iter())
+            .map(|(&r, &w)| r * w)
+            .sum();
+        if inner != eval {
+            return Err(format!(
+                "Hyrax multi-point: inner product check failed at entry {i}: got {inner:?}, expected {eval:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Batch Accumulator (all groups → 1 lhs MSM + 1 rhs MSM at finalize)
+// ---------------------------------------------------------------------------
+
+/// Accumulates multiple Hyrax openings (batched or single) and defers all MSMs
+/// to a single `finalize` call, reducing K×2 MSMs to just 2.
+///
+/// Usage pattern:
+///   1. Call `add_verify_batch` / `add_verify` for each opening.
+///      - Inner-product checks are performed immediately (field ops only).
+///      - Transcript challenges (eta) consumed here as usual.
+///   2. Call `finalize(params, transcript)` once all slots are added.
+///      - Derives one `b"hyrax_group_mu"` challenge from transcript.
+///      - Runs 1 lhs MSM + 1 rhs MSM for all accumulated slots.
+pub struct HyraxBatchAccumulator {
+    slots: Vec<HyraxAccSlot>,
+}
+
+struct HyraxAccSlot {
+    /// G1 row commitments for this slot (already weighted by inner eta^k * l_vec[i]).
+    row_coms: Vec<G1Affine>,
+    /// Corresponding lhs scalars (eta^k * l_vec[i] for batch, l_vec[i] for single).
+    row_scalars: Vec<F>,
+    /// The w' proof vector for this slot.
+    w_prime: Vec<F>,
+}
+
+impl HyraxBatchAccumulator {
+    pub fn new() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    /// Add a batched opening (K commitments at the same point, with transcript eta).
+    /// Performs inner-product check immediately; defers MSM to `finalize`.
+    pub fn add_verify_batch(
+        &mut self,
+        commitments: &[HyraxCommitment],
+        evals: &[F],
+        point: &[F],
+        proof: &HyraxProof,
+        transcript: &mut Transcript,
+    ) -> Result<(), String> {
+        let count = commitments.len();
+        let nu = commitments[0].nu;
+
+        let eta = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+        let eta_pows = powers_of(eta, count);
+
+        let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
+        let r_r_rev: Vec<F> = point[nu..].iter().rev().copied().collect();
+        let l_vec = lagrange_basis(&r_l_rev);
+        let r_vec = lagrange_basis(&r_r_rev);
+
+        // Immediate inner-product check (field ops only).
+        let inner: F = r_vec
+            .iter()
+            .zip(proof.w_prime.iter())
+            .map(|(&r, &w)| r * w)
+            .sum();
+        let expected_inner: F = evals
+            .iter()
+            .zip(eta_pows.iter())
+            .map(|(&v, &e)| v * e)
+            .sum();
+        if inner != expected_inner {
+            return Err(
+                "HyraxBatchAccumulator add_verify_batch: inner product check failed".to_string(),
+            );
+        }
+
+        // Accumulate lhs contributions (MSM deferred to finalize).
+        let num_rows = 1usize << nu;
+        let mut row_coms_slot: Vec<G1Affine> = Vec::with_capacity(count * num_rows);
+        let mut row_scalars_slot: Vec<F> = Vec::with_capacity(count * num_rows);
+        for (k, com) in commitments.iter().enumerate() {
+            for (i, &row_com) in com.row_coms.iter().enumerate() {
+                row_coms_slot.push(row_com);
+                row_scalars_slot.push(eta_pows[k] * l_vec[i]);
+            }
+        }
+
+        self.slots.push(HyraxAccSlot {
+            row_coms: row_coms_slot,
+            row_scalars: row_scalars_slot,
+            w_prime: proof.w_prime.clone(),
+        });
+        Ok(())
+    }
+
+    /// Add a single opening (no transcript eta).
+    /// Performs inner-product check immediately; defers MSM to `finalize`.
+    pub fn add_verify(
+        &mut self,
+        commitment: &HyraxCommitment,
+        eval: F,
+        point: &[F],
+        proof: &HyraxProof,
+    ) -> Result<(), String> {
+        let nu = commitment.nu;
+
+        let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
+        let r_r_rev: Vec<F> = point[nu..].iter().rev().copied().collect();
+        let l_vec = lagrange_basis(&r_l_rev);
+        let r_vec = lagrange_basis(&r_r_rev);
+
+        let inner: F = r_vec
+            .iter()
+            .zip(proof.w_prime.iter())
+            .map(|(&r, &w)| r * w)
+            .sum();
+        if inner != eval {
+            return Err(
+                "HyraxBatchAccumulator add_verify: inner product check failed".to_string(),
+            );
+        }
+
+        self.slots.push(HyraxAccSlot {
+            row_coms: commitment.row_coms.clone(),
+            row_scalars: l_vec,
+            w_prime: proof.w_prime.clone(),
+        });
+        Ok(())
+    }
+
+    /// Finalize: derive one `b"hyrax_group_mu"` challenge, then run exactly
+    /// 1 lhs MSM + 1 rhs MSM for all accumulated slots.
+    pub fn finalize(self, params: &HyraxParams, transcript: &mut Transcript) -> Result<(), String> {
+        if self.slots.is_empty() {
+            return Ok(());
+        }
+        let count = self.slots.len();
+        let num_cols = params.gens.len();
+
+        let mu = transcript.challenge_field::<F>(b"hyrax_group_mu");
+        let mu_pows = powers_of(mu, count);
+
+        // Combined rhs: w'_combined[j] = Σ_k μ^k * w'_k[j]
+        let mut w_prime_combined = vec![F::ZERO; num_cols];
+        for (k, slot) in self.slots.iter().enumerate() {
+            let mu_k = mu_pows[k];
+            for (j, &w) in slot.w_prime.iter().enumerate() {
+                w_prime_combined[j] += mu_k * w;
+            }
+        }
+        let rhs = msm(&params.gens, &w_prime_combined);
+
+        // Combined lhs: scale each slot's row_coms by μ^k * original_scalar
+        let total: usize = self.slots.iter().map(|s| s.row_coms.len()).sum();
+        let mut all_points: Vec<G1Affine> = Vec::with_capacity(total);
+        let mut all_scalars: Vec<F> = Vec::with_capacity(total);
+        for (k, slot) in self.slots.iter().enumerate() {
+            let mu_k = mu_pows[k];
+            for (&com, &scalar) in slot.row_coms.iter().zip(slot.row_scalars.iter()) {
+                all_points.push(com);
+                all_scalars.push(mu_k * scalar);
+            }
+        }
+        let lhs = msm(&all_points, &all_scalars);
+
+        if lhs != rhs {
+            return Err("HyraxBatchAccumulator finalize: commitment check failed".to_string());
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -342,13 +613,13 @@ fn msm_g1(bases: &[G1Affine], scalars: &[F]) -> G1Affine {
 pub fn setup_hyrax_params(bits_per_chunk: usize) -> HyraxParams {
     let nu = bits_per_chunk / 2;
     let sigma = bits_per_chunk - nu;
-    HyraxParams::new(sigma)
+    cached_hyrax_params(sigma)
 }
 
 pub fn params_from_vars(total_vars: usize) -> (usize, usize, HyraxParams) {
     let nu = total_vars / 2;
     let sigma = (total_vars - nu).max(1);
-    (nu, sigma, HyraxParams::new(sigma))
+    (nu, sigma, cached_hyrax_params(sigma))
 }
 
 pub fn poly_hyrax(poly: &DenseMLPoly) -> (usize, usize, HyraxParams) {

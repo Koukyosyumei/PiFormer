@@ -41,6 +41,7 @@ import torch.nn as nn
 
 from .model import PiFormerModel
 from .quant import (
+    extract_phi_tables_int,
     extract_ternary_weight_matrix,
     int_to_field_hex,
     mat_to_json,
@@ -175,6 +176,16 @@ def export_weights_rust(
         ffn_w1 = _proj_weight_int(blk.ffn.fc1, quant_scale)  # d × d_ff
         ffn_w2 = _proj_weight_int(blk.ffn.fc2, quant_scale)  # d_ff × d
 
+        # Activation tables (fixed per model, needed by setup for precommitment)
+        attn_tables_int = extract_phi_tables_int(
+            attn.phi.export_tables(), output_scale=quant_scale
+        )
+        ffn_tables_int = extract_phi_tables_int(
+            blk.ffn.act.export_tables(), output_scale=quant_scale
+        )
+        attn_bits = attn.phi.bits_per_chunk
+        ffn_bits = blk.ffn.act.bits_per_chunk
+
         blocks_json.append({
             "ln1_gamma": vec_to_json(ln1_gamma),
             "ln1_beta":  vec_to_json(ln1_beta),
@@ -193,6 +204,12 @@ def export_weights_rust(
             "ln2_beta":  vec_to_json(ln2_beta),
             "ffn_w1": ffn_w1,
             "ffn_w2": ffn_w2,
+            # Activation tables for Lasso precommitment at setup time
+            "ffn_activation_tables": [[int_to_field_hex(v) for v in tbl] for tbl in ffn_tables_int],
+            "ffn_activation_bits_per_chunk": ffn_bits,
+            "q_activation_tables":  [[int_to_field_hex(v) for v in tbl] for tbl in attn_tables_int],
+            "k_activation_tables":  [[int_to_field_hex(v) for v in tbl] for tbl in attn_tables_int],
+            "qk_activation_bits_per_chunk": attn_bits,
         })
 
     if final_ln_weights is not None:

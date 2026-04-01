@@ -11,10 +11,12 @@
 //!     space at a single random point (r_t, r_d, r_b) in O(1) time.
 
 use crate::field::F;
-use crate::lookup::range::{prove_range, verify_range, RangeProof, RangeProofWitness};
+use crate::lookup::range::{
+    prove_range, verify_range_deferred, verify_range_m_batch, RangeProof, RangeProofWitness,
+};
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_n, poly_hyrax, HyraxCommitment,
-    HyraxProof,
+    absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, params_from_n, poly_hyrax,
+    HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
 };
 use crate::poly::utils::{combine, eval_rows, mat_to_mle, vec_to_mle};
 use crate::poly::DenseMLPoly;
@@ -69,39 +71,34 @@ pub struct LayerNormInternalCommitments {
 }
 
 pub struct LayerNormOpenings {
-    // Batch Sumcheck point at r_t
+    // Group 1: at r_t — [sum_x, sq_sum_x]
     pub sum_x_at_rt: F,
     pub sq_sum_x_at_rt: F,
-    pub sum_x_rt_proof: HyraxProof,
-    pub sq_sum_x_rt_proof: HyraxProof,
-    pub sum_x_sq_at_rsig: F, // 【追加】
-    pub sum_x_sq_rsig_proof: HyraxProof,
+    pub rt_batch_proof: HyraxProof,
+
+    // Individual: x at combine(r_t, r_d_mean) — unique point, cannot batch
     pub x_at_rt_rmean: F,
     pub x_rt_rmean_proof: HyraxProof,
 
-    // Constraint Fusion points for Sigma: r_sig_t
+    // Group 2: at r_sig_t — [sum_x, sq_sum_x, sigma, sigma_sq, sum_x_sq]
     pub sum_x_at_rsig: F,
-    pub sum_x_rsig_proof: HyraxProof,
     pub sq_sum_x_at_rsig: F,
-    pub sq_sum_x_rsig_proof: HyraxProof,
     pub sigma_at_rsig: F,
-    pub sigma_rsig_proof: HyraxProof,
-    pub sigma_sq_at_rsig: F,             // 【追加】
-    pub sigma_sq_rsig_proof: HyraxProof, // 【追加】
+    pub sigma_sq_at_rsig: F,
+    pub sum_x_sq_at_rsig: F,
+    pub rsig_batch_proof: HyraxProof,
 
-    // Constraint Fusion points for Y: (r_y_t, r_y_d)
+    // Group 3: at combine(r_y_t, r_y_d) — [x, y, gamma_x, sigma_y]
     pub x_at_ry: F,
-    pub x_ry_proof: HyraxProof,
     pub y_at_ry: F,
-    pub y_ry_proof: HyraxProof,
-    pub sum_x_at_ryt: F,
-    pub sum_x_ryt_proof: HyraxProof,
-    pub sigma_at_ryt: F,
-    pub sigma_ryt_proof: HyraxProof,
-    pub sigma_y_at_ry: F,
-    pub sigma_y_ry_proof: HyraxProof,
     pub gamma_x_at_ry: F,
-    pub gamma_x_ry_proof: HyraxProof,
+    pub sigma_y_at_ry: F,
+    pub ry_td_batch_proof: HyraxProof,
+
+    // Group 4: at r_y_t — [sum_x, sigma]
+    pub sum_x_at_ryt: F,
+    pub sigma_at_ryt: F,
+    pub ryt_batch_proof: HyraxProof,
 }
 
 pub struct LayerNormProof {
@@ -238,7 +235,64 @@ pub fn prove_layernorm(
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
     let _r_y_b = r_y[t_bits + d_bits];
 
-    // 7. Openings
+    // Advance transcript to match verifier's verify_range_m_batch lambda challenge.
+    // (verify_range_deferred defers hyrax_verify for m_com; verify_range_m_batch
+    //  batches both openings with hyrax_verify_multi_point which adds one challenge.)
+    let _ = transcript.challenge_field::<F>(b"hyrax_mp_lambda");
+
+    // 7. Openings (batched by evaluation point)
+
+    // Group 1: [sum_x, sq_sum_x] at r_t
+    let rt_batch_proof = hyrax_open_batch(
+        &[&sum_x_mle.evaluations, &sq_sum_x_mle.evaluations],
+        &r_t,
+        nu_t,
+        sigma_t,
+        transcript,
+    );
+
+    // Individual: x at combine(r_t, r_d_mean) — unique point
+    let x_rt_rmean_proof =
+        hyrax_open(&x_mle.evaluations, &combine(&r_t, &r_d_mean), nu_td, sigma_td);
+
+    // Group 2: [sum_x, sq_sum_x, sigma, sigma_sq, sum_x_sq] at r_sig_t
+    let rsig_batch_proof = hyrax_open_batch(
+        &[
+            &sum_x_mle.evaluations,
+            &sq_sum_x_mle.evaluations,
+            &sigma_mle.evaluations,
+            &sigma_sq_mle.evaluations,
+            &sum_x_sq_mle.evaluations,
+        ],
+        &r_sig_t,
+        nu_t,
+        sigma_t,
+        transcript,
+    );
+
+    // Group 3: [x, y, gamma_x, sigma_y] at combine(r_y_t, r_y_d)
+    let ry_td = combine(&r_y_t, &r_y_d);
+    let ry_td_batch_proof = hyrax_open_batch(
+        &[
+            &x_mle.evaluations,
+            &y_mle.evaluations,
+            &gamma_x_mle.evaluations,
+            &sigma_y_mle.evaluations,
+        ],
+        &ry_td,
+        nu_td,
+        sigma_td,
+        transcript,
+    );
+
+    // Group 4: [sum_x, sigma] at r_y_t
+    let ryt_batch_proof = hyrax_open_batch(
+        &[&sum_x_mle.evaluations, &sigma_mle.evaluations],
+        &r_y_t,
+        nu_t,
+        sigma_t,
+        transcript,
+    );
 
     Ok(LayerNormProof {
         internal_coms: LayerNormInternalCommitments {
@@ -256,62 +310,23 @@ pub fn prove_layernorm(
         openings: LayerNormOpenings {
             sum_x_at_rt: claim_s,
             sq_sum_x_at_rt: claim_q,
-            sum_x_rt_proof: hyrax_open(&sum_x_mle.evaluations, &r_t, nu_t, sigma_t),
-            sq_sum_x_rt_proof: hyrax_open(&sq_sum_x_mle.evaluations, &r_t, nu_t, sigma_t),
+            rt_batch_proof,
             x_at_rt_rmean: x_mle.evaluate(&combine(&r_t, &r_d_mean)),
-            x_rt_rmean_proof: hyrax_open(
-                &x_mle.evaluations,
-                &combine(&r_t, &r_d_mean),
-                nu_td,
-                sigma_td,
-            ),
+            x_rt_rmean_proof,
             sum_x_at_rsig: sum_x_mle.evaluate(&r_sig_t),
-            sum_x_rsig_proof: hyrax_open(&sum_x_mle.evaluations, &r_sig_t, nu_t, sigma_t),
             sq_sum_x_at_rsig: sq_sum_x_mle.evaluate(&r_sig_t),
-            sq_sum_x_rsig_proof: hyrax_open(&sq_sum_x_mle.evaluations, &r_sig_t, nu_t, sigma_t),
             sigma_at_rsig: sigma_mle.evaluate(&r_sig_t),
-            sigma_rsig_proof: hyrax_open(&sigma_mle.evaluations, &r_sig_t, nu_t, sigma_t),
             sigma_sq_at_rsig: sigma_sq_mle.evaluate(&r_sig_t),
-            sigma_sq_rsig_proof: hyrax_open(&sigma_sq_mle.evaluations, &r_sig_t, nu_t, sigma_t),
-            x_at_ry: x_mle.evaluate(&combine(&r_y_t, &r_y_d)),
-            x_ry_proof: hyrax_open(
-                &x_mle.evaluations,
-                &combine(&r_y_t, &r_y_d),
-                nu_td,
-                sigma_td,
-            ),
-            y_at_ry: y_mle.evaluate(&combine(&r_y_t, &r_y_d)),
-            y_ry_proof: hyrax_open(
-                &mat_to_mle(&witness.y, t, d).evaluations,
-                &combine(&r_y_t, &r_y_d),
-                nu_td,
-                sigma_td,
-            ),
-            sum_x_at_ryt: sum_x_mle.evaluate(&r_y_t),
-            sum_x_ryt_proof: hyrax_open(&sum_x_mle.evaluations, &r_y_t, nu_t, sigma_t),
-            sigma_at_ryt: sigma_mle.evaluate(&r_y_t),
-            sigma_ryt_proof: hyrax_open(&sigma_mle.evaluations, &r_y_t, nu_t, sigma_t),
             sum_x_sq_at_rsig: sum_x_sq_mle.evaluate(&r_sig_t),
-            sum_x_sq_rsig_proof: hyrax_open(
-                &sum_x_sq_mle.evaluations,
-                &r_sig_t,
-                nu_t,
-                params_t.sigma,
-            ),
-            gamma_x_at_ry: gamma_x_mle.evaluate(&combine(&r_y_t, &r_y_d)),
-            gamma_x_ry_proof: hyrax_open(
-                &gamma_x_mle.evaluations,
-                &combine(&r_y_t, &r_y_d),
-                nu_td,
-                sigma_td,
-            ),
-            sigma_y_at_ry: sigma_y_mle.evaluate(&combine(&r_y_t, &r_y_d)),
-            sigma_y_ry_proof: hyrax_open(
-                &sigma_y_mle.evaluations,
-                &combine(&r_y_t, &r_y_d),
-                nu_td,
-                sigma_td,
-            ),
+            rsig_batch_proof,
+            x_at_ry: x_mle.evaluate(&ry_td),
+            y_at_ry: y_mle.evaluate(&ry_td),
+            gamma_x_at_ry: gamma_x_mle.evaluate(&ry_td),
+            sigma_y_at_ry: sigma_y_mle.evaluate(&ry_td),
+            ry_td_batch_proof,
+            sum_x_at_ryt: sum_x_mle.evaluate(&r_y_t),
+            sigma_at_ryt: sigma_mle.evaluate(&r_y_t),
+            ryt_batch_proof,
         },
     })
 }
@@ -329,6 +344,8 @@ pub fn verify_layernorm(
     io_coms: &LayerNormIOCommitments,
     vk: &LayerNormVerifyingKey,
     transcript: &mut Transcript,
+    acc_t: &mut HyraxBatchAccumulator,
+    acc_td: &mut HyraxBatchAccumulator,
 ) -> Result<(), String> {
     let t = vk.seq_len;
     let d = vk.d_head;
@@ -336,12 +353,11 @@ pub fn verify_layernorm(
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
     let d_f = F::from(d as u64);
 
-    let n_td = t.next_power_of_two().max(1) * d.next_power_of_two().max(1);
-    let n_t = t.next_power_of_two().max(1);
-    let (_nu_td, _sigma_td, params_td) = params_from_n(n_td);
-    let (_nu_t, _sigma_t, params_t) = params_from_n(n_t);
+    use std::time::Instant;
+
 
     // 1. Absorb IO & Internal Commitments
+    let _ta = Instant::now();
     absorb_com(transcript, b"x_com", &io_coms.x_com);
     absorb_com(transcript, b"y_com", &io_coms.y_com);
     absorb_com(transcript, b"sum_x_com", &proof.internal_coms.sum_x_com);
@@ -363,6 +379,7 @@ pub fn verify_layernorm(
     );
     absorb_com(transcript, b"sigma_y_com", &proof.internal_coms.sigma_y_com);
     absorb_com(transcript, b"gamma_x_com", &proof.internal_coms.gamma_x_com);
+    eprintln!("[LN]  absorb_coms:   {:>8.3}ms", _ta.elapsed().as_secs_f64()*1000.0);
 
     // 2. Sumchecks
     let r_t = challenge_vec(transcript, t_bits, b"layernorm_rt");
@@ -370,6 +387,7 @@ pub fn verify_layernorm(
     transcript.append_field(b"claimed_s", &proof.openings.sum_x_at_rt);
     transcript.append_field(b"claimed_q", &proof.openings.sq_sum_x_at_rt);
 
+    let _tm = Instant::now();
     let (r_d_mean, final_mean) = verify_sumcheck(
         &proof.mean_sumcheck,
         proof.openings.sum_x_at_rt,
@@ -380,11 +398,16 @@ pub fn verify_layernorm(
     if final_mean != proof.openings.x_at_rt_rmean {
         return Err("Mean sumcheck mismatch".into());
     }
+    eprintln!("[LN]  mean_sc:       {:>8.3}ms", _tm.elapsed().as_secs_f64()*1000.0);
 
     // 3. Sigma Constraint Fusion (O(1))
-    // 【重要】Verifierも、verify_range_succinct から返された評価点を受け取る
-    let (r_sig, sig_eval) = verify_range(&proof.sigma_range_proof, t_bits + 1, 32, transcript)
-        .map_err(|e| format!("Sigam Range: {e}"))?;
+    // Use deferred path: hyrax_verify for m_com is batched below with y_range.
+    let _ts = Instant::now();
+    let (r_sig, sig_eval, r_m_sig) =
+        verify_range_deferred(&proof.sigma_range_proof, t_bits + 1, 32, transcript)
+            .map_err(|e| format!("Sigma Range: {e}"))?;
+    eprintln!("[LN]  sigma_range:   {:>8.3}ms", _ts.elapsed().as_secs_f64()*1000.0);
+    let r_sig_t = r_sig[0..t_bits].to_vec();
     let r_sig_b = r_sig[t_bits];
 
     let v_ev = d_f * (d_f * proof.openings.sq_sum_x_at_rsig - proof.openings.sum_x_sq_at_rsig);
@@ -397,9 +420,12 @@ pub fn verify_layernorm(
         return Err("Chunk fusion mismatch: Sigma logic".into());
     }
 
-    // 4. Y Constraint Fusion (O(D) to eval public weights, O(1) for residual)
-    let (r_y, y_eval) = verify_range(&proof.y_range_proof, t_bits + d_bits + 1, 32, transcript)
-        .map_err(|e| format!("Y Range: {e}"))?;
+    // 4. Y Constraint Fusion — deferred m_com, batched below.
+    let _ty = Instant::now();
+    let (r_y, y_eval, r_m_y) =
+        verify_range_deferred(&proof.y_range_proof, t_bits + d_bits + 1, 32, transcript)
+            .map_err(|e| format!("Y Range: {e}"))?;
+    eprintln!("[LN]  y_range:       {:>8.3}ms", _ty.elapsed().as_secs_f64()*1000.0);
     let r_y_t = r_y[0..t_bits].to_vec();
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
     let r_y_b = r_y[t_bits + d_bits];
@@ -425,69 +451,95 @@ pub fn verify_layernorm(
         return Err("Y constraint fusion mismatch".into());
     }
 
-    // 5. Openings (Binding check against IO and Internal commitments)
-    // 1. sum_x_at_rt
-    hyrax_verify(
-        &proof.internal_coms.sum_x_com,
-        proof.openings.sum_x_at_rt,
+    // Batch-verify both m_com openings (sigma + y) in 2 MSMs instead of 4.
+    let _tmb = Instant::now();
+    verify_range_m_batch(
+        &[
+            (&proof.sigma_range_proof, &r_m_sig),
+            (&proof.y_range_proof, &r_m_y),
+        ],
+        transcript,
+    )
+    .map_err(|e| format!("LN range m_batch: {e}"))?;
+    eprintln!("[LN]  m_batch:        {:>8.3}ms", _tmb.elapsed().as_secs_f64()*1000.0);
+
+    // 5. Batched openings — accumulate all 5 groups into 2 MSMs via HyraxBatchAccumulator.
+    //    acc_t: groups 1, 2, 4 (all at params_t)
+    //    acc_td: x_indiv (no eta) + group 3 (at params_td)
+    //
+    //    Order must match prover's hyrax_open_batch call order (transcript sync).
+
+    // Group 1: [sum_x, sq_sum_x] at r_t  → acc_t
+    acc_t.add_verify_batch(
+        &[
+            proof.internal_coms.sum_x_com.clone(),
+            proof.internal_coms.sq_sum_x_com.clone(),
+        ],
+        &[proof.openings.sum_x_at_rt, proof.openings.sq_sum_x_at_rt],
         &r_t,
-        &proof.openings.sum_x_rt_proof,
-        &params_t,
+        &proof.openings.rt_batch_proof,
+        transcript,
     )?;
-    hyrax_verify(
-        &proof.internal_coms.sum_x_com,
-        proof.openings.sum_x_at_rt,
-        &r_t,
-        &proof.openings.sum_x_rt_proof,
-        &params_t,
-    )?;
-    hyrax_verify(
-        &proof.internal_coms.sq_sum_x_com,
-        proof.openings.sq_sum_x_at_rt,
-        &r_t,
-        &proof.openings.sq_sum_x_rt_proof,
-        &params_t,
-    )?;
-    hyrax_verify(
+
+    // Individual: x at combine(r_t, r_d_mean) — no transcript eta  → acc_td
+    acc_td.add_verify(
         &io_coms.x_com,
         proof.openings.x_at_rt_rmean,
         &combine(&r_t, &r_d_mean),
         &proof.openings.x_rt_rmean_proof,
-        &params_td,
     )?;
 
-    // 7. x_at_ry
-    hyrax_verify(
-        &io_coms.x_com,
-        proof.openings.x_at_ry,
-        &combine(&r_y_t, &r_y_d),
-        &proof.openings.x_ry_proof,
-        &params_td,
-    )?;
-    // 8. y_at_ry
-    hyrax_verify(
-        &io_coms.y_com,
-        proof.openings.y_at_ry,
-        &combine(&r_y_t, &r_y_d),
-        &proof.openings.y_ry_proof,
-        &params_td,
+    // Group 2: [sum_x, sq_sum_x, sigma, sigma_sq, sum_x_sq] at r_sig_t  → acc_t
+    acc_t.add_verify_batch(
+        &[
+            proof.internal_coms.sum_x_com.clone(),
+            proof.internal_coms.sq_sum_x_com.clone(),
+            proof.internal_coms.sigma_com.clone(),
+            proof.internal_coms.sigma_sq_com.clone(),
+            proof.internal_coms.sum_x_sq_com.clone(),
+        ],
+        &[
+            proof.openings.sum_x_at_rsig,
+            proof.openings.sq_sum_x_at_rsig,
+            proof.openings.sigma_at_rsig,
+            proof.openings.sigma_sq_at_rsig,
+            proof.openings.sum_x_sq_at_rsig,
+        ],
+        &r_sig_t,
+        &proof.openings.rsig_batch_proof,
+        transcript,
     )?;
 
-    // 9. sum_x_at_ryt
-    hyrax_verify(
-        &proof.internal_coms.sum_x_com,
-        proof.openings.sum_x_at_ryt,
-        &r_y_t,
-        &proof.openings.sum_x_ryt_proof,
-        &params_t,
+    // Group 3: [x, y, gamma_x, sigma_y] at combine(r_y_t, r_y_d)  → acc_td
+    let ry_td = combine(&r_y_t, &r_y_d);
+    acc_td.add_verify_batch(
+        &[
+            io_coms.x_com.clone(),
+            io_coms.y_com.clone(),
+            proof.internal_coms.gamma_x_com.clone(),
+            proof.internal_coms.sigma_y_com.clone(),
+        ],
+        &[
+            proof.openings.x_at_ry,
+            proof.openings.y_at_ry,
+            proof.openings.gamma_x_at_ry,
+            proof.openings.sigma_y_at_ry,
+        ],
+        &ry_td,
+        &proof.openings.ry_td_batch_proof,
+        transcript,
     )?;
-    // 10. sigma_at_ryt
-    hyrax_verify(
-        &proof.internal_coms.sigma_com,
-        proof.openings.sigma_at_ryt,
+
+    // Group 4: [sum_x, sigma] at r_y_t  → acc_t
+    acc_t.add_verify_batch(
+        &[
+            proof.internal_coms.sum_x_com.clone(),
+            proof.internal_coms.sigma_com.clone(),
+        ],
+        &[proof.openings.sum_x_at_ryt, proof.openings.sigma_at_ryt],
         &r_y_t,
-        &proof.openings.sigma_ryt_proof,
-        &params_t,
+        &proof.openings.ryt_batch_proof,
+        transcript,
     )?;
 
     Ok(())
@@ -577,9 +629,22 @@ mod layernorm_tests {
         let (witness, io_coms, vk) = setup_test_pipeline();
         let mut pt = Transcript::new(b"layernorm_test");
         let proof = prove_layernorm(&witness, &io_coms, &vk, &mut pt).unwrap();
+        // Advance transcript to match verifier's 2 finalize calls.
+        let _ = pt.challenge_field::<F>(b"hyrax_group_mu");
+        let _ = pt.challenge_field::<F>(b"hyrax_group_mu");
 
         let mut vt = Transcript::new(b"layernorm_test");
-        let result = verify_layernorm(&proof, &io_coms, &vk, &mut vt);
+        let mut ln_acc_t = HyraxBatchAccumulator::new();
+        let mut ln_acc_td = HyraxBatchAccumulator::new();
+        let result = verify_layernorm(&proof, &io_coms, &vk, &mut vt, &mut ln_acc_t, &mut ln_acc_td);
+        if result.is_ok() {
+            let n_t = vk.seq_len.next_power_of_two().max(1);
+            let n_td = n_t * vk.d_head.next_power_of_two().max(1);
+            let (_, _, params_t) = params_from_n(n_t);
+            let (_, _, params_td) = params_from_n(n_td);
+            ln_acc_t.finalize(&params_t, &mut vt).expect("acc_t finalize");
+            ln_acc_td.finalize(&params_td, &mut vt).expect("acc_td finalize");
+        }
         assert!(result.is_ok(), "Verification failed: {:?}", result.err());
     }
 
@@ -590,8 +655,22 @@ mod layernorm_tests {
 
         let mut pt = Transcript::new(b"layernorm_test");
         if let Ok(proof) = prove_layernorm(&witness, &io_coms, &vk, &mut pt) {
+            // Advance transcript to match verifier's 2 finalize calls.
+            let _ = pt.challenge_field::<F>(b"hyrax_group_mu");
+            let _ = pt.challenge_field::<F>(b"hyrax_group_mu");
+
             let mut vt = Transcript::new(b"layernorm_test");
-            let result = verify_layernorm(&proof, &io_coms, &vk, &mut vt);
+            let mut ln_acc_t = HyraxBatchAccumulator::new();
+            let mut ln_acc_td = HyraxBatchAccumulator::new();
+            let result = verify_layernorm(&proof, &io_coms, &vk, &mut vt, &mut ln_acc_t, &mut ln_acc_td);
+            if result.is_ok() {
+                let n_t = vk.seq_len.next_power_of_two().max(1);
+                let n_td = n_t * vk.d_head.next_power_of_two().max(1);
+                let (_, _, params_t) = params_from_n(n_t);
+                let (_, _, params_td) = params_from_n(n_td);
+                let _ = ln_acc_t.finalize(&params_t, &mut vt);
+                let _ = ln_acc_td.finalize(&params_td, &mut vt);
+            }
             assert!(
                 result.is_err(),
                 "Should reject forged proof against trusted IO"

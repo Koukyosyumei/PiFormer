@@ -19,7 +19,8 @@
 //! The Hyrax commitment is a transparent (no trusted setup) vector commitment
 //! over BN254 G1, with O(√N) proof size and O(√N) verifier work.
 
-use crate::field::{eq_eval, index_to_bits, F};
+use crate::field::F;
+use crate::poly::utils::compute_eq_evals;
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch,
     HyraxCommitment, HyraxParams, HyraxProof,
@@ -31,6 +32,38 @@ use crate::subprotocols::sumcheck::{
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
 use ark_ff::Field;
+
+/// Precomputed table commitments — computed once at setup, not per proof.
+#[derive(Clone)]
+pub struct LassoProvingKey {
+    pub table_coms: Vec<HyraxCommitment>,
+    pub nu: usize,
+}
+
+impl LassoProvingKey {
+    pub fn vk(&self) -> LassoVerifyingKey {
+        LassoVerifyingKey {
+            table_coms: self.table_coms.clone(),
+        }
+    }
+}
+
+/// Verifier-side key: same precommitted table commitments.
+#[derive(Clone)]
+pub struct LassoVerifyingKey {
+    pub table_coms: Vec<HyraxCommitment>,
+}
+
+/// Precommit activation tables during setup phase (call once, not per inference).
+pub fn precommit_lasso_tables(
+    tables: &[Vec<F>],
+    bits_per_chunk: usize,
+    params: &HyraxParams,
+) -> LassoProvingKey {
+    let nu = bits_per_chunk / 2;
+    let table_coms = tables.iter().map(|t| hyrax_commit(t, nu, params)).collect();
+    LassoProvingKey { table_coms, nu }
+}
 
 /// Public description of a lookup instance.
 #[derive(Clone)]
@@ -53,14 +86,13 @@ pub struct LassoProof {
     pub sumcheck_proofs: Vec<SumcheckProof>,
     /// Claimed T_k(r_k) at the sumcheck random point.
     pub table_openings: Vec<F>,
-    /// Hyrax commitments to each sub-table (sent to verifier).
-    pub hyrax_commitments: Vec<HyraxCommitment>,
     /// Hyrax opening proofs for T_k(r_k).
     pub hyrax_proofs: Vec<HyraxProof>,
 }
 
 pub fn prove_lasso(
     instance: &LassoInstance,
+    pk: &LassoProvingKey,
     transcript: &mut Transcript,
     params: &HyraxParams,
 ) -> LassoProof {
@@ -69,25 +101,16 @@ pub fn prove_lasso(
     let n = instance.query_indices.len();
     let mask = (1usize << m) - 1;
 
-    // nu + sigma = m; choose nu = m/2 (square-ish layout)
-    let nu = m / 2;
-    let sigma = m - nu;
-    assert_eq!(params.sigma, sigma, "HyraxParams sigma mismatch");
-
-    // Step 1: commit to each sub-table and absorb commitments into transcript
-    let mut hyrax_commitments = Vec::with_capacity(c);
+    // Step 1: absorb precommitted table commitments into transcript
+    let nu = pk.nu;
+    let sigma = params.sigma;
+    assert_eq!(
+        nu + sigma,
+        instance.bits_per_chunk,
+        "LassoProvingKey nu/sigma mismatch with bits_per_chunk"
+    );
     for k in 0..c {
-        let commitment = hyrax_commit(&instance.tables[k], nu, params);
-        for pt in &commitment.row_coms {
-            let bytes = {
-                use ark_serialize::CanonicalSerialize;
-                let mut buf = Vec::new();
-                pt.serialize_compressed(&mut buf).unwrap();
-                buf
-            };
-            transcript.append_bytes(b"hyrax_com", &bytes);
-        }
-        hyrax_commitments.push(commitment);
+        absorb_com(transcript, b"hyrax_com", &pk.table_coms[k]);
     }
 
     // Commit claimed outputs to transcript
@@ -107,21 +130,27 @@ pub fn prove_lasso(
     for k in 0..c {
         let t_poly = DenseMLPoly::new(instance.tables[k].clone());
 
-        // Build selector polynomial L_k as a dense MLE
+        // Build selector polynomial L_k as a dense MLE.
+        // Each x ∈ [size] is independent — compute in parallel over x.
         let size = 1usize << m;
-        let mut l_evals = vec![F::ZERO; size];
-        for j in 0..n {
-            let ch = chunk(instance.query_indices[j], k, m, mask);
-            for x in 0..size {
-                let mut eq_val = F::ONE;
-                for bit in 0..m {
-                    let a = F::from(((ch >> bit) & 1) as u64);
-                    let b = F::from(((x >> bit) & 1) as u64);
-                    eq_val *= a * b + (F::ONE - a) * (F::ONE - b);
-                }
-                l_evals[x] += rho_pows[j] * eq_val;
-            }
-        }
+        let l_evals: Vec<F> = (0..size)
+            .into_iter()
+            .map(|x| {
+                (0..n)
+                    .map(|j| {
+                        let ch = chunk(instance.query_indices[j], k, m, mask);
+                        let eq_val: F = (0..m)
+                            .map(|bit| {
+                                let a = F::from(((ch >> bit) & 1) as u64);
+                                let b = F::from(((x >> bit) & 1) as u64);
+                                a * b + (F::ONE - a) * (F::ONE - b)
+                            })
+                            .product();
+                        rho_pows[j] * eq_val
+                    })
+                    .sum()
+            })
+            .collect();
         let l_poly = DenseMLPoly::new(l_evals);
 
         // Claimed sum for this sub-table
@@ -146,7 +175,6 @@ pub fn prove_lasso(
         sub_claims,
         sumcheck_proofs,
         table_openings,
-        hyrax_commitments,
         hyrax_proofs,
     }
 }
@@ -154,6 +182,7 @@ pub fn prove_lasso(
 pub fn verify_lasso(
     proof: &LassoProof,
     instance: &LassoInstance,
+    vk: &LassoVerifyingKey,
     transcript: &mut Transcript,
     params: &HyraxParams,
 ) -> Result<(), String> {
@@ -166,17 +195,9 @@ pub fn verify_lasso(
     let sigma = m - nu;
     assert_eq!(params.sigma, sigma, "HyraxParams sigma mismatch");
 
-    // Replay commitment absorptions
+    // Replay precommitted table absorptions using verifying key
     for k in 0..c {
-        for pt in &proof.hyrax_commitments[k].row_coms {
-            let bytes = {
-                use ark_serialize::CanonicalSerialize;
-                let mut buf = Vec::new();
-                pt.serialize_compressed(&mut buf).unwrap();
-                buf
-            };
-            transcript.append_bytes(b"hyrax_com", &bytes);
-        }
+        absorb_com(transcript, b"hyrax_com", &vk.table_coms[k]);
     }
 
     for &out in &instance.outputs {
@@ -223,12 +244,17 @@ pub fn verify_lasso(
         // index_to_bits is LSB-first, and eq_eval pairs r_rev[i] with bits[i].
         // So we reverse r_vec before computing L_k(r).
         let r_rev: Vec<F> = r_vec.iter().copied().rev().collect();
-        let l_at_r: F = (0..n)
-            .map(|j| {
-                let ch = chunk(instance.query_indices[j], k, m, mask);
-                let bits = index_to_bits(ch, m);
-                rho_pows[j] * eq_eval(&bits, &r_rev)
-            })
+        // Precompute eq_table for this table's r_rev (r_rev differs per table k).
+        let eq_table_k = compute_eq_evals(&r_rev, 1 << m);
+        let mut hist_k = vec![F::ZERO; 1 << m];
+        for j in 0..n {
+            let ch = chunk(instance.query_indices[j], k, m, mask);
+            hist_k[ch] += rho_pows[j];
+        }
+        let l_at_r: F = hist_k
+            .iter()
+            .zip(eq_table_k.iter())
+            .map(|(&h, &e)| h * e)
             .sum();
 
         let expected_final = t_opening * l_at_r;
@@ -242,7 +268,7 @@ pub fn verify_lasso(
 
         // Verify Hyrax opening: T_k(r_vec) == t_opening
         hyrax_verify(
-            &proof.hyrax_commitments[k],
+            &vk.table_coms[k],
             t_opening,
             &r_vec,
             &proof.hyrax_proofs[k],
@@ -251,6 +277,51 @@ pub fn verify_lasso(
         .map_err(|e| format!("Table {k} Hyrax: {e}"))?;
     }
     Ok(())
+}
+
+/// Precomputed table commitments for multi-instance Lasso (setup phase).
+#[derive(Clone)]
+pub struct LassoMultiProvingKey {
+    /// instance_table_coms[t][k] = commitment to sub-table k of instance t
+    pub instance_table_coms: Vec<Vec<HyraxCommitment>>,
+    pub nu: usize,
+}
+
+impl LassoMultiProvingKey {
+    pub fn vk(&self) -> LassoMultiVerifyingKey {
+        LassoMultiVerifyingKey {
+            instance_table_coms: self.instance_table_coms.clone(),
+        }
+    }
+}
+
+/// Verifier-side key for multi-instance Lasso.
+#[derive(Clone)]
+pub struct LassoMultiVerifyingKey {
+    pub instance_table_coms: Vec<Vec<HyraxCommitment>>,
+}
+
+/// Precommit tables for all instances in a multi-Lasso (call at setup, once).
+pub fn precommit_lasso_multi_tables(
+    multi_instance: &LassoMultiInstance,
+    bits_per_chunk: usize,
+    params: &HyraxParams,
+) -> LassoMultiProvingKey {
+    let nu = bits_per_chunk / 2;
+    let instance_table_coms = multi_instance
+        .instances
+        .iter()
+        .map(|inst| {
+            inst.tables
+                .iter()
+                .map(|t| hyrax_commit(t, nu, params))
+                .collect()
+        })
+        .collect();
+    LassoMultiProvingKey {
+        instance_table_coms,
+        nu,
+    }
 }
 
 /// 複数のLassoルックアップ要求をまとめたもの
@@ -266,14 +337,13 @@ pub struct LassoMultiProof {
     pub combined_sumcheck_proof: SumcheckProofMulti,
     /// 各サブテーブル T_{t,k}(r) の評価値
     pub table_openings: Vec<Vec<F>>,
-    /// インスタンスごとのHyraxコミットメント
-    pub hyrax_commitments: Vec<Vec<HyraxCommitment>>,
     /// 全評価値を一括で証明するバッチHyrax証明
     pub hyrax_proof: HyraxProof,
 }
 
 pub fn prove_lasso_multi(
     multi_instance: &LassoMultiInstance,
+    pk: &LassoMultiProvingKey,
     transcript: &mut Transcript,
     params: &HyraxParams,
 ) -> LassoMultiProof {
@@ -295,17 +365,11 @@ pub fn prove_lasso_multi(
         );
     }
 
-    // --- STEP 1: コミットメントの吸収 ---
-    let mut hyrax_commitments = Vec::new();
-    for instance in &multi_instance.instances {
-        let mut inst_coms = Vec::new();
-        for table in &instance.tables {
-            let com = hyrax_commit(table, m / 2, params);
-            // コミットメントを吸収 (Lasso論文のプロトコルに準拠)
-            absorb_com(transcript, b"hyrax_com", &com);
-            inst_coms.push(com);
+    // --- STEP 1: absorb precommitted table commitments (from setup phase) ---
+    for inst_coms in &pk.instance_table_coms {
+        for com in inst_coms {
+            absorb_com(transcript, b"hyrax_com", com);
         }
-        hyrax_commitments.push(inst_coms);
     }
 
     // --- STEP 2: 公開出力の吸収 ---
@@ -383,7 +447,6 @@ pub fn prove_lasso_multi(
         combined_grand_sum,
         combined_sumcheck_proof,
         table_openings,
-        hyrax_commitments,
         hyrax_proof,
     }
 }
@@ -391,6 +454,7 @@ pub fn prove_lasso_multi(
 pub fn verify_lasso_multi(
     proof: &LassoMultiProof,
     multi_instance: &LassoMultiInstance,
+    vk: &LassoMultiVerifyingKey,
     transcript: &mut Transcript,
     params: &HyraxParams,
 ) -> Result<(), String> {
@@ -398,10 +462,10 @@ pub fn verify_lasso_multi(
     let m = multi_instance.instances[0].bits_per_chunk;
     let mask = (1usize << m) - 1;
 
-    // --- STEP 1: 再現のための吸収 (Proverと完全に一致させる) ---
-    for (t, instance) in multi_instance.instances.iter().enumerate() {
-        for k in 0..instance.tables.len() {
-            absorb_com(transcript, b"hyrax_com", &proof.hyrax_commitments[t][k]);
+    // --- STEP 1: replay precommitted table absorptions (from verifying key) ---
+    for inst_coms in &vk.instance_table_coms {
+        for com in inst_coms {
+            absorb_com(transcript, b"hyrax_com", com);
         }
     }
     for instance in &multi_instance.instances {
@@ -430,21 +494,29 @@ pub fn verify_lasso_multi(
     )?;
 
     let r_rev: Vec<F> = r_vec.iter().copied().rev().collect();
+    // Precompute eq_table[ch] = eq(index_to_bits(ch,m), r_rev) for ch in 0..2^m.
+    // compute_eq_evals builds the same table in O(2^m) via iterative doubling,
+    // avoiding n*m individual eq_eval calls inside the inner loop.
+    let eq_table = compute_eq_evals(&r_rev, 1 << m);
     let mut expected_final_eval = F::ZERO;
     let mut table_idx = 0;
 
     for (t, instance) in multi_instance.instances.iter().enumerate() {
         let n = instance.query_indices.len();
         let rho_pows = powers_of(rho, n);
-        //let gamma_pows = powers_of(gamma, instance.tables.len());
 
         for k in 0..instance.tables.len() {
-            // 公開情報から L_{t,k}(r) を直接計算
-            let l_tk_at_r: F = (0..n)
-                .map(|j| {
-                    let ch = chunk(instance.query_indices[j], k, m, mask);
-                    rho_pows[j] * eq_eval(&index_to_bits(ch, m), &r_rev)
-                })
+            // Build histogram: hist[ch] = Σ_{j: chunk_k(query_j)==ch} rho_pows[j]
+            // Then l_tk_at_r = <hist, eq_table>, reducing O(n*m) → O(n + 2^m).
+            let mut hist = vec![F::ZERO; 1 << m];
+            for j in 0..n {
+                let ch = chunk(instance.query_indices[j], k, m, mask);
+                hist[ch] += rho_pows[j];
+            }
+            let l_tk_at_r: F = hist
+                .iter()
+                .zip(eq_table.iter())
+                .map(|(&h, &e)| h * e)
                 .sum();
 
             // 重み付けされたセレクタ評価値
@@ -474,7 +546,7 @@ pub fn verify_lasso_multi(
         );
     }
 
-    let flatten_commitments: Vec<_> = proof.hyrax_commitments.iter().flatten().cloned().collect();
+    let flatten_commitments: Vec<_> = vk.instance_table_coms.iter().flatten().cloned().collect();
     let flatten_openings: Vec<_> = proof.table_openings.iter().flatten().copied().collect();
 
     // 検証側も transcript を含めた引数構成に修正
@@ -549,13 +621,16 @@ mod lasso_tests {
         let sigma = m / 2;
         let params = HyraxParams::new(sigma);
 
+        let pk = precommit_lasso_tables(&instance.tables, instance.bits_per_chunk, &params);
+        let vk = pk.vk();
+
         // --- Prover Side ---
         let mut prover_transcript = Transcript::new(b"lasso-protocol");
-        let proof = prove_lasso(&instance, &mut prover_transcript, &params);
+        let proof = prove_lasso(&instance, &pk, &mut prover_transcript, &params);
 
         // --- Verifier Side ---
         let mut verifier_transcript = Transcript::new(b"lasso-protocol");
-        let result = verify_lasso(&proof, &instance, &mut verifier_transcript, &params);
+        let result = verify_lasso(&proof, &instance, &vk, &mut verifier_transcript, &params);
 
         assert!(
             result.is_ok(),
@@ -570,14 +645,17 @@ mod lasso_tests {
         let sigma = instance.bits_per_chunk / 2;
         let params = HyraxParams::new(sigma);
 
+        let pk = precommit_lasso_tables(&instance.tables, instance.bits_per_chunk, &params);
+        let vk = pk.vk();
+
         // Maliciously change the claimed output
         instance.outputs[0] = F::from(999);
 
         let mut prover_transcript = Transcript::new(b"lasso-protocol");
-        let proof = prove_lasso(&instance, &mut prover_transcript, &params);
+        let proof = prove_lasso(&instance, &pk, &mut prover_transcript, &params);
 
         let mut verifier_transcript = Transcript::new(b"lasso-protocol");
-        let result = verify_lasso(&proof, &instance, &mut verifier_transcript, &params);
+        let result = verify_lasso(&proof, &instance, &vk, &mut verifier_transcript, &params);
 
         // Verifier should catch the sub-claim mismatch immediately
         assert!(result.is_err());
@@ -590,14 +668,17 @@ mod lasso_tests {
         let sigma = instance.bits_per_chunk / 2;
         let params = HyraxParams::new(sigma);
 
+        let pk = precommit_lasso_tables(&instance.tables, instance.bits_per_chunk, &params);
+        let vk = pk.vk();
+
         let mut prover_transcript = Transcript::new(b"lasso-protocol");
-        let mut proof = prove_lasso(&instance, &mut prover_transcript, &params);
+        let mut proof = prove_lasso(&instance, &pk, &mut prover_transcript, &params);
 
         // Tamper with a sumcheck round polynomial
         proof.sumcheck_proofs[0].round_polys[0].evals[0] += F::one();
 
         let mut verifier_transcript = Transcript::new(b"lasso-protocol");
-        let result = verify_lasso(&proof, &instance, &mut verifier_transcript, &params);
+        let result = verify_lasso(&proof, &instance, &vk, &mut verifier_transcript, &params);
 
         assert!(result.is_err());
     }
@@ -607,8 +688,12 @@ mod lasso_tests {
         let instance = setup_test_instance();
         let sigma = instance.bits_per_chunk / 2;
         let params = HyraxParams::new(sigma);
+
+        let pk = precommit_lasso_tables(&instance.tables, instance.bits_per_chunk, &params);
+        let vk = pk.vk();
+
         let mut prover_transcript = Transcript::new(b"lasso-protocol");
-        let mut proof = prove_lasso(&instance, &mut prover_transcript, &params);
+        let mut proof = prove_lasso(&instance, &pk, &mut prover_transcript, &params);
 
         // --- CLEVER TAMPERING ---
         // Add 1 to sub_claim[0] and subtract 1 from sub_claim[1].
@@ -617,7 +702,7 @@ mod lasso_tests {
         proof.sub_claims[1] -= F::one();
 
         let mut verifier_transcript = Transcript::new(b"lasso-protocol");
-        let result = verify_lasso(&proof, &instance, &mut verifier_transcript, &params);
+        let result = verify_lasso(&proof, &instance, &vk, &mut verifier_transcript, &params);
 
         assert!(result.is_err());
         let err_msg = result.unwrap_err();
@@ -648,11 +733,14 @@ mod lasso_tests {
         let sigma = m / 2;
         let params = HyraxParams::new(sigma);
 
+        let pk = precommit_lasso_tables(&instance.tables, instance.bits_per_chunk, &params);
+        let vk = pk.vk();
+
         let mut pt = Transcript::new(b"single-table");
-        let proof = prove_lasso(&instance, &mut pt, &params);
+        let proof = prove_lasso(&instance, &pk, &mut pt, &params);
 
         let mut vt = Transcript::new(b"single-table");
-        let result = verify_lasso(&proof, &instance, &mut vt, &params);
+        let result = verify_lasso(&proof, &instance, &vk, &mut vt, &params);
         assert!(
             result.is_ok(),
             "single-table lasso failed: {:?}",
@@ -679,11 +767,14 @@ mod lasso_tests {
         let sigma = m / 2;
         let params = HyraxParams::new(sigma);
 
+        let pk = precommit_lasso_tables(&instance.tables, instance.bits_per_chunk, &params);
+        let vk = pk.vk();
+
         let mut pt = Transcript::new(b"single-query");
-        let proof = prove_lasso(&instance, &mut pt, &params);
+        let proof = prove_lasso(&instance, &pk, &mut pt, &params);
 
         let mut vt = Transcript::new(b"single-query");
-        let result = verify_lasso(&proof, &instance, &mut vt, &params);
+        let result = verify_lasso(&proof, &instance, &vk, &mut vt, &params);
         assert!(
             result.is_ok(),
             "single-query lasso failed: {:?}",
@@ -782,13 +873,22 @@ mod lasso_multi_tests {
         let m = multi_instance.instances[0].bits_per_chunk;
         let params = setup_hyrax_params(m);
 
+        let pk = precommit_lasso_multi_tables(&multi_instance, m, &params);
+        let vk = pk.vk();
+
         // Prover
         let mut prover_transcript = Transcript::new(b"multi-lasso-test");
-        let proof = prove_lasso_multi(&multi_instance, &mut prover_transcript, &params);
+        let proof = prove_lasso_multi(&multi_instance, &pk, &mut prover_transcript, &params);
 
         // Verifier
         let mut verifier_transcript = Transcript::new(b"multi-lasso-test");
-        let result = verify_lasso_multi(&proof, &multi_instance, &mut verifier_transcript, &params);
+        let result = verify_lasso_multi(
+            &proof,
+            &multi_instance,
+            &vk,
+            &mut verifier_transcript,
+            &params,
+        );
 
         assert!(
             result.is_ok(),
@@ -804,14 +904,17 @@ mod lasso_multi_tests {
         let m = multi_instance.instances[0].bits_per_chunk;
         let params = setup_hyrax_params(m);
 
+        let pk = precommit_lasso_multi_tables(&multi_instance, m, &params);
+        let vk = pk.vk();
+
         // インスタンスBの出力を不正な値に変更
         multi_instance.instances[1].outputs[0] = F::from(999u64);
 
         let mut pt = Transcript::new(b"multi-lasso-test");
-        let proof = prove_lasso_multi(&multi_instance, &mut pt, &params);
+        let proof = prove_lasso_multi(&multi_instance, &pk, &mut pt, &params);
 
         let mut vt = Transcript::new(b"multi-lasso-test");
-        let result = verify_lasso_multi(&proof, &multi_instance, &mut vt, &params);
+        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &mut vt, &params);
 
         // 検証側で expected_final_eval と sumcheck の主張が一致しなくなるため失敗する
         assert!(result.is_err(), "Should reject due to wrong public output");
@@ -824,14 +927,17 @@ mod lasso_multi_tests {
         let m = multi_instance.instances[0].bits_per_chunk;
         let params = setup_hyrax_params(m);
 
+        let pk = precommit_lasso_multi_tables(&multi_instance, m, &params);
+        let vk = pk.vk();
+
         let mut pt = Transcript::new(b"multi-lasso-test");
-        let mut proof = prove_lasso_multi(&multi_instance, &mut pt, &params);
+        let mut proof = prove_lasso_multi(&multi_instance, &pk, &mut pt, &params);
 
         // 統合Sumcheckのラウンド多項式を改ざん
         proof.combined_sumcheck_proof.round_polys[0].evals[0] += F::one();
 
         let mut vt = Transcript::new(b"multi-lasso-test");
-        let result = verify_lasso_multi(&proof, &multi_instance, &mut vt, &params);
+        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &mut vt, &params);
 
         assert!(result.is_err(), "Should reject tampered sumcheck proof");
     }
@@ -843,11 +949,14 @@ mod lasso_multi_tests {
         let m = multi_instance.instances[0].bits_per_chunk;
         let params = setup_hyrax_params(m);
 
+        let pk = precommit_lasso_multi_tables(&multi_instance, m, &params);
+        let vk = pk.vk();
+
         let mut pt = Transcript::new(b"domain-A");
-        let proof = prove_lasso_multi(&multi_instance, &mut pt, &params);
+        let proof = prove_lasso_multi(&multi_instance, &pk, &mut pt, &params);
 
         let mut vt = Transcript::new(b"domain-B"); // ラベルが異なる
-        let result = verify_lasso_multi(&proof, &multi_instance, &mut vt, &params);
+        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &mut vt, &params);
 
         assert!(
             result.is_err(),
@@ -862,14 +971,17 @@ mod lasso_multi_tests {
         let m = multi_instance.instances[0].bits_per_chunk;
         let params = setup_hyrax_params(m);
 
+        let pk = precommit_lasso_multi_tables(&multi_instance, m, &params);
+        let vk = pk.vk();
+
         let mut pt = Transcript::new(b"multi-lasso-test");
-        let mut proof = prove_lasso_multi(&multi_instance, &mut pt, &params);
+        let mut proof = prove_lasso_multi(&multi_instance, &pk, &mut pt, &params);
 
         // 個別の評価値 table_openings を改ざん
         proof.table_openings[0][0] += F::one();
 
         let mut vt = Transcript::new(b"multi-lasso-test");
-        let result = verify_lasso_multi(&proof, &multi_instance, &mut vt, &params);
+        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &mut vt, &params);
 
         // expected_final_eval の計算に不整合が生じるか、Hyraxのバッチ検証で失敗する
         assert!(result.is_err(), "Should reject tampered table opening");
@@ -884,11 +996,14 @@ mod lasso_multi_tests {
         let m = multi_instance.instances[0].bits_per_chunk;
         let params = setup_hyrax_params(m);
 
+        let pk = precommit_lasso_multi_tables(&multi_instance, m, &params);
+        let vk = pk.vk();
+
         let mut pt = Transcript::new(b"single-in-multi");
-        let proof = prove_lasso_multi(&multi_instance, &mut pt, &params);
+        let proof = prove_lasso_multi(&multi_instance, &pk, &mut pt, &params);
 
         let mut vt = Transcript::new(b"single-in-multi");
-        let result = verify_lasso_multi(&proof, &multi_instance, &mut vt, &params);
+        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &mut vt, &params);
 
         assert!(
             result.is_ok(),
