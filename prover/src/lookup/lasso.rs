@@ -31,7 +31,6 @@ use crate::subprotocols::sumcheck::{
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
 use ark_ff::Field;
-use rayon::prelude::*;
 
 /// Precomputed table commitments — computed once at setup, not per proof.
 #[derive(Clone)]

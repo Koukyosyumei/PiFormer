@@ -14,7 +14,6 @@ use crate::poly::DenseMLPoly;
 use crate::subprotocols::sumcheck::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
 use ark_ff::{One, Zero};
-use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Public types

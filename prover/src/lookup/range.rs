@@ -9,7 +9,8 @@
 
 use crate::field::F;
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_verify, HyraxCommitment, HyraxParams, HyraxProof,
+    hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment, HyraxParams,
+    HyraxProof,
 };
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
@@ -196,11 +197,6 @@ fn vec_to_mle(v: &[F], len: usize) -> DenseMLPoly {
         evals[i] = x;
     }
     DenseMLPoly::new(evals)
-}
-fn params_from_vars(total_vars: usize) -> (usize, usize, HyraxParams) {
-    let nu = total_vars / 2;
-    let sigma = (total_vars - nu).max(1);
-    (nu, sigma, HyraxParams::new(sigma))
 }
 fn challenge_vec(transcript: &mut Transcript, len: usize, label: &[u8]) -> Vec<F> {
     (0..len)

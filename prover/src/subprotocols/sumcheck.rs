@@ -13,7 +13,7 @@ use crate::field::F;
 use crate::poly::DenseMLPoly;
 use crate::transcript::Transcript;
 use ark_ff::Field;
-use rayon::prelude::*;
+
 
 /// A round polynomial g_i(X) given by its values at X = 0, 1, 2.
 #[derive(Clone, Debug)]

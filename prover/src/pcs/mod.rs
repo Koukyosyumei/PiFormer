@@ -21,8 +21,22 @@ use ark_ec::{Group, VariableBaseMSM};
 use ark_ff::{Field, PrimeField, Zero};
 use rayon::prelude::*;
 use sha3::{Digest, Sha3_256};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use crate::{field::F, poly::DenseMLPoly, transcript::Transcript};
+
+// ---------------------------------------------------------------------------
+// Global HyraxParams cache: HyraxParams::new(sigma) is expensive (2^sigma G1
+// scalar muls). Cache by sigma so setup runs at most once per distinct sigma.
+// ---------------------------------------------------------------------------
+static HYRAX_PARAMS_CACHE: OnceLock<Mutex<HashMap<usize, HyraxParams>>> = OnceLock::new();
+
+fn cached_hyrax_params(sigma: usize) -> HyraxParams {
+    let cache = HYRAX_PARAMS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    map.entry(sigma).or_insert_with(|| HyraxParams::new(sigma)).clone()
+}
 
 // ---------------------------------------------------------------------------
 // Public parameters
@@ -345,13 +359,13 @@ fn msm_g1(bases: &[G1Affine], scalars: &[F]) -> G1Affine {
 pub fn setup_hyrax_params(bits_per_chunk: usize) -> HyraxParams {
     let nu = bits_per_chunk / 2;
     let sigma = bits_per_chunk - nu;
-    HyraxParams::new(sigma)
+    cached_hyrax_params(sigma)
 }
 
 pub fn params_from_vars(total_vars: usize) -> (usize, usize, HyraxParams) {
     let nu = total_vars / 2;
     let sigma = (total_vars - nu).max(1);
-    (nu, sigma, HyraxParams::new(sigma))
+    (nu, sigma, cached_hyrax_params(sigma))
 }
 
 pub fn poly_hyrax(poly: &DenseMLPoly) -> (usize, usize, HyraxParams) {

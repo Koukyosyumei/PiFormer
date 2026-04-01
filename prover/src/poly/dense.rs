@@ -11,7 +11,7 @@
 
 use crate::field::F;
 use ark_ff::Field;
-use rayon::prelude::*;
+
 
 #[derive(Clone, Debug)]
 pub struct DenseMLPoly {
