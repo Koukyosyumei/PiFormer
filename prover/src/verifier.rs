@@ -125,12 +125,12 @@ pub fn verify_transformer_block(
     };
     verify_layernorm(&proof.ln2_proof, &ln2_io, &vk.ln2_vk, transcript)?;
 
-    // --- 6. FFN ---
+    // --- 6. FFN — returns (y_claim, x_claim) deferred to combine ---
     let ffn_io = crate::ffn::ffn::FFNIOCommitments {
         x_com: proof.x_norm2_com.clone(),
         y_com: proof.out_ffn_com.clone(),
     };
-    verify_ffn(
+    let (ffn_y_claim, ffn_x_claim) = verify_ffn(
         &proof.ffn_proof,
         inst_ffn,
         &vk.ffn_vk,
@@ -156,6 +156,10 @@ pub fn verify_transformer_block(
     ).map_err(|e| format!("x_norm1_combine: {e}"))?;
     verify_combine(&proof.out_attn_combine, &proof.out_attn_com, &[o_y_claim], td_num_vars, transcript)
         .map_err(|e| format!("out_attn_combine: {e}"))?;
+    verify_combine(&proof.x_norm2_combine, &proof.x_norm2_com, &[ffn_x_claim], td_num_vars, transcript)
+        .map_err(|e| format!("x_norm2_combine: {e}"))?;
+    verify_combine(&proof.out_ffn_combine, &proof.out_ffn_com, &[ffn_y_claim], td_num_vars, transcript)
+        .map_err(|e| format!("out_ffn_combine: {e}"))?;
 
     // =========================================================================
     // Residual Connection 2: X_out = X_mid + Out_ffn

@@ -485,23 +485,17 @@ fn read_attn_internal_coms<R: Read>(r: &mut R) -> io::Result<AttentionInternalCo
 
 fn write_attn_openings<W: Write>(w: &mut W, o: &AttentionOpenings) -> io::Result<()> {
     write_f(w, &o.out_eval)?;
-    write_ep!(w, &o.phi_q_eval, &o.phi_q_open);
-    write_ep!(w, &o.phi_k_eval, &o.phi_k_open);
+    write_f(w, &o.phi_q_eval)?;
+    write_f(w, &o.phi_k_eval)?;
     write_f(w, &o.v_eval)?;
     Ok(())
 }
 fn read_attn_openings<R: Read>(r: &mut R) -> io::Result<AttentionOpenings> {
-    let out_eval = read_f(r)?;
-    let (phi_q_eval, phi_q_open) = read_ep!(r);
-    let (phi_k_eval, phi_k_open) = read_ep!(r);
-    let v_eval = read_f(r)?;
     Ok(AttentionOpenings {
-        out_eval,
-        phi_q_eval,
-        phi_q_open,
-        phi_k_eval,
-        phi_k_open,
-        v_eval,
+        out_eval: read_f(r)?,
+        phi_q_eval: read_f(r)?,
+        phi_k_eval: read_f(r)?,
+        v_eval: read_f(r)?,
     })
 }
 
@@ -522,7 +516,9 @@ fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result
             write_sumcheck_proof(w, context_sumcheck)?;
         }
     }
-    write_attn_openings(w, &p.openings)
+    write_attn_openings(w, &p.openings)?;
+    write_combine_proof(w, &p.phi_q_combine)?;
+    write_combine_proof(w, &p.phi_k_combine)
 }
 fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
     let internal_coms = read_attn_internal_coms(r)?;
@@ -548,6 +544,8 @@ fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
         internal_coms,
         sumcheck,
         openings: read_attn_openings(r)?,
+        phi_q_combine: read_combine_proof(r)?,
+        phi_k_combine: read_combine_proof(r)?,
     })
 }
 
@@ -567,42 +565,31 @@ fn read_ffn_internal_coms<R: Read>(r: &mut R) -> io::Result<FFNInternalCommitmen
 }
 
 fn write_ffn_openings<W: Write>(w: &mut W, o: &FFNOpenings) -> io::Result<()> {
-    write_ep!(w, &o.y_eval, &o.y_open);
-    write_ep!(w, &o.a_eval, &o.a_open);
+    write_f(w, &o.y_eval)?;
+    write_f(w, &o.x_eval)?;
+    write_f(w, &o.a_eval)?;
     write_ep!(w, &o.w2_eval, &o.w2_open);
-    write_ep!(w, &o.m_eval, &o.m_open);
-    write_ep!(w, &o.x_eval, &o.x_open);
+    write_f(w, &o.m_eval)?;
     write_ep!(w, &o.w1_eval, &o.w1_open);
     Ok(())
 }
 fn read_ffn_openings<R: Read>(r: &mut R) -> io::Result<FFNOpenings> {
-    let (y_eval, y_open) = read_ep!(r);
-    let (a_eval, a_open) = read_ep!(r);
+    let y_eval = read_f(r)?;
+    let x_eval = read_f(r)?;
+    let a_eval = read_f(r)?;
     let (w2_eval, w2_open) = read_ep!(r);
-    let (m_eval, m_open) = read_ep!(r);
-    let (x_eval, x_open) = read_ep!(r);
+    let m_eval = read_f(r)?;
     let (w1_eval, w1_open) = read_ep!(r);
-    Ok(FFNOpenings {
-        y_eval,
-        y_open,
-        a_eval,
-        a_open,
-        w2_eval,
-        w2_open,
-        m_eval,
-        m_open,
-        x_eval,
-        x_open,
-        w1_eval,
-        w1_open,
-    })
+    Ok(FFNOpenings { y_eval, x_eval, a_eval, w2_eval, w2_open, m_eval, w1_eval, w1_open })
 }
 
 fn write_ffn_proof<W: Write>(w: &mut W, p: &FFNProof) -> io::Result<()> {
     write_ffn_internal_coms(w, &p.internal_coms)?;
     write_sumcheck_proof(w, &p.y_sumcheck)?;
     write_sumcheck_proof(w, &p.m_sumcheck)?;
-    write_ffn_openings(w, &p.openings)
+    write_ffn_openings(w, &p.openings)?;
+    write_combine_proof(w, &p.m_combine)?;
+    write_combine_proof(w, &p.a_combine)
 }
 fn read_ffn_proof<R: Read>(r: &mut R) -> io::Result<FFNProof> {
     Ok(FFNProof {
@@ -610,6 +597,8 @@ fn read_ffn_proof<R: Read>(r: &mut R) -> io::Result<FFNProof> {
         y_sumcheck: read_sumcheck_proof(r)?,
         m_sumcheck: read_sumcheck_proof(r)?,
         openings: read_ffn_openings(r)?,
+        m_combine: read_combine_proof(r)?,
+        a_combine: read_combine_proof(r)?,
     })
 }
 
@@ -656,7 +645,9 @@ fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Resu
     write_combine_proof(w, &p.v_combine)?;
     write_combine_proof(w, &p.out_inner_combine)?;
     write_combine_proof(w, &p.x_norm1_combine)?;
-    write_combine_proof(w, &p.out_attn_combine)
+    write_combine_proof(w, &p.out_attn_combine)?;
+    write_combine_proof(w, &p.x_norm2_combine)?;
+    write_combine_proof(w, &p.out_ffn_combine)
 }
 fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
     Ok(TransformerBlockProof {
@@ -682,6 +673,8 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
         out_inner_combine: read_combine_proof(r)?,
         x_norm1_combine: read_combine_proof(r)?,
         out_attn_combine: read_combine_proof(r)?,
+        x_norm2_combine: read_combine_proof(r)?,
+        out_ffn_combine: read_combine_proof(r)?,
     })
 }
 

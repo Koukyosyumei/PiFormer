@@ -22,7 +22,10 @@ use crate::pcs::{
 };
 use crate::poly::utils::{combine, convert_tm_to_fm, eval_cols, eval_rows, mat_to_mle, TernaryValue};
 use crate::poly::DenseMLPoly;
-use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
+use crate::subprotocols::{
+    prove_combine, prove_sumcheck, verify_combine, verify_sumcheck, CombineProof, EvalClaim,
+    SumcheckProof,
+};
 use crate::transcript::{challenge_vec, Transcript};
 
 // ---------------------------------------------------------------------------
@@ -117,17 +120,13 @@ pub struct FFNInternalCommitments {
 }
 
 pub struct FFNOpenings {
+    /// y_eval / x_eval deferred to block-level combine proofs (no direct opens).
     pub y_eval: F,
-    pub y_open: HyraxProof,
+    pub x_eval: F,
     pub a_eval: F,
-    pub a_open: HyraxProof,
     pub w2_eval: F,
     pub w2_open: HyraxProof,
-
     pub m_eval: F,
-    pub m_open: HyraxProof,
-    pub x_eval: F,
-    pub x_open: HyraxProof,
     pub w1_eval: F,
     pub w1_open: HyraxProof,
 }
@@ -137,12 +136,20 @@ pub struct FFNProof {
     pub y_sumcheck: SumcheckProof,
     pub m_sumcheck: SumcheckProof,
     pub openings: FFNOpenings,
+    /// GKR combine proof for m_com (replaces direct m_open).
+    pub m_combine: CombineProof,
+    /// GKR combine proof for a_com (replaces direct a_open).
+    pub a_combine: CombineProof,
 }
 
 // ---------------------------------------------------------------------------
 // Prover
 // ---------------------------------------------------------------------------
 
+/// Returns `(proof, y_claim, x_claim)`.
+///
+/// `y_claim` = EvalClaim on the output y at (rx_y, ry_y) — deferred to block-level combine.
+/// `x_claim` = EvalClaim on the input x at (rx_m, r_j)  — deferred to block-level combine.
 pub fn prove_ffn(
     pk: &FFNProvingKey,
     witness: &FFNWitness,
@@ -150,7 +157,7 @@ pub fn prove_ffn(
     io_coms: &FFNIOCommitments,
     transcript: &mut Transcript,
     _lasso_params: &HyraxParams,
-) -> Result<FFNProof, String> {
+) -> Result<(FFNProof, EvalClaim, EvalClaim), String> {
     let t = pk.vk.seq_len;
     let d = pk.vk.d_model;
     let f = pk.vk.d_ff;
@@ -209,34 +216,45 @@ pub fn prove_ffn(
     let x_eval = m_sumcheck.final_eval_f;
     let w1_eval = m_sumcheck.final_eval_g;
 
-    // 6. Openings
-    let y_open = hyrax_open(&y_mle.evaluations, &combine(&rx_y, &ry_y), nu_x, sigma_x);
-    let a_open = hyrax_open(&a_mle.evaluations, &combine(&rx_y, &r_k), nu_m, sigma_m);
+    // 6. Static weight openings (w1, w2 are public model weights — must keep).
     let w2_open = hyrax_open(&w2_mle.evaluations, &combine(&r_k, &ry_y), nu_w2, sigma_w2);
-
-    let m_open = hyrax_open(&m_mle.evaluations, &combine(&rx_m, &ry_m), nu_m, sigma_m);
-    let x_open = hyrax_open(&x_mle.evaluations, &combine(&rx_m, &r_j), nu_x, sigma_x);
     let w1_open = hyrax_open(&w1_mle.evaluations, &combine(&r_j, &ry_m), nu_w1, sigma_w1);
 
-    Ok(FFNProof {
-        internal_coms: FFNInternalCommitments { m_com, a_com },
-        y_sumcheck,
-        m_sumcheck,
-        openings: FFNOpenings {
-            y_eval,
-            y_open,
-            a_eval,
-            a_open,
-            w2_eval,
-            w2_open,
-            m_eval,
-            m_open,
-            x_eval,
-            x_open,
-            w1_eval,
-            w1_open,
+    // 7. GKR combine proofs for internal polynomials m and a (replaces direct opens).
+    let tf_num_vars = t_bits + f_bits;
+    let m_claim = EvalClaim { point: combine(&rx_m, &ry_m), value: m_eval };
+    let (m_combine, _) =
+        prove_combine(&m_mle.evaluations, &m_com, &[m_claim], tf_num_vars, transcript);
+
+    let a_claim_inner = EvalClaim { point: combine(&rx_y, &r_k), value: a_eval };
+    let (a_combine, _) =
+        prove_combine(&a_mle.evaluations, &a_com, &[a_claim_inner], tf_num_vars, transcript);
+
+    // 8. IO EvalClaims returned to block level — no direct opens for x and y.
+    let y_claim = EvalClaim { point: combine(&rx_y, &ry_y), value: y_eval };
+    let x_claim = EvalClaim { point: combine(&rx_m, &r_j), value: x_eval };
+
+    Ok((
+        FFNProof {
+            internal_coms: FFNInternalCommitments { m_com, a_com },
+            y_sumcheck,
+            m_sumcheck,
+            openings: FFNOpenings {
+                y_eval,
+                x_eval,
+                a_eval,
+                w2_eval,
+                w2_open,
+                m_eval,
+                w1_eval,
+                w1_open,
+            },
+            m_combine,
+            a_combine,
         },
-    })
+        y_claim,
+        x_claim,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -250,17 +268,15 @@ pub fn verify_ffn(
     io_coms: &FFNIOCommitments,
     transcript: &mut Transcript,
     _lasso_params: &HyraxParams,
-) -> Result<(), String> {
+) -> Result<(EvalClaim, EvalClaim), String> {
     let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
     let d_bits = vk.d_model.next_power_of_two().trailing_zeros() as usize;
     let f_bits = vk.d_ff.next_power_of_two().trailing_zeros() as usize;
 
-    let (_, _, params_x) = params_from_vars(t_bits + d_bits);
-    let (_, _, params_m) = params_from_vars(t_bits + f_bits);
     let (_, _, params_w1) = params_from_vars(d_bits + f_bits);
     let (_, _, params_w2) = params_from_vars(f_bits + d_bits);
 
-    // 1. Absorb Cryptographic Commitments (Zero O(N) operations!)
+    // 1. Absorb Cryptographic Commitments
     absorb_com(transcript, b"w1_com", &vk.w1_com);
     absorb_com(transcript, b"w2_com", &vk.w2_com);
     absorb_com(transcript, b"x_com", &io_coms.x_com);
@@ -279,7 +295,7 @@ pub fn verify_ffn(
         return Err("Y Sumcheck mismatch".into());
     }
 
-    // 4. Verify M Sumcheck
+    // 3. Verify M Sumcheck
     let rx_m = challenge_vec(transcript, t_bits, b"ffn_rx_m");
     let ry_m = challenge_vec(transcript, f_bits, b"ffn_ry_m");
     transcript.append_field(b"claim_m", &proof.openings.m_eval);
@@ -290,42 +306,13 @@ pub fn verify_ffn(
         return Err("M Sumcheck mismatch".into());
     }
 
-    // 5. Verify ALL Openings (Cryptographically binds evaluations to VK and IO)
-    hyrax_verify(
-        &io_coms.y_com,
-        proof.openings.y_eval,
-        &combine(&rx_y, &ry_y),
-        &proof.openings.y_open,
-        &params_x,
-    )?;
-    hyrax_verify(
-        &proof.internal_coms.a_com,
-        proof.openings.a_eval,
-        &combine(&rx_y, &r_k),
-        &proof.openings.a_open,
-        &params_m,
-    )?;
+    // 4. Static weight openings (w1 and w2 are public model weights).
     hyrax_verify(
         &vk.w2_com,
         proof.openings.w2_eval,
         &combine(&r_k, &ry_y),
         &proof.openings.w2_open,
         &params_w2,
-    )?;
-
-    hyrax_verify(
-        &proof.internal_coms.m_com,
-        proof.openings.m_eval,
-        &combine(&rx_m, &ry_m),
-        &proof.openings.m_open,
-        &params_m,
-    )?;
-    hyrax_verify(
-        &io_coms.x_com,
-        proof.openings.x_eval,
-        &combine(&rx_m, &r_j),
-        &proof.openings.x_open,
-        &params_x,
     )?;
     hyrax_verify(
         &vk.w1_com,
@@ -335,7 +322,32 @@ pub fn verify_ffn(
         &params_w1,
     )?;
 
-    Ok(())
+    // 5. Internal GKR combine proofs for m and a (replaces direct opens).
+    let tf_num_vars = t_bits + f_bits;
+    let m_claim = EvalClaim { point: combine(&rx_m, &ry_m), value: proof.openings.m_eval };
+    verify_combine(
+        &proof.m_combine,
+        &proof.internal_coms.m_com,
+        &[m_claim],
+        tf_num_vars,
+        transcript,
+    )
+    .map_err(|e| format!("FFN m_combine: {e}"))?;
+
+    let a_claim_inner = EvalClaim { point: combine(&rx_y, &r_k), value: proof.openings.a_eval };
+    verify_combine(
+        &proof.a_combine,
+        &proof.internal_coms.a_com,
+        &[a_claim_inner],
+        tf_num_vars,
+        transcript,
+    )
+    .map_err(|e| format!("FFN a_combine: {e}"))?;
+
+    // 6. Return IO EvalClaims for block-level combine — no direct opens for x and y.
+    let y_claim = EvalClaim { point: combine(&rx_y, &ry_y), value: proof.openings.y_eval };
+    let x_claim = EvalClaim { point: combine(&rx_m, &r_j), value: proof.openings.x_eval };
+    Ok((y_claim, x_claim))
 }
 
 // ---------------------------------------------------------------------------
@@ -430,7 +442,7 @@ mod ffn_tests {
         let lasso_params = HyraxParams::new(2);
 
         let mut pt = Transcript::new(b"ffn-test");
-        let proof = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
         let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
@@ -445,7 +457,7 @@ mod ffn_tests {
         pk.w2[0][0] = TernaryValue::ZERO; // Tamper weight internally (was ONE)
 
         let mut pt = Transcript::new(b"ffn-test");
-        let proof = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
         let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
@@ -463,7 +475,7 @@ mod ffn_tests {
         witness.x[0][0] += F::one();
 
         let mut pt = Transcript::new(b"ffn-test");
-        let proof = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
         let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
@@ -479,7 +491,7 @@ mod ffn_tests {
         witness.y[0][0] += F::one();
 
         let mut pt = Transcript::new(b"ffn-test");
-        let proof = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
         let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
@@ -495,7 +507,7 @@ mod ffn_tests {
         witness.a[0][0] += F::one();
 
         let mut pt = Transcript::new(b"ffn-test");
-        let proof = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
         let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
@@ -511,7 +523,7 @@ mod ffn_tests {
         pk.w1[0][0] = TernaryValue::ZERO; // Tamper weight internally (was ONE)
 
         let mut pt = Transcript::new(b"ffn-test");
-        let proof = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
         let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);

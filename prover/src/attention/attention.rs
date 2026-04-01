@@ -25,8 +25,8 @@ use crate::pcs::{
 use crate::poly::utils::{combine, eval_cols, eval_rows, mat_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{
-    prove_sumcheck, prove_sumcheck_multi_batched, verify_sumcheck, verify_sumcheck_multi_batched,
-    EvalClaim, SumcheckProof, SumcheckProofMulti,
+    prove_combine, prove_sumcheck, prove_sumcheck_multi_batched, verify_combine, verify_sumcheck,
+    verify_sumcheck_multi_batched, CombineProof, EvalClaim, SumcheckProof, SumcheckProofMulti,
 };
 use crate::transcript::{challenge_vec, Transcript};
 
@@ -113,11 +113,9 @@ pub struct AttentionInternalCommitments {
 pub struct AttentionOpenings {
     /// Claimed out eval at (rx, ry). Deferred to block-level combine proof.
     pub out_eval: F,
-    /// Internal phi_q opening — phi_q_com is created inside attention only.
+    /// phi_q/phi_k evals deferred to internal CombineProofs (no direct Hyrax open).
     pub phi_q_eval: F,
-    pub phi_q_open: HyraxProof,
     pub phi_k_eval: F,
-    pub phi_k_open: HyraxProof,
     /// Claimed v eval at v_point. Deferred to block-level combine proof.
     pub v_eval: F,
 }
@@ -141,6 +139,10 @@ pub struct LinearAttentionProof {
     pub internal_coms: AttentionInternalCommitments,
     pub sumcheck: AttentionSumcheckProof,
     pub openings: AttentionOpenings,
+    /// Single Hyrax opening for phi_q_com via GKR combine (replaces direct phi_q_open).
+    pub phi_q_combine: CombineProof,
+    /// Single Hyrax opening for phi_k_com via GKR combine (replaces direct phi_k_open).
+    pub phi_k_combine: CombineProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -273,20 +275,23 @@ pub fn prove_linear_attention(
             )
         };
 
+    let td_num_vars = phi_q_mle.num_vars;
+
+    // Replace direct Hyrax opens with internal GKR combine proofs.
+    let phi_q_claim = EvalClaim { point: phi_q_point, value: phi_q_eval };
+    let (phi_q_combine, _) =
+        prove_combine(&phi_q_mle.evaluations, &phi_q_com, &[phi_q_claim], td_num_vars, transcript);
+
+    let phi_k_claim = EvalClaim { point: phi_k_point, value: phi_k_eval };
+    let (phi_k_combine, _) =
+        prove_combine(&phi_k_mle.evaluations, &phi_k_com, &[phi_k_claim], td_num_vars, transcript);
+
     let proof = LinearAttentionProof {
-        internal_coms: AttentionInternalCommitments {
-            phi_q_com,
-            phi_k_com,
-        },
+        internal_coms: AttentionInternalCommitments { phi_q_com, phi_k_com },
         sumcheck,
-        openings: AttentionOpenings {
-            out_eval,
-            phi_q_eval,
-            phi_q_open: hyrax_open(&phi_q_mle.evaluations, &phi_q_point, nu_td, sigma_td),
-            phi_k_eval,
-            phi_k_open: hyrax_open(&phi_k_mle.evaluations, &phi_k_point, nu_td, sigma_td),
-            v_eval,
-        },
+        openings: AttentionOpenings { out_eval, phi_q_eval, phi_k_eval, v_eval },
+        phi_q_combine,
+        phi_k_combine,
     };
 
     let out_claim = EvalClaim { point: combine(&rx, &ry), value: out_eval };
@@ -400,21 +405,28 @@ pub fn verify_linear_attention(
         }
     };
 
-    // 4. Internal Hyrax openings (phi_q and phi_k are internal to attention)
-    hyrax_verify(
+    // 4. Verify phi_q/phi_k via internal GKR combine proofs (replaces direct Hyrax opens).
+    let td_num_vars = (t.next_power_of_two().trailing_zeros()
+        + d.next_power_of_two().trailing_zeros()) as usize;
+    let phi_q_claim = EvalClaim { point: phi_q_point, value: proof.openings.phi_q_eval };
+    verify_combine(
+        &proof.phi_q_combine,
         &proof.internal_coms.phi_q_com,
-        proof.openings.phi_q_eval,
-        &phi_q_point,
-        &proof.openings.phi_q_open,
-        &params_td,
-    )?;
-    hyrax_verify(
+        &[phi_q_claim],
+        td_num_vars,
+        transcript,
+    )
+    .map_err(|e| format!("phi_q combine: {e}"))?;
+
+    let phi_k_claim = EvalClaim { point: phi_k_point, value: proof.openings.phi_k_eval };
+    verify_combine(
+        &proof.phi_k_combine,
         &proof.internal_coms.phi_k_com,
-        proof.openings.phi_k_eval,
-        &phi_k_point,
-        &proof.openings.phi_k_open,
-        &params_td,
-    )?;
+        &[phi_k_claim],
+        td_num_vars,
+        transcript,
+    )
+    .map_err(|e| format!("phi_k combine: {e}"))?;
 
     // out_com and v_com deferred to block-level combine proof
     let out_claim = EvalClaim { point: combine(&rx, &ry), value: proof.openings.out_eval };

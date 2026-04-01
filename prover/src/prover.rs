@@ -80,6 +80,10 @@ pub struct TransformerBlockProof {
     pub x_norm1_combine: CombineProof,
     /// Verifies out_attn_com: 1 claim from O-projection y_claim.
     pub out_attn_combine: CombineProof,
+    /// Verifies x_norm2_com: 1 claim from FFN x_claim (input to FFN).
+    pub x_norm2_combine: CombineProof,
+    /// Verifies out_ffn_com: 1 claim from FFN y_claim (output of FFN).
+    pub out_ffn_combine: CombineProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,12 +195,12 @@ pub fn prove_transformer_block(
     };
     let ln2_proof = prove_layernorm(&witness.ln2_wit, &ln2_io, &pk.ln2_vk, transcript)?;
 
-    // --- FFN ---
+    // --- FFN — returns (proof, y_claim, x_claim) ---
     let ffn_io = FFNIOCommitments {
         x_com: x_norm2_com.clone(),
         y_com: out_ffn_com.clone(),
     };
-    let ffn_proof = prove_ffn(
+    let (ffn_proof, ffn_y_claim, ffn_x_claim) = prove_ffn(
         &pk.ffn_pk,
         &witness.ffn_wit,
         inst_ffn,
@@ -254,6 +258,16 @@ pub fn prove_transformer_block(
     let (out_attn_combine, _) =
         prove_combine(&out_attn_evals, &out_attn_com, &[o_y_claim], td_num_vars, transcript);
 
+    // x_norm2_com: 1 claim (FFN x_claim — input to FFN = output of LN2)
+    let x_norm2_evals = mat_evals(&witness.ln2_wit.y, t, d);
+    let (x_norm2_combine, _) =
+        prove_combine(&x_norm2_evals, &x_norm2_com, &[ffn_x_claim], td_num_vars, transcript);
+
+    // out_ffn_com: 1 claim (FFN y_claim — output of FFN)
+    let out_ffn_evals = mat_evals(&witness.ffn_wit.y, t, d);
+    let (out_ffn_combine, _) =
+        prove_combine(&out_ffn_evals, &out_ffn_com, &[ffn_y_claim], td_num_vars, transcript);
+
     Ok(TransformerBlockProof {
         ln1_proof,
         q_proj_proof,
@@ -277,6 +291,8 @@ pub fn prove_transformer_block(
         out_inner_combine,
         x_norm1_combine,
         out_attn_combine,
+        x_norm2_combine,
+        out_ffn_combine,
     })
 }
 
