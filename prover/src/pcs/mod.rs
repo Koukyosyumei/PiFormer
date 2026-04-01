@@ -19,6 +19,7 @@
 use ark_bn254::{Fr, G1Affine, G1Projective};
 use ark_ec::{Group, VariableBaseMSM};
 use ark_ff::{Field, PrimeField, Zero};
+use rayon::prelude::*;
 use sha3::{Digest, Sha3_256};
 
 use crate::{field::F, poly::DenseMLPoly, transcript::Transcript};
@@ -79,6 +80,7 @@ pub fn hyrax_commit(evals: &[F], nu: usize, params: &HyraxParams) -> HyraxCommit
     assert_eq!(evals.len(), num_rows * num_cols, "eval length mismatch");
 
     let row_coms = (0..num_rows)
+        .into_par_iter()
         .map(|i| msm(&params.gens, &evals[i * num_cols..(i + 1) * num_cols]))
         .collect();
 
@@ -117,13 +119,14 @@ pub fn hyrax_open(evals: &[F], point: &[F], nu: usize, sigma: usize) -> HyraxPro
     let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
     let l_vec = lagrange_basis(&r_l_rev);
 
-    let mut w_prime = vec![F::ZERO; num_cols];
-    for (i, &l_i) in l_vec.iter().enumerate() {
-        let row = &evals[i * num_cols..(i + 1) * num_cols];
-        for (j, &m_ij) in row.iter().enumerate() {
-            w_prime[j] += l_i * m_ij;
-        }
-    }
+    let w_prime: Vec<F> = (0..num_cols)
+        .into_par_iter()
+        .map(|j| {
+            l_vec.iter().enumerate()
+                .map(|(i, &l_i)| l_i * evals[i * num_cols + j])
+                .sum()
+        })
+        .collect();
 
     HyraxProof { w_prime }
 }

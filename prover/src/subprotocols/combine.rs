@@ -14,6 +14,7 @@ use crate::poly::DenseMLPoly;
 use crate::subprotocols::sumcheck::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
 use ark_ff::{One, Zero};
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -66,14 +67,24 @@ pub fn prove_combine(
         .sum();
 
     // Build G polynomial: G(x) = Σ_i weights[i] · eq(z_i, x)
-    let mut g_evals = vec![F::zero(); n];
-    for (i, claim) in claims.iter().enumerate() {
-        let rev_point: Vec<F> = claim.point.iter().cloned().rev().collect();
-        let eq_at_zi = compute_eq_evals(&rev_point, n);
-        for (j, &eq_j) in eq_at_zi.iter().enumerate().take(n) {
-            g_evals[j] += weights[i] * eq_j;
-        }
-    }
+    // Pre-compute each claim's eq table sequentially (few claims), then accumulate in parallel.
+    let eq_arrays: Vec<Vec<F>> = claims
+        .iter()
+        .map(|claim| {
+            let rev_point: Vec<F> = claim.point.iter().cloned().rev().collect();
+            compute_eq_evals(&rev_point, n)
+        })
+        .collect();
+    let g_evals: Vec<F> = (0..n)
+        .into_par_iter()
+        .map(|j| {
+            eq_arrays
+                .iter()
+                .zip(weights.iter())
+                .map(|(eq_arr, &w)| w * eq_arr[j])
+                .sum()
+        })
+        .collect();
     let g_poly = DenseMLPoly::from_vec_padded(g_evals);
     let f_poly = DenseMLPoly::new(f_evals.to_vec());
 

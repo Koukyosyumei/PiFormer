@@ -20,6 +20,7 @@
 //! over BN254 G1, with O(√N) proof size and O(√N) verifier work.
 
 use crate::field::{eq_eval, index_to_bits, F};
+use rayon::prelude::*;
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch,
     HyraxCommitment, HyraxParams, HyraxProof,
@@ -123,21 +124,27 @@ pub fn prove_lasso(
     for k in 0..c {
         let t_poly = DenseMLPoly::new(instance.tables[k].clone());
 
-        // Build selector polynomial L_k as a dense MLE
+        // Build selector polynomial L_k as a dense MLE.
+        // Each x ∈ [size] is independent — compute in parallel over x.
         let size = 1usize << m;
-        let mut l_evals = vec![F::ZERO; size];
-        for j in 0..n {
-            let ch = chunk(instance.query_indices[j], k, m, mask);
-            for x in 0..size {
-                let mut eq_val = F::ONE;
-                for bit in 0..m {
-                    let a = F::from(((ch >> bit) & 1) as u64);
-                    let b = F::from(((x >> bit) & 1) as u64);
-                    eq_val *= a * b + (F::ONE - a) * (F::ONE - b);
-                }
-                l_evals[x] += rho_pows[j] * eq_val;
-            }
-        }
+        let l_evals: Vec<F> = (0..size)
+            .into_par_iter()
+            .map(|x| {
+                (0..n)
+                    .map(|j| {
+                        let ch = chunk(instance.query_indices[j], k, m, mask);
+                        let eq_val: F = (0..m)
+                            .map(|bit| {
+                                let a = F::from(((ch >> bit) & 1) as u64);
+                                let b = F::from(((x >> bit) & 1) as u64);
+                                a * b + (F::ONE - a) * (F::ONE - b)
+                            })
+                            .product();
+                        rho_pows[j] * eq_val
+                    })
+                    .sum()
+            })
+            .collect();
         let l_poly = DenseMLPoly::new(l_evals);
 
         // Claimed sum for this sub-table

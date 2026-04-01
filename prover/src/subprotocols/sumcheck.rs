@@ -13,6 +13,7 @@ use crate::field::F;
 use crate::poly::DenseMLPoly;
 use crate::transcript::Transcript;
 use ark_ff::Field;
+use rayon::prelude::*;
 
 /// A round polynomial g_i(X) given by its values at X = 0, 1, 2.
 #[derive(Clone, Debug)]
@@ -70,23 +71,25 @@ pub fn prove_sumcheck(
     let mut round_polys = Vec::with_capacity(n);
     let mut challenges = Vec::with_capacity(n);
 
+    let two = F::from(2u64);
     for _ in 0..n {
         let half = f_cur.evaluations.len() >> 1;
 
-        // g_i(0) = Σ_{x2,...} f(0, x2,...) · g(0, x2,...)
+        // g_i(0), g_i(1), g_i(2) are independent — compute in parallel.
         let e0: F = (0..half)
+            .into_par_iter()
             .map(|i| f_cur.evaluations[i] * g_cur.evaluations[i])
             .sum();
 
-        // g_i(1) = Σ_{x2,...} f(1, x2,...) · g(1, x2,...)
         let e1: F = (0..half)
+            .into_par_iter()
             .map(|i| f_cur.evaluations[i + half] * g_cur.evaluations[i + half])
             .sum();
 
         // g_i(2): extrapolate each to x=2 then multiply
         // f(2, x2,...) = 2·f(1,x2,...) - f(0,x2,...) (linear extrapolation)
-        let two = F::from(2u64);
         let e2: F = (0..half)
+            .into_par_iter()
             .map(|i| {
                 let f2 = two * f_cur.evaluations[i + half] - f_cur.evaluations[i];
                 let g2 = two * g_cur.evaluations[i + half] - g_cur.evaluations[i];
