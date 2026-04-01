@@ -16,7 +16,10 @@
 //! **Self-contained:** uses its own tiny HyraxParams (sigma=1, 2 generators).
 
 use crate::field::F;
-use crate::lookup::lasso::{prove_lasso, verify_lasso, LassoInstance, LassoProof};
+use crate::lookup::lasso::{
+    precommit_lasso_tables, prove_lasso, verify_lasso,
+    LassoInstance, LassoProof,
+};
 use crate::pcs::HyraxParams;
 use crate::transcript::Transcript;
 use ark_ff::{Field, PrimeField};
@@ -37,7 +40,8 @@ pub fn prove_ternary_weights(
     transcript: &mut Transcript,
 ) -> TernaryWeightProof {
     let (lasso_inst, params) = build_lasso_instance(inst);
-    let lasso_proof = prove_lasso(&lasso_inst, transcript, &params);
+    let pk = precommit_lasso_tables(&lasso_inst.tables, lasso_inst.bits_per_chunk, &params);
+    let lasso_proof = prove_lasso(&lasso_inst, &pk, transcript, &params);
     TernaryWeightProof { lasso_proof }
 }
 
@@ -47,7 +51,9 @@ pub fn verify_ternary_weights(
     transcript: &mut Transcript,
 ) -> Result<(), String> {
     let (lasso_inst, params) = build_lasso_instance(inst);
-    verify_lasso(&proof.lasso_proof, &lasso_inst, transcript, &params)
+    let pk = precommit_lasso_tables(&lasso_inst.tables, lasso_inst.bits_per_chunk, &params);
+    let vk = pk.vk();
+    verify_lasso(&proof.lasso_proof, &lasso_inst, &vk, transcript, &params)
 }
 
 // ---------------------------------------------------------------------------

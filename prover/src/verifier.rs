@@ -11,7 +11,9 @@ use crate::pcs::{absorb_com, HyraxCommitment, HyraxParams};
 use crate::transcript::Transcript;
 
 // Sub-module keys and verifiers
-use crate::attention::attention::{verify_linear_attention, LinearAttentionInstance};
+use crate::attention::attention::{
+    verify_linear_attention, AttentionProvingKey, LinearAttentionInstance,
+};
 use crate::attention::layernorm::{
     verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey,
 };
@@ -50,6 +52,7 @@ pub struct TransformerBlockVerifyingKey {
     pub v_pk: ProjectionProvingKey,
     pub o_pk: ProjectionProvingKey,
     pub ffn_pk: FFNProvingKey,
+    pub attn_pk: AttentionProvingKey,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +109,7 @@ pub fn verify_transformer_block(
     verify_linear_attention(
         &proof.attn_proof,
         inst_attn,
+        &vk.attn_pk.vk(),
         &attn_io,
         transcript,
         lasso_params,

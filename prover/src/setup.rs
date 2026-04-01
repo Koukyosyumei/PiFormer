@@ -4,10 +4,13 @@
 //! 高コストなO(N)のコミットメント計算（hyrax_commit）を行います。
 //! 生成された `VerifyingKey` は非常に小さく、スマートコントラクトやスマホに配布されます。
 
+use crate::attention::attention::precommit_attention_tables;
 use crate::attention::layernorm::LayerNormVerifyingKey;
-use crate::attention::projection::{preprocess_projection, ProjectionProvingKey};
+use crate::attention::projection::preprocess_projection;
 use crate::ffn::ffn::preprocess_ffn;
 use crate::field::F;
+use crate::lookup::lasso::LassoInstance;
+use crate::pcs::HyraxParams;
 use crate::poly::utils::TernaryValue;
 use crate::prover::{TransformerModelProvingKey, TransformerModelVerifyingKey};
 use crate::verifier::TransformerBlockVerifyingKey;
@@ -40,6 +43,13 @@ pub struct TransformerBlockWeights {
     // FFN
     pub ffn_w1: Vec<Vec<TernaryValue>>, // d_model × d_ff
     pub ffn_w2: Vec<Vec<TernaryValue>>, // d_ff × d_model
+    // FFN activation function table
+    pub ffn_activation_tables: Vec<Vec<F>>,
+    pub ffn_activation_bits_per_chunk: usize,
+    // Q and K activation tables
+    pub q_activation_tables: Vec<Vec<F>>,
+    pub k_activation_tables: Vec<Vec<F>>,
+    pub qk_activation_bits_per_chunk: usize,
 }
 
 /// モデル全体の生の重み
@@ -68,6 +78,7 @@ pub struct TransformerModelWeights {
 pub fn preprocess_transformer_model(
     weights: TransformerModelWeights,
     seq_len: usize,
+    lasso_params: &HyraxParams,
 ) -> TransformerModelProvingKey {
     let t = seq_len;
     let d = weights.d_model;
@@ -107,7 +118,28 @@ pub fn preprocess_transformer_model(
         let o_pk = preprocess_projection(t, d, d, bw.o_w.clone(), bw.o_alpha, bw.o_bias.clone());
 
         // --- FFNの事前計算 ---
-        let ffn_pk = preprocess_ffn(t, d, f_dim, bw.ffn_w1.clone(), bw.ffn_w2.clone());
+        let ffn_pk = preprocess_ffn(
+            t, d, f_dim,
+            bw.ffn_w1.clone(), bw.ffn_w2.clone(),
+            bw.ffn_activation_tables.clone(),
+            bw.ffn_activation_bits_per_chunk,
+            lasso_params,
+        );
+
+        // --- Attention activation tables precommitment ---
+        let q_lasso_dummy = LassoInstance {
+            tables: bw.q_activation_tables.clone(),
+            query_indices: vec![],
+            outputs: vec![],
+            bits_per_chunk: bw.qk_activation_bits_per_chunk,
+        };
+        let k_lasso_dummy = LassoInstance {
+            tables: bw.k_activation_tables.clone(),
+            query_indices: vec![],
+            outputs: vec![],
+            bits_per_chunk: bw.qk_activation_bits_per_chunk,
+        };
+        let attn_pk = precommit_attention_tables(&q_lasso_dummy, &k_lasso_dummy, lasso_params);
 
         // ブロックごとのVKを組み立て
         let block_vk = TransformerBlockVerifyingKey {
@@ -126,6 +158,7 @@ pub fn preprocess_transformer_model(
             v_pk,
             o_pk,
             ffn_pk,
+            attn_pk,
         };
 
         block_vks.push(block_vk.clone());

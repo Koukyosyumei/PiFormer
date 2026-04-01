@@ -36,7 +36,9 @@ fn zeros_vec(n: usize) -> Vec<F> {
     vec![F::ZERO; n]
 }
 
-fn make_block(d_model: usize, d_ff: usize) -> TransformerBlockWeights {
+fn make_block(d_model: usize, d_ff: usize, m_bits: usize) -> TransformerBlockWeights {
+    let table_size = 1usize << m_bits;
+    let dummy_table = vec![vec![F::ZERO; table_size]];
     TransformerBlockWeights {
         ln1_gamma: vec![F::from(2u64); d_model],
         ln1_beta: vec![F::from(5u64); d_model],
@@ -56,6 +58,11 @@ fn make_block(d_model: usize, d_ff: usize) -> TransformerBlockWeights {
         ln2_beta: vec![F::from(5u64); d_model],
         ffn_w1: zero_ternary_mat(d_model, d_ff),
         ffn_w2: zero_ternary_mat(d_ff, d_model),
+        ffn_activation_tables: dummy_table.clone(),
+        ffn_activation_bits_per_chunk: m_bits,
+        q_activation_tables: dummy_table.clone(),
+        k_activation_tables: dummy_table.clone(),
+        qk_activation_bits_per_chunk: m_bits,
     }
 }
 
@@ -71,7 +78,7 @@ pub fn build_zero_weights(
         d_model,
         d_ff,
         vocab_size,
-        blocks: (0..num_blocks).map(|_| make_block(d_model, d_ff)).collect(),
+        blocks: (0..num_blocks).map(|_| make_block(d_model, d_ff, 4)).collect(),
         final_ln_gamma: vec![F::from(2u64); d_model],
         final_ln_beta: vec![F::from(5u64); d_model],
         lm_head_w: zero_ternary_mat(d_model, vocab_size),

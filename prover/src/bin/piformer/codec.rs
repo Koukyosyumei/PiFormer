@@ -13,8 +13,8 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate
 use piformer_prover::{
     attention::{
         attention::{
-            AttentionInternalCommitments, AttentionOpenings, LinearAttentionInstance,
-            LinearAttentionProof,
+            AttentionInternalCommitments, AttentionOpenings, AttentionProvingKey,
+            AttentionVerifyingKey, LinearAttentionInstance, LinearAttentionProof,
         },
         layernorm::{
             LayerNormInternalCommitments, LayerNormOpenings, LayerNormProof, LayerNormVerifyingKey,
@@ -27,7 +27,10 @@ use piformer_prover::{
         FFNInstance, FFNInternalCommitments, FFNOpenings, FFNProof, FFNProvingKey, FFNVerifyingKey,
     },
     lookup::{
-        lasso::{LassoInstance, LassoProof},
+        lasso::{
+            LassoInstance, LassoMultiProof, LassoMultiProvingKey, LassoMultiVerifyingKey,
+            LassoProof, LassoProvingKey, LassoVerifyingKey,
+        },
         range::RangeProof,
     },
     pcs::{HyraxCommitment, HyraxProof},
@@ -36,7 +39,7 @@ use piformer_prover::{
         TransformerBlockProof, TransformerModelProof, TransformerModelProvingKey,
         TransformerModelVerifyingKey,
     },
-    subprotocols::sumcheck::{RoundPoly, SumcheckProof},
+    subprotocols::sumcheck::{RoundPoly, SumcheckProof, SumcheckProofMulti},
     verifier::TransformerBlockVerifyingKey,
     F,
 };
@@ -243,7 +246,6 @@ fn write_lasso_proof<W: Write>(w: &mut W, p: &LassoProof) -> io::Result<()> {
     write_vec_f(w, &p.sub_claims)?;
     write_vec(w, &p.sumcheck_proofs, write_sumcheck_proof)?;
     write_vec_f(w, &p.table_openings)?;
-    write_vec(w, &p.hyrax_commitments, write_hyrax_commitment)?;
     write_vec(w, &p.hyrax_proofs, write_hyrax_proof)
 }
 fn read_lasso_proof<R: Read>(r: &mut R) -> io::Result<LassoProof> {
@@ -251,8 +253,35 @@ fn read_lasso_proof<R: Read>(r: &mut R) -> io::Result<LassoProof> {
         sub_claims: read_vec_f(r)?,
         sumcheck_proofs: read_vec(r, read_sumcheck_proof)?,
         table_openings: read_vec_f(r)?,
-        hyrax_commitments: read_vec(r, read_hyrax_commitment)?,
         hyrax_proofs: read_vec(r, read_hyrax_proof)?,
+    })
+}
+
+fn write_sumcheck_proof_multi<W: Write>(w: &mut W, p: &SumcheckProofMulti) -> io::Result<()> {
+    write_vec(w, &p.round_polys, write_round_poly)?;
+    write_vec_f(w, &p.final_evals_f)?;
+    write_vec_f(w, &p.final_evals_g)
+}
+fn read_sumcheck_proof_multi<R: Read>(r: &mut R) -> io::Result<SumcheckProofMulti> {
+    Ok(SumcheckProofMulti {
+        round_polys: read_vec(r, read_round_poly)?,
+        final_evals_f: read_vec_f(r)?,
+        final_evals_g: read_vec_f(r)?,
+    })
+}
+
+fn write_lasso_multi_proof<W: Write>(w: &mut W, p: &LassoMultiProof) -> io::Result<()> {
+    write_f(w, &p.combined_grand_sum)?;
+    write_sumcheck_proof_multi(w, &p.combined_sumcheck_proof)?;
+    write_vec(w, &p.table_openings, |w, v: &Vec<F>| write_vec_f(w, v))?;
+    write_hyrax_proof(w, &p.hyrax_proof)
+}
+fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
+    Ok(LassoMultiProof {
+        combined_grand_sum: read_f(r)?,
+        combined_sumcheck_proof: read_sumcheck_proof_multi(r)?,
+        table_openings: read_vec(r, |r| read_vec_f(r))?,
+        hyrax_proof: read_hyrax_proof(r)?,
     })
 }
 
@@ -478,8 +507,7 @@ fn read_attn_openings<R: Read>(r: &mut R) -> io::Result<AttentionOpenings> {
 
 fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result<()> {
     write_attn_internal_coms(w, &p.internal_coms)?;
-    write_lasso_proof(w, &p.phi_q_lasso)?;
-    write_lasso_proof(w, &p.phi_k_lasso)?;
+    write_lasso_multi_proof(w, &p.qk_lasso)?;
     write_sumcheck_proof(w, &p.out_sumcheck)?;
     write_sumcheck_proof(w, &p.context_sumcheck)?;
     write_attn_openings(w, &p.openings)
@@ -487,8 +515,7 @@ fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result
 fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
     Ok(LinearAttentionProof {
         internal_coms: read_attn_internal_coms(r)?,
-        phi_q_lasso: read_lasso_proof(r)?,
-        phi_k_lasso: read_lasso_proof(r)?,
+        qk_lasso: read_lasso_multi_proof(r)?,
         out_sumcheck: read_sumcheck_proof(r)?,
         context_sumcheck: read_sumcheck_proof(r)?,
         openings: read_attn_openings(r)?,
@@ -719,12 +746,68 @@ fn read_proj_pk<R: Read>(r: &mut R) -> io::Result<ProjectionProvingKey> {
     })
 }
 
+fn write_lasso_vk<W: Write>(w: &mut W, vk: &LassoVerifyingKey) -> io::Result<()> {
+    write_vec(w, &vk.table_coms, write_hyrax_commitment)
+}
+fn read_lasso_vk<R: Read>(r: &mut R) -> io::Result<LassoVerifyingKey> {
+    Ok(LassoVerifyingKey {
+        table_coms: read_vec(r, read_hyrax_commitment)?,
+    })
+}
+
+fn write_lasso_pk<W: Write>(w: &mut W, pk: &LassoProvingKey) -> io::Result<()> {
+    write_usize(w, pk.nu)?;
+    write_vec(w, &pk.table_coms, write_hyrax_commitment)
+}
+fn read_lasso_pk<R: Read>(r: &mut R) -> io::Result<LassoProvingKey> {
+    let nu = read_usize(r)?;
+    Ok(LassoProvingKey {
+        nu,
+        table_coms: read_vec(r, read_hyrax_commitment)?,
+    })
+}
+
+fn write_lasso_multi_vk<W: Write>(w: &mut W, vk: &LassoMultiVerifyingKey) -> io::Result<()> {
+    write_vec(w, &vk.instance_table_coms, |w, v: &Vec<HyraxCommitment>| {
+        write_vec(w, v, write_hyrax_commitment)
+    })
+}
+fn read_lasso_multi_vk<R: Read>(r: &mut R) -> io::Result<LassoMultiVerifyingKey> {
+    Ok(LassoMultiVerifyingKey {
+        instance_table_coms: read_vec(r, |r| read_vec(r, read_hyrax_commitment))?,
+    })
+}
+
+fn write_lasso_multi_pk<W: Write>(w: &mut W, pk: &LassoMultiProvingKey) -> io::Result<()> {
+    write_usize(w, pk.nu)?;
+    write_vec(w, &pk.instance_table_coms, |w, v: &Vec<HyraxCommitment>| {
+        write_vec(w, v, write_hyrax_commitment)
+    })
+}
+fn read_lasso_multi_pk<R: Read>(r: &mut R) -> io::Result<LassoMultiProvingKey> {
+    let nu = read_usize(r)?;
+    Ok(LassoMultiProvingKey {
+        nu,
+        instance_table_coms: read_vec(r, |r| read_vec(r, read_hyrax_commitment))?,
+    })
+}
+
+fn write_attn_pk<W: Write>(w: &mut W, pk: &AttentionProvingKey) -> io::Result<()> {
+    write_lasso_multi_pk(w, &pk.qk_lasso_pk)
+}
+fn read_attn_pk<R: Read>(r: &mut R) -> io::Result<AttentionProvingKey> {
+    Ok(AttentionProvingKey {
+        qk_lasso_pk: read_lasso_multi_pk(r)?,
+    })
+}
+
 fn write_ffn_vk<W: Write>(w: &mut W, vk: &FFNVerifyingKey) -> io::Result<()> {
     write_usize(w, vk.seq_len)?;
     write_usize(w, vk.d_model)?;
     write_usize(w, vk.d_ff)?;
     write_hyrax_commitment(w, &vk.w1_com)?;
-    write_hyrax_commitment(w, &vk.w2_com)
+    write_hyrax_commitment(w, &vk.w2_com)?;
+    write_lasso_vk(w, &vk.activation_lasso_vk)
 }
 fn read_ffn_vk<R: Read>(r: &mut R) -> io::Result<FFNVerifyingKey> {
     Ok(FFNVerifyingKey {
@@ -733,19 +816,22 @@ fn read_ffn_vk<R: Read>(r: &mut R) -> io::Result<FFNVerifyingKey> {
         d_ff: read_usize(r)?,
         w1_com: read_hyrax_commitment(r)?,
         w2_com: read_hyrax_commitment(r)?,
+        activation_lasso_vk: read_lasso_vk(r)?,
     })
 }
 
 fn write_ffn_pk<W: Write>(w: &mut W, pk: &FFNProvingKey) -> io::Result<()> {
     write_ffn_vk(w, &pk.vk)?;
     write_vec_vec_t(w, &pk.w1)?;
-    write_vec_vec_t(w, &pk.w2)
+    write_vec_vec_t(w, &pk.w2)?;
+    write_lasso_pk(w, &pk.activation_lasso_pk)
 }
 fn read_ffn_pk<R: Read>(r: &mut R) -> io::Result<FFNProvingKey> {
     Ok(FFNProvingKey {
         vk: read_ffn_vk(r)?,
         w1: read_vec_vec_t(r)?,
         w2: read_vec_vec_t(r)?,
+        activation_lasso_pk: read_lasso_pk(r)?,
     })
 }
 
@@ -764,6 +850,8 @@ fn write_block_vk<W: Write>(
     write_proj_vk(w, &bvk.o_vk)?;
     write_ln_vk(w, &bvk.ln2_vk)?;
     write_ffn_vk(w, &bvk.ffn_vk)?;
+    // Always write attn_pk commitments: verifier needs them to replay transcript.
+    write_attn_pk(w, &bvk.attn_pk)?;
     write_bool(w, include_weights)?;
     if include_weights {
         write_proj_pk(w, &bvk.q_pk)?;
@@ -784,6 +872,8 @@ fn read_block_vk<R: Read>(r: &mut R) -> io::Result<TransformerBlockVerifyingKey>
     let o_vk = read_proj_vk(r)?;
     let ln2_vk = read_ln_vk(r)?;
     let ffn_vk = read_ffn_vk(r)?;
+    // attn_pk commitments are always present (needed by verifier to replay transcript).
+    let attn_pk = read_attn_pk(r)?;
     let has_weights = read_bool(r)?;
     let (q_pk, k_pk, v_pk, o_pk, ffn_pk) = if has_weights {
         (
@@ -804,6 +894,8 @@ fn read_block_vk<R: Read>(r: &mut R) -> io::Result<TransformerBlockVerifyingKey>
             vk: vk.clone(),
             w1: vec![],
             w2: vec![],
+            // activation_lasso_pk not needed for verification (verifier uses vk.activation_lasso_vk)
+            activation_lasso_pk: LassoProvingKey { table_coms: vec![], nu: 0 },
         };
         (
             stub_proj(&q_vk),
@@ -828,6 +920,7 @@ fn read_block_vk<R: Read>(r: &mut R) -> io::Result<TransformerBlockVerifyingKey>
         v_pk,
         o_pk,
         ffn_pk,
+        attn_pk,
     })
 }
 

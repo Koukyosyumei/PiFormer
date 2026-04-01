@@ -183,7 +183,8 @@ fn run_setup(weights_path: &Path, seq_len: usize, pk_path: &Path, vk_path: &Path
     // Preprocess (offline Hyrax commitment phase)
     eprint!("  Preprocessing (offline commitment phase) ... ");
     let t0 = Instant::now();
-    let pk = preprocess_transformer_model(weights, seq_len);
+    let lasso_params = HyraxParams::new(2); // default sigma=2 (4-bit tables)
+    let pk = preprocess_transformer_model(weights, seq_len, &lasso_params);
     eprintln!("done ({:.2}s)", t0.elapsed().as_secs_f64());
 
     // Write verifying key (slim — no raw weights)

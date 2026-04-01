@@ -14,7 +14,11 @@
 //!   4. out[t][j]     = Σ_i phi_q[t][i] · context[i][j] (Sumcheck)
 
 use crate::field::F;
-use crate::lookup::lasso::{prove_lasso, verify_lasso, LassoInstance, LassoProof};
+use crate::lookup::lasso::{
+    precommit_lasso_multi_tables, prove_lasso_multi, verify_lasso_multi,
+    LassoInstance, LassoMultiInstance, LassoMultiProof,
+    LassoMultiProvingKey, LassoMultiVerifyingKey,
+};
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_n, poly_hyrax, HyraxCommitment,
     HyraxParams, HyraxProof,
@@ -23,6 +27,45 @@ use crate::poly::utils::{combine, eval_cols, eval_rows, mat_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::{challenge_vec, Transcript};
+
+// ---------------------------------------------------------------------------
+// Pipeline Keys (Setup Phase)
+// ---------------------------------------------------------------------------
+
+/// Precomputed Lasso keys for Q and K activation tables (computed at setup).
+#[derive(Clone)]
+pub struct AttentionProvingKey {
+    pub qk_lasso_pk: LassoMultiProvingKey,
+}
+
+impl AttentionProvingKey {
+    pub fn vk(&self) -> AttentionVerifyingKey {
+        AttentionVerifyingKey { qk_lasso_vk: self.qk_lasso_pk.vk() }
+    }
+}
+
+/// Verifier-side key for attention activations.
+#[derive(Clone)]
+pub struct AttentionVerifyingKey {
+    pub qk_lasso_vk: LassoMultiVerifyingKey,
+}
+
+/// Precommit Q and K activation tables at setup time.
+pub fn precommit_attention_tables(
+    q_lasso: &LassoInstance,
+    k_lasso: &LassoInstance,
+    params: &HyraxParams,
+) -> AttentionProvingKey {
+    let multi_inst = LassoMultiInstance {
+        instances: vec![q_lasso.clone(), k_lasso.clone()],
+    };
+    let qk_lasso_pk = precommit_lasso_multi_tables(
+        &multi_inst,
+        q_lasso.bits_per_chunk,
+        params,
+    );
+    AttentionProvingKey { qk_lasso_pk }
+}
 
 // ---------------------------------------------------------------------------
 // Pipeline Interfaces (Strictly Enforced Boundaries)
@@ -82,8 +125,8 @@ pub struct AttentionOpenings {
 
 pub struct LinearAttentionProof {
     pub internal_coms: AttentionInternalCommitments,
-    pub phi_q_lasso: LassoProof,
-    pub phi_k_lasso: LassoProof,
+    /// Batched Lasso proof for phi_q and phi_k activations.
+    pub qk_lasso: LassoMultiProof,
     pub out_sumcheck: SumcheckProof,
     pub context_sumcheck: SumcheckProof,
     pub openings: AttentionOpenings,
@@ -96,6 +139,7 @@ pub struct LinearAttentionProof {
 pub fn prove_linear_attention(
     witness: &LinearAttentionWitness,
     inst: &LinearAttentionInstance,
+    pk: &AttentionProvingKey,
     io_coms: &AttentionIOCommitments,
     transcript: &mut Transcript,
     lasso_params: &HyraxParams,
@@ -128,9 +172,11 @@ pub fn prove_linear_attention(
     absorb_com(transcript, b"phi_k_com", &phi_k_com);
     absorb_com(transcript, b"context_com", &context_com);
 
-    // 2. Lasso
-    let phi_q_lasso = prove_lasso(&inst.q_lasso, transcript, lasso_params);
-    let phi_k_lasso = prove_lasso(&inst.k_lasso, transcript, lasso_params);
+    // 2. Batched Lasso for phi_q and phi_k activations
+    let qk_multi = LassoMultiInstance {
+        instances: vec![inst.q_lasso.clone(), inst.k_lasso.clone()],
+    };
+    let qk_lasso = prove_lasso_multi(&qk_multi, &pk.qk_lasso_pk, transcript, lasso_params);
 
     // 3. Sumcheck for OUT
     let rx = challenge_vec(transcript, t_bits, b"rx_out");
@@ -172,8 +218,7 @@ pub fn prove_linear_attention(
             phi_k_com,
             context_com,
         },
-        phi_q_lasso,
-        phi_k_lasso,
+        qk_lasso,
         out_sumcheck,
         context_sumcheck,
         openings: AttentionOpenings {
@@ -203,6 +248,7 @@ pub fn prove_linear_attention(
 pub fn verify_linear_attention(
     proof: &LinearAttentionProof,
     inst: &LinearAttentionInstance,
+    vk: &AttentionVerifyingKey,
     io_coms: &AttentionIOCommitments, // Trusted inputs from pipeline!
     transcript: &mut Transcript,
     lasso_params: &HyraxParams,
@@ -227,13 +273,12 @@ pub fn verify_linear_attention(
     absorb_com(transcript, b"phi_k_com", &proof.internal_coms.phi_k_com);
     absorb_com(transcript, b"context_com", &proof.internal_coms.context_com);
 
-    // 2. Lasso Verification (Crucial: Binds IO com to Internal com)
-    // Note: In a fully integrated Lasso setup, verify_lasso asserts that
-    // output_com == phi_q_com and query_com == q_com.
-    verify_lasso(&proof.phi_q_lasso, &inst.q_lasso, transcript, lasso_params)
-        .map_err(|e| format!("phi_q lasso: {e}"))?;
-    verify_lasso(&proof.phi_k_lasso, &inst.k_lasso, transcript, lasso_params)
-        .map_err(|e| format!("phi_k lasso: {e}"))?;
+    // 2. Batched Lasso Verification for phi_q and phi_k
+    let qk_multi = LassoMultiInstance {
+        instances: vec![inst.q_lasso.clone(), inst.k_lasso.clone()],
+    };
+    verify_lasso_multi(&proof.qk_lasso, &qk_multi, &vk.qk_lasso_vk, transcript, lasso_params)
+        .map_err(|e| format!("qk batched lasso: {e}"))?;
 
     // 3. Replay challenges
     let rx = challenge_vec(transcript, t_bits, b"rx_out");
@@ -328,6 +373,7 @@ mod linear_attention_tests {
         LinearAttentionWitness,
         LinearAttentionInstance,
         AttentionIOCommitments,
+        AttentionProvingKey,
     ) {
         let m = 4usize;
         let table_size = 1 << m;
@@ -437,7 +483,10 @@ mod linear_attention_tests {
             out_com,
         };
 
-        (witness, inst, io_coms)
+        let lp = lasso_params();
+        let pk = precommit_attention_tables(&inst.q_lasso, &inst.k_lasso, &lp);
+
+        (witness, inst, io_coms, pk)
     }
 
     fn lasso_params() -> HyraxParams {
@@ -446,16 +495,17 @@ mod linear_attention_tests {
 
     #[test]
     fn test_linear_attention_succinct_e2e_success() {
-        let (witness, inst, io_coms) = setup_test_pipeline(2, 2);
+        let (witness, inst, io_coms, pk) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
+        let vk = pk.vk();
 
         // 1. Prover generates the proof using Witness + IO Coms
         let mut pt = Transcript::new(b"linear_attn_test");
-        let proof = prove_linear_attention(&witness, &inst, &io_coms, &mut pt, &lp);
+        let proof = prove_linear_attention(&witness, &inst, &pk, &io_coms, &mut pt, &lp);
 
         // 2. Verifier checks the proof strictly in O(√N) using ONLY IO Coms
         let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt, &lp);
+        let result = verify_linear_attention(&proof, &inst, &vk, &io_coms, &mut vt, &lp);
         assert!(
             result.is_ok(),
             "Succinct verification failed: {:?}",
@@ -471,24 +521,26 @@ mod linear_attention_tests {
 
     #[test]
     fn test_rejects_tampered_context_matrix() {
-        let (mut witness, inst, io_coms) = setup_test_pipeline(2, 2);
+        let (mut witness, inst, io_coms, pk) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
+        let vk = pk.vk();
 
         // Tamper context: Breaks the Sumcheck mathematical relationship
         witness.context[0][0] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_tamper_ctx");
-        let proof = prove_linear_attention(&witness, &inst, &io_coms, &mut pt, &lp);
+        let proof = prove_linear_attention(&witness, &inst, &pk, &io_coms, &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_tamper_ctx");
-        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt, &lp);
+        let result = verify_linear_attention(&proof, &inst, &vk, &io_coms, &mut vt, &lp);
         assert!(result.is_err(), "should reject tampered context");
     }
 
     #[test]
     fn test_rejects_tampered_out_matrix() {
-        let (mut witness, inst, io_coms) = setup_test_pipeline(2, 2);
+        let (mut witness, inst, io_coms, pk) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
+        let vk = pk.vk();
 
         // Tamper out: The Prover computes Sumcheck with a fake out matrix.
         // The Verifier checks the final Opening against `io_coms.out_com`,
@@ -496,10 +548,10 @@ mod linear_attention_tests {
         witness.out[1][1] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_test");
-        let proof = prove_linear_attention(&witness, &inst, &io_coms, &mut pt, &lp);
+        let proof = prove_linear_attention(&witness, &inst, &pk, &io_coms, &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt, &lp);
+        let result = verify_linear_attention(&proof, &inst, &vk, &io_coms, &mut vt, &lp);
         assert!(
             result.is_err(),
             "should reject tampered out opening against IO commitment"
@@ -508,34 +560,36 @@ mod linear_attention_tests {
 
     #[test]
     fn test_rejects_tampered_phi_q_matrix() {
-        let (mut witness, inst, io_coms) = setup_test_pipeline(2, 2);
+        let (mut witness, inst, io_coms, pk) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
+        let vk = pk.vk();
 
         // Tamper phi_q: Breaks Lasso lookup consistency
         witness.phi_q[1][0] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_test");
-        let proof = prove_linear_attention(&witness, &inst, &io_coms, &mut pt, &lp);
+        let proof = prove_linear_attention(&witness, &inst, &pk, &io_coms, &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt, &lp);
+        let result = verify_linear_attention(&proof, &inst, &vk, &io_coms, &mut vt, &lp);
         assert!(result.is_err(), "should reject tampered phi_q");
     }
 
     #[test]
     fn test_rejects_tampered_v_matrix() {
-        let (mut witness, inst, io_coms) = setup_test_pipeline(2, 2);
+        let (mut witness, inst, io_coms, pk) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
+        let vk = pk.vk();
 
         // Tamper v: Prover uses a fake V, but the proof will fail to verify
         // against the trusted external `io_coms.v_com`.
         witness.v[0][1] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_test");
-        let proof = prove_linear_attention(&witness, &inst, &io_coms, &mut pt, &lp);
+        let proof = prove_linear_attention(&witness, &inst, &pk, &io_coms, &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt, &lp);
+        let result = verify_linear_attention(&proof, &inst, &vk, &io_coms, &mut vt, &lp);
         assert!(
             result.is_err(),
             "should reject tampered v against IO commitment"

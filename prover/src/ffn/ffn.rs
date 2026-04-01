@@ -12,7 +12,10 @@
 //!   Y = A · W2        (Sumcheck 2)
 
 use crate::field::F;
-use crate::lookup::lasso::{prove_lasso, verify_lasso, LassoInstance, LassoProof};
+use crate::lookup::lasso::{
+    precommit_lasso_tables, prove_lasso, verify_lasso,
+    LassoInstance, LassoProof, LassoProvingKey, LassoVerifyingKey,
+};
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment,
     HyraxParams, HyraxProof,
@@ -40,6 +43,7 @@ pub struct FFNVerifyingKey {
     pub d_ff: usize,
     pub w1_com: HyraxCommitment,
     pub w2_com: HyraxCommitment,
+    pub activation_lasso_vk: LassoVerifyingKey,
 }
 
 /// Preprocessing Key for the Prover.
@@ -48,6 +52,7 @@ pub struct FFNProvingKey {
     pub vk: FFNVerifyingKey,
     pub w1: Vec<Vec<TernaryValue>>,
     pub w2: Vec<Vec<TernaryValue>>,
+    pub activation_lasso_pk: LassoProvingKey,
 }
 
 /// Private witness data. ONLY the Prover holds this.
@@ -72,6 +77,9 @@ pub fn preprocess_ffn(
     d_ff: usize,
     w1: Vec<Vec<TernaryValue>>,
     w2: Vec<Vec<TernaryValue>>,
+    activation_tables: Vec<Vec<F>>,
+    activation_bits_per_chunk: usize,
+    lasso_params: &HyraxParams,
 ) -> FFNProvingKey {
     let w1_mle = mat_to_mle(&convert_tm_to_fm(&w1), d_model, d_ff);
     let w2_mle = mat_to_mle(&convert_tm_to_fm(&w2), d_ff, d_model);
@@ -85,14 +93,18 @@ pub fn preprocess_ffn(
     let w1_com = hyrax_commit(&w1_mle.evaluations, nu_w1, &params_w1);
     let w2_com = hyrax_commit(&w2_mle.evaluations, nu_w2, &params_w2);
 
+    let activation_lasso_pk = precommit_lasso_tables(&activation_tables, activation_bits_per_chunk, lasso_params);
+    let activation_lasso_vk = activation_lasso_pk.vk();
+
     let vk = FFNVerifyingKey {
         seq_len,
         d_model,
         d_ff,
         w1_com,
         w2_com,
+        activation_lasso_vk,
     };
-    FFNProvingKey { vk, w1, w2 }
+    FFNProvingKey { vk, w1, w2, activation_lasso_pk }
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +185,7 @@ pub fn prove_ffn(
     absorb_com(transcript, b"a_com", &a_com);
 
     // 3. Lasso for A = φ(M)
-    let activation_proof = prove_lasso(&inst.activation_lasso, transcript, lasso_params);
+    let activation_proof = prove_lasso(&inst.activation_lasso, &pk.activation_lasso_pk, transcript, lasso_params);
 
     // 4. Sumcheck 1: Y = A · W2
     let rx_y = challenge_vec(transcript, t_bits, b"ffn_rx_y");
@@ -265,6 +277,7 @@ pub fn verify_ffn(
     verify_lasso(
         &proof.activation_proof,
         &inst.activation_lasso,
+        &vk.activation_lasso_vk,
         transcript,
         lasso_params,
     )
@@ -398,7 +411,7 @@ mod ffn_tests {
             }
         }
         let activation_lasso = LassoInstance {
-            tables: vec![table],
+            tables: vec![table.clone()],
             query_indices,
             outputs,
             bits_per_chunk: m_bits,
@@ -406,7 +419,7 @@ mod ffn_tests {
         let y = matmul(&a, &w2_f, t, f_dim, d);
 
         // 1. Offline Preprocessing
-        let pk = preprocess_ffn(t, d, f_dim, w1, w2);
+        let pk = preprocess_ffn(t, d, f_dim, w1, w2, vec![table.clone()], m_bits, &HyraxParams::new(m_bits / 2));
 
         // 2. IO Commitments from Pipeline
         let x_mle = mat_to_mle(&x, t, d);

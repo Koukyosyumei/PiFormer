@@ -149,6 +149,17 @@ pub struct JsonBlockWeights {
     pub ln2_beta: Vec<String>,
     pub ffn_w1: Vec<Vec<i8>>,
     pub ffn_w2: Vec<Vec<i8>>,
+    // Activation tables for Lasso precommitment at setup time
+    #[serde(default)]
+    pub ffn_activation_tables: Vec<Vec<String>>,
+    #[serde(default)]
+    pub ffn_activation_bits_per_chunk: usize,
+    #[serde(default)]
+    pub q_activation_tables: Vec<Vec<String>>,
+    #[serde(default)]
+    pub k_activation_tables: Vec<Vec<String>>,
+    #[serde(default)]
+    pub qk_activation_bits_per_chunk: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -206,6 +217,11 @@ pub fn weights_to_json(w: &TransformerModelWeights) -> JsonWeights {
             ln2_beta: vec_to_json(&b.ln2_beta),
             ffn_w1: ternary_mat_to_json(&b.ffn_w1),
             ffn_w2: ternary_mat_to_json(&b.ffn_w2),
+            ffn_activation_tables: mat_to_json(&b.ffn_activation_tables),
+            ffn_activation_bits_per_chunk: b.ffn_activation_bits_per_chunk,
+            q_activation_tables: mat_to_json(&b.q_activation_tables),
+            k_activation_tables: mat_to_json(&b.k_activation_tables),
+            qk_activation_bits_per_chunk: b.qk_activation_bits_per_chunk,
         })
         .collect();
     JsonWeights {
@@ -246,6 +262,11 @@ pub fn weights_from_json(j: JsonWeights) -> Result<TransformerModelWeights, Stri
                 ln2_beta: vec_from_json(b.ln2_beta)?,
                 ffn_w1: ternary_mat_from_json(b.ffn_w1)?,
                 ffn_w2: ternary_mat_from_json(b.ffn_w2)?,
+                ffn_activation_tables: mat_from_json(b.ffn_activation_tables)?,
+                ffn_activation_bits_per_chunk: b.ffn_activation_bits_per_chunk,
+                q_activation_tables: mat_from_json(b.q_activation_tables)?,
+                k_activation_tables: mat_from_json(b.k_activation_tables)?,
+                qk_activation_bits_per_chunk: b.qk_activation_bits_per_chunk,
             })
         })
         .collect();

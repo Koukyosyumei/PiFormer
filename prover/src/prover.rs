@@ -22,8 +22,8 @@ use crate::transcript::Transcript;
 
 // Sub-module imports (Assuming the interfaces we built previously)
 use crate::attention::attention::{
-    prove_linear_attention, AttentionIOCommitments, LinearAttentionInstance, LinearAttentionProof,
-    LinearAttentionWitness,
+    prove_linear_attention, AttentionIOCommitments,
+    LinearAttentionInstance, LinearAttentionProof, LinearAttentionWitness,
 };
 use crate::attention::layernorm::{
     prove_layernorm, LayerNormIOCommitments, LayerNormProof, LayerNormVerifyingKey,
@@ -154,6 +154,7 @@ pub fn prove_transformer_block(
     let attn_proof = prove_linear_attention(
         &witness.attn_wit,
         inst_attn,
+        &pk.attn_pk,
         &attn_io,
         transcript,
         lasso_params,
@@ -400,6 +401,7 @@ mod tests {
             lm_head_w[i][i] = TernaryValue::ONE;
         }
 
+        let identity_table: Vec<F> = (0u64..1 << M_BITS).map(F::from).collect();
         let block = TransformerBlockWeights {
             ln1_gamma: vec![F::from(2u64); D],
             ln1_beta: vec![F::from(5u64); D],
@@ -419,6 +421,11 @@ mod tests {
             ln2_beta: vec![F::from(5u64); D],
             ffn_w1,
             ffn_w2,
+            ffn_activation_tables: vec![identity_table.clone()],
+            ffn_activation_bits_per_chunk: M_BITS,
+            q_activation_tables: vec![identity_table.clone()],
+            k_activation_tables: vec![identity_table.clone()],
+            qk_activation_bits_per_chunk: M_BITS,
         };
 
         TransformerModelWeights {
@@ -703,7 +710,7 @@ mod tests {
     #[test]
     fn test_prove_verify_transformer_block_e2e() {
         let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let x_in_com = commit_mat_test(&witness.x_in, T, D);
@@ -746,7 +753,7 @@ mod tests {
     #[test]
     fn test_block_rejects_wrong_x_out_com() {
         let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let x_in_com = commit_mat_test(&witness.x_in, T, D);
@@ -791,7 +798,7 @@ mod tests {
     #[test]
     fn test_block_rejects_tampered_ln1_opening() {
         let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let x_in_com = commit_mat_test(&witness.x_in, T, D);
@@ -832,7 +839,7 @@ mod tests {
     #[test]
     fn test_block_rejects_tampered_x_norm1_com() {
         let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let x_in_com = commit_mat_test(&witness.x_in, T, D);
@@ -884,7 +891,7 @@ mod tests {
     fn test_prove_verify_full_model_e2e() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let mut pt = Transcript::new(b"model_e2e");
@@ -904,7 +911,7 @@ mod tests {
     fn test_model_rejects_tampered_block_proof() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let mut pt = Transcript::new(b"model_tamper_block");
@@ -922,7 +929,7 @@ mod tests {
     fn test_model_rejects_tampered_final_ln_proof() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let mut pt = Transcript::new(b"model_tamper_final_ln");
@@ -940,7 +947,7 @@ mod tests {
     fn test_model_rejects_tampered_lm_head_proof() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let mut pt = Transcript::new(b"model_tamper_lm");
@@ -959,7 +966,7 @@ mod tests {
     fn test_model_rejects_tampered_x_in_com() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
-        let pk = preprocess_transformer_model(build_test_weights(), T);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
         let mut pt = Transcript::new(b"model_tamper_xin");
