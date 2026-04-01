@@ -35,7 +35,9 @@ static HYRAX_PARAMS_CACHE: OnceLock<Mutex<HashMap<usize, HyraxParams>>> = OnceLo
 fn cached_hyrax_params(sigma: usize) -> HyraxParams {
     let cache = HYRAX_PARAMS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = cache.lock().unwrap();
-    map.entry(sigma).or_insert_with(|| HyraxParams::new(sigma)).clone()
+    map.entry(sigma)
+        .or_insert_with(|| HyraxParams::new(sigma))
+        .clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +138,9 @@ pub fn hyrax_open(evals: &[F], point: &[F], nu: usize, sigma: usize) -> HyraxPro
     let w_prime: Vec<F> = (0..num_cols)
         .into_par_iter()
         .map(|j| {
-            l_vec.iter().enumerate()
+            l_vec
+                .iter()
+                .enumerate()
                 .map(|(i, &l_i)| l_i * evals[i * num_cols + j])
                 .sum()
         })
