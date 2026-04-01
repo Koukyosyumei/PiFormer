@@ -14,7 +14,8 @@ use piformer_prover::{
     attention::{
         attention::{
             AttentionInternalCommitments, AttentionOpenings, AttentionProvingKey,
-            AttentionVerifyingKey, LinearAttentionInstance, LinearAttentionProof,
+            AttentionSumcheckProof, AttentionVerifyingKey, LinearAttentionInstance,
+            LinearAttentionProof,
         },
         layernorm::{
             LayerNormInternalCommitments, LayerNormOpenings, LayerNormProof, LayerNormVerifyingKey,
@@ -484,7 +485,6 @@ fn read_attn_internal_coms<R: Read>(r: &mut R) -> io::Result<AttentionInternalCo
 fn write_attn_openings<W: Write>(w: &mut W, o: &AttentionOpenings) -> io::Result<()> {
     write_ep!(w, &o.out_eval, &o.out_open);
     write_ep!(w, &o.phi_q_eval, &o.phi_q_open);
-    //write_ep!(w, &o.ctx_eval, &o.ctx_open);
     write_ep!(w, &o.phi_k_eval, &o.phi_k_open);
     write_ep!(w, &o.v_eval, &o.v_open);
     Ok(())
@@ -492,7 +492,6 @@ fn write_attn_openings<W: Write>(w: &mut W, o: &AttentionOpenings) -> io::Result
 fn read_attn_openings<R: Read>(r: &mut R) -> io::Result<AttentionOpenings> {
     let (out_eval, out_open) = read_ep!(r);
     let (phi_q_eval, phi_q_open) = read_ep!(r);
-    //let (ctx_eval, ctx_open) = read_ep!(r);
     let (phi_k_eval, phi_k_open) = read_ep!(r);
     let (v_eval, v_open) = read_ep!(r);
     Ok(AttentionOpenings {
@@ -509,15 +508,46 @@ fn read_attn_openings<R: Read>(r: &mut R) -> io::Result<AttentionOpenings> {
 
 fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result<()> {
     write_attn_internal_coms(w, &p.internal_coms)?;
-    write_sumcheck_proof(w, &p.out_sumcheck)?;
-    write_sumcheck_proof(w, &p.context_sumcheck)?;
+    match &p.sumcheck {
+        AttentionSumcheckProof::Batched { proof, ctx_eval } => {
+            w.write_all(&[0u8])?; // tag: Batched
+            write_sumcheck_proof_multi(w, proof)?;
+            write_f(w, ctx_eval)?;
+        }
+        AttentionSumcheckProof::Sequential {
+            out_sumcheck,
+            context_sumcheck,
+        } => {
+            w.write_all(&[1u8])?; // tag: Sequential
+            write_sumcheck_proof(w, out_sumcheck)?;
+            write_sumcheck_proof(w, context_sumcheck)?;
+        }
+    }
     write_attn_openings(w, &p.openings)
 }
 fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
+    let internal_coms = read_attn_internal_coms(r)?;
+    let mut tag = [0u8; 1];
+    r.read_exact(&mut tag)?;
+    let sumcheck = match tag[0] {
+        0 => AttentionSumcheckProof::Batched {
+            proof: read_sumcheck_proof_multi(r)?,
+            ctx_eval: read_f(r)?,
+        },
+        1 => AttentionSumcheckProof::Sequential {
+            out_sumcheck: read_sumcheck_proof(r)?,
+            context_sumcheck: read_sumcheck_proof(r)?,
+        },
+        t => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown AttentionSumcheckProof tag: {}", t),
+            ))
+        }
+    };
     Ok(LinearAttentionProof {
-        internal_coms: read_attn_internal_coms(r)?,
-        out_sumcheck: read_sumcheck_proof(r)?,
-        context_sumcheck: read_sumcheck_proof(r)?,
+        internal_coms,
+        sumcheck,
         openings: read_attn_openings(r)?,
     })
 }

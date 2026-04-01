@@ -24,7 +24,10 @@ use crate::pcs::{
 };
 use crate::poly::utils::{combine, eval_cols, eval_rows, mat_to_mle};
 use crate::poly::DenseMLPoly;
-use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
+use crate::subprotocols::{
+    prove_sumcheck, prove_sumcheck_multi_batched, verify_sumcheck, verify_sumcheck_multi_batched,
+    SumcheckProof, SumcheckProofMulti,
+};
 use crate::transcript::{challenge_vec, Transcript};
 
 // ---------------------------------------------------------------------------
@@ -112,17 +115,30 @@ pub struct AttentionOpenings {
     pub out_open: HyraxProof,
     pub phi_q_eval: F,
     pub phi_q_open: HyraxProof,
-    // ctx_eval, ctx_open を削除 (Chainで接続されるため)
     pub phi_k_eval: F,
     pub phi_k_open: HyraxProof,
     pub v_eval: F,
     pub v_open: HyraxProof,
 }
 
+/// Sumcheck variant chosen at proving time based on model geometry.
+pub enum AttentionSumcheckProof {
+    /// Single batched proof — used when seq_len == d_head (t_bits == d_bits).
+    Batched {
+        proof: SumcheckProofMulti,
+        /// ctx(r_i, ry) for the combined batch claim. Soundness via random alpha.
+        ctx_eval: F,
+    },
+    /// Two chained sumchecks — used when seq_len != d_head.
+    Sequential {
+        out_sumcheck: SumcheckProof,
+        context_sumcheck: SumcheckProof,
+    },
+}
+
 pub struct LinearAttentionProof {
     pub internal_coms: AttentionInternalCommitments,
-    pub out_sumcheck: SumcheckProof,
-    pub context_sumcheck: SumcheckProof,
+    pub sumcheck: AttentionSumcheckProof,
     pub openings: AttentionOpenings,
 }
 
@@ -165,52 +181,108 @@ pub fn prove_linear_attention(
     absorb_com(transcript, b"phi_q_com", &phi_q_com);
     absorb_com(transcript, b"phi_k_com", &phi_k_com);
 
-    // 3. OUT に関する Sumcheck: Out = Phi_Q * Context
     let rx = challenge_vec(transcript, t_bits, b"rx_out");
     let ry = challenge_vec(transcript, d_bits, b"ry_out");
-
     let out_eval = out_mle.evaluate(&combine(&rx, &ry));
-    transcript.append_field(b"claimed_out", &out_eval);
 
-    // Out(rx, ry) = Σ_z Phi_Q(rx, z) * Context(z, ry)
-    let f_out = DenseMLPoly::from_vec_padded(eval_rows(&phi_q_mle, t_bits, &rx));
-    let g_out = DenseMLPoly::from_vec_padded(eval_cols(&ctx_mle, d_bits, &ry));
-    let (out_sumcheck, r_i) = prove_sumcheck(&f_out, &g_out, out_eval, transcript);
+    let (sumcheck, phi_q_eval, phi_k_eval, v_eval, phi_q_point, phi_k_point, v_point) =
+        if t_bits == d_bits {
+            // 3a. Batched Sumcheck — seq_len == d_head, both pairs share the same variable count.
+            transcript.append_field(b"claimed_out", &out_eval);
 
-    // --- Claims-Chaining Point ---
-    // ここで Context をコミットせず、Sumcheckの結果得られた評価値を直接使う
-    let ctx_eval_at_ri = out_sumcheck.final_eval_g;
-    transcript.append_field(b"claimed_ctx_chained", &ctx_eval_at_ri);
+            let r_i = challenge_vec(transcript, d_bits, b"r_i_attn");
+            let ctx_eval = ctx_mle.evaluate(&combine(&r_i, &ry));
+            transcript.append_field(b"claimed_ctx", &ctx_eval);
 
-    // 4. Context に関する Sumcheck: Context = Phi_K^T * V
-    // Context(ri, ry) = Σ_t Phi_K(t, ri) * V(t, ry)
-    let f_ctx = DenseMLPoly::from_vec_padded(eval_cols(&phi_k_mle, t_bits, &r_i));
-    let g_ctx = DenseMLPoly::from_vec_padded(eval_cols(&v_mle, t_bits, &ry));
-    let (context_sumcheck, r_t) = prove_sumcheck(&f_ctx, &g_ctx, ctx_eval_at_ri, transcript);
+            let alpha = transcript.challenge_field::<F>(b"attn_batch_alpha");
+            let combined = out_eval + alpha * ctx_eval;
 
-    // 5. 端点（Leaf）の Opening 生成
-    // 中間値である context_open は不要
+            let f_out = DenseMLPoly::from_vec_padded(eval_rows(&phi_q_mle, t_bits, &rx));
+            let g_out = DenseMLPoly::from_vec_padded(eval_cols(&ctx_mle, d_bits, &ry));
+            let f_ctx = DenseMLPoly::from_vec_padded(eval_cols(&phi_k_mle, t_bits, &r_i));
+            let g_v = DenseMLPoly::from_vec_padded(eval_cols(&v_mle, t_bits, &ry));
+
+            let (proof, batch_r) = prove_sumcheck_multi_batched(
+                &[f_out, f_ctx],
+                &[g_out, g_v],
+                &[F::from(1u64), alpha],
+                combined,
+                transcript,
+            );
+
+            let phi_q_eval = proof.final_evals_f[0];
+            let phi_k_eval = proof.final_evals_f[1];
+            let v_eval = proof.final_evals_g[1];
+
+            let phi_q_point = combine(&rx, &batch_r);
+            let phi_k_point = combine(&batch_r, &r_i);
+            let v_point = combine(&batch_r, &ry);
+
+            (
+                AttentionSumcheckProof::Batched { proof, ctx_eval },
+                phi_q_eval,
+                phi_k_eval,
+                v_eval,
+                phi_q_point,
+                phi_k_point,
+                v_point,
+            )
+        } else {
+            // 3b. Sequential chained sumchecks — seq_len != d_head.
+            //
+            // Out(rx, ry) = Σ_i Phi_Q(rx, i) · Context(i, ry)   [d_bits vars]
+            let f_out = DenseMLPoly::from_vec_padded(eval_rows(&phi_q_mle, t_bits, &rx));
+            let g_out = DenseMLPoly::from_vec_padded(eval_cols(&ctx_mle, d_bits, &ry));
+            let (out_sumcheck, batch_r_out) =
+                prove_sumcheck(&f_out, &g_out, out_eval, transcript);
+
+            let phi_q_eval = out_sumcheck.final_eval_f;
+            // ctx(batch_r_out, ry) — derived from out-sumcheck, not committed separately.
+            let ctx_at_batch = out_sumcheck.final_eval_g;
+
+            // Context(batch_r_out, ry) = Σ_t Phi_K(t, batch_r_out) · V(t, ry)   [t_bits vars]
+            let f_ctx =
+                DenseMLPoly::from_vec_padded(eval_cols(&phi_k_mle, t_bits, &batch_r_out));
+            let g_v = DenseMLPoly::from_vec_padded(eval_cols(&v_mle, t_bits, &ry));
+            let (context_sumcheck, batch_r_ctx) =
+                prove_sumcheck(&f_ctx, &g_v, ctx_at_batch, transcript);
+
+            let phi_k_eval = context_sumcheck.final_eval_f;
+            let v_eval = context_sumcheck.final_eval_g;
+
+            let phi_q_point = combine(&rx, &batch_r_out);
+            let phi_k_point = combine(&batch_r_ctx, &batch_r_out);
+            let v_point = combine(&batch_r_ctx, &ry);
+
+            (
+                AttentionSumcheckProof::Sequential {
+                    out_sumcheck,
+                    context_sumcheck,
+                },
+                phi_q_eval,
+                phi_k_eval,
+                v_eval,
+                phi_q_point,
+                phi_k_point,
+                v_point,
+            )
+        };
+
     LinearAttentionProof {
         internal_coms: AttentionInternalCommitments {
             phi_q_com,
             phi_k_com,
         },
-        out_sumcheck: out_sumcheck.clone(),
-        context_sumcheck: context_sumcheck.clone(),
+        sumcheck,
         openings: AttentionOpenings {
             out_eval,
             out_open: hyrax_open(&out_mle.evaluations, &combine(&rx, &ry), nu_td, sigma_td),
-            phi_q_eval: out_sumcheck.final_eval_f,
-            phi_q_open: hyrax_open(&phi_q_mle.evaluations, &combine(&rx, &r_i), nu_td, sigma_td),
-            phi_k_eval: context_sumcheck.final_eval_f,
-            phi_k_open: hyrax_open(
-                &phi_k_mle.evaluations,
-                &combine(&r_t, &r_i),
-                nu_td,
-                sigma_td,
-            ),
-            v_eval: context_sumcheck.final_eval_g,
-            v_open: hyrax_open(&v_mle.evaluations, &combine(&r_t, &ry), nu_td, sigma_td),
+            phi_q_eval,
+            phi_q_open: hyrax_open(&phi_q_mle.evaluations, &phi_q_point, nu_td, sigma_td),
+            phi_k_eval,
+            phi_k_open: hyrax_open(&phi_k_mle.evaluations, &phi_k_point, nu_td, sigma_td),
+            v_eval,
+            v_open: hyrax_open(&v_mle.evaluations, &v_point, nu_td, sigma_td),
         },
     }
 }
@@ -245,44 +317,81 @@ pub fn verify_linear_attention(
     absorb_com(transcript, b"phi_q_com", &proof.internal_coms.phi_q_com);
     absorb_com(transcript, b"phi_k_com", &proof.internal_coms.phi_k_com);
 
-    // 2. チャレンジ再生
+    // 2. Reproduce challenge points
     let rx = challenge_vec(transcript, t_bits, b"rx_out");
     let ry = challenge_vec(transcript, d_bits, b"ry_out");
 
-    // 3. OUT Sumcheck 検証 (Claim引き継ぎの準備)
-    let claimed_out = proof.openings.out_eval;
-    transcript.append_field(b"claimed_out", &claimed_out);
+    // 3. Verify sumcheck (variant selected by the prover at proof time)
+    let (phi_q_point, phi_k_point, v_point) = match &proof.sumcheck {
+        AttentionSumcheckProof::Batched { proof: sc, ctx_eval } => {
+            // Reproduce r_i and alpha from transcript (mirrors prover exactly).
+            transcript.append_field(b"claimed_out", &proof.openings.out_eval);
+            let r_i = challenge_vec(transcript, d_bits, b"r_i_attn");
+            transcript.append_field(b"claimed_ctx", ctx_eval);
+            let alpha = transcript.challenge_field::<F>(b"attn_batch_alpha");
+            let combined = proof.openings.out_eval + alpha * ctx_eval;
 
-    let (r_i, _final_out) = verify_sumcheck(&proof.out_sumcheck, claimed_out, d_bits, transcript)?;
+            let (batch_r, _) = verify_sumcheck_multi_batched(
+                sc,
+                &[F::from(1u64), alpha],
+                combined,
+                d_bits,
+                transcript,
+            )?;
 
-    // --- Claims-Chaining Point ---
-    // Use the sumcheck leaf directly — avoids division and matches prover exactly.
-    // verify_sumcheck already checked final_eval_f * final_eval_g == running claim.
-    let ctx_eval = proof.out_sumcheck.final_eval_g;
-    if proof.openings.phi_q_eval != proof.out_sumcheck.final_eval_f {
-        return Err("phi_q opening eval inconsistent with out sumcheck leaf".into());
-    }
-    transcript.append_field(b"claimed_ctx_chained", &ctx_eval);
+            if proof.openings.phi_q_eval != sc.final_evals_f[0] {
+                return Err("phi_q eval inconsistent with batch sumcheck leaf".into());
+            }
+            if proof.openings.phi_k_eval != sc.final_evals_f[1] {
+                return Err("phi_k eval inconsistent with batch sumcheck leaf".into());
+            }
+            if proof.openings.v_eval != sc.final_evals_g[1] {
+                return Err("v eval inconsistent with batch sumcheck leaf".into());
+            }
 
-    // 4. Context Sumcheck 検証
-    let (r_t, _final_ctx) = verify_sumcheck(
-        &proof.context_sumcheck,
-        ctx_eval,
-        t_bits,
-        transcript,
-    )?;
+            (
+                combine(&rx, &batch_r),
+                combine(&batch_r, &r_i),
+                combine(&batch_r, &ry),
+            )
+        }
+        AttentionSumcheckProof::Sequential {
+            out_sumcheck,
+            context_sumcheck,
+        } => {
+            // Out(rx, ry) = Σ_i Phi_Q(rx, i) · Context(i, ry)   [d_bits vars]
+            let (batch_r_out, _) = verify_sumcheck(
+                out_sumcheck,
+                proof.openings.out_eval,
+                d_bits,
+                transcript,
+            )?;
 
-    // 5. Bind phi_k and v opening claims to the context sumcheck leaves
-    if proof.openings.phi_k_eval != proof.context_sumcheck.final_eval_f {
-        return Err("phi_k opening eval inconsistent with context sumcheck leaf".into());
-    }
-    if proof.openings.v_eval != proof.context_sumcheck.final_eval_g {
-        return Err("v opening eval inconsistent with context sumcheck leaf".into());
-    }
+            if proof.openings.phi_q_eval != out_sumcheck.final_eval_f {
+                return Err("phi_q eval inconsistent with out sumcheck leaf".into());
+            }
+            let ctx_at_batch = out_sumcheck.final_eval_g;
 
-    // 6. 開封（Opening）の一括検証
-    // ここで前のターンの `hyrax_verify_batch` を使うと、MSMを一本に集約できる
-    // 評価点が異なるため、個別に検証するか、MSMアグリゲーションを適用する
+            // Context(batch_r_out, ry) = Σ_t Phi_K(t, batch_r_out) · V(t, ry)   [t_bits vars]
+            let (batch_r_ctx, _) =
+                verify_sumcheck(context_sumcheck, ctx_at_batch, t_bits, transcript)?;
+
+            if proof.openings.phi_k_eval != context_sumcheck.final_eval_f {
+                return Err("phi_k eval inconsistent with context sumcheck leaf".into());
+            }
+            if proof.openings.v_eval != context_sumcheck.final_eval_g {
+                return Err("v eval inconsistent with context sumcheck leaf".into());
+            }
+
+            (
+                combine(&rx, &batch_r_out),
+                combine(&batch_r_ctx, &batch_r_out),
+                combine(&batch_r_ctx, &ry),
+            )
+        }
+    };
+
+    // 4. Hyrax openings
     hyrax_verify(
         &io_coms.out_com,
         proof.openings.out_eval,
@@ -291,24 +400,24 @@ pub fn verify_linear_attention(
         &params_td,
     )?;
     hyrax_verify(
-        &io_coms.v_com,
-        proof.openings.v_eval,
-        &combine(&r_t, &ry),
-        &proof.openings.v_open,
-        &params_td,
-    )?;
-    hyrax_verify(
         &proof.internal_coms.phi_q_com,
         proof.openings.phi_q_eval,
-        &combine(&rx, &r_i),
+        &phi_q_point,
         &proof.openings.phi_q_open,
         &params_td,
     )?;
     hyrax_verify(
         &proof.internal_coms.phi_k_com,
         proof.openings.phi_k_eval,
-        &combine(&r_t, &r_i),
+        &phi_k_point,
         &proof.openings.phi_k_open,
+        &params_td,
+    )?;
+    hyrax_verify(
+        &io_coms.v_com,
+        proof.openings.v_eval,
+        &v_point,
+        &proof.openings.v_open,
         &params_td,
     )?;
 
