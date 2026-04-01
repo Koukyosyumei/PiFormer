@@ -13,6 +13,7 @@ use crate::field::F;
 use crate::poly::DenseMLPoly;
 use crate::transcript::Transcript;
 use ark_ff::Field;
+use rayon::prelude::*;
 
 
 /// A round polynomial g_i(X) given by its values at X = 0, 1, 2.
@@ -75,27 +76,37 @@ pub fn prove_sumcheck(
     for _ in 0..n {
         let half = f_cur.evaluations.len() >> 1;
 
-        // g_i(0), g_i(1), g_i(2) are independent — compute in parallel.
-        let e0: F = (0..half)
-            .into_iter()
-            .map(|i| f_cur.evaluations[i] * g_cur.evaluations[i])
-            .sum();
-
-        let e1: F = (0..half)
-            .into_iter()
-            .map(|i| f_cur.evaluations[i + half] * g_cur.evaluations[i + half])
-            .sum();
-
-        // g_i(2): extrapolate each to x=2 then multiply
-        // f(2, x2,...) = 2·f(1,x2,...) - f(0,x2,...) (linear extrapolation)
-        let e2: F = (0..half)
-            .into_iter()
-            .map(|i| {
-                let f2 = two * f_cur.evaluations[i + half] - f_cur.evaluations[i];
-                let g2 = two * g_cur.evaluations[i + half] - g_cur.evaluations[i];
-                f2 * g2
+        // Single pass: compute g_i(0), g_i(1), g_i(2) together,
+        // loading each f/g pair once per index.
+        // Use parallel reduction only for large halfs where threading pays off.
+        const PAR_THRESHOLD: usize = 512;
+        let (e0, e1, e2) = if half >= PAR_THRESHOLD {
+            (0..half)
+                .into_par_iter()
+                .map(|i| {
+                    let f0 = f_cur.evaluations[i];
+                    let f1 = f_cur.evaluations[i + half];
+                    let g0 = g_cur.evaluations[i];
+                    let g1 = g_cur.evaluations[i + half];
+                    let f2 = two * f1 - f0;
+                    let g2 = two * g1 - g0;
+                    (f0 * g0, f1 * g1, f2 * g2)
+                })
+                .reduce(
+                    || (F::ZERO, F::ZERO, F::ZERO),
+                    |(a0, a1, a2), (b0, b1, b2)| (a0 + b0, a1 + b1, a2 + b2),
+                )
+        } else {
+            (0..half).fold((F::ZERO, F::ZERO, F::ZERO), |(a0, a1, a2), i| {
+                let f0 = f_cur.evaluations[i];
+                let f1 = f_cur.evaluations[i + half];
+                let g0 = g_cur.evaluations[i];
+                let g1 = g_cur.evaluations[i + half];
+                let f2 = two * f1 - f0;
+                let g2 = two * g1 - g0;
+                (a0 + f0 * g0, a1 + f1 * g1, a2 + f2 * g2)
             })
-            .sum();
+        };
 
         let rp = RoundPoly {
             evals: [e0, e1, e2],
@@ -223,38 +234,54 @@ pub fn prove_sumcheck_multi_batched(
         let half = fs_cur[0].evaluations.len() >> 1;
         let two = F::from(2u64);
 
-        // --- ラウンド多項式 g_i(X) = Σ_k weights[k] * Σ_{x2...} f_k(X, x2...) * g_k(X, x2...) ---
-
-        // g_i(0) の計算
-        let mut e0 = F::ZERO;
-        for k in 0..num_pairs {
-            let sum_k: F = (0..half)
-                .map(|i| fs_cur[k].evaluations[i] * gs_cur[k].evaluations[i])
-                .sum();
-            e0 += weights[k] * sum_k;
-        }
-
-        // g_i(1) の計算
-        let mut e1 = F::ZERO;
-        for k in 0..num_pairs {
-            let sum_k: F = (0..half)
-                .map(|i| fs_cur[k].evaluations[i + half] * gs_cur[k].evaluations[i + half])
-                .sum();
-            e1 += weights[k] * sum_k;
-        }
-
-        // g_i(2) の計算 (線形外挿を用いて評価)
-        let mut e2 = F::ZERO;
-        for k in 0..num_pairs {
-            let sum_k: F = (0..half)
+        // Single pass over half-size index range.
+        // For each index i, accumulate weighted contributions from all k pairs,
+        // computing e0/e1/e2 simultaneously to avoid redundant loads.
+        // Parallelise only for large halfs where threading overhead is justified.
+        const PAR_THRESHOLD: usize = 512;
+        let (e0, e1, e2) = if half >= PAR_THRESHOLD {
+            (0..half)
+                .into_par_iter()
                 .map(|i| {
-                    let f2 = two * fs_cur[k].evaluations[i + half] - fs_cur[k].evaluations[i];
-                    let g2 = two * gs_cur[k].evaluations[i + half] - gs_cur[k].evaluations[i];
-                    f2 * g2
+                    let mut r0 = F::ZERO;
+                    let mut r1 = F::ZERO;
+                    let mut r2 = F::ZERO;
+                    for k in 0..num_pairs {
+                        let f0 = fs_cur[k].evaluations[i];
+                        let f1 = fs_cur[k].evaluations[i + half];
+                        let g0 = gs_cur[k].evaluations[i];
+                        let g1 = gs_cur[k].evaluations[i + half];
+                        let f2 = two * f1 - f0;
+                        let g2 = two * g1 - g0;
+                        r0 += weights[k] * (f0 * g0);
+                        r1 += weights[k] * (f1 * g1);
+                        r2 += weights[k] * (f2 * g2);
+                    }
+                    (r0, r1, r2)
                 })
-                .sum();
-            e2 += weights[k] * sum_k;
-        }
+                .reduce(
+                    || (F::ZERO, F::ZERO, F::ZERO),
+                    |(a0, a1, a2), (b0, b1, b2)| (a0 + b0, a1 + b1, a2 + b2),
+                )
+        } else {
+            (0..half).fold((F::ZERO, F::ZERO, F::ZERO), |(a0, a1, a2), i| {
+                let mut r0 = F::ZERO;
+                let mut r1 = F::ZERO;
+                let mut r2 = F::ZERO;
+                for k in 0..num_pairs {
+                    let f0 = fs_cur[k].evaluations[i];
+                    let f1 = fs_cur[k].evaluations[i + half];
+                    let g0 = gs_cur[k].evaluations[i];
+                    let g1 = gs_cur[k].evaluations[i + half];
+                    let f2 = two * f1 - f0;
+                    let g2 = two * g1 - g0;
+                    r0 += weights[k] * (f0 * g0);
+                    r1 += weights[k] * (f1 * g1);
+                    r2 += weights[k] * (f2 * g2);
+                }
+                (a0 + r0, a1 + r1, a2 + r2)
+            })
+        };
 
         let rp = RoundPoly {
             evals: [e0, e1, e2],

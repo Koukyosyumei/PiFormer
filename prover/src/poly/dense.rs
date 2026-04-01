@@ -11,6 +11,7 @@
 
 use crate::field::F;
 use ark_ff::Field;
+use rayon::prelude::*;
 
 
 #[derive(Clone, Debug)]
@@ -63,10 +64,16 @@ impl DenseMLPoly {
     pub fn fix_first_variable(&self, r: F) -> Self {
         let half = self.evaluations.len() >> 1;
         let r_inv = F::ONE - r;
-        let new_evals: Vec<F> = (0..half)
-            .into_iter()
-            .map(|i| self.evaluations[i] * r_inv + self.evaluations[i + half] * r)
-            .collect();
+        let new_evals: Vec<F> = if half >= 512 {
+            (0..half)
+                .into_par_iter()
+                .map(|i| self.evaluations[i] * r_inv + self.evaluations[i + half] * r)
+                .collect()
+        } else {
+            (0..half)
+                .map(|i| self.evaluations[i] * r_inv + self.evaluations[i + half] * r)
+                .collect()
+        };
         Self::new(new_evals)
     }
 
