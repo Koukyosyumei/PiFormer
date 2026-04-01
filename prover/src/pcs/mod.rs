@@ -388,6 +388,172 @@ pub fn hyrax_verify_multi_point(
 }
 
 // ---------------------------------------------------------------------------
+// Batch Accumulator (all groups → 1 lhs MSM + 1 rhs MSM at finalize)
+// ---------------------------------------------------------------------------
+
+/// Accumulates multiple Hyrax openings (batched or single) and defers all MSMs
+/// to a single `finalize` call, reducing K×2 MSMs to just 2.
+///
+/// Usage pattern:
+///   1. Call `add_verify_batch` / `add_verify` for each opening.
+///      - Inner-product checks are performed immediately (field ops only).
+///      - Transcript challenges (eta) consumed here as usual.
+///   2. Call `finalize(params, transcript)` once all slots are added.
+///      - Derives one `b"hyrax_group_mu"` challenge from transcript.
+///      - Runs 1 lhs MSM + 1 rhs MSM for all accumulated slots.
+pub struct HyraxBatchAccumulator {
+    slots: Vec<HyraxAccSlot>,
+}
+
+struct HyraxAccSlot {
+    /// G1 row commitments for this slot (already weighted by inner eta^k * l_vec[i]).
+    row_coms: Vec<G1Affine>,
+    /// Corresponding lhs scalars (eta^k * l_vec[i] for batch, l_vec[i] for single).
+    row_scalars: Vec<F>,
+    /// The w' proof vector for this slot.
+    w_prime: Vec<F>,
+}
+
+impl HyraxBatchAccumulator {
+    pub fn new() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    /// Add a batched opening (K commitments at the same point, with transcript eta).
+    /// Performs inner-product check immediately; defers MSM to `finalize`.
+    pub fn add_verify_batch(
+        &mut self,
+        commitments: &[HyraxCommitment],
+        evals: &[F],
+        point: &[F],
+        proof: &HyraxProof,
+        transcript: &mut Transcript,
+    ) -> Result<(), String> {
+        let count = commitments.len();
+        let nu = commitments[0].nu;
+
+        let eta = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+        let eta_pows = powers_of(eta, count);
+
+        let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
+        let r_r_rev: Vec<F> = point[nu..].iter().rev().copied().collect();
+        let l_vec = lagrange_basis(&r_l_rev);
+        let r_vec = lagrange_basis(&r_r_rev);
+
+        // Immediate inner-product check (field ops only).
+        let inner: F = r_vec
+            .iter()
+            .zip(proof.w_prime.iter())
+            .map(|(&r, &w)| r * w)
+            .sum();
+        let expected_inner: F = evals
+            .iter()
+            .zip(eta_pows.iter())
+            .map(|(&v, &e)| v * e)
+            .sum();
+        if inner != expected_inner {
+            return Err(
+                "HyraxBatchAccumulator add_verify_batch: inner product check failed".to_string(),
+            );
+        }
+
+        // Accumulate lhs contributions (MSM deferred to finalize).
+        let num_rows = 1usize << nu;
+        let mut row_coms_slot: Vec<G1Affine> = Vec::with_capacity(count * num_rows);
+        let mut row_scalars_slot: Vec<F> = Vec::with_capacity(count * num_rows);
+        for (k, com) in commitments.iter().enumerate() {
+            for (i, &row_com) in com.row_coms.iter().enumerate() {
+                row_coms_slot.push(row_com);
+                row_scalars_slot.push(eta_pows[k] * l_vec[i]);
+            }
+        }
+
+        self.slots.push(HyraxAccSlot {
+            row_coms: row_coms_slot,
+            row_scalars: row_scalars_slot,
+            w_prime: proof.w_prime.clone(),
+        });
+        Ok(())
+    }
+
+    /// Add a single opening (no transcript eta).
+    /// Performs inner-product check immediately; defers MSM to `finalize`.
+    pub fn add_verify(
+        &mut self,
+        commitment: &HyraxCommitment,
+        eval: F,
+        point: &[F],
+        proof: &HyraxProof,
+    ) -> Result<(), String> {
+        let nu = commitment.nu;
+
+        let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
+        let r_r_rev: Vec<F> = point[nu..].iter().rev().copied().collect();
+        let l_vec = lagrange_basis(&r_l_rev);
+        let r_vec = lagrange_basis(&r_r_rev);
+
+        let inner: F = r_vec
+            .iter()
+            .zip(proof.w_prime.iter())
+            .map(|(&r, &w)| r * w)
+            .sum();
+        if inner != eval {
+            return Err(
+                "HyraxBatchAccumulator add_verify: inner product check failed".to_string(),
+            );
+        }
+
+        self.slots.push(HyraxAccSlot {
+            row_coms: commitment.row_coms.clone(),
+            row_scalars: l_vec,
+            w_prime: proof.w_prime.clone(),
+        });
+        Ok(())
+    }
+
+    /// Finalize: derive one `b"hyrax_group_mu"` challenge, then run exactly
+    /// 1 lhs MSM + 1 rhs MSM for all accumulated slots.
+    pub fn finalize(self, params: &HyraxParams, transcript: &mut Transcript) -> Result<(), String> {
+        if self.slots.is_empty() {
+            return Ok(());
+        }
+        let count = self.slots.len();
+        let num_cols = params.gens.len();
+
+        let mu = transcript.challenge_field::<F>(b"hyrax_group_mu");
+        let mu_pows = powers_of(mu, count);
+
+        // Combined rhs: w'_combined[j] = Σ_k μ^k * w'_k[j]
+        let mut w_prime_combined = vec![F::ZERO; num_cols];
+        for (k, slot) in self.slots.iter().enumerate() {
+            let mu_k = mu_pows[k];
+            for (j, &w) in slot.w_prime.iter().enumerate() {
+                w_prime_combined[j] += mu_k * w;
+            }
+        }
+        let rhs = msm(&params.gens, &w_prime_combined);
+
+        // Combined lhs: scale each slot's row_coms by μ^k * original_scalar
+        let total: usize = self.slots.iter().map(|s| s.row_coms.len()).sum();
+        let mut all_points: Vec<G1Affine> = Vec::with_capacity(total);
+        let mut all_scalars: Vec<F> = Vec::with_capacity(total);
+        for (k, slot) in self.slots.iter().enumerate() {
+            let mu_k = mu_pows[k];
+            for (&com, &scalar) in slot.row_coms.iter().zip(slot.row_scalars.iter()) {
+                all_points.push(com);
+                all_scalars.push(mu_k * scalar);
+            }
+        }
+        let lhs = msm(&all_points, &all_scalars);
+
+        if lhs != rhs {
+            return Err("HyraxBatchAccumulator finalize: commitment check failed".to_string());
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Additional Helpers
 // ---------------------------------------------------------------------------
 

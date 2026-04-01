@@ -15,8 +15,8 @@ use crate::lookup::range::{
     prove_range, verify_range_deferred, verify_range_m_batch, RangeProof, RangeProofWitness,
 };
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch,
-    params_from_n, poly_hyrax, HyraxCommitment, HyraxProof,
+    absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, params_from_n, poly_hyrax,
+    HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
 };
 use crate::poly::utils::{combine, eval_rows, mat_to_mle, vec_to_mle};
 use crate::poly::DenseMLPoly;
@@ -294,6 +294,11 @@ pub fn prove_layernorm(
         transcript,
     );
 
+    // Advance transcript to match verifier's HyraxBatchAccumulator::finalize calls.
+    // acc_t finalizes first (groups 1+2+4 at params_t), then acc_td (group3 + x_indiv).
+    let _ = transcript.challenge_field::<F>(b"hyrax_group_mu"); // acc_t
+    let _ = transcript.challenge_field::<F>(b"hyrax_group_mu"); // acc_td
+
     Ok(LayerNormProof {
         internal_coms: LayerNormInternalCommitments {
             sum_x_com,
@@ -465,11 +470,18 @@ pub fn verify_layernorm(
     .map_err(|e| format!("LN range m_batch: {e}"))?;
     eprintln!("[LN]  m_batch:        {:>8.3}ms", _tmb.elapsed().as_secs_f64()*1000.0);
 
-    // 5. Batched openings (same order as prover's hyrax_open_batch calls)
+    // 5. Batched openings — accumulate all 5 groups into 2 MSMs via HyraxBatchAccumulator.
+    //    acc_t: groups 1, 2, 4 (all at params_t)
+    //    acc_td: x_indiv (no eta) + group 3 (at params_td)
+    //
+    //    Order must match prover's hyrax_open_batch call order (transcript sync).
 
-    // Group 1: [sum_x, sq_sum_x] at r_t
-    let _tg1 = Instant::now();
-    hyrax_verify_batch(
+    let _tg = Instant::now();
+    let mut acc_t = HyraxBatchAccumulator::new();
+    let mut acc_td = HyraxBatchAccumulator::new();
+
+    // Group 1: [sum_x, sq_sum_x] at r_t  → acc_t
+    acc_t.add_verify_batch(
         &[
             proof.internal_coms.sum_x_com.clone(),
             proof.internal_coms.sq_sum_x_com.clone(),
@@ -477,25 +489,19 @@ pub fn verify_layernorm(
         &[proof.openings.sum_x_at_rt, proof.openings.sq_sum_x_at_rt],
         &r_t,
         &proof.openings.rt_batch_proof,
-        &params_t,
         transcript,
     )?;
-    eprintln!("[LN]  group1:        {:>8.3}ms", _tg1.elapsed().as_secs_f64()*1000.0);
 
-    // Individual: x at combine(r_t, r_d_mean) — unique point
-    let _txi = Instant::now();
-    hyrax_verify(
+    // Individual: x at combine(r_t, r_d_mean) — no transcript eta  → acc_td
+    acc_td.add_verify(
         &io_coms.x_com,
         proof.openings.x_at_rt_rmean,
         &combine(&r_t, &r_d_mean),
         &proof.openings.x_rt_rmean_proof,
-        &params_td,
     )?;
-    eprintln!("[LN]  x_indiv:       {:>8.3}ms", _txi.elapsed().as_secs_f64()*1000.0);
 
-    // Group 2: [sum_x, sq_sum_x, sigma, sigma_sq, sum_x_sq] at r_sig_t
-    let _tg2 = Instant::now();
-    hyrax_verify_batch(
+    // Group 2: [sum_x, sq_sum_x, sigma, sigma_sq, sum_x_sq] at r_sig_t  → acc_t
+    acc_t.add_verify_batch(
         &[
             proof.internal_coms.sum_x_com.clone(),
             proof.internal_coms.sq_sum_x_com.clone(),
@@ -512,15 +518,12 @@ pub fn verify_layernorm(
         ],
         &r_sig_t,
         &proof.openings.rsig_batch_proof,
-        &params_t,
         transcript,
     )?;
-    eprintln!("[LN]  group2:        {:>8.3}ms", _tg2.elapsed().as_secs_f64()*1000.0);
 
-    // Group 3: [x, y, gamma_x, sigma_y] at combine(r_y_t, r_y_d)
-    let _tg3 = Instant::now();
+    // Group 3: [x, y, gamma_x, sigma_y] at combine(r_y_t, r_y_d)  → acc_td
     let ry_td = combine(&r_y_t, &r_y_d);
-    hyrax_verify_batch(
+    acc_td.add_verify_batch(
         &[
             io_coms.x_com.clone(),
             io_coms.y_com.clone(),
@@ -535,14 +538,11 @@ pub fn verify_layernorm(
         ],
         &ry_td,
         &proof.openings.ry_td_batch_proof,
-        &params_td,
         transcript,
     )?;
-    eprintln!("[LN]  group3:        {:>8.3}ms", _tg3.elapsed().as_secs_f64()*1000.0);
 
-    // Group 4: [sum_x, sigma] at r_y_t
-    let _tg4 = Instant::now();
-    hyrax_verify_batch(
+    // Group 4: [sum_x, sigma] at r_y_t  → acc_t
+    acc_t.add_verify_batch(
         &[
             proof.internal_coms.sum_x_com.clone(),
             proof.internal_coms.sigma_com.clone(),
@@ -550,10 +550,13 @@ pub fn verify_layernorm(
         &[proof.openings.sum_x_at_ryt, proof.openings.sigma_at_ryt],
         &r_y_t,
         &proof.openings.ryt_batch_proof,
-        &params_t,
         transcript,
     )?;
-    eprintln!("[LN]  group4:        {:>8.3}ms", _tg4.elapsed().as_secs_f64()*1000.0);
+
+    // Finalize: 1 lhs MSM + 1 rhs MSM per accumulator (2 MSMs total, down from 10).
+    acc_t.finalize(&params_t, transcript)?;
+    acc_td.finalize(&params_td, transcript)?;
+    eprintln!("[LN]  groups(acc):   {:>8.3}ms", _tg.elapsed().as_secs_f64()*1000.0);
 
     Ok(())
 }
