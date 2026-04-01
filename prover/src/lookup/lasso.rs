@@ -21,9 +21,11 @@
 
 use crate::field::{eq_eval, index_to_bits, F};
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_verify, HyraxCommitment, HyraxParams, HyraxProof,
+    hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, HyraxCommitment, HyraxParams,
+    HyraxProof,
 };
 use crate::poly::DenseMLPoly;
+use crate::subprotocols::sumcheck::{prove_sumcheck_multi_batched, SumcheckProofMulti};
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
 use ark_ff::Field;
@@ -249,6 +251,118 @@ pub fn verify_lasso(
     Ok(())
 }
 
+/*
+/// 複数のLassoルックアップ要求をまとめたもの
+pub struct LassoMultiInstance {
+    pub instances: Vec<LassoInstance>,
+}
+
+/// 集約されたLasso証明
+pub struct LassoMultiProof {
+    /// 全インスタンスの重み付き合計: Σ_t α^t · (Σ_j ρ^j · output_{t,j})
+    pub combined_grand_sum: F,
+    /// 全インスタンス・全サブテーブルを統合した単一のSumcheck証明
+    pub combined_sumcheck_proof: SumcheckProofMulti,
+    /// 各サブテーブル T_{t,k}(r) の評価値
+    pub table_openings: Vec<Vec<F>>,
+    /// インスタンスごとのHyraxコミットメント
+    pub hyrax_commitments: Vec<Vec<HyraxCommitment>>,
+    /// 全評価値を一括で証明するバッチHyrax証明
+    pub hyrax_proof: HyraxProof,
+}
+
+pub fn prove_lasso_multi(
+    multi_instance: &LassoMultiInstance,
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> LassoMultiProof {
+    let t_count = multi_instance.instances.len();
+    let m = multi_instance.instances[0].bits_per_chunk; // 全インスタンスで共通と仮定
+
+    // 1. すべてのサブテーブルに対してHyraxコミットメントを作成 [cite: 1104]
+    let mut hyrax_commitments = Vec::new();
+    for instance in &multi_instance.instances {
+        let coms: Vec<_> = instance
+            .tables
+            .iter()
+            .map(|table| hyrax_commit(table, m / 2, params))
+            .collect();
+        hyrax_commitments.push(coms);
+    }
+
+    // 2. チャレンジの生成 (Lassoのバッチ化 )
+    let alpha = transcript.challenge_field::<F>(b"instance_batch_alpha"); // インスタンス間
+    let rho = transcript.challenge_field::<F>(b"lookup_batch_rho"); // 同一インスタンス内
+    let gamma = transcript.challenge_field::<F>(b"table_batch_gamma"); // サブテーブル間
+
+    let alpha_pows = powers_of(alpha, t_count);
+    let mut combined_grand_sum = F::ZERO;
+    let mut all_t_polys = Vec::new(); // 全ての T_{t,k}
+    let mut all_l_polys = Vec::new(); // 全ての α^t * γ^k * L_{t,k}
+
+    // 3. インスタンスごとに多項式を構築
+    for (t, instance) in multi_instance.instances.iter().enumerate() {
+        let n = instance.query_indices.len();
+        let rho_pows = powers_of(rho, n);
+        let gamma_pows = powers_of(gamma, instance.tables.len());
+
+        for (k, table_evals) in instance.tables.iter().enumerate() {
+            let t_poly = DenseMLPoly::new(table_evals.clone());
+
+            // 重み付けされたセレクタ L_{t,k} の構築
+            let mut l_evals = vec![F::ZERO; 1 << m];
+            for j in 0..n {
+                let ch = chunk(instance.query_indices[j], k, m, instance.mask());
+                // α^t * γ^k * ρ^j を重みとして eq(ch, x) に加算
+                l_evals[ch] += alpha_pows[t] * gamma_pows[k] * rho_pows[j];
+            }
+
+            all_t_polys.push(t_poly);
+            all_l_polys.push(DenseMLPoly::new(l_evals));
+        }
+
+        // インスタンスの出力を加算
+        let instance_out_sum: F = (0..n).map(|j| rho_pows[j] * instance.outputs[j]).sum();
+        combined_grand_sum += alpha_pows[t] * instance_out_sum;
+    }
+
+    // 4. 単一の集約Sumcheckプロトコルを実行
+    // P(r) = Σ_t Σ_k (α^t * γ^k) * T_{t,k}(r) * L_{t,k}(r)
+    let (combined_sumcheck_proof, r_vec) = prove_sumcheck_multi_batched(
+        &all_t_polys,
+        &all_l_polys,
+        &alpha_pows,
+        combined_grand_sum,
+        transcript,
+    );
+
+    // 5. Hyraxオープニングの生成 [cite: 1210]
+    let mut table_openings = Vec::new();
+    let mut flatten_tables = Vec::new();
+    let mut flatten_openings = Vec::new();
+
+    for (t, instance) in multi_instance.instances.iter().enumerate() {
+        let mut inst_openings = Vec::new();
+        for k in 0..instance.tables.len() {
+            let eval = all_t_polys[t * instance.tables.len() + k].evaluate(&r_vec);
+            inst_openings.push(eval);
+            flatten_tables.push(&instance.tables[k]);
+            flatten_openings.push(eval);
+        }
+        table_openings.push(inst_openings);
+    }
+
+    let hyrax_proof = hyrax_open_batch(&flatten_tables, &r_vec, flatten_openings, params);
+
+    LassoMultiProof {
+        combined_grand_sum,
+        combined_sumcheck_proof,
+        table_openings,
+        hyrax_commitments,
+        hyrax_proof,
+    }
+}*/
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -398,10 +512,7 @@ mod lasso_tests {
             .collect();
 
         let query_indices = vec![0, 1, 3, 7, 15];
-        let outputs: Vec<F> = query_indices
-            .iter()
-            .map(|&idx| t0[idx])
-            .collect();
+        let outputs: Vec<F> = query_indices.iter().map(|&idx| t0[idx]).collect();
 
         let instance = LassoInstance {
             tables: vec![t0],
@@ -417,7 +528,11 @@ mod lasso_tests {
 
         let mut vt = Transcript::new(b"single-table");
         let result = verify_lasso(&proof, &instance, &mut vt, &params);
-        assert!(result.is_ok(), "single-table lasso failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "single-table lasso failed: {:?}",
+            result.err()
+        );
     }
 
     /// Single-query Lasso: only one lookup entry to prove.
@@ -444,7 +559,11 @@ mod lasso_tests {
 
         let mut vt = Transcript::new(b"single-query");
         let result = verify_lasso(&proof, &instance, &mut vt, &params);
-        assert!(result.is_ok(), "single-query lasso failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "single-query lasso failed: {:?}",
+            result.err()
+        );
     }
 
     /// Verify the internal `chunk` helper function correctness.
