@@ -8,6 +8,7 @@
 //!    are cryptographically bound across adjacent sub-verifiers.
 
 use crate::lookup::lasso::{verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey};
+use crate::lookup::range::verify_range_batched;
 use crate::pcs::{absorb_com, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams};
 use crate::subprotocols::verify_combine_deferred;
 use crate::pcs::hyrax_verify_multi_point;
@@ -87,12 +88,36 @@ pub fn verify_transformer_block(
     let td_num_vars = t_bits + d_bits;
     let (_, _, td_params) = params_from_vars(td_num_vars);
 
+    // --- 0. Global range batch for all 4 range proofs in this block ---
+    //    Transcript ordering must match prove_transformer_block: range batch first.
+    let t = vk.seq_len;
+    let d = vk.d_model;
+    let ln_sigma_n = (2 * t).next_power_of_two().trailing_zeros() as usize;
+    let ln_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
+    let (block_r_vs, _block_r_m) = verify_range_batched(
+        &[
+            &proof.ln1_proof.sigma_range_proof,
+            &proof.ln1_proof.y_range_proof,
+            &proof.ln2_proof.sigma_range_proof,
+            &proof.ln2_proof.y_range_proof,
+        ],
+        &proof.block_range_m,
+        &[ln_sigma_n, ln_y_n, ln_sigma_n, ln_y_n],
+        32,
+        transcript,
+    )?;
+    let ln1_sig_rv = &block_r_vs[0];
+    let ln1_y_rv   = &block_r_vs[1];
+    let ln2_sig_rv = &block_r_vs[2];
+    let ln2_y_rv   = &block_r_vs[3];
+
     // --- 1. LayerNorm 1 ---
     let ln1_io = LayerNormIOCommitments {
         x_com: x_in_com.clone(),
         y_com: proof.x_norm1_com.clone(),
     };
-    let _t = Instant::now(); verify_layernorm(&proof.ln1_proof, &ln1_io, &vk.ln1_vk, transcript, ln_acc_t, ln_acc_td)?;
+    let _t = Instant::now();
+    verify_layernorm(&proof.ln1_proof, &ln1_io, &vk.ln1_vk, ln1_sig_rv, ln1_y_rv, transcript, ln_acc_t, ln_acc_td)?;
     eprintln!("[block] ln1:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     let _ = td_params; // ensure td_params isn't flagged unused
@@ -133,7 +158,8 @@ pub fn verify_transformer_block(
         x_com: x_mid_com.clone(),
         y_com: proof.x_norm2_com.clone(),
     };
-    let _t = Instant::now(); verify_layernorm(&proof.ln2_proof, &ln2_io, &vk.ln2_vk, transcript, ln_acc_t, ln_acc_td)?;
+    let _t = Instant::now();
+    verify_layernorm(&proof.ln2_proof, &ln2_io, &vk.ln2_vk, ln2_sig_rv, ln2_y_rv, transcript, ln_acc_t, ln_acc_td)?;
     eprintln!("[block] ln2:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // --- 6. FFN — returns (y_claim, x_claim) deferred to combine ---
@@ -297,14 +323,38 @@ pub fn verify(
         current_x_com = expected_x_out_com;
     }
 
-    // 3. Final LayerNorm Verification
+    // 3. Final LayerNorm — global range batch for final_ln (sigma + y)
+    let t = vk.seq_len;
+    let d = vk.d_model;
+    let final_sigma_n = (2 * t).next_power_of_two().trailing_zeros() as usize;
+    let final_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
+    let (final_r_vs, _final_r_m) = verify_range_batched(
+        &[
+            &proof.final_ln_proof.sigma_range_proof,
+            &proof.final_ln_proof.y_range_proof,
+        ],
+        &proof.final_range_m,
+        &[final_sigma_n, final_y_n],
+        32,
+        transcript,
+    )
+    .map_err(|e| format!("Final LN range batch failed: {}", e))?;
     let _t = Instant::now();
     let ln_io = LayerNormIOCommitments {
         x_com: current_x_com.clone(),
         y_com: proof.final_ln_out_com.clone(),
     };
-    verify_layernorm(&proof.final_ln_proof, &ln_io, &vk.final_ln_vk, transcript, &mut ln_acc_t, &mut ln_acc_td)
-        .map_err(|e| format!("Final LN failed: {}", e))?;
+    verify_layernorm(
+        &proof.final_ln_proof,
+        &ln_io,
+        &vk.final_ln_vk,
+        &final_r_vs[0],
+        &final_r_vs[1],
+        transcript,
+        &mut ln_acc_t,
+        &mut ln_acc_td,
+    )
+    .map_err(|e| format!("Final LN failed: {}", e))?;
     eprintln!("[model] final_ln:   {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // 4. LM Head Verification

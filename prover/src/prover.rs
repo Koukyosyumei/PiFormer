@@ -27,7 +27,8 @@ use crate::attention::attention::{
     LinearAttentionInstance, LinearAttentionProof, LinearAttentionWitness,
 };
 use crate::attention::layernorm::{
-    prove_layernorm, LayerNormIOCommitments, LayerNormProof, LayerNormVerifyingKey,
+    compute_range_witnesses, prove_layernorm, LayerNormIOCommitments, LayerNormProof,
+    LayerNormVerifyingKey,
     LayerNormWitness,
 };
 use crate::attention::projection::{
@@ -39,6 +40,7 @@ use crate::ffn::ffn::{prove_ffn, FFNIOCommitments, FFNInstance, FFNProof, FFNWit
 use crate::lookup::lasso::{
     prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
 };
+use crate::lookup::range::{prove_range_batched, GlobalRangeM};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey}; // Imported from verifier.rs
 
 // ---------------------------------------------------------------------------
@@ -87,6 +89,10 @@ pub struct TransformerBlockProof {
     pub x_norm2_open: HyraxProof,
     /// Direct Hyrax opening of out_ffn_com at the FFN y_claim point.
     pub out_ffn_open: HyraxProof,
+
+    /// Shared multiplicity commitment for all 4 range proofs in this block
+    /// (ln1_sigma, ln1_y, ln2_sigma, ln2_y).  One m_com instead of 4.
+    pub block_range_m: GlobalRangeM,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,13 +154,48 @@ pub fn prove_transformer_block(
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
     let td_num_vars = t_bits + d_bits;
 
-    // 2. Execute Sub-Provers with strictly bound IO Commitments
+    // 2. Global range batch for all LayerNorm range proofs in this block.
+    //    Phase 1+2: commit chunk_coms for all 4 witnesses, one shared m_com, then sumchecks.
+    //    Transcript ordering: all range material comes BEFORE any layernorm sub-prover.
+    let ln1_rw = compute_range_witnesses(&witness.ln1_wit, &pk.ln1_vk);
+    let ln2_rw = compute_range_witnesses(&witness.ln2_wit, &pk.ln2_vk);
+    let ln1_sigma_n = (2 * t).next_power_of_two().trailing_zeros() as usize;
+    let ln1_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
+    let (mut block_range_proofs, block_range_m, block_r_vs) = prove_range_batched(
+        &[
+            &ln1_rw.sigma_witness,
+            &ln1_rw.y_witness,
+            &ln2_rw.sigma_witness,
+            &ln2_rw.y_witness,
+        ],
+        32,
+        transcript,
+    )?;
+    // Destructure in reverse order to avoid index shifting
+    let ln2_y_rp    = block_range_proofs.remove(3);
+    let ln2_sig_rp  = block_range_proofs.remove(2);
+    let ln1_y_rp    = block_range_proofs.remove(1);
+    let ln1_sig_rp  = block_range_proofs.remove(0);
+    let ln2_y_rv    = block_r_vs[3].clone();
+    let ln2_sig_rv  = block_r_vs[2].clone();
+    let ln1_y_rv    = block_r_vs[1].clone();
+    let ln1_sig_rv  = block_r_vs[0].clone();
+    let _ = (ln1_sigma_n, ln1_y_n); // used only for verifier num_vars
+
+    // 3. Execute Sub-Provers with strictly bound IO Commitments
     // --- LayerNorm 1 ---
     let ln1_io = LayerNormIOCommitments {
         x_com: x_in_com.clone(),
         y_com: x_norm1_com.clone(),
     };
-    let ln1_proof = prove_layernorm(&witness.ln1_wit, &ln1_io, &pk.ln1_vk, transcript)?;
+    let ln1_proof = prove_layernorm(
+        &witness.ln1_wit,
+        &ln1_io,
+        &pk.ln1_vk,
+        (ln1_sig_rp, ln1_sig_rv),
+        (ln1_y_rp, ln1_y_rv),
+        transcript,
+    )?;
 
     // --- Batched Q, K, V Projections — one sumcheck, single r_k ---
     let qkv_wit = BatchedQKVProjectionWitness {
@@ -197,7 +238,14 @@ pub fn prove_transformer_block(
         x_com: x_mid_com.clone(),
         y_com: x_norm2_com.clone(),
     };
-    let ln2_proof = prove_layernorm(&witness.ln2_wit, &ln2_io, &pk.ln2_vk, transcript)?;
+    let ln2_proof = prove_layernorm(
+        &witness.ln2_wit,
+        &ln2_io,
+        &pk.ln2_vk,
+        (ln2_sig_rp, ln2_sig_rv),
+        (ln2_y_rp, ln2_y_rv),
+        transcript,
+    )?;
 
     // --- FFN — returns (proof, y_claim, x_claim) ---
     let ffn_io = FFNIOCommitments {
@@ -281,6 +329,7 @@ pub fn prove_transformer_block(
         out_attn_open,
         x_norm2_open,
         out_ffn_open,
+        block_range_m,
     })
 }
 
@@ -325,6 +374,10 @@ pub struct TransformerModelProof {
     /// Single batched Lasso proof covering all activation lookups across all layers.
     /// Order per block: [FFN_i, Q_i, K_i].
     pub all_lasso_proof: LassoMultiProof,
+
+    /// Shared multiplicity commitment for the final LayerNorm range proofs
+    /// (final_ln_sigma, final_ln_y).  One m_com instead of 2.
+    pub final_range_m: GlobalRangeM,
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +432,15 @@ pub fn prove(
         block_proofs.push(block_proof);
     }
 
-    // 3. Final LayerNorm
+    // 3. Final LayerNorm — global range batch for final_ln (sigma + y)
+    let final_rw = compute_range_witnesses(&witness.final_ln_wit, &pk.vk.final_ln_vk);
+    let (mut final_range_proofs, final_range_m, final_r_vs) = prove_range_batched(
+        &[&final_rw.sigma_witness, &final_rw.y_witness],
+        32,
+        transcript,
+    )?;
+    let final_y_rp   = final_range_proofs.remove(1);
+    let final_sig_rp = final_range_proofs.remove(0);
     let final_ln_out_com = commit_mat(&witness.final_ln_wit.y, t, d);
     let ln_io = LayerNormIOCommitments {
         x_com: current_x_com.clone(),
@@ -389,6 +450,8 @@ pub fn prove(
         &witness.final_ln_wit,
         &ln_io,
         &pk.vk.final_ln_vk,
+        (final_sig_rp, final_r_vs[0].clone()),
+        (final_y_rp, final_r_vs[1].clone()),
         transcript,
     )?;
 
@@ -437,6 +500,7 @@ pub fn prove(
         final_ln_out_com,
         logits_com,
         all_lasso_proof,
+        final_range_m,
     })
 }
 
