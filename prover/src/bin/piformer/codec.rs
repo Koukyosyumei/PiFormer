@@ -13,7 +13,7 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate
 use piformer_prover::{
     attention::{
         attention::{
-            AttentionInternalCommitments, AttentionOpenings, AttentionProvingKey,
+            AttentionOpenings, AttentionProvingKey,
             AttentionSumcheckProof, AttentionVerifyingKey, LinearAttentionInstance,
             LinearAttentionProof,
         },
@@ -606,22 +606,6 @@ fn read_batched_qkv_proof<R: Read>(r: &mut R) -> io::Result<BatchedQKVProjection
 // Attention proof
 // ---------------------------------------------------------------------------
 
-fn write_attn_internal_coms<W: Write>(
-    w: &mut W,
-    c: &AttentionInternalCommitments,
-) -> io::Result<()> {
-    write_hyrax_commitment(w, &c.phi_q_com)?;
-    write_hyrax_commitment(w, &c.phi_k_com)
-    //write_hyrax_commitment(w, &c.context_com)
-}
-fn read_attn_internal_coms<R: Read>(r: &mut R) -> io::Result<AttentionInternalCommitments> {
-    Ok(AttentionInternalCommitments {
-        phi_q_com: read_hyrax_commitment(r)?,
-        phi_k_com: read_hyrax_commitment(r)?,
-        //context_com: read_hyrax_commitment(r)?,
-    })
-}
-
 fn write_attn_openings<W: Write>(w: &mut W, o: &AttentionOpenings) -> io::Result<()> {
     write_f(w, &o.out_eval)?;
     write_f(w, &o.phi_q_eval)?;
@@ -639,7 +623,6 @@ fn read_attn_openings<R: Read>(r: &mut R) -> io::Result<AttentionOpenings> {
 }
 
 fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result<()> {
-    write_attn_internal_coms(w, &p.internal_coms)?;
     match &p.sumcheck {
         AttentionSumcheckProof::Batched { proof, ctx_eval } => {
             w.write_all(&[0u8])?; // tag: Batched
@@ -655,12 +638,9 @@ fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result
             write_sumcheck_proof(w, context_sumcheck)?;
         }
     }
-    write_attn_openings(w, &p.openings)?;
-    write_hyrax_proof(w, &p.phi_q_open)?;
-    write_hyrax_proof(w, &p.phi_k_open)
+    write_attn_openings(w, &p.openings)
 }
 fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
-    let internal_coms = read_attn_internal_coms(r)?;
     let mut tag = [0u8; 1];
     r.read_exact(&mut tag)?;
     let sumcheck = match tag[0] {
@@ -680,11 +660,8 @@ fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
         }
     };
     Ok(LinearAttentionProof {
-        internal_coms,
         sumcheck,
         openings: read_attn_openings(r)?,
-        phi_q_open: read_hyrax_proof(r)?,
-        phi_k_open: read_hyrax_proof(r)?,
     })
 }
 

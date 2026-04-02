@@ -38,7 +38,6 @@ use crate::attention::projection::{
 use crate::ffn::ffn::{prove_ffn, FFNIOCommitments, FFNInstance, FFNProof, FFNWitness};
 use crate::lookup::lasso::{
     prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
-    LassoOutputBinding,
 };
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey}; // Imported from verifier.rs
 
@@ -406,19 +405,11 @@ pub fn prove(
 
     // 5. Global batched Lasso: one proof for all activation lookups across all layers.
     // Instance order per block: [FFN_i, Q_i, K_i].
-    let t_bits = t.next_power_of_two().trailing_zeros() as usize;
-    let d_bits = d.next_power_of_two().trailing_zeros() as usize;
     let mut all_lasso_instances: Vec<_> = Vec::new();
     let mut all_instance_coms = Vec::new();
-    let mut output_bindings: Vec<LassoOutputBinding> = Vec::new();
     let mut global_nu = 0usize;
     for i in 0..pk.vk.num_blocks {
         let bpk = &pk.block_pks[i];
-        let bw = &witness.block_witnesses[i];
-        let bp = &block_proofs[i];
-
-        let d_ff = bpk.ffn_pk.vk.d_ff;
-        let f_bits = d_ff.next_power_of_two().trailing_zeros() as usize;
 
         all_lasso_instances.push(inst_ffn.activation_lasso.clone());
         all_lasso_instances.push(inst_attn.q_lasso.clone());
@@ -427,27 +418,12 @@ pub fn prove(
         all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
         all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
         global_nu = bpk.ffn_pk.activation_lasso_pk.nu;
-
-        // Output bindings: link a_com / phi_q_com / phi_k_com to Lasso outputs.
-        output_bindings.push(LassoOutputBinding {
-            com: bp.ffn_proof.internal_coms.a_com.clone(),
-            num_vars: t_bits + f_bits,
-            mle_evals: mat_to_mle(&bw.ffn_wit.a, t, d_ff).evaluations,
-        });
-        output_bindings.push(LassoOutputBinding {
-            com: bp.attn_proof.internal_coms.phi_q_com.clone(),
-            num_vars: t_bits + d_bits,
-            mle_evals: mat_to_mle(&bw.attn_wit.phi_q, t, d).evaluations,
-        });
-        output_bindings.push(LassoOutputBinding {
-            com: bp.attn_proof.internal_coms.phi_k_com.clone(),
-            num_vars: t_bits + d_bits,
-            mle_evals: mat_to_mle(&bw.attn_wit.phi_k, t, d).evaluations,
-        });
+        // phi_q/phi_k output bindings eliminated (verified via MLE of public Lasso outputs
+        // in attention verifier). FFN a_com deferred to block-level combine proof.
     }
     let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
     let global_lasso_pk = LassoMultiProvingKey { instance_table_coms: all_instance_coms, nu: global_nu };
-    let all_lasso_proof = prove_lasso_multi(&global_multi_inst, &global_lasso_pk, &output_bindings, transcript, lasso_params);
+    let all_lasso_proof = prove_lasso_multi(&global_multi_inst, &global_lasso_pk, &[], transcript, lasso_params);
 
     Ok(TransformerModelProof {
         x_in_com,

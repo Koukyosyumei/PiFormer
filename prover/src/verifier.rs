@@ -330,16 +330,11 @@ pub fn verify(
 
     // 5. Global batched Lasso
     let _t = Instant::now();
-    let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
-    let d_bits = vk.d_model.next_power_of_two().trailing_zeros() as usize;
     let mut all_lasso_instances = Vec::new();
     let mut all_instance_coms = Vec::new();
-    // Output commitments for binding (a_com, phi_q_com, phi_k_com per block).
-    let mut output_coms: Vec<(HyraxCommitment, usize)> = Vec::new();
+    // Output commitments for binding (phi_q/phi_k eliminated; verified via MLE of public Lasso outputs).
     for i in 0..vk.num_blocks {
         let bvk = &vk.block_vks[i];
-        let bp = &proof.block_proofs[i];
-        let f_bits = bvk.ffn_vk.d_ff.next_power_of_two().trailing_zeros() as usize;
 
         all_lasso_instances.push(inst_ffn.activation_lasso.clone());
         all_lasso_instances.push(inst_attn.q_lasso.clone());
@@ -347,10 +342,6 @@ pub fn verify(
         all_instance_coms.push(bvk.ffn_vk.activation_lasso_vk.table_coms.clone());
         all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
         all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
-
-        output_coms.push((bp.ffn_proof.internal_coms.a_com.clone(), t_bits + f_bits));
-        output_coms.push((bp.attn_proof.internal_coms.phi_q_com.clone(), t_bits + d_bits));
-        output_coms.push((bp.attn_proof.internal_coms.phi_k_com.clone(), t_bits + d_bits));
     }
     let global_multi_inst = LassoMultiInstance {
         instances: all_lasso_instances,
@@ -362,7 +353,7 @@ pub fn verify(
         &proof.all_lasso_proof,
         &global_multi_inst,
         &global_lasso_vk,
-        &output_coms,
+        &[],
         transcript,
         lasso_params,
     )
