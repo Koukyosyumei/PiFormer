@@ -21,7 +21,8 @@ use crate::pcs::{
 use crate::poly::utils::{combine, eval_rows, mat_to_mle, vec_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::sumcheck::{
-    prove_sumcheck_cubic, verify_sumcheck_cubic, SumcheckCubicProof,
+    prove_sumcheck_cubic, prove_sumcheck_cubic_multi_batched, verify_sumcheck_cubic,
+    verify_sumcheck_cubic_multi_batched, SumcheckCubicProof, SumcheckCubicProofMulti,
 };
 use crate::subprotocols::{eq_poly_eval, prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::{challenge_vec, Transcript};
@@ -116,8 +117,8 @@ pub struct LayerNormProof {
     pub mean_sumcheck: SumcheckProof,
     pub sq_sum_sumcheck: SumcheckCubicProof,
     pub sum_x_sq_sumcheck: SumcheckCubicProof,
-    pub gamma_x_sumcheck: SumcheckCubicProof,
-    pub sigma_y_sumcheck: SumcheckCubicProof,
+    /// Batched cubic sumcheck for gamma*X and sigma*Y (shared eq_y, same challenge vector)
+    pub gamma_sigma_sumcheck: SumcheckCubicProofMulti,
     pub sigma_range_proof: RangeProof,
     pub y_range_proof: RangeProof,
     pub openings: LayerNormOpenings,
@@ -249,7 +250,7 @@ pub fn prove_layernorm(
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
     let ry_td = combine(&r_y_t, &r_y_d);
 
-    // [Binding] gamma_x = gamma * X
+    // [Binding] gamma_x = gamma * X  and  sigma_y = sigma * Y  (batched)
     let eq_y = gen_eq_poly(&ry_td);
     let mut gamma_x_evals = vec![F::zero(); 1 << (t_bits + d_bits)];
     for i in 0..t {
@@ -264,10 +265,7 @@ pub fn prove_layernorm(
             .map(|i| vk.gamma[i & ((1 << d_bits) - 1)])
             .collect(),
     );
-    let (gamma_x_sumcheck, r_f_gx) =
-        prove_sumcheck_cubic(&eq_y, &gamma_ext, &x_mle, g_x_eval, transcript);
 
-    // [Binding] sigma_y = sigma * Y
     let mut sigma_y_evals = vec![F::zero(); 1 << (t_bits + d_bits)];
     for i in 0..t {
         for j in 0..d {
@@ -281,8 +279,20 @@ pub fn prove_layernorm(
             .map(|i| witness.sigma[i >> d_bits])
             .collect(),
     );
-    let (sigma_y_sumcheck, r_f_sy) =
-        prove_sumcheck_cubic(&eq_y, &sigma_ext, &y_mle, s_y_eval, transcript);
+
+    let lambda = transcript.challenge_field::<F>(b"gamma_sigma_batch_lambda");
+    let claim_gamma_sigma = g_x_eval + lambda * s_y_eval;
+    let (gamma_sigma_sumcheck, r_f) = prove_sumcheck_cubic_multi_batched(
+        &[eq_y.clone(), eq_y],
+        &[gamma_ext, sigma_ext],
+        &[x_mle.clone(), y_mle.clone()],
+        &[F::one(), lambda],
+        claim_gamma_sigma,
+        transcript,
+    );
+    // Both gamma_x and sigma_y now share the same challenge vector r_f
+    let r_f_gx = r_f.clone();
+    let r_f_sy = r_f;
 
     let _ = transcript.challenge_field::<F>(b"hyrax_mp_lambda");
 
@@ -305,8 +315,7 @@ pub fn prove_layernorm(
         mean_sumcheck,
         sq_sum_sumcheck,
         sum_x_sq_sumcheck,
-        gamma_x_sumcheck,
-        sigma_y_sumcheck,
+        gamma_sigma_sumcheck,
         sigma_range_proof,
         y_range_proof,
         openings: LayerNormOpenings {
@@ -449,30 +458,37 @@ pub fn verify_layernorm(
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
     let ry_td = combine(&r_y_t, &r_y_d);
 
-    // gamma * x Binding
-    let (r_f_gx, f_gx) = verify_sumcheck_cubic(
-        &proof.gamma_x_sumcheck,
-        proof.openings.gamma_x_at_ry,
+    // gamma * X  and  sigma * Y  Binding (batched)
+    let lambda = transcript.challenge_field::<F>(b"gamma_sigma_batch_lambda");
+    let claim_gamma_sigma =
+        proof.openings.gamma_x_at_ry + lambda * proof.openings.sigma_y_at_ry;
+    let (r_f, _) = verify_sumcheck_cubic_multi_batched(
+        &proof.gamma_sigma_sumcheck,
+        &[F::one(), lambda],
+        claim_gamma_sigma,
         t_bits + d_bits,
         transcript,
     )?;
-    let eq_val_gx = eq_poly_eval(&r_f_gx, &ry_td);
-    let gamma_eval_at_f = vec_to_mle(&vk.gamma, vk.d_head).evaluate(&r_f_gx[t_bits..]);
-    if f_gx != eq_val_gx * gamma_eval_at_f * proof.openings.x_at_rf_gx {
+    let eq_val = eq_poly_eval(&r_f, &ry_td);
+    let gamma_eval_at_f = vec_to_mle(&vk.gamma, vk.d_head).evaluate(&r_f[t_bits..]);
+    // gamma_x final check
+    if proof.gamma_sigma_sumcheck.final_evals_f[0]
+        * proof.gamma_sigma_sumcheck.final_evals_g[0]
+        * proof.gamma_sigma_sumcheck.final_evals_h[0]
+        != eq_val * gamma_eval_at_f * proof.openings.x_at_rf_gx
+    {
         return Err("gamma_x binding failed".into());
     }
-
-    // sigma * y Binding
-    let (r_f_sy, f_sy) = verify_sumcheck_cubic(
-        &proof.sigma_y_sumcheck,
-        proof.openings.sigma_y_at_ry,
-        t_bits + d_bits,
-        transcript,
-    )?;
-    let eq_val_sy = eq_poly_eval(&r_f_sy, &ry_td);
-    if f_sy != eq_val_sy * proof.openings.sigma_at_rf_sy_t * proof.openings.y_at_rf_sy {
+    // sigma_y final check
+    if proof.gamma_sigma_sumcheck.final_evals_f[1]
+        * proof.gamma_sigma_sumcheck.final_evals_g[1]
+        * proof.gamma_sigma_sumcheck.final_evals_h[1]
+        != eq_val * proof.openings.sigma_at_rf_sy_t * proof.openings.y_at_rf_sy
+    {
         return Err("sigma_y binding failed".into());
     }
+    let r_f_gx = r_f.clone();
+    let r_f_sy = r_f;
 
     // -----------------------------------------------------------------------
     // 4. Final Fusion Checks (Algebraic Consistency)

@@ -43,7 +43,8 @@ use piformer_prover::{
     subprotocols::{
         combine::CombineProof,
         sumcheck::{
-            CubicRoundPoly, RoundPoly, SumcheckCubicProof, SumcheckProof, SumcheckProofMulti,
+            CubicRoundPoly, RoundPoly, SumcheckCubicProof, SumcheckCubicProofMulti, SumcheckProof,
+            SumcheckProofMulti,
         },
     },
     verifier::TransformerBlockVerifyingKey,
@@ -303,6 +304,24 @@ fn read_sumcheck_cubic_proof<R: Read>(r: &mut R) -> io::Result<SumcheckCubicProo
     })
 }
 
+fn write_sumcheck_cubic_proof_multi<W: Write>(
+    w: &mut W,
+    p: &SumcheckCubicProofMulti,
+) -> io::Result<()> {
+    write_vec(w, &p.round_polys, write_cubic_round_poly)?;
+    write_vec_f(w, &p.final_evals_f)?;
+    write_vec_f(w, &p.final_evals_g)?;
+    write_vec_f(w, &p.final_evals_h)
+}
+fn read_sumcheck_cubic_proof_multi<R: Read>(r: &mut R) -> io::Result<SumcheckCubicProofMulti> {
+    Ok(SumcheckCubicProofMulti {
+        round_polys: read_vec(r, read_cubic_round_poly)?,
+        final_evals_f: read_vec_f(r)?,
+        final_evals_g: read_vec_f(r)?,
+        final_evals_h: read_vec_f(r)?,
+    })
+}
+
 fn write_lasso_multi_proof<W: Write>(w: &mut W, p: &LassoMultiProof) -> io::Result<()> {
     write_f(w, &p.combined_grand_sum)?;
     write_sumcheck_proof_multi(w, &p.combined_sumcheck_proof)?;
@@ -468,8 +487,7 @@ fn write_ln_proof<W: Write>(w: &mut W, p: &LayerNormProof) -> io::Result<()> {
     write_sumcheck_proof(w, &p.mean_sumcheck)?;
     write_sumcheck_cubic_proof(w, &p.sq_sum_sumcheck)?;
     write_sumcheck_cubic_proof(w, &p.sum_x_sq_sumcheck)?;
-    write_sumcheck_cubic_proof(w, &p.gamma_x_sumcheck)?;
-    write_sumcheck_cubic_proof(w, &p.sigma_y_sumcheck)?;
+    write_sumcheck_cubic_proof_multi(w, &p.gamma_sigma_sumcheck)?;
     write_range_proof(w, &p.sigma_range_proof)?;
     write_range_proof(w, &p.y_range_proof)?;
     write_ln_openings(w, &p.openings)
@@ -480,8 +498,7 @@ fn read_ln_proof<R: Read>(r: &mut R) -> io::Result<LayerNormProof> {
         mean_sumcheck: read_sumcheck_proof(r)?,
         sq_sum_sumcheck: read_sumcheck_cubic_proof(r)?,
         sum_x_sq_sumcheck: read_sumcheck_cubic_proof(r)?,
-        gamma_x_sumcheck: read_sumcheck_cubic_proof(r)?,
-        sigma_y_sumcheck: read_sumcheck_cubic_proof(r)?,
+        gamma_sigma_sumcheck: read_sumcheck_cubic_proof_multi(r)?,
         sigma_range_proof: read_range_proof(r)?,
         y_range_proof: read_range_proof(r)?,
         openings: read_ln_openings(r)?,
