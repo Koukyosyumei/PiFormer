@@ -77,6 +77,9 @@ pub fn verify_transformer_block(
     ln_acc_td: &mut HyraxBatchAccumulator,
     proj_acc_w: &mut HyraxBatchAccumulator,
     proj_acc_b: &mut HyraxBatchAccumulator,
+    acc_range_sig: &mut HyraxBatchAccumulator,
+    acc_range_y: &mut HyraxBatchAccumulator,
+    acc_range_m: &mut HyraxBatchAccumulator,
 ) -> Result<(), String> {
     // =========================================================================
     // Pipeline Stitching (The Binding of IO Commitments)
@@ -94,6 +97,7 @@ pub fn verify_transformer_block(
     let d = vk.d_model;
     let ln_sigma_n = (2 * t).next_power_of_two().trailing_zeros() as usize;
     let ln_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
+    let _t = Instant::now();
     let (block_r_vs, _block_r_m) = verify_range_batched(
         &[
             &proof.ln1_proof.sigma_range_proof,
@@ -105,7 +109,11 @@ pub fn verify_transformer_block(
         &[ln_sigma_n, ln_y_n, ln_sigma_n, ln_y_n],
         32,
         transcript,
+        acc_range_sig,
+        acc_range_y,
+        acc_range_m,
     )?;
+    eprintln!("[block] range_batch:{:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
     let ln1_sig_rv = &block_r_vs[0];
     let ln1_y_rv   = &block_r_vs[1];
     let ln2_sig_rv = &block_r_vs[2];
@@ -291,6 +299,15 @@ pub fn verify(
     let mut proj_acc_b = HyraxBatchAccumulator::new();
     let mut lmh_acc_w = HyraxBatchAccumulator::new();
     let mut lmh_acc_b = HyraxBatchAccumulator::new();
+    // Range proof chunk/m accumulators: sigma witnesses, y witnesses, m_com
+    let ln_sig_n = (2 * vk.seq_len).next_power_of_two().trailing_zeros() as usize;
+    let ln_y_n_global = (2 * vk.seq_len * vk.d_model).next_power_of_two().trailing_zeros() as usize;
+    let (_, _, params_range_sig) = params_from_vars(ln_sig_n);
+    let (_, _, params_range_y)   = params_from_vars(ln_y_n_global);
+    let (_, _, params_range_m)   = params_from_vars(crate::lookup::range::CHUNK_BITS);
+    let mut acc_range_sig = HyraxBatchAccumulator::new();
+    let mut acc_range_y   = HyraxBatchAccumulator::new();
+    let mut acc_range_m   = HyraxBatchAccumulator::new();
 
     // 2. Block Verification Chaining
     let mut current_x_com = proof.x_in_com.clone();
@@ -316,6 +333,9 @@ pub fn verify(
             &mut ln_acc_td,
             &mut proj_acc_w,
             &mut proj_acc_b,
+            &mut acc_range_sig,
+            &mut acc_range_y,
+            &mut acc_range_m,
         )
         .map_err(|e| format!("Block {} failed: {}", i, e))?;
 
@@ -328,6 +348,7 @@ pub fn verify(
     let d = vk.d_model;
     let final_sigma_n = (2 * t).next_power_of_two().trailing_zeros() as usize;
     let final_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
+    let _t = Instant::now();
     let (final_r_vs, _final_r_m) = verify_range_batched(
         &[
             &proof.final_ln_proof.sigma_range_proof,
@@ -337,8 +358,12 @@ pub fn verify(
         &[final_sigma_n, final_y_n],
         32,
         transcript,
+        &mut acc_range_sig,
+        &mut acc_range_y,
+        &mut acc_range_m,
     )
     .map_err(|e| format!("Final LN range batch failed: {}", e))?;
+    eprintln!("[model] range_batch:{:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
     let _t = Instant::now();
     let ln_io = LayerNormIOCommitments {
         x_com: current_x_com.clone(),
@@ -364,7 +389,7 @@ pub fn verify(
         .map_err(|e| format!("LM Head failed: {}", e))?;
     eprintln!("[model] lm_head:    {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
-    // Finalize all 6 accumulators (each adds hyrax_group_mu to transcript)
+    // Finalize all 9 accumulators (each adds hyrax_group_mu to transcript)
     let _tacc = Instant::now();
     ln_acc_t.finalize(&params_t, transcript)?;
     ln_acc_td.finalize(&params_td, transcript)?;
@@ -372,6 +397,10 @@ pub fn verify(
     proj_acc_b.finalize(&params_qkvo_b, transcript)?;
     lmh_acc_w.finalize(&params_lmh_w, transcript)?;
     lmh_acc_b.finalize(&params_lmh_b, transcript)?;
+    // Range proof chunk/m accumulators (3 new — must match prover burns)
+    acc_range_sig.finalize(&params_range_sig, transcript)?;
+    acc_range_y.finalize(&params_range_y, transcript)?;
+    acc_range_m.finalize(&params_range_m, transcript)?;
     eprintln!("[model] acc_finalize:{:>8.3}ms", _tacc.elapsed().as_secs_f64()*1000.0);
 
     // 5. Global batched Lasso

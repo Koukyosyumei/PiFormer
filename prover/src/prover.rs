@@ -461,13 +461,16 @@ pub fn prove(
     let (lm_head_proof, _, _) =
         prove_projection(&pk.lm_head_pk, &witness.lm_head_wit, &lm_io, transcript)?;
 
-    // Advance transcript to match verifier's 6 accumulator finalizations.
+    // Advance transcript to match verifier's 9 accumulator finalizations.
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // ln_acc_t
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // ln_acc_td
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // proj_acc_w (QKVO)
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // proj_acc_b (QKVO)
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // lmh_acc_w
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // lmh_acc_b
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // acc_range_sig
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // acc_range_y
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // acc_range_m
 
     // 5. Global batched Lasso: one proof for all activation lookups across all layers.
     // Instance order per block: [FFN_i, Q_i, K_i].
@@ -906,6 +909,9 @@ mod tests {
         let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -919,6 +925,9 @@ mod tests {
             &mut ln_acc_td,
             &mut proj_acc_w,
             &mut proj_acc_b,
+            &mut acc_range_sig,
+            &mut acc_range_y,
+            &mut acc_range_m,
         );
         assert!(
             result.is_ok(),
@@ -963,6 +972,9 @@ mod tests {
         let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -976,6 +988,9 @@ mod tests {
             &mut ln_acc_td,
             &mut proj_acc_w,
             &mut proj_acc_b,
+            &mut acc_range_sig,
+            &mut acc_range_y,
+            &mut acc_range_m,
         );
         assert!(result.is_err(), "Should reject wrong x_out_com");
     }
@@ -1012,6 +1027,9 @@ mod tests {
         let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -1025,6 +1043,9 @@ mod tests {
             &mut ln_acc_td,
             &mut proj_acc_w,
             &mut proj_acc_b,
+            &mut acc_range_sig,
+            &mut acc_range_y,
+            &mut acc_range_m,
         );
         assert!(result.is_err(), "Should reject tampered LN1 proof");
     }
@@ -1068,6 +1089,9 @@ mod tests {
         let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -1081,6 +1105,9 @@ mod tests {
             &mut ln_acc_td,
             &mut proj_acc_w,
             &mut proj_acc_b,
+            &mut acc_range_sig,
+            &mut acc_range_y,
+            &mut acc_range_m,
         );
         assert!(result.is_err(), "Should reject tampered x_norm1_com");
     }

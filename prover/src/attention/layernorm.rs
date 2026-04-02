@@ -15,8 +15,8 @@ use crate::lookup::range::{
     prove_range_batched, verify_range_batched, GlobalRangeM, RangeProofWitness, RangeWitnessProof,
 };
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, params_from_n, poly_hyrax,
-    HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
+    absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, params_from_n, params_from_vars,
+    poly_hyrax, HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
 };
 use crate::poly::utils::{combine, eval_rows, mat_to_mle, vec_to_mle};
 use crate::poly::DenseMLPoly;
@@ -789,19 +789,28 @@ mod layernorm_tests {
             &mut pt,
         )
         .unwrap();
-        let _ = pt.challenge_field::<F>(b"hyrax_group_mu");
-        let _ = pt.challenge_field::<F>(b"hyrax_group_mu");
+        let _ = pt.challenge_field::<F>(b"hyrax_group_mu"); // ln_acc_t
+        let _ = pt.challenge_field::<F>(b"hyrax_group_mu"); // ln_acc_td
+        let _ = pt.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_sig
+        let _ = pt.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_y
+        let _ = pt.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_m
 
         // Verifier side
         let mut vt = Transcript::new(b"layernorm_test");
         let sigma_rp_ref = &proof.sigma_range_proof;
         let y_rp_ref = &proof.y_range_proof;
+        let mut acc_range_sig = HyraxBatchAccumulator::new();
+        let mut acc_range_y   = HyraxBatchAccumulator::new();
+        let mut acc_range_m   = HyraxBatchAccumulator::new();
         let (rv_v, _r_m_v) = verify_range_batched(
             &[sigma_rp_ref, y_rp_ref],
             &global_m,
             &[sigma_n_vars, y_n_vars],
             32,
             &mut vt,
+            &mut acc_range_sig,
+            &mut acc_range_y,
+            &mut acc_range_m,
         )
         .unwrap();
 
@@ -822,8 +831,14 @@ mod layernorm_tests {
             let n_td = n_t * vk.d_head.next_power_of_two().max(1);
             let (_, _, params_t) = params_from_n(n_t);
             let (_, _, params_td) = params_from_n(n_td);
+            let (_, _, params_rsig) = params_from_vars(sigma_n_vars);
+            let (_, _, params_ry)   = params_from_vars(y_n_vars);
+            let (_, _, params_rm)   = params_from_vars(crate::lookup::range::CHUNK_BITS);
             ln_acc_t.finalize(&params_t, &mut vt).unwrap();
             ln_acc_td.finalize(&params_td, &mut vt).unwrap();
+            acc_range_sig.finalize(&params_rsig, &mut vt).unwrap();
+            acc_range_y.finalize(&params_ry, &mut vt).unwrap();
+            acc_range_m.finalize(&params_rm, &mut vt).unwrap();
         }
         result.expect("verify_layernorm failed");
         (proof, global_m, r_vs)
@@ -858,15 +873,24 @@ mod layernorm_tests {
             (y_rp, r_vs[1].clone()),
             &mut pt,
         ) {
-            let _ = pt.challenge_field::<F>(b"hyrax_group_mu");
-            let _ = pt.challenge_field::<F>(b"hyrax_group_mu");
+            let _ = pt.challenge_field::<F>(b"hyrax_group_mu"); // ln_acc_t
+            let _ = pt.challenge_field::<F>(b"hyrax_group_mu"); // ln_acc_td
+            let _ = pt.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_sig
+            let _ = pt.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_y
+            let _ = pt.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_m
             let mut vt = Transcript::new(b"layernorm_test");
+            let mut acc_range_sig = HyraxBatchAccumulator::new();
+            let mut acc_range_y   = HyraxBatchAccumulator::new();
+            let mut acc_range_m   = HyraxBatchAccumulator::new();
             let (rv_v, _) = verify_range_batched(
                 &[&proof.sigma_range_proof, &proof.y_range_proof],
                 &global_m,
                 &[sigma_n_vars, y_n_vars],
                 32,
                 &mut vt,
+                &mut acc_range_sig,
+                &mut acc_range_y,
+                &mut acc_range_m,
             )
             .unwrap();
             let mut ln_acc_t = HyraxBatchAccumulator::new();
@@ -886,8 +910,14 @@ mod layernorm_tests {
                 let n_td = n_t * vk.d_head.next_power_of_two().max(1);
                 let (_, _, params_t) = params_from_n(n_t);
                 let (_, _, params_td) = params_from_n(n_td);
+                let (_, _, params_rsig) = params_from_vars(sigma_n_vars);
+                let (_, _, params_ry)   = params_from_vars(y_n_vars);
+                let (_, _, params_rm)   = params_from_vars(crate::lookup::range::CHUNK_BITS);
                 let _ = ln_acc_t.finalize(&params_t, &mut vt);
                 let _ = ln_acc_td.finalize(&params_td, &mut vt);
+                let _ = acc_range_sig.finalize(&params_rsig, &mut vt);
+                let _ = acc_range_y.finalize(&params_ry, &mut vt);
+                let _ = acc_range_m.finalize(&params_rm, &mut vt);
             }
             assert!(
                 result.is_err(),

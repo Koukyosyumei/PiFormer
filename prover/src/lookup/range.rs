@@ -10,7 +10,8 @@
 use crate::field::F;
 use crate::pcs::{
     hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch,
-    hyrax_verify_multi_point, params_from_vars, HyraxCommitment, HyraxParams, HyraxProof,
+    hyrax_verify_multi_point, params_from_vars, HyraxBatchAccumulator, HyraxCommitment,
+    HyraxParams, HyraxProof,
 };
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
@@ -444,15 +445,34 @@ pub fn prove_range_batched(
 /// `num_vars_list[i]` is the num_vars for witness i (= ceil(log2(n_i))).
 /// Returns `(r_vs, r_m)` — the per-witness evaluation points and the
 /// multiplicity evaluation point.
+/// Verifier side of globally-batched range proofs.
+///
+/// Hyrax MSMs are deferred via two chunk accumulators and one m accumulator:
+///   - `acc_small`: receives chunk openings for witnesses with the smallest num_vars
+///                  (the sigma witnesses in LayerNorm).
+///   - `acc_large`: receives chunk openings for all other witnesses (y witnesses).
+///   - `acc_m`:     receives the single shared m_com opening.
+///
+/// The routing rule: a witness whose `num_vars == min(num_vars_list)` goes to
+/// `acc_small`; all other witnesses go to `acc_large`.  When every witness has
+/// the same `num_vars`, they all go to `acc_small` and `acc_large` is untouched.
+///
+/// All three accumulators must be finalised by the caller AFTER all
+/// `verify_range_batched` calls, in the order (acc_small, acc_large, acc_m).
+/// The corresponding prover-side burns must appear in the same order.
 pub fn verify_range_batched(
     witness_proofs: &[&RangeWitnessProof],
     global_m: &GlobalRangeM,
     num_vars_list: &[usize],
     bits: usize,
     transcript: &mut Transcript,
+    acc_small: &mut HyraxBatchAccumulator,
+    acc_large: &mut HyraxBatchAccumulator,
+    acc_m: &mut HyraxBatchAccumulator,
 ) -> Result<(Vec<Vec<F>>, Vec<F>), String> {
     let num_chunks = (bits + CHUNK_BITS - 1) / CHUNK_BITS;
-    let (_, _, params_m) = params_from_vars(CHUNK_BITS);
+
+    let min_nv = num_vars_list.iter().copied().min().unwrap_or(0);
 
     // Phase 1: absorb chunk_coms for each witness
     for proof in witness_proofs {
@@ -464,27 +484,27 @@ pub fn verify_range_batched(
     // Absorb shared m_com
     absorb_com(transcript, b"logup_m_com", &global_m.m_com);
 
-    // Phase 2: per-witness sumcheck + chunk fusion check
+    // Phase 2: per-witness sumcheck + deferred chunk opening
     let mut r_vs: Vec<Vec<F>> = Vec::with_capacity(witness_proofs.len());
     for (i, proof) in witness_proofs.iter().enumerate() {
         let num_vars = num_vars_list[i];
-        let (_, _, params_c) = params_from_vars(num_vars);
 
         transcript.append_field(b"claim_v", &proof.claim_v);
         let (r_v, final_val) =
             verify_sumcheck(&proof.sumcheck, proof.claim_v, num_vars, transcript)
                 .map_err(|e| format!("GlobalRange witness {i} sumcheck: {e}"))?;
 
-        // Chunk batch opening
-        hyrax_verify_batch(
-            &proof.chunk_coms,
-            &proof.chunk_evals,
-            &r_v,
-            &proof.chunk_batch_proof,
-            &params_c,
-            transcript,
-        )
-        .map_err(|e| format!("GlobalRange witness {i} chunk opening: {e}"))?;
+        // Route chunk opening to the right accumulator based on num_vars.
+        let acc_chunk = if num_vars == min_nv { &mut *acc_small } else { &mut *acc_large };
+        acc_chunk
+            .add_verify_batch(
+                &proof.chunk_coms,
+                &proof.chunk_evals,
+                &r_v,
+                &proof.chunk_batch_proof,
+                transcript,
+            )
+            .map_err(|e| format!("GlobalRange witness {i} chunk opening (deferred): {e}"))?;
 
         // Algebraic fusion: V(r_v) = Σ_c chunk_eval[c] * 2^(16c)
         let mut expected = F::ZERO;
@@ -501,10 +521,16 @@ pub fn verify_range_batched(
         r_vs.push(r_v);
     }
 
-    // Derive r_m and verify shared m opening
+    // Derive r_m and defer shared m opening
     let r_m = challenge_vec(transcript, CHUNK_BITS, b"logup_rm");
-    hyrax_verify(&global_m.m_com, global_m.m_eval, &r_m, &global_m.m_open, &params_m)
-        .map_err(|e| format!("GlobalRange m opening: {e}"))?;
+    acc_m
+        .add_verify(
+            &global_m.m_com,
+            global_m.m_eval,
+            &r_m,
+            &global_m.m_open,
+        )
+        .map_err(|e| format!("GlobalRange m opening (deferred): {e}"))?;
 
     Ok((r_vs, r_m))
 }
