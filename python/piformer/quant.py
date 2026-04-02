@@ -6,17 +6,18 @@ Conversion to BN254 field elements (mod p) happens only at JSON-serialization
 time via ``int_to_field_hex``.
 
 Protocol invariants matched to layernorm.rs / lasso.rs / range.rs:
-  - LayerNorm: sum_x, var_x, sigma, y are small non-negative Python ints.
+  - LayerNorm: sum_x, sq_sum_x, inv_sigma, norm_x, y are small non-negative
+    Python ints computed via the Lasso-based inv_sqrt lookup.
   - Lasso: query_indices are in [0, 2^num_bits - 1]; table entries are
     non-negative Python ints; outputs = sum of sub-table lookups.
-  - Range-proof residuals (sigma lo/hi, y lo/hi) must fit in 32 bits.
+  - Range-proof residuals (y lo/hi) must fit in 32 bits.
   - Projections / context matrix: arbitrary signed Python ints → field elements.
 """
 
 from __future__ import annotations
 
 import math
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # BN254 scalar field modulus
@@ -25,6 +26,49 @@ from typing import List, Tuple
 BN254_P: int = (
     21888242871839275222246405745257275088548364400416034343698204186575808495617
 )
+
+# ---------------------------------------------------------------------------
+# Lasso inv-sqrt lookup constants (must match inv_sqrt.rs)
+# ---------------------------------------------------------------------------
+
+INV_SQRT_SCALE: int = 1 << 16   # 65536
+CHUNK_BITS: int = 16
+CHUNK_SIZE: int = 1 << CHUNK_BITS  # 65536
+
+_INV_SQRT_T1: Optional[List[int]] = None
+
+
+def _get_inv_sqrt_t1() -> List[int]:
+    """Build (once) and return T_1: T_1[h] = round(65536 / sqrt((h+0.5)*65536))."""
+    global _INV_SQRT_T1
+    if _INV_SQRT_T1 is not None:
+        return _INV_SQRT_T1
+    scale = float(INV_SQRT_SCALE)
+    chunk_f = float(CHUNK_SIZE)
+    t1 = []
+    for h in range(CHUNK_SIZE):
+        x_center = (h + 0.5) * chunk_f
+        if x_center > 0.0:
+            val = round(scale / math.sqrt(x_center))
+        else:
+            val = round(scale / math.sqrt(0.5 * chunk_f))
+        t1.append(val)
+    _INV_SQRT_T1 = t1
+    return t1
+
+
+def lookup_inv_sqrt(var_x: int) -> int:
+    """
+    Look up approximate 1/sqrt(var_x) using the two-table Lasso decomposition.
+
+    Matches Rust ``lookup_inv_sqrt`` in inv_sqrt.rs:
+      T_0[lo] = 0  (k=0, low bits)
+      T_1[hi] = round(65536 / sqrt((hi+0.5)*65536))  (k=1, high bits)
+      result = T_0[lo] + T_1[hi] = T_1[hi]
+    """
+    t1 = _get_inv_sqrt_t1()
+    hi = (var_x >> CHUNK_BITS) & (CHUNK_SIZE - 1)
+    return t1[min(hi, CHUNK_SIZE - 1)]
 
 # ---------------------------------------------------------------------------
 # Field-element helpers
@@ -137,72 +181,57 @@ def compute_ln_witness(
     gamma: List[int],
     beta: List[int],
     d: int,
-) -> Tuple[List[List[int]], List[int], List[int], List[int]]:
+) -> Tuple[List[List[int]], List[int], List[int]]:
     """
-    Compute LayerNorm witness in exact integer arithmetic matching the Rust
-    protocol in ``attention/layernorm.rs``.
+    Compute LayerNorm witness using the Lasso inv-sqrt lookup, matching the
+    Rust protocol in ``attention/layernorm.rs``.
 
     Protocol:
-      sum_x[i]   = Σ_j x[i][j]
-      sq_sum_x[i]= Σ_j x[i][j]²  (sum of squares; matches Rust sq_sum_x field)
-      actual_var[i] = Σ_j (d·x[i][j] − sum_x[i])²  = d·(d·sq_sum_x − sum_x²)
-      sigma[i]  = floor(√actual_var[i] / d)
-                  i.e. largest s such that (d·s)² ≤ actual_var[i]
-      sig_d     = d · sigma[i]
-      expr[i,j] = gamma[j]·(d·x[i][j] − sum_x[i]) + beta[j]·sig_d
-      y[i][j]   = floor((2·expr + sig_d) / (2·sig_d))
+      sum_x[i]    = Σ_j x[i][j]
+      sq_sum_x[i] = Σ_j x[i][j]²
+      var_x[i]    = d·(d·sq_sum_x[i] − sum_x[i]²)  (= Σ_j (d·x−sum)²)
+      inv_sigma[i]= lookup_inv_sqrt(var_x[i])         (= T_1[var_x >> 16])
+      norm_x[i,j] = (d·x[i][j] − sum_x[i]) · inv_sigma[i]
+      expr[i,j]   = gamma[j]·norm_x[i,j] + beta[j]·INV_SQRT_SCALE
+      y[i][j]     = round(expr / INV_SQRT_SCALE)
+                  = (expr + INV_SQRT_SCALE//2) // INV_SQRT_SCALE
 
     All arguments and return values are Python ints (no field reduction).
 
     Returns:
-        (y, sum_x, sq_sum_x, sigma)
+        (y, sum_x, sq_sum_x)   — 3 values
 
     Raises:
         ValueError if any y value is negative (beta_floor is too small).
     """
     t = len(x_rows)
+    S = INV_SQRT_SCALE
 
     sum_x = [sum(row) for row in x_rows]
-
-    # sq_sum_x[i] = Σ_j x[i][j]² — what the Rust prover reads via the "var_x" JSON key
-    sq_sum_x: List[int] = []
-    # actual_var[i] = Σ_j (d·x[i][j] − sum_x[i])² — used only for sigma computation
-    actual_var: List[int] = []
-    for i in range(t):
-        sq_sum_x.append(sum(x_rows[i][j] ** 2 for j in range(d)))
-        actual_var.append(sum((d * x_rows[i][j] - sum_x[i]) ** 2 for j in range(d)))
-
-    # sigma[i] = largest int s.t. (d·s)² ≤ actual_var[i]
-    sigma: List[int] = []
-    for v in actual_var:
-        s = math.isqrt(v) // d
-        # Correct for potential off-by-one from integer square root
-        while (d * (s + 1)) ** 2 <= v:
-            s += 1
-        while s > 0 and (d * s) ** 2 > v:
-            s -= 1
-        sigma.append(s)
+    sq_sum_x: List[int] = [
+        sum(x_rows[i][j] ** 2 for j in range(d)) for i in range(t)
+    ]
 
     y: List[List[int]] = []
     for i in range(t):
-        sig_d = d * sigma[i]
+        var_x = d * (d * sq_sum_x[i] - sum_x[i] ** 2)
+        var_x = max(0, var_x)
+        inv_sigma = lookup_inv_sqrt(var_x)
+
         row_y: List[int] = []
         for j in range(d):
-            if sig_d == 0:
-                # Degenerate case: all x[i][j] are equal → y = 0 (by convention)
-                row_y.append(0)
-                continue
-            expr = gamma[j] * (d * x_rows[i][j] - sum_x[i]) + beta[j] * sig_d
-            yij = (2 * expr + sig_d) // (2 * sig_d)
+            norm_x = (d * x_rows[i][j] - sum_x[i]) * inv_sigma
+            expr = gamma[j] * norm_x + beta[j] * S
+            yij = (expr + S // 2) // S
             if yij < 0:
                 raise ValueError(
                     f"y[{i}][{j}] = {yij} < 0. Increase beta_floor. "
-                    f"expr={expr}, sig_d={sig_d}, gamma={gamma[j]}, beta={beta[j]}"
+                    f"expr={expr}, inv_sigma={inv_sigma}, gamma={gamma[j]}, beta={beta[j]}"
                 )
             row_y.append(yij)
         y.append(row_y)
 
-    return y, sum_x, sq_sum_x, sigma
+    return y, sum_x, sq_sum_x
 
 
 def min_beta_floor(
@@ -214,40 +243,30 @@ def min_beta_floor(
     Compute the minimum integer BETA_FLOOR to add to every beta[j] so that
     all LayerNorm y values are non-negative.
 
-    This is conservative: returns the smallest floor that guarantees
-    ``compute_ln_witness`` succeeds with ``beta_exported[j] = beta[j] + floor``.
+    Uses the Lasso-based formula: y = (gamma*norm_x + beta*S + S//2) // S >= 0
+    ⟹ beta >= ceil((-gamma*norm_x - S//2) / S)
     """
     if not x_rows:
         return 0
 
-    t, _d = len(x_rows), len(x_rows[0])
+    S = INV_SQRT_SCALE
+    t = len(x_rows)
     sum_x = [sum(row) for row in x_rows]
-    var_x = [
-        sum((d * x_rows[i][j] - sum_x[i]) ** 2 for j in range(d))
-        for i in range(t)
-    ]
-    sigma_list = []
-    for v in var_x:
-        s = math.isqrt(v) // d
-        while (d * (s + 1)) ** 2 <= v:
-            s += 1
-        while s > 0 and (d * s) ** 2 > v:
-            s -= 1
-        sigma_list.append(s)
+    sq_sum_x = [sum(x_rows[i][j] ** 2 for j in range(d)) for i in range(t)]
 
     floor_needed = 0
     for i in range(t):
-        sig_d = d * sigma_list[i]
-        if sig_d == 0:
+        var_x = max(0, d * (d * sq_sum_x[i] - sum_x[i] ** 2))
+        inv_sigma = lookup_inv_sqrt(var_x)
+        if inv_sigma == 0:
             continue
         for j in range(d):
-            # Worst case: beta = 0
-            expr_no_beta = gamma[j] * (d * x_rows[i][j] - sum_x[i])
-            # We need: expr_no_beta + beta_floor * sig_d >= -sig_d/2 + 1
-            # (so that (2*expr + sig_d) // (2*sig_d) >= 0)
-            # Rearranging: beta_floor >= (-sig_d/2 + 1 - expr_no_beta) / sig_d
-            #                          = 1 - expr_no_beta/sig_d - 1/2
-            min_floor_ij = math.ceil((-expr_no_beta - sig_d // 2) / sig_d) + 1
+            norm_x = (d * x_rows[i][j] - sum_x[i]) * inv_sigma
+            # expr_no_beta = gamma[j] * norm_x
+            # Need: gamma[j]*norm_x + beta_floor*S + S//2 >= 0
+            # ⟹ beta_floor >= ceil((-gamma[j]*norm_x - S//2) / S)
+            expr_no_beta = gamma[j] * norm_x
+            min_floor_ij = math.ceil((-expr_no_beta - S // 2) / S)
             if min_floor_ij > floor_needed:
                 floor_needed = min_floor_ij
 

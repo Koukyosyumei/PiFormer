@@ -14,8 +14,8 @@ Design contract
 * The phi activation clamps inputs to [0, 2^num_bits − 1], so Lasso
   query_indices are always small non-negative integers.
 
-* LayerNorm witnesses (sum_x, var_x, sigma, y) are small non-negative Python
-  ints computed with the exact formula from ``layernorm.rs``.
+* LayerNorm witnesses (sum_x, sq_sum_x, y) are small non-negative Python
+  ints computed via the Lasso inv-sqrt lookup, matching ``layernorm.rs``.
 
 * Ternary weight matrices are integer-valued ({−alpha_int, 0, +alpha_int});
   their products with integer activations remain exact.
@@ -205,7 +205,7 @@ def _gen_block_witness(
         ln_scale,
         extra_beta_floor,
     )
-    ln1_y, ln1_sum_x, ln1_var_x, ln1_sigma = compute_ln_witness(
+    ln1_y, ln1_sum_x, ln1_sq_sum_x = compute_ln_witness(
         x_in, ln1_gamma_int, ln1_beta_int, d
     )
 
@@ -273,7 +273,7 @@ def _gen_block_witness(
         ln_scale,
         extra_beta_floor,
     )
-    ln2_y, ln2_sum_x, ln2_var_x, ln2_sigma = compute_ln_witness(
+    ln2_y, ln2_sum_x, ln2_sq_sum_x = compute_ln_witness(
         x_mid, ln2_gamma_int, ln2_beta_int, d
     )
 
@@ -329,8 +329,7 @@ def _gen_block_witness(
             "x": mat_to_json(x_in),
             "y": mat_to_json(ln1_y),
             "sum_x": vec_to_json(ln1_sum_x),
-            "var_x": vec_to_json(ln1_var_x),
-            "sigma": vec_to_json(ln1_sigma),
+            "sq_sum_x": vec_to_json(ln1_sq_sum_x),
         },
         "q_proj": {"x": mat_to_json(ln1_y), "y": mat_to_json(q_raw)},
         "k_proj": {"x": mat_to_json(ln1_y), "y": mat_to_json(k_raw)},
@@ -350,8 +349,7 @@ def _gen_block_witness(
             "x": mat_to_json(x_mid),
             "y": mat_to_json(ln2_y),
             "sum_x": vec_to_json(ln2_sum_x),
-            "var_x": vec_to_json(ln2_var_x),
-            "sigma": vec_to_json(ln2_sigma),
+            "sq_sum_x": vec_to_json(ln2_sq_sum_x),
         },
         "ffn": {
             "x": mat_to_json(ln2_y),
@@ -470,7 +468,7 @@ class WitnessGenerator:
             self.ln_scale,
             self.extra_beta_floor,
         )
-        final_ln_y, final_ln_sum_x, final_ln_var_x, final_ln_sigma = (
+        final_ln_y, final_ln_sum_x, final_ln_sq_sum_x = (
             compute_ln_witness(x_cur, final_gamma_int, final_beta_int, d_model)
         )
 
@@ -515,8 +513,7 @@ class WitnessGenerator:
                 "x": mat_to_json(x_cur),
                 "y": mat_to_json(final_ln_y),
                 "sum_x": vec_to_json(final_ln_sum_x),
-                "var_x": vec_to_json(final_ln_var_x),
-                "sigma": vec_to_json(final_ln_sigma),
+                "sq_sum_x": vec_to_json(final_ln_sq_sum_x),
             },
             "lm_head": {
                 "x": mat_to_json(final_ln_y),
