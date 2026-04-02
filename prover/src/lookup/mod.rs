@@ -1,3 +1,4 @@
+pub mod inv_sqrt;
 pub mod lasso;
 pub mod range;
 

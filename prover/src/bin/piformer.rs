@@ -43,6 +43,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use piformer_prover::{
+    attention::layernorm::LayerNormLassoKey,
     pcs::HyraxParams,
     prover::prove,
     setup::preprocess_transformer_model,
@@ -380,8 +381,9 @@ fn run_sample(out_dir: &Path) -> io::Result<()> {
     run_setup(&weights_path, T, &pk_path, &vk_path)?;
 
     // --- Witness ---
+    let lk = LayerNormLassoKey::setup();
     let (witness, inst_attn, inst_ffn) =
-        sample::build_zero_witness(T, D, D_FF, V, M_BITS);
+        sample::build_zero_witness(T, D, D_FF, V, M_BITS, &lk);
     let lasso_sigma = M_BITS / 2;
     let jw = json_io::witness_to_json(&witness, &inst_attn, &inst_ffn, lasso_sigma);
     let witness_path = out_dir.join("witness.json");

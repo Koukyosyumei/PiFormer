@@ -27,8 +27,8 @@ use crate::attention::attention::{
     LinearAttentionInstance, LinearAttentionProof, LinearAttentionWitness,
 };
 use crate::attention::layernorm::{
-    prove_layernorm, LayerNormIOCommitments, LayerNormProof, LayerNormVerifyingKey,
-    LayerNormWitness,
+    prove_layernorm, LayerNormIOCommitments, LayerNormLassoKey, LayerNormProof,
+    LayerNormVerifyingKey, LayerNormWitness,
 };
 use crate::attention::projection::{
     prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionProvingKey,
@@ -151,7 +151,7 @@ pub fn prove_transformer_block(
         x_com: x_in_com.clone(),
         y_com: x_norm1_com.clone(),
     };
-    let ln1_proof = prove_layernorm(&witness.ln1_wit, &ln1_io, &pk.ln1_vk, transcript)?;
+    let ln1_proof = prove_layernorm(&witness.ln1_wit, &ln1_io, &pk.ln1_vk, &pk.ln_lasso_key, transcript)?;
 
     // --- Q, K, V Projections — return (proof, y_claim, x_claim) ---
     let q_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
@@ -193,7 +193,7 @@ pub fn prove_transformer_block(
         x_com: x_mid_com.clone(),
         y_com: x_norm2_com.clone(),
     };
-    let ln2_proof = prove_layernorm(&witness.ln2_wit, &ln2_io, &pk.ln2_vk, transcript)?;
+    let ln2_proof = prove_layernorm(&witness.ln2_wit, &ln2_io, &pk.ln2_vk, &pk.ln_lasso_key, transcript)?;
 
     // --- FFN — returns (proof, y_claim, x_claim) ---
     let ffn_io = FFNIOCommitments {
@@ -312,6 +312,7 @@ pub struct TransformerModelVerifyingKey {
 
     pub block_vks: Vec<TransformerBlockVerifyingKey>,
     pub final_ln_vk: LayerNormVerifyingKey,
+    pub final_ln_lasso_key: LayerNormLassoKey,
     pub lm_head_vk: ProjectionVerifyingKey,
 }
 
@@ -405,6 +406,7 @@ pub fn prove(
         &witness.final_ln_wit,
         &ln_io,
         &pk.vk.final_ln_vk,
+        &pk.vk.final_ln_lasso_key,
         transcript,
     )?;
 
@@ -575,72 +577,38 @@ mod tests {
     }
 
     /// LN witness for x_in = [[10,20],[30,40]], gamma=[2,2], beta=[5,5].
-    /// var=200, d·sigma=14, sigma=7, y=[[4,6],[4,6]].
-    fn build_ln1_witness() -> LayerNormWitness {
-        LayerNormWitness {
-            x: vec![
-                vec![F::from(10u64), F::from(20u64)],
-                vec![F::from(30u64), F::from(40u64)],
-            ],
-            y: vec![
-                vec![F::from(4u64), F::from(6u64)],
-                vec![F::from(4u64), F::from(6u64)],
-            ],
-            sum_x: vec![F::from(30u64), F::from(70u64)],
-            sigma: vec![F::from(7u64), F::from(7u64)],
-            // sq_sum_x[i] = sum_j x[i][j]^2: row0=10^2+20^2=500, row1=30^2+40^2=2500
-            sq_sum_x: vec![F::from(500u64), F::from(2500u64)],
-            // sum_x_sq[i] = sum_x[i]^2: 30^2=900, 70^2=4900
-            sum_x_sq: vec![F::from(900u64), F::from(4900u64)],
-            // sigma_sq_scaled[i] = (d*sigma[i])^2 = (2*7)^2=196
-            sigma_sq_scaled: vec![F::from(196u64), F::from(196u64)],
-        }
+    fn build_ln1_witness(lk: &LayerNormLassoKey) -> LayerNormWitness {
+        let x = vec![
+            vec![F::from(10u64), F::from(20u64)],
+            vec![F::from(30u64), F::from(40u64)],
+        ];
+        let gamma = vec![F::from(2u64); 2];
+        let beta = vec![F::from(5u64); 2];
+        LayerNormWitness::from_forward(x, &gamma, &beta, F::ONE, F::ONE, &lk.t0, &lk.t1)
     }
 
-    /// LN witness for x_mid = [[138,20],[158,40]], gamma=[2,2], beta=[5,5].
-    /// var=27848, d·sigma=166, sigma=83, y=[[6,4],[6,4]].
-    fn build_ln2_witness() -> LayerNormWitness {
-        LayerNormWitness {
-            x: vec![
-                vec![F::from(138u64), F::from(20u64)],
-                vec![F::from(158u64), F::from(40u64)],
-            ],
-            y: vec![
-                vec![F::from(6u64), F::from(4u64)],
-                vec![F::from(6u64), F::from(4u64)],
-            ],
-            sum_x: vec![F::from(158u64), F::from(198u64)],
-            sigma: vec![F::from(83u64), F::from(83u64)],
-            // sq_sum_x[i] = sum_j x[i][j]^2: row0=138^2+20^2=19444, row1=158^2+40^2=26564
-            sq_sum_x: vec![F::from(19444u64), F::from(26564u64)],
-            // sum_x_sq[i] = sum_x[i]^2: 158^2=24964, 198^2=39204
-            sum_x_sq: vec![F::from(24964u64), F::from(39204u64)],
-            // sigma_sq_scaled[i] = (d*sigma[i])^2 = (2*83)^2=27556
-            sigma_sq_scaled: vec![F::from(27556u64), F::from(27556u64)],
-        }
+    /// LN witness for x_mid = [[260,20],[280,40]], gamma=[2,2], beta=[5,5].
+    /// (x_mid = x_in + attn_out = [[10+250,20],[30+250,40]])
+    fn build_ln2_witness(lk: &LayerNormLassoKey) -> LayerNormWitness {
+        let x = vec![
+            vec![F::from(260u64), F::from(20u64)],
+            vec![F::from(280u64), F::from(40u64)],
+        ];
+        let gamma = vec![F::from(2u64); 2];
+        let beta = vec![F::from(5u64); 2];
+        LayerNormWitness::from_forward(x, &gamma, &beta, F::ONE, F::ONE, &lk.t0, &lk.t1)
     }
 
-    /// LN witness for x_out = [[144,20],[164,40]], gamma=[2,2], beta=[5,5].
-    /// var=30752, d·sigma=174, sigma=87, y=[[6,4],[6,4]].
-    fn build_ln_final_witness() -> LayerNormWitness {
-        LayerNormWitness {
-            x: vec![
-                vec![F::from(144u64), F::from(20u64)],
-                vec![F::from(164u64), F::from(40u64)],
-            ],
-            y: vec![
-                vec![F::from(6u64), F::from(4u64)],
-                vec![F::from(6u64), F::from(4u64)],
-            ],
-            sum_x: vec![F::from(164u64), F::from(204u64)],
-            sigma: vec![F::from(87u64), F::from(87u64)],
-            // sq_sum_x[i] = sum_j x[i][j]^2: row0=144^2+20^2=21136, row1=164^2+40^2=28496
-            sq_sum_x: vec![F::from(21136u64), F::from(28496u64)],
-            // sum_x_sq[i] = sum_x[i]^2: 164^2=26896, 204^2=41616
-            sum_x_sq: vec![F::from(26896u64), F::from(41616u64)],
-            // sigma_sq_scaled[i] = (d*sigma[i])^2 = (2*87)^2=30276
-            sigma_sq_scaled: vec![F::from(30276u64), F::from(30276u64)],
-        }
+    /// LN witness for x_out = [[267,20],[287,40]], gamma=[2,2], beta=[5,5].
+    /// (x_out = x_mid + ffn_out = [[260+7,20],[280+7,40]])
+    fn build_ln_final_witness(lk: &LayerNormLassoKey) -> LayerNormWitness {
+        let x = vec![
+            vec![F::from(267u64), F::from(20u64)],
+            vec![F::from(287u64), F::from(40u64)],
+        ];
+        let gamma = vec![F::from(2u64); 2];
+        let beta = vec![F::from(5u64); 2];
+        LayerNormWitness::from_forward(x, &gamma, &beta, F::ONE, F::ONE, &lk.t0, &lk.t1)
     }
 
     /// Build a Lasso instance from explicit query indices and outputs.
@@ -672,21 +640,24 @@ mod tests {
         TransformerBlockWitness,
         LinearAttentionInstance,
         FFNInstance,
+        LayerNormLassoKey,
     ) {
+        let ln_lasso_key = LayerNormLassoKey::setup();
+
         // x_in = [[10,20],[30,40]]
         let x_in = vec![
             vec![F::from(10u64), F::from(20u64)],
             vec![F::from(30u64), F::from(40u64)],
         ];
 
-        // LN1: y_norm1 = [[4,6],[4,6]]
-        let ln1_wit = build_ln1_witness();
+        // LN1
+        let ln1_wit = build_ln1_witness(&ln_lasso_key);
         let y_norm1 = ln1_wit.y.clone();
 
-        // Q/K/V projections: y_norm1 @ W where W[0][0]=1 → [[4,0],[4,0]]
+        // Q/K/V projections: y_norm1 @ W where W[0][0]=1 → [[y_norm1[i][0], 0]] = [[5,0],[5,0]]
         let proj_out = vec![
-            vec![F::from(4u64), F::from(0u64)],
-            vec![F::from(4u64), F::from(0u64)],
+            vec![F::from(5u64), F::from(0u64)],
+            vec![F::from(5u64), F::from(0u64)],
         ];
         let q_proj_wit = ProjectionWitness {
             x: y_norm1.clone(),
@@ -701,16 +672,18 @@ mod tests {
             y: proj_out.clone(),
         };
 
-        // phi is identity on [0,15]: phi_q = phi_k = [[4,0],[4,0]]
-        // context = phi_k^T @ v = [[4,4],[0,0]] @ [[4,0],[4,0]] = [[32,0],[0,0]]
+        // phi is identity on [0,15]: phi_q = phi_k = [[5,0],[5,0]]
+        // context = phi_k^T @ v: context[k][j] = sum_t phi_k[t][k]*v[t][j]
+        //   = [[5*5+5*5, 0], [0, 0]] = [[50, 0], [0, 0]]
         let context = vec![
-            vec![F::from(32u64), F::from(0u64)],
+            vec![F::from(50u64), F::from(0u64)],
             vec![F::from(0u64), F::from(0u64)],
         ];
-        // attn inner = phi_q @ context = [[4,0],[4,0]] @ [[32,0],[0,0]] = [[128,0],[128,0]]
+        // attn inner = phi_q @ context: attn[t][j] = sum_k phi_q[t][k]*context[k][j]
+        //   = [[5*50+0, 0], [5*50+0, 0]] = [[250,0],[250,0]]
         let attn_inner = vec![
-            vec![F::from(128u64), F::from(0u64)],
-            vec![F::from(128u64), F::from(0u64)],
+            vec![F::from(250u64), F::from(0u64)],
+            vec![F::from(250u64), F::from(0u64)],
         ];
 
         let attn_wit = LinearAttentionWitness {
@@ -723,32 +696,32 @@ mod tests {
             out: attn_inner.clone(),
         };
 
-        // O projection: attn_inner @ W where W[0][0]=1 → [[128,0],[128,0]]
+        // O projection: attn_inner @ W where W[0][0]=1 → [[250,0],[250,0]]
         let out_attn = attn_inner.clone();
         let o_proj_wit = ProjectionWitness {
             x: attn_inner.clone(),
             y: out_attn.clone(),
         };
 
-        // Residual 1: x_mid = x_in + out_attn = [[138,20],[158,40]]
+        // Residual 1: x_mid = x_in + out_attn = [[10+250,20+0],[30+250,40+0]] = [[260,20],[280,40]]
         let x_mid = vec![
-            vec![F::from(138u64), F::from(20u64)],
-            vec![F::from(158u64), F::from(40u64)],
+            vec![F::from(260u64), F::from(20u64)],
+            vec![F::from(280u64), F::from(40u64)],
         ];
 
-        // LN2: y_norm2 = [[6,4],[6,4]]
-        let ln2_wit = build_ln2_witness();
+        // LN2
+        let ln2_wit = build_ln2_witness(&ln_lasso_key);
         let y_norm2 = ln2_wit.y.clone();
 
-        // FFN: W1[0][0]=1 → m=[[6,0,0,0],[6,0,0,0]], phi identity → a=m
+        // FFN: W1[0][0]=1 → m[i][0]=y_norm2[i][0]=7, phi identity → a=m
         let m_ffn = vec![
-            vec![F::from(6u64), F::from(0u64), F::from(0u64), F::from(0u64)],
-            vec![F::from(6u64), F::from(0u64), F::from(0u64), F::from(0u64)],
+            vec![F::from(7u64), F::from(0u64), F::from(0u64), F::from(0u64)],
+            vec![F::from(7u64), F::from(0u64), F::from(0u64), F::from(0u64)],
         ];
-        // W2[0][0]=1 → out_ffn=[[6,0],[6,0]]
+        // W2[0][0]=1 → out_ffn=[[7,0],[7,0]]
         let out_ffn = vec![
-            vec![F::from(6u64), F::from(0u64)],
-            vec![F::from(6u64), F::from(0u64)],
+            vec![F::from(7u64), F::from(0u64)],
+            vec![F::from(7u64), F::from(0u64)],
         ];
         let ffn_wit = FFNWitness {
             x: y_norm2,
@@ -757,10 +730,10 @@ mod tests {
             y: out_ffn.clone(),
         };
 
-        // Residual 2: x_out = x_mid + out_ffn = [[144,20],[164,40]]
+        // Residual 2: x_out = x_mid + out_ffn = [[260+7,20],[280+7,40]] = [[267,20],[287,40]]
         let x_out = vec![
-            vec![F::from(144u64), F::from(20u64)],
-            vec![F::from(164u64), F::from(40u64)],
+            vec![F::from(267u64), F::from(20u64)],
+            vec![F::from(287u64), F::from(40u64)],
         ];
 
         let witness = TransformerBlockWitness {
@@ -777,34 +750,34 @@ mod tests {
             x_out,
         };
 
-        // Lasso for phi(q) and phi(k): indices [4,0,4,0], outputs [4,0,4,0]
+        // Lasso for phi(q) and phi(k): proj_out=[[5,0],[5,0]], flattened → [5,0,5,0]
         let inst_attn = LinearAttentionInstance {
             seq_len: T,
             d_head: D,
-            q_lasso: build_lasso(vec![4, 0, 4, 0], vec![4, 0, 4, 0]),
-            k_lasso: build_lasso(vec![4, 0, 4, 0], vec![4, 0, 4, 0]),
+            q_lasso: build_lasso(vec![5, 0, 5, 0], vec![5, 0, 5, 0]),
+            k_lasso: build_lasso(vec![5, 0, 5, 0], vec![5, 0, 5, 0]),
         };
 
-        // Lasso for FFN phi(m): indices [6,0,0,0,6,0,0,0], outputs same
+        // Lasso for FFN phi(m): m_ffn=[[7,0,0,0],[7,0,0,0]], flattened → [7,0,0,0,7,0,0,0]
         let inst_ffn = FFNInstance {
             activation_lasso: build_lasso(
-                vec![6, 0, 0, 0, 6, 0, 0, 0],
-                vec![6, 0, 0, 0, 6, 0, 0, 0],
+                vec![7, 0, 0, 0, 7, 0, 0, 0],
+                vec![7, 0, 0, 0, 7, 0, 0, 0],
             ),
         };
 
-        (witness, inst_attn, inst_ffn)
+        (witness, inst_attn, inst_ffn, ln_lasso_key)
     }
 
     // -----------------------------------------------------------------------
     // Model-level fixture
     // -----------------------------------------------------------------------
 
-    fn build_model_witness(block_wit: TransformerBlockWitness) -> TransformerModelWitness {
+    fn build_model_witness(block_wit: TransformerBlockWitness, lk: &LayerNormLassoKey) -> TransformerModelWitness {
         let x_in = block_wit.x_in.clone();
 
-        // Final LN: x_out = [[144,20],[164,40]] → y_final = [[6,4],[6,4]]
-        let final_ln_wit = build_ln_final_witness();
+        // Final LN: x_out = [[144,20],[164,40]]
+        let final_ln_wit = build_ln_final_witness(lk);
         let y_final = final_ln_wit.y.clone();
 
         // LM head diagonal: y_final @ I = [[6,4],[6,4]]
@@ -827,7 +800,7 @@ mod tests {
 
     #[test]
     fn test_prove_verify_transformer_block_e2e() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let (witness, inst_attn, inst_ffn, _ln_lk) = build_block_witness_and_instances();
         let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
@@ -878,7 +851,7 @@ mod tests {
     /// Passing the wrong x_out_com must trigger the residual-connection binding check.
     #[test]
     fn test_block_rejects_wrong_x_out_com() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let (witness, inst_attn, inst_ffn, _ln_lk) = build_block_witness_and_instances();
         let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
@@ -931,7 +904,7 @@ mod tests {
     /// Tampering with the LN1 proof must be detected by the sub-verifier.
     #[test]
     fn test_block_rejects_tampered_ln1_opening() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let (witness, inst_attn, inst_ffn, _ln_lk) = build_block_witness_and_instances();
         let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
@@ -980,7 +953,7 @@ mod tests {
     /// Tampering with an intermediate commitment breaks the pipeline binding.
     #[test]
     fn test_block_rejects_tampered_x_norm1_com() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let (witness, inst_attn, inst_ffn, _ln_lk) = build_block_witness_and_instances();
         let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
@@ -1039,8 +1012,8 @@ mod tests {
 
     #[test]
     fn test_prove_verify_full_model_e2e() {
-        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let model_wit = build_model_witness(block_wit);
+        let (block_wit, inst_attn, inst_ffn, ln_lk) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit, &ln_lk);
         let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
@@ -1059,8 +1032,8 @@ mod tests {
     /// Tampering with a block sub-proof must propagate up to the model verifier.
     #[test]
     fn test_model_rejects_tampered_block_proof() {
-        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let model_wit = build_model_witness(block_wit);
+        let (block_wit, inst_attn, inst_ffn, ln_lk) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit, &ln_lk);
         let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
@@ -1077,8 +1050,8 @@ mod tests {
     /// Tampering with the final-LN proof must be detected.
     #[test]
     fn test_model_rejects_tampered_final_ln_proof() {
-        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let model_wit = build_model_witness(block_wit);
+        let (block_wit, inst_attn, inst_ffn, ln_lk) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit, &ln_lk);
         let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
@@ -1095,8 +1068,8 @@ mod tests {
     /// Tampering with the LM head proof must be detected.
     #[test]
     fn test_model_rejects_tampered_lm_head_proof() {
-        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let model_wit = build_model_witness(block_wit);
+        let (block_wit, inst_attn, inst_ffn, ln_lk) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit, &ln_lk);
         let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
@@ -1114,8 +1087,8 @@ mod tests {
     /// Shifting x_in_com in the proof makes every downstream check fail.
     #[test]
     fn test_model_rejects_tampered_x_in_com() {
-        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let model_wit = build_model_witness(block_wit);
+        let (block_wit, inst_attn, inst_ffn, ln_lk) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit, &ln_lk);
         let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 

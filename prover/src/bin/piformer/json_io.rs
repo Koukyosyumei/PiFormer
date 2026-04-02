@@ -314,8 +314,7 @@ pub struct JsonLayerNormWitness {
     pub x: Vec<Vec<String>>,
     pub y: Vec<Vec<String>>,
     pub sum_x: Vec<String>,
-    pub var_x: Vec<String>,
-    pub sigma: Vec<String>,
+    pub sq_sum_x: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -402,33 +401,16 @@ fn ln_wit_to_json(w: &LayerNormWitness) -> JsonLayerNormWitness {
         x: mat_to_json(&w.x),
         y: mat_to_json(&w.y),
         sum_x: vec_to_json(&w.sum_x),
-        sigma: vec_to_json(&w.sigma),
-        // var_x stores sq_sum_x (sum of squares per row)
-        var_x: vec_to_json(&w.sq_sum_x),
+        sq_sum_x: vec_to_json(&w.sq_sum_x),
     }
 }
 
 fn ln_wit_from_json(j: JsonLayerNormWitness) -> Result<LayerNormWitness, String> {
     let x = mat_from_json(j.x)?;
     let y = mat_from_json(j.y)?;
-    let sum_x = vec_from_json(j.sum_x)?;
-    let sigma = vec_from_json(j.sigma)?;
-    // var_x in JSON encodes sq_sum_x (sum of squares per row)
-    let sq_sum_x = vec_from_json(j.var_x)?;
-    // sum_x_sq and sigma_sq_scaled are derived quantities
     let d = x.first().map(|r: &Vec<F>| r.len()).unwrap_or(0);
-    let d_f = F::from(d as u64);
-    let sum_x_sq: Vec<F> = sum_x.iter().map(|&s| s * s).collect();
-    let sigma_sq_scaled: Vec<F> = sigma.iter().map(|&s| (d_f * s) * (d_f * s)).collect();
-    Ok(LayerNormWitness {
-        x,
-        y,
-        sum_x,
-        sigma,
-        sq_sum_x,
-        sum_x_sq,
-        sigma_sq_scaled,
-    })
+    let lk = piformer_prover::attention::layernorm::LayerNormLassoKey::setup();
+    Ok(LayerNormWitness::from_inputs(x, y, d, &lk.t0, &lk.t1))
 }
 
 fn proj_wit_to_json(w: &ProjectionWitness) -> JsonProjectionWitness {

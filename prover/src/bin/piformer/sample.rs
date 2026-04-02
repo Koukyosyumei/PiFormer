@@ -9,7 +9,7 @@ use ark_ff::Field;
 use piformer_prover::{
     attention::{
         attention::{LinearAttentionInstance, LinearAttentionWitness},
-        layernorm::LayerNormWitness,
+        layernorm::{LayerNormLassoKey, LayerNormWitness},
         projection::ProjectionWitness,
     },
     ffn::ffn::{FFNInstance, FFNWitness},
@@ -100,6 +100,7 @@ pub fn build_zero_witness(
     d_ff: usize,
     vocab_size: usize,
     m_bits: usize,
+    lk: &LayerNormLassoKey,
 ) -> (
     TransformerModelWitness,
     LinearAttentionInstance,
@@ -125,7 +126,7 @@ pub fn build_zero_witness(
     let zero_tv = zero_mat(seq_len, vocab_size);
     let zero_dd = zero_mat(d_model, d_model);
 
-    let make_ln_wit = || build_ln_witness(&x_in, d_model);
+    let make_ln_wit = || build_ln_witness(&x_in, d_model, lk);
     let ln_y = make_ln_wit().y.clone();
 
     let block_wit = TransformerBlockWitness {
@@ -203,51 +204,8 @@ pub fn build_zero_witness(
 }
 
 /// Construct a LayerNorm witness for the given x matrix and unit weights.
-fn build_ln_witness(x: &[Vec<F>], d_model: usize) -> LayerNormWitness {
+fn build_ln_witness(x: &[Vec<F>], d_model: usize, lk: &LayerNormLassoKey) -> LayerNormWitness {
     let t = x.len();
-    if t == 2 && d_model == 2 {
-        let expected = [
-            [F::from(10u64), F::from(20u64)],
-            [F::from(30u64), F::from(40u64)],
-        ];
-        let matches = x
-            .iter()
-            .zip(expected.iter())
-            .all(|(row, exp): (&Vec<F>, &[F; 2])| row.iter().zip(exp.iter()).all(|(a, b)| a == b));
-        if matches {
-            return LayerNormWitness {
-                x: x.to_vec(),
-                y: vec![
-                    vec![F::from(4u64), F::from(6u64)],
-                    vec![F::from(4u64), F::from(6u64)],
-                ],
-                sum_x: vec![F::from(30u64), F::from(70u64)],
-                sigma: vec![F::from(7u64), F::from(7u64)],
-                // sq_sum_x[i] = sum_j x[i][j]^2: [10^2+20^2=500, 30^2+40^2=2500]
-                sq_sum_x: vec![F::from(500u64), F::from(2500u64)],
-                // sum_x_sq[i] = sum_x[i]^2: [30^2=900, 70^2=4900]
-                sum_x_sq: vec![F::from(900u64), F::from(4900u64)],
-                // sigma_sq_scaled[i] = (d*sigma[i])^2 = (2*7)^2=196
-                sigma_sq_scaled: vec![F::from(196u64), F::from(196u64)],
-            };
-        }
-    }
-    // Generic fallback: sigma=0, sum_x=0 (placeholder, not valid for real proving)
-    let d_f = F::from(d_model as u64);
-    let sq_sum_x: Vec<F> = x
-        .iter()
-        .map(|row: &Vec<F>| row.iter().copied().map(|v| v * v).sum())
-        .collect();
-    let sum_x_sq = vec![F::ZERO; t];
-    let sigma_sq_scaled = vec![F::ZERO; t];
-    let _ = d_f; // d_f not needed when sigma=0
-    LayerNormWitness {
-        x: x.to_vec(),
-        y: vec![vec![F::ZERO; d_model]; t],
-        sum_x: vec![F::ZERO; t],
-        sigma: vec![F::ZERO; t],
-        sq_sum_x,
-        sum_x_sq,
-        sigma_sq_scaled,
-    }
+    let y = vec![vec![F::ZERO; d_model]; t];
+    LayerNormWitness::from_inputs(x.to_vec(), y, d_model, &lk.t0, &lk.t1)
 }

@@ -18,7 +18,8 @@ use crate::attention::attention::{
     verify_linear_attention, AttentionProvingKey, LinearAttentionInstance,
 };
 use crate::attention::layernorm::{
-    verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey,
+    verify_layernorm, LayerNormIOCommitments, LayerNormLassoKey, LayerNormLassoVerifyingKey,
+    LayerNormVerifyingKey,
 };
 use crate::attention::projection::{
     verify_projection, ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
@@ -41,11 +42,13 @@ pub struct TransformerBlockVerifyingKey {
     pub d_model: usize,
 
     pub ln1_vk: LayerNormVerifyingKey,
+    pub ln2_vk: LayerNormVerifyingKey,
+    /// Shared Lasso key for both LN1 and LN2 (same inv-sqrt tables).
+    pub ln_lasso_key: LayerNormLassoKey,
     pub q_vk: ProjectionVerifyingKey,
     pub k_vk: ProjectionVerifyingKey,
     pub v_vk: ProjectionVerifyingKey,
     pub o_vk: ProjectionVerifyingKey,
-    pub ln2_vk: LayerNormVerifyingKey,
     pub ffn_vk: FFNVerifyingKey,
 
     // Proving keys are attached here just for the Prover reference in real code,
@@ -91,7 +94,8 @@ pub fn verify_transformer_block(
         x_com: x_in_com.clone(),
         y_com: proof.x_norm1_com.clone(),
     };
-    let _t = Instant::now(); verify_layernorm(&proof.ln1_proof, &ln1_io, &vk.ln1_vk, transcript, ln_acc_t, ln_acc_td)?;
+    let ln_lasso_vk = vk.ln_lasso_key.vk();
+    let _t = Instant::now(); verify_layernorm(&proof.ln1_proof, &ln1_io, &vk.ln1_vk, &ln_lasso_vk, transcript, ln_acc_t, ln_acc_td)?;
     eprintln!("[block] ln1:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     let _ = td_params; // ensure td_params isn't flagged unused
@@ -135,7 +139,7 @@ pub fn verify_transformer_block(
         x_com: x_mid_com.clone(),
         y_com: proof.x_norm2_com.clone(),
     };
-    let _t = Instant::now(); verify_layernorm(&proof.ln2_proof, &ln2_io, &vk.ln2_vk, transcript, ln_acc_t, ln_acc_td)?;
+    let _t = Instant::now(); verify_layernorm(&proof.ln2_proof, &ln2_io, &vk.ln2_vk, &ln_lasso_vk, transcript, ln_acc_t, ln_acc_td)?;
     eprintln!("[block] ln2:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // --- 6. FFN — returns (y_claim, x_claim) deferred to combine ---
@@ -322,7 +326,8 @@ pub fn verify(
         x_com: current_x_com.clone(),
         y_com: proof.final_ln_out_com.clone(),
     };
-    verify_layernorm(&proof.final_ln_proof, &ln_io, &vk.final_ln_vk, transcript, &mut ln_acc_t, &mut ln_acc_td)
+    let final_ln_lasso_vk = vk.final_ln_lasso_key.vk();
+    verify_layernorm(&proof.final_ln_proof, &ln_io, &vk.final_ln_vk, &final_ln_lasso_vk, transcript, &mut ln_acc_t, &mut ln_acc_td)
         .map_err(|e| format!("Final LN failed: {}", e))?;
     eprintln!("[model] final_ln:   {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 

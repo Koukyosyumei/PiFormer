@@ -18,7 +18,8 @@ use piformer_prover::{
             LinearAttentionProof,
         },
         layernorm::{
-            LayerNormInternalCommitments, LayerNormOpenings, LayerNormProof, LayerNormVerifyingKey,
+            LayerNormInternalCommitments, LayerNormLassoKey, LayerNormOpenings, LayerNormProof,
+            LayerNormVerifyingKey,
         },
         projection::{
             ProjectionOpenings, ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey,
@@ -320,71 +321,61 @@ fn write_ln_internal_coms<W: Write>(w: &mut W, c: &LayerNormInternalCommitments)
     write_hyrax_commitment(w, &c.sum_x_com)?;
     write_hyrax_commitment(w, &c.sq_sum_x_com)?;
     write_hyrax_commitment(w, &c.sum_x_sq_com)?;
-    write_hyrax_commitment(w, &c.sigma_com)?;
-    write_hyrax_commitment(w, &c.sigma_sq_com)?;
-    write_hyrax_commitment(w, &c.sigma_y_com)?;
-    write_hyrax_commitment(w, &c.gamma_x_com)
+    write_hyrax_commitment(w, &c.inv_sigma_com)?;
+    write_hyrax_commitment(w, &c.norm_x_com)
 }
 fn read_ln_internal_coms<R: Read>(r: &mut R) -> io::Result<LayerNormInternalCommitments> {
     Ok(LayerNormInternalCommitments {
         sum_x_com: read_hyrax_commitment(r)?,
         sq_sum_x_com: read_hyrax_commitment(r)?,
         sum_x_sq_com: read_hyrax_commitment(r)?,
-        sigma_com: read_hyrax_commitment(r)?,
-        sigma_sq_com: read_hyrax_commitment(r)?,
-        sigma_y_com: read_hyrax_commitment(r)?,
-        gamma_x_com: read_hyrax_commitment(r)?,
+        inv_sigma_com: read_hyrax_commitment(r)?,
+        norm_x_com: read_hyrax_commitment(r)?,
     })
 }
 
 fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<()> {
-    // Group 1: at r_t
+    // Group A: at r_t
     write_f(w, &o.sum_x_at_rt)?;
     write_f(w, &o.sq_sum_x_at_rt)?;
     write_hyrax_proof(w, &o.rt_batch_proof)?;
     // Individual: x at combine(r_t, r_d_mean)
     write_ep!(w, &o.x_at_rt_rmean, &o.x_rt_rmean_proof);
-    // Group 2: at r_sig_t
-    write_f(w, &o.sum_x_at_rsig)?;
-    write_f(w, &o.sq_sum_x_at_rsig)?;
-    write_f(w, &o.sigma_at_rsig)?;
-    write_f(w, &o.sigma_sq_at_rsig)?;
-    write_f(w, &o.sum_x_sq_at_rsig)?;
-    write_hyrax_proof(w, &o.rsig_batch_proof)?;
-    // Group 3: at combine(r_y_t, r_y_d)
+    // Group B: at r_bind_t
+    write_f(w, &o.sq_sum_x_at_rbind)?;
+    write_f(w, &o.sum_x_sq_at_rbind)?;
+    write_f(w, &o.inv_sigma_at_rbind)?;
+    write_hyrax_proof(w, &o.rbind_batch_proof)?;
+    // Group C: at combine(r_y_t, r_y_d)
     write_f(w, &o.x_at_ry)?;
     write_f(w, &o.y_at_ry)?;
-    write_f(w, &o.gamma_x_at_ry)?;
-    write_f(w, &o.sigma_y_at_ry)?;
+    write_f(w, &o.norm_x_at_ry)?;
     write_hyrax_proof(w, &o.ry_td_batch_proof)?;
-    // Group 4: at r_y_t
+    // Group D: at r_y_t
     write_f(w, &o.sum_x_at_ryt)?;
-    write_f(w, &o.sigma_at_ryt)?;
+    write_f(w, &o.inv_sigma_at_ryt)?;
     write_hyrax_proof(w, &o.ryt_batch_proof)
 }
 fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
-    // Group 1: at r_t
+    // Group A: at r_t
     let sum_x_at_rt = read_f(r)?;
     let sq_sum_x_at_rt = read_f(r)?;
     let rt_batch_proof = read_hyrax_proof(r)?;
     // Individual: x at combine(r_t, r_d_mean)
     let (x_at_rt_rmean, x_rt_rmean_proof) = read_ep!(r);
-    // Group 2: at r_sig_t
-    let sum_x_at_rsig = read_f(r)?;
-    let sq_sum_x_at_rsig = read_f(r)?;
-    let sigma_at_rsig = read_f(r)?;
-    let sigma_sq_at_rsig = read_f(r)?;
-    let sum_x_sq_at_rsig = read_f(r)?;
-    let rsig_batch_proof = read_hyrax_proof(r)?;
-    // Group 3: at combine(r_y_t, r_y_d)
+    // Group B: at r_bind_t
+    let sq_sum_x_at_rbind = read_f(r)?;
+    let sum_x_sq_at_rbind = read_f(r)?;
+    let inv_sigma_at_rbind = read_f(r)?;
+    let rbind_batch_proof = read_hyrax_proof(r)?;
+    // Group C: at combine(r_y_t, r_y_d)
     let x_at_ry = read_f(r)?;
     let y_at_ry = read_f(r)?;
-    let gamma_x_at_ry = read_f(r)?;
-    let sigma_y_at_ry = read_f(r)?;
+    let norm_x_at_ry = read_f(r)?;
     let ry_td_batch_proof = read_hyrax_proof(r)?;
-    // Group 4: at r_y_t
+    // Group D: at r_y_t
     let sum_x_at_ryt = read_f(r)?;
-    let sigma_at_ryt = read_f(r)?;
+    let inv_sigma_at_ryt = read_f(r)?;
     let ryt_batch_proof = read_hyrax_proof(r)?;
     Ok(LayerNormOpenings {
         sum_x_at_rt,
@@ -392,19 +383,16 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
         rt_batch_proof,
         x_at_rt_rmean,
         x_rt_rmean_proof,
-        sum_x_at_rsig,
-        sq_sum_x_at_rsig,
-        sigma_at_rsig,
-        sigma_sq_at_rsig,
-        sum_x_sq_at_rsig,
-        rsig_batch_proof,
+        sq_sum_x_at_rbind,
+        sum_x_sq_at_rbind,
+        inv_sigma_at_rbind,
+        rbind_batch_proof,
         x_at_ry,
         y_at_ry,
-        gamma_x_at_ry,
-        sigma_y_at_ry,
+        norm_x_at_ry,
         ry_td_batch_proof,
         sum_x_at_ryt,
-        sigma_at_ryt,
+        inv_sigma_at_ryt,
         ryt_batch_proof,
     })
 }
@@ -412,17 +400,41 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
 fn write_ln_proof<W: Write>(w: &mut W, p: &LayerNormProof) -> io::Result<()> {
     write_ln_internal_coms(w, &p.internal_coms)?;
     write_sumcheck_proof(w, &p.mean_sumcheck)?;
-    write_range_proof(w, &p.sigma_range_proof)?;
+    // lasso_query_indices and lasso_outputs
+    let n = p.lasso_query_indices.len();
+    w.write_all(&(n as u32).to_le_bytes())?;
+    for &idx in &p.lasso_query_indices {
+        w.write_all(&(idx as u64).to_le_bytes())?;
+    }
+    write_vec_f(w, &p.lasso_outputs)?;
+    write_lasso_proof(w, &p.inv_sigma_lasso)?;
     write_range_proof(w, &p.y_range_proof)?;
     write_ln_openings(w, &p.openings)
 }
 fn read_ln_proof<R: Read>(r: &mut R) -> io::Result<LayerNormProof> {
+    let internal_coms = read_ln_internal_coms(r)?;
+    let mean_sumcheck = read_sumcheck_proof(r)?;
+    let mut n_buf = [0u8; 4];
+    r.read_exact(&mut n_buf)?;
+    let n = u32::from_le_bytes(n_buf) as usize;
+    let mut lasso_query_indices = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut buf = [0u8; 8];
+        r.read_exact(&mut buf)?;
+        lasso_query_indices.push(u64::from_le_bytes(buf) as usize);
+    }
+    let lasso_outputs = read_vec_f(r)?;
+    let inv_sigma_lasso = read_lasso_proof(r)?;
+    let y_range_proof = read_range_proof(r)?;
+    let openings = read_ln_openings(r)?;
     Ok(LayerNormProof {
-        internal_coms: read_ln_internal_coms(r)?,
-        mean_sumcheck: read_sumcheck_proof(r)?,
-        sigma_range_proof: read_range_proof(r)?,
-        y_range_proof: read_range_proof(r)?,
-        openings: read_ln_openings(r)?,
+        internal_coms,
+        mean_sumcheck,
+        lasso_query_indices,
+        lasso_outputs,
+        inv_sigma_lasso,
+        y_range_proof,
+        openings,
     })
 }
 
@@ -964,6 +976,7 @@ fn read_block_vk<R: Read>(r: &mut R) -> io::Result<TransformerBlockVerifyingKey>
         d_model,
         ln1_vk,
         ln2_vk,
+        ln_lasso_key: LayerNormLassoKey::setup(),
         q_vk,
         k_vk,
         v_vk,
@@ -1031,6 +1044,7 @@ pub fn decode_pk(bytes: &[u8]) -> io::Result<TransformerModelProvingKey> {
             vocab_size,
             block_vks,
             final_ln_vk,
+            final_ln_lasso_key: LayerNormLassoKey::setup(),
             lm_head_vk,
         },
         block_pks,
@@ -1081,6 +1095,7 @@ pub fn decode_vk(bytes: &[u8]) -> io::Result<TransformerModelVerifyingKey> {
         vocab_size,
         block_vks,
         final_ln_vk,
+        final_ln_lasso_key: LayerNormLassoKey::setup(),
         lm_head_vk,
     })
 }

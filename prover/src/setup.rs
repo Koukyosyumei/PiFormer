@@ -147,6 +147,7 @@ pub fn preprocess_transformer_model(
             d_model: d,
             ln1_vk,
             ln2_vk,
+            ln_lasso_key: crate::attention::layernorm::LayerNormLassoKey::setup(),
             q_vk: q_pk.vk.clone(),
             k_vk: k_pk.vk.clone(),
             v_vk: v_pk.vk.clone(),
@@ -193,6 +194,7 @@ pub fn preprocess_transformer_model(
         vocab_size: v,
         block_vks,
         final_ln_vk,
+        final_ln_lasso_key: crate::attention::layernorm::LayerNormLassoKey::setup(),
         lm_head_vk: lm_head_pk.vk.clone(),
     };
 
