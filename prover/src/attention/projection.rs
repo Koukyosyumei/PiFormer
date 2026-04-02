@@ -29,9 +29,10 @@ use crate::transcript::{challenge_vec, Transcript};
 // ---------------------------------------------------------------------------
 
 /// IO Commitments for the projection layer.
-/// Only x_com is needed — y is verified via GKR claim threading.
+/// x_com is optional: when None (GKR backward mode), the input is not committed
+/// independently — the binding comes from the sumcheck argument itself.
 pub struct ProjectionIOCommitments {
-    pub x_com: HyraxCommitment,
+    pub x_com: Option<HyraxCommitment>,
 }
 
 /// Preprocessing Key for the Verifier.
@@ -153,9 +154,12 @@ pub fn prove_projection(
     let (nu_w, sigma_w, _) = params_from_vars(in_bits + out_bits);
     let (nu_b, sigma_b, _) = params_from_vars(out_bits);
 
-    // 1. Absorb (y_com removed — y is verified via combine)
+    // 1. Absorb static weight commitments. x_com is only absorbed if present
+    //    (GKR backward: when x_com is None, x is bound by the sumcheck itself).
     absorb_com(transcript, b"w_com", &pk.vk.w_com);
-    absorb_com(transcript, b"x_com", &io_coms.x_com);
+    if let Some(ref xc) = io_coms.x_com {
+        absorb_com(transcript, b"x_com", xc);
+    }
     transcript.append_field(b"alpha", &pk.vk.alpha);
     absorb_com(transcript, b"bias_com", &pk.vk.bias_com);
 
@@ -219,9 +223,11 @@ pub fn verify_projection(
     let in_bits = vk.d_in.next_power_of_two().trailing_zeros() as usize;
     let out_bits = vk.d_out.next_power_of_two().trailing_zeros() as usize;
 
-    // 1. Absorb (mirrors prover — y_com removed)
+    // 1. Absorb (mirrors prover — y_com removed; x_com optional in GKR backward mode)
     absorb_com(transcript, b"w_com", &vk.w_com);
-    absorb_com(transcript, b"x_com", &io_coms.x_com);
+    if let Some(ref xc) = io_coms.x_com {
+        absorb_com(transcript, b"x_com", xc);
+    }
     transcript.append_field(b"alpha", &vk.alpha);
     absorb_com(transcript, b"bias_com", &vk.bias_com);
 
@@ -248,6 +254,264 @@ pub fn verify_projection(
     let x_claim = EvalClaim { point: combine(&r_t, &r_k), value: proof.openings.x_eval };
     Ok((y_claim, x_claim))
 }
+// ---------------------------------------------------------------------------
+// Batched QKV Projection (Level 3 Optimization)
+//
+// Instead of three independent sumchecks for Q, K, V (each finding a separate
+// r_k point), a single batched sumcheck is run:
+//
+//   Σ_k X[r_t, k] · (λ·α_Q·W_Q[k,r_out_q] + μ·α_K·W_K[k,r_out_k] + α_V·W_V[k,r_out_v])
+//   = λ·(q_eval - bias_q_eval) + μ·(k_eval - bias_k_eval) + (v_eval - bias_v_eval)
+//
+// This yields a single r_k, so x_norm1_com can be directly opened at (r_t, r_k)
+// instead of requiring a 3-claim CombineProof. Savings: 2 sumchecks + 1 combine.
+// ---------------------------------------------------------------------------
+
+pub struct BatchedQKVProjectionWitness {
+    pub x: Vec<Vec<F>>,
+    pub q: Vec<Vec<F>>,
+    pub k: Vec<Vec<F>>,
+    pub v: Vec<Vec<F>>,
+}
+
+pub struct BatchedQKVProjectionIOCommitments {
+    pub x_com: HyraxCommitment,
+}
+
+pub struct BatchedQKVProjectionOpenings {
+    pub q_eval: F,
+    pub k_eval: F,
+    pub v_eval: F,
+    pub x_eval: F,
+    pub w_q_eval: F,
+    pub w_k_eval: F,
+    pub w_v_eval: F,
+    pub bias_q_eval: F,
+    pub bias_k_eval: F,
+    pub bias_v_eval: F,
+    pub w_q_open: HyraxProof,
+    pub w_k_open: HyraxProof,
+    pub w_v_open: HyraxProof,
+    pub bias_q_open: HyraxProof,
+    pub bias_k_open: HyraxProof,
+    pub bias_v_open: HyraxProof,
+}
+
+pub struct BatchedQKVProjectionProof {
+    pub sumcheck: SumcheckProof,
+    pub openings: BatchedQKVProjectionOpenings,
+}
+
+/// Returns (proof, q_claim, k_claim, v_claim, x_norm1_claim).
+///
+/// All three projections share the same input x_norm1 and the same r_t / r_k
+/// after the batched sumcheck, eliminating the 3-claim CombineProof for x_norm1_com.
+pub fn prove_qkv_projections(
+    pk_q: &ProjectionProvingKey,
+    pk_k: &ProjectionProvingKey,
+    pk_v: &ProjectionProvingKey,
+    witness: &BatchedQKVProjectionWitness,
+    io_coms: &BatchedQKVProjectionIOCommitments,
+    transcript: &mut Transcript,
+) -> Result<(BatchedQKVProjectionProof, EvalClaim, EvalClaim, EvalClaim, EvalClaim), String> {
+    let t = pk_q.vk.seq_len;
+    let d_in = pk_q.vk.d_in;
+    let d_out = pk_q.vk.d_out;
+
+    let t_bits = t.next_power_of_two().trailing_zeros() as usize;
+    let in_bits = d_in.next_power_of_two().trailing_zeros() as usize;
+    let out_bits = d_out.next_power_of_two().trailing_zeros() as usize;
+
+    let x_mle = mat_to_mle(&witness.x, t, d_in);
+    let q_mle = mat_to_mle(&witness.q, t, d_out);
+    let k_mle = mat_to_mle(&witness.k, t, d_out);
+    let v_mle = mat_to_mle(&witness.v, t, d_out);
+    let w_q_mle = mat_to_mle(&convert_tm_to_fm(&pk_q.w), d_in, d_out);
+    let w_k_mle = mat_to_mle(&convert_tm_to_fm(&pk_k.w), d_in, d_out);
+    let w_v_mle = mat_to_mle(&convert_tm_to_fm(&pk_v.w), d_in, d_out);
+    let bias_q_mle = vec_to_mle(&pk_q.bias, d_out);
+    let bias_k_mle = vec_to_mle(&pk_k.bias, d_out);
+    let bias_v_mle = vec_to_mle(&pk_v.bias, d_out);
+
+    let (nu_w, sigma_w, _) = params_from_vars(in_bits + out_bits);
+    let (nu_b, sigma_b, _) = params_from_vars(out_bits);
+
+    // 1. Absorb all static commitments
+    absorb_com(transcript, b"qkv_w_q_com", &pk_q.vk.w_com);
+    absorb_com(transcript, b"qkv_w_k_com", &pk_k.vk.w_com);
+    absorb_com(transcript, b"qkv_w_v_com", &pk_v.vk.w_com);
+    absorb_com(transcript, b"qkv_x_com", &io_coms.x_com);
+    transcript.append_field(b"qkv_alpha_q", &pk_q.vk.alpha);
+    transcript.append_field(b"qkv_alpha_k", &pk_k.vk.alpha);
+    transcript.append_field(b"qkv_alpha_v", &pk_v.vk.alpha);
+    absorb_com(transcript, b"qkv_bias_q_com", &pk_q.vk.bias_com);
+    absorb_com(transcript, b"qkv_bias_k_com", &pk_k.vk.bias_com);
+    absorb_com(transcript, b"qkv_bias_v_com", &pk_v.vk.bias_com);
+
+    // 2. Challenges: shared r_t, independent r_out per projection, batch scalars λ, μ
+    let r_t = challenge_vec(transcript, t_bits, b"qkv_rt");
+    let r_out_q = challenge_vec(transcript, out_bits, b"qkv_rout_q");
+    let r_out_k = challenge_vec(transcript, out_bits, b"qkv_rout_k");
+    let r_out_v = challenge_vec(transcript, out_bits, b"qkv_rout_v");
+    let lambda: F = transcript.challenge_field(b"qkv_lambda");
+    let mu: F = transcript.challenge_field(b"qkv_mu");
+
+    // 3. Evaluate outputs and biases at the challenge points
+    let q_eval = q_mle.evaluate(&combine(&r_t, &r_out_q));
+    let k_eval = k_mle.evaluate(&combine(&r_t, &r_out_k));
+    let v_eval = v_mle.evaluate(&combine(&r_t, &r_out_v));
+    let bias_q_eval = bias_q_mle.evaluate(&r_out_q);
+    let bias_k_eval = bias_k_mle.evaluate(&r_out_k);
+    let bias_v_eval = bias_v_mle.evaluate(&r_out_v);
+
+    // 4. Build batched sumcheck polynomials
+    // f(k) = X[r_t, k]
+    // g(k) = λ·α_Q·W_Q[k,r_out_q] + μ·α_K·W_K[k,r_out_k] + α_V·W_V[k,r_out_v]
+    let f_x_evals = eval_rows(&x_mle, t_bits, &r_t);
+    let g_w_q_evals = eval_cols_ternary(&pk_q.w, &r_out_q, d_in, d_out);
+    let g_w_k_evals = eval_cols_ternary(&pk_k.w, &r_out_k, d_in, d_out);
+    let g_w_v_evals = eval_cols_ternary(&pk_v.w, &r_out_v, d_in, d_out);
+    let n_padded = d_in.next_power_of_two();
+    let g_w_combined: Vec<F> = (0..n_padded)
+        .map(|i| {
+            lambda * pk_q.vk.alpha * g_w_q_evals[i]
+                + mu * pk_k.vk.alpha * g_w_k_evals[i]
+                + pk_v.vk.alpha * g_w_v_evals[i]
+        })
+        .collect();
+
+    let target =
+        lambda * (q_eval - bias_q_eval) + mu * (k_eval - bias_k_eval) + (v_eval - bias_v_eval);
+
+    let f_poly = DenseMLPoly::from_vec_padded(f_x_evals);
+    let g_poly = DenseMLPoly::from_vec_padded(g_w_combined);
+    let (sumcheck, r_k) = prove_sumcheck(&f_poly, &g_poly, target, transcript);
+
+    transcript.append_field(b"qkv_q_eval", &q_eval);
+    transcript.append_field(b"qkv_k_eval", &k_eval);
+    transcript.append_field(b"qkv_v_eval", &v_eval);
+
+    // 5. Evaluate prover witnesses at r_k
+    let x_eval = x_mle.evaluate(&combine(&r_t, &r_k));
+    let w_q_eval = w_q_mle.evaluate(&combine(&r_k, &r_out_q));
+    let w_k_eval = w_k_mle.evaluate(&combine(&r_k, &r_out_k));
+    let w_v_eval = w_v_mle.evaluate(&combine(&r_k, &r_out_v));
+
+    let proof = BatchedQKVProjectionProof {
+        sumcheck,
+        openings: BatchedQKVProjectionOpenings {
+            q_eval,
+            k_eval,
+            v_eval,
+            x_eval,
+            w_q_eval,
+            w_k_eval,
+            w_v_eval,
+            bias_q_eval,
+            bias_k_eval,
+            bias_v_eval,
+            w_q_open: hyrax_open(&w_q_mle.evaluations, &combine(&r_k, &r_out_q), nu_w, sigma_w),
+            w_k_open: hyrax_open(&w_k_mle.evaluations, &combine(&r_k, &r_out_k), nu_w, sigma_w),
+            w_v_open: hyrax_open(&w_v_mle.evaluations, &combine(&r_k, &r_out_v), nu_w, sigma_w),
+            bias_q_open: hyrax_open(&bias_q_mle.evaluations, &r_out_q, nu_b, sigma_b),
+            bias_k_open: hyrax_open(&bias_k_mle.evaluations, &r_out_k, nu_b, sigma_b),
+            bias_v_open: hyrax_open(&bias_v_mle.evaluations, &r_out_v, nu_b, sigma_b),
+        },
+    };
+
+    let q_claim = EvalClaim { point: combine(&r_t, &r_out_q), value: q_eval };
+    let k_claim = EvalClaim { point: combine(&r_t, &r_out_k), value: k_eval };
+    let v_claim = EvalClaim { point: combine(&r_t, &r_out_v), value: v_eval };
+    let x_norm1_claim = EvalClaim { point: combine(&r_t, &r_k), value: x_eval };
+
+    Ok((proof, q_claim, k_claim, v_claim, x_norm1_claim))
+}
+
+/// GKR-style succinct verifier for batched QKV projections.
+///
+/// Returns (q_claim, k_claim, v_claim, x_norm1_claim).
+/// x_norm1_claim is at a single point (r_t, r_k) — the caller opens x_norm1_com directly.
+pub fn verify_qkv_projections(
+    proof: &BatchedQKVProjectionProof,
+    vk_q: &ProjectionVerifyingKey,
+    vk_k: &ProjectionVerifyingKey,
+    vk_v: &ProjectionVerifyingKey,
+    io_coms: &BatchedQKVProjectionIOCommitments,
+    transcript: &mut Transcript,
+    acc_w: &mut HyraxBatchAccumulator,
+    acc_b: &mut HyraxBatchAccumulator,
+) -> Result<(EvalClaim, EvalClaim, EvalClaim, EvalClaim), String> {
+    let t_bits = vk_q.seq_len.next_power_of_two().trailing_zeros() as usize;
+    let in_bits = vk_q.d_in.next_power_of_two().trailing_zeros() as usize;
+    let out_bits = vk_q.d_out.next_power_of_two().trailing_zeros() as usize;
+
+    // 1. Absorb (mirrors prover)
+    absorb_com(transcript, b"qkv_w_q_com", &vk_q.w_com);
+    absorb_com(transcript, b"qkv_w_k_com", &vk_k.w_com);
+    absorb_com(transcript, b"qkv_w_v_com", &vk_v.w_com);
+    absorb_com(transcript, b"qkv_x_com", &io_coms.x_com);
+    transcript.append_field(b"qkv_alpha_q", &vk_q.alpha);
+    transcript.append_field(b"qkv_alpha_k", &vk_k.alpha);
+    transcript.append_field(b"qkv_alpha_v", &vk_v.alpha);
+    absorb_com(transcript, b"qkv_bias_q_com", &vk_q.bias_com);
+    absorb_com(transcript, b"qkv_bias_k_com", &vk_k.bias_com);
+    absorb_com(transcript, b"qkv_bias_v_com", &vk_v.bias_com);
+
+    let r_t = challenge_vec(transcript, t_bits, b"qkv_rt");
+    let r_out_q = challenge_vec(transcript, out_bits, b"qkv_rout_q");
+    let r_out_k = challenge_vec(transcript, out_bits, b"qkv_rout_k");
+    let r_out_v = challenge_vec(transcript, out_bits, b"qkv_rout_v");
+    let lambda: F = transcript.challenge_field(b"qkv_lambda");
+    let mu: F = transcript.challenge_field(b"qkv_mu");
+
+    // 2. Verify batched sumcheck
+    let target = lambda * (proof.openings.q_eval - proof.openings.bias_q_eval)
+        + mu * (proof.openings.k_eval - proof.openings.bias_k_eval)
+        + (proof.openings.v_eval - proof.openings.bias_v_eval);
+    let (r_k, final_val) =
+        verify_sumcheck(&proof.sumcheck, target, in_bits, transcript)
+            .map_err(|e| format!("BatchedQKV Sumcheck: {e}"))?;
+
+    transcript.append_field(b"qkv_q_eval", &proof.openings.q_eval);
+    transcript.append_field(b"qkv_k_eval", &proof.openings.k_eval);
+    transcript.append_field(b"qkv_v_eval", &proof.openings.v_eval);
+
+    // 3. Algebraic relation: final = x_eval * (λ·α_Q·w_q_eval + μ·α_K·w_k_eval + α_V·w_v_eval)
+    let combined_w = lambda * vk_q.alpha * proof.openings.w_q_eval
+        + mu * vk_k.alpha * proof.openings.w_k_eval
+        + vk_v.alpha * proof.openings.w_v_eval;
+    if final_val != proof.openings.x_eval * combined_w {
+        return Err("BatchedQKV algebraic relation failed".into());
+    }
+
+    // 4. Defer weight and bias openings to block-level accumulators
+    acc_w.add_verify(
+        &vk_q.w_com, proof.openings.w_q_eval, &combine(&r_k, &r_out_q), &proof.openings.w_q_open,
+    )?;
+    acc_w.add_verify(
+        &vk_k.w_com, proof.openings.w_k_eval, &combine(&r_k, &r_out_k), &proof.openings.w_k_open,
+    )?;
+    acc_w.add_verify(
+        &vk_v.w_com, proof.openings.w_v_eval, &combine(&r_k, &r_out_v), &proof.openings.w_v_open,
+    )?;
+    acc_b.add_verify(
+        &vk_q.bias_com, proof.openings.bias_q_eval, &r_out_q, &proof.openings.bias_q_open,
+    )?;
+    acc_b.add_verify(
+        &vk_k.bias_com, proof.openings.bias_k_eval, &r_out_k, &proof.openings.bias_k_open,
+    )?;
+    acc_b.add_verify(
+        &vk_v.bias_com, proof.openings.bias_v_eval, &r_out_v, &proof.openings.bias_v_open,
+    )?;
+
+    let q_claim = EvalClaim { point: combine(&r_t, &r_out_q), value: proof.openings.q_eval };
+    let k_claim = EvalClaim { point: combine(&r_t, &r_out_k), value: proof.openings.k_eval };
+    let v_claim = EvalClaim { point: combine(&r_t, &r_out_v), value: proof.openings.v_eval };
+    let x_norm1_claim = EvalClaim { point: combine(&r_t, &r_k), value: proof.openings.x_eval };
+
+    Ok((q_claim, k_claim, v_claim, x_norm1_claim))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -302,11 +566,11 @@ mod projection_full_tests {
             ProjectionProvingKey { vk, w, bias },
             ProjectionWitness { x, y },
             ProjectionIOCommitments {
-                x_com: hyrax_commit(
+                x_com: Some(hyrax_commit(
                     &x_mle.evaluations,
                     params_from_vars(x_mle.num_vars).0,
                     &params_from_vars(x_mle.num_vars).2,
-                ),
+                )),
             },
         )
     }

@@ -16,7 +16,7 @@
 //!   X_out = X_mid + Out_ffn   <-- Residual 2
 
 use crate::field::F;
-use crate::pcs::{absorb_com, hyrax_commit, params_from_vars, HyraxCommitment, HyraxParams};
+use crate::pcs::{absorb_com, hyrax_commit, hyrax_open, params_from_vars, HyraxCommitment, HyraxParams, HyraxProof};
 use crate::poly::utils::mat_to_mle;
 use crate::subprotocols::{prove_combine, CombineProof};
 use crate::transcript::Transcript;
@@ -27,17 +27,20 @@ use crate::attention::attention::{
     LinearAttentionInstance, LinearAttentionProof, LinearAttentionWitness,
 };
 use crate::attention::layernorm::{
-    prove_layernorm, LayerNormIOCommitments, LayerNormProof, LayerNormVerifyingKey,
+    compute_range_witnesses, prove_layernorm, LayerNormIOCommitments, LayerNormProof,
+    LayerNormVerifyingKey,
     LayerNormWitness,
 };
 use crate::attention::projection::{
-    prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionProvingKey,
-    ProjectionVerifyingKey, ProjectionWitness,
+    prove_projection, prove_qkv_projections, BatchedQKVProjectionIOCommitments,
+    BatchedQKVProjectionProof, BatchedQKVProjectionWitness, ProjectionIOCommitments,
+    ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey, ProjectionWitness,
 };
 use crate::ffn::ffn::{prove_ffn, FFNIOCommitments, FFNInstance, FFNProof, FFNWitness};
 use crate::lookup::lasso::{
     prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
 };
+use crate::lookup::range::{prove_range_batched, GlobalRangeM};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey}; // Imported from verifier.rs
 
 // ---------------------------------------------------------------------------
@@ -45,45 +48,51 @@ use crate::verifier::{add_commitments, TransformerBlockVerifyingKey}; // Importe
 // ---------------------------------------------------------------------------
 
 /// The complete ZK Proof for one Transformer Block.
+///
+/// GKR backward fusion (out_inner elimination):
+/// O_proj runs before attention in the transcript. O_proj's x_claim is passed as
+/// the external out_inner evaluation point to attention. Both sub-provers reference
+/// the same out_inner evaluation, eliminating the need for out_inner_com or
+/// out_inner_combine. Soundness holds because the two sumchecks together pin down
+/// out_inner at the shared evaluation point.
 pub struct TransformerBlockProof {
-    // Sub-proofs
+    // Sub-proofs (O_proj runs before attention in transcript order)
     pub ln1_proof: LayerNormProof,
-    pub q_proj_proof: ProjectionProof,
-    pub k_proj_proof: ProjectionProof,
-    pub v_proj_proof: ProjectionProof,
+    pub qkv_proj_proof: BatchedQKVProjectionProof,
+    pub o_proj_proof: ProjectionProof,  // runs before attn (GKR backward)
     pub attn_proof: LinearAttentionProof,
-    pub o_proj_proof: ProjectionProof,
     pub ln2_proof: LayerNormProof,
     pub ffn_proof: FFNProof,
 
-    // Intermediate IO Commitments (Passed to Verifier to stitch the pipeline)
+    // Intermediate IO Commitments (out_inner_com eliminated via GKR backward fusion)
     pub x_norm1_com: HyraxCommitment,
     pub q_com: HyraxCommitment,
     pub k_com: HyraxCommitment,
     pub v_com: HyraxCommitment,
-    pub out_inner_com: HyraxCommitment,
+    // out_inner_com: eliminated — out_inner bound by shared sumcheck claim
     pub out_attn_com: HyraxCommitment,
     pub x_norm2_com: HyraxCommitment,
     pub out_ffn_com: HyraxCommitment,
 
-    // GKR combine proofs — each bundles multiple eval claims on the same
-    // intermediate commitment into a single Hyrax opening.
-    /// Verifies q_com: 1 claim from Q-projection y_claim.
-    pub q_combine: CombineProof,
-    /// Verifies k_com: 1 claim from K-projection y_claim.
-    pub k_combine: CombineProof,
+    /// Direct Hyrax opening of q_com at the Q-projection y_claim point.
+    pub q_open: HyraxProof,
+    /// Direct Hyrax opening of k_com at the K-projection y_claim point.
+    pub k_open: HyraxProof,
     /// Verifies v_com: 2 claims — V-projection y_claim + attention v_claim.
     pub v_combine: CombineProof,
-    /// Verifies out_inner_com: 2 claims — attention out_claim + O-projection x_claim.
-    pub out_inner_combine: CombineProof,
-    /// Verifies x_norm1_com: 3 claims — Q/K/V-projection x_claims.
-    pub x_norm1_combine: CombineProof,
-    /// Verifies out_attn_com: 1 claim from O-projection y_claim.
-    pub out_attn_combine: CombineProof,
-    /// Verifies x_norm2_com: 1 claim from FFN x_claim (input to FFN).
-    pub x_norm2_combine: CombineProof,
-    /// Verifies out_ffn_com: 1 claim from FFN y_claim (output of FFN).
-    pub out_ffn_combine: CombineProof,
+    // out_inner_combine: eliminated — no out_inner_com to combine
+    /// Direct Hyrax opening of x_norm1_com at the shared batched-QKV x_claim point.
+    pub x_norm1_open: HyraxProof,
+    /// Direct Hyrax opening of out_attn_com at the O-projection y_claim point.
+    pub out_attn_open: HyraxProof,
+    /// Direct Hyrax opening of x_norm2_com at the FFN x_claim point.
+    pub x_norm2_open: HyraxProof,
+    /// Direct Hyrax opening of out_ffn_com at the FFN y_claim point.
+    pub out_ffn_open: HyraxProof,
+
+    /// Shared multiplicity commitment for all 4 range proofs in this block
+    /// (ln1_sigma, ln1_y, ln2_sigma, ln2_y).  One m_com instead of 4.
+    pub block_range_m: GlobalRangeM,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,12 +139,12 @@ pub fn prove_transformer_block(
         hyrax_commit(&mle.evaluations, nu, &HyraxParams::new(sigma))
     };
 
-    // 1. Generate all Intermediate IO Commitments (O(N) operations done ONLY ONCE)
+    // 1. Generate Intermediate IO Commitments (out_inner_com eliminated via GKR backward)
     let x_norm1_com = commit_mat(&witness.ln1_wit.y, t, d);
     let q_com = commit_mat(&witness.attn_wit.q, t, d);
     let k_com = commit_mat(&witness.attn_wit.k, t, d);
     let v_com = commit_mat(&witness.attn_wit.v, t, d);
-    let out_inner_com = commit_mat(&witness.attn_wit.out, t, d);
+    // out_inner_com: NOT committed — bound by shared sumcheck claim (GKR backward)
     let out_attn_com = commit_mat(&witness.o_proj_wit.y, t, d);
     let x_norm2_com = commit_mat(&witness.ln2_wit.y, t, d);
     let out_ffn_com = commit_mat(&witness.ffn_wit.y, t, d);
@@ -145,47 +154,83 @@ pub fn prove_transformer_block(
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
     let td_num_vars = t_bits + d_bits;
 
-    // 2. Execute Sub-Provers with strictly bound IO Commitments
+    // 2. Global range batch for all LayerNorm range proofs in this block.
+    //    Phase 1+2: commit chunk_coms for all 4 witnesses, one shared m_com, then sumchecks.
+    //    Transcript ordering: all range material comes BEFORE any layernorm sub-prover.
+    let ln1_rw = compute_range_witnesses(&witness.ln1_wit, &pk.ln1_vk);
+    let ln2_rw = compute_range_witnesses(&witness.ln2_wit, &pk.ln2_vk);
+    let ln1_sigma_n = (2 * t).next_power_of_two().trailing_zeros() as usize;
+    let ln1_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
+    let (mut block_range_proofs, block_range_m, block_r_vs) = prove_range_batched(
+        &[
+            &ln1_rw.sigma_witness,
+            &ln1_rw.y_witness,
+            &ln2_rw.sigma_witness,
+            &ln2_rw.y_witness,
+        ],
+        32,
+        transcript,
+    )?;
+    // Destructure in reverse order to avoid index shifting
+    let ln2_y_rp    = block_range_proofs.remove(3);
+    let ln2_sig_rp  = block_range_proofs.remove(2);
+    let ln1_y_rp    = block_range_proofs.remove(1);
+    let ln1_sig_rp  = block_range_proofs.remove(0);
+    let ln2_y_rv    = block_r_vs[3].clone();
+    let ln2_sig_rv  = block_r_vs[2].clone();
+    let ln1_y_rv    = block_r_vs[1].clone();
+    let ln1_sig_rv  = block_r_vs[0].clone();
+    let _ = (ln1_sigma_n, ln1_y_n); // used only for verifier num_vars
+
+    // 3. Execute Sub-Provers with strictly bound IO Commitments
     // --- LayerNorm 1 ---
     let ln1_io = LayerNormIOCommitments {
         x_com: x_in_com.clone(),
         y_com: x_norm1_com.clone(),
     };
-    let ln1_proof = prove_layernorm(&witness.ln1_wit, &ln1_io, &pk.ln1_vk, transcript)?;
+    let ln1_proof = prove_layernorm(
+        &witness.ln1_wit,
+        &ln1_io,
+        &pk.ln1_vk,
+        (ln1_sig_rp, ln1_sig_rv),
+        (ln1_y_rp, ln1_y_rv),
+        transcript,
+    )?;
 
-    // --- Q, K, V Projections — return (proof, y_claim, x_claim) ---
-    let q_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
-    let (q_proj_proof, q_y_claim, q_x_claim) =
-        prove_projection(&pk.q_pk, &witness.q_proj_wit, &q_io, transcript)?;
+    // --- Batched Q, K, V Projections — one sumcheck, single r_k ---
+    let qkv_wit = BatchedQKVProjectionWitness {
+        x: witness.ln1_wit.y.clone(),
+        q: witness.q_proj_wit.y.clone(),
+        k: witness.k_proj_wit.y.clone(),
+        v: witness.v_proj_wit.y.clone(),
+    };
+    let qkv_io = BatchedQKVProjectionIOCommitments { x_com: x_norm1_com.clone() };
+    let (qkv_proj_proof, q_y_claim, k_y_claim, v_y_claim, x_norm1_claim) =
+        prove_qkv_projections(&pk.q_pk, &pk.k_pk, &pk.v_pk, &qkv_wit, &qkv_io, transcript)?;
 
-    let k_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
-    let (k_proj_proof, k_y_claim, k_x_claim) =
-        prove_projection(&pk.k_pk, &witness.k_proj_wit, &k_io, transcript)?;
+    // --- GKR backward fusion: O_proj runs BEFORE attention ---
+    // O_proj's x_claim gives an evaluation of out_inner at a transcript-derived point.
+    // out_inner is NOT committed; x_com is None (GKR backward, no out_inner_com).
+    let o_io = ProjectionIOCommitments { x_com: None };
+    let (o_proj_proof, o_y_claim, o_x_claim) =
+        prove_projection(&pk.o_pk, &witness.o_proj_wit, &o_io, transcript)?;
 
-    let v_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
-    let (v_proj_proof, v_y_claim, v_x_claim) =
-        prove_projection(&pk.v_pk, &witness.v_proj_wit, &v_io, transcript)?;
-
-    // --- Linear Attention — returns (proof, out_claim, v_claim) ---
+    // --- Linear Attention — receives O_proj's x_claim as the external out_inner claim ---
+    // out_com removed from IO; both sub-provers reference the same out_inner eval point.
     let attn_io = AttentionIOCommitments {
         q_com: q_com.clone(),
         k_com: k_com.clone(),
         v_com: v_com.clone(),
-        out_com: out_inner_com.clone(),
     };
-    let (attn_proof, attn_out_claim, attn_v_claim) = prove_linear_attention(
+    let (attn_proof, _attn_out_claim, attn_v_claim) = prove_linear_attention(
         &witness.attn_wit,
         inst_attn,
         &pk.attn_pk,
         &attn_io,
+        Some(o_x_claim.clone()),  // GKR backward: out_inner eval from O_proj
         transcript,
         lasso_params,
     );
-
-    // --- Output Projection — returns (proof, y_claim, x_claim) ---
-    let o_io = ProjectionIOCommitments { x_com: out_inner_com.clone() };
-    let (o_proj_proof, o_y_claim, o_x_claim) =
-        prove_projection(&pk.o_pk, &witness.o_proj_wit, &o_io, transcript)?;
 
     // --- LayerNorm 2 ---
     let x_mid_com = add_commitments(x_in_com, &out_attn_com);
@@ -193,7 +238,14 @@ pub fn prove_transformer_block(
         x_com: x_mid_com.clone(),
         y_com: x_norm2_com.clone(),
     };
-    let ln2_proof = prove_layernorm(&witness.ln2_wit, &ln2_io, &pk.ln2_vk, transcript)?;
+    let ln2_proof = prove_layernorm(
+        &witness.ln2_wit,
+        &ln2_io,
+        &pk.ln2_vk,
+        (ln2_sig_rp, ln2_sig_rv),
+        (ln2_y_rp, ln2_y_rv),
+        transcript,
+    )?;
 
     // --- FFN — returns (proof, y_claim, x_claim) ---
     let ffn_io = FFNIOCommitments {
@@ -216,57 +268,39 @@ pub fn prove_transformer_block(
     };
 
     let (nu_td, sigma_td, _) = params_from_vars(td_num_vars);
-    let _ = (nu_td, sigma_td); // used implicitly by prove_combine
 
-    // q_com: 1 claim (Q-proj y_claim)
+    // q_com: direct open at Q-proj y_claim point
     let q_evals = mat_evals(&witness.attn_wit.q, t, d);
-    let (q_combine, _) =
-        prove_combine(&q_evals, &q_com, &[q_y_claim], td_num_vars, transcript);
+    let q_open = hyrax_open(&q_evals, &q_y_claim.point, nu_td, sigma_td);
 
-    // k_com: 1 claim (K-proj y_claim)
+    // k_com: direct open at K-proj y_claim point
     let k_evals = mat_evals(&witness.attn_wit.k, t, d);
-    let (k_combine, _) =
-        prove_combine(&k_evals, &k_com, &[k_y_claim], td_num_vars, transcript);
+    let k_open = hyrax_open(&k_evals, &k_y_claim.point, nu_td, sigma_td);
 
     // v_com: 2 claims — V-proj y_claim + attention v_claim
     let v_evals = mat_evals(&witness.attn_wit.v, t, d);
     let (v_combine, _) =
         prove_combine(&v_evals, &v_com, &[v_y_claim, attn_v_claim], td_num_vars, transcript);
 
-    // out_inner_com: 2 claims — attention out_claim + O-proj x_claim
-    let out_inner_evals = mat_evals(&witness.attn_wit.out, t, d);
-    let (out_inner_combine, _) = prove_combine(
-        &out_inner_evals,
-        &out_inner_com,
-        &[attn_out_claim, o_x_claim],
-        td_num_vars,
-        transcript,
-    );
+    // out_inner_com: ELIMINATED via GKR backward fusion.
+    // O_proj's x_claim and attention's external_out_claim both reference the same
+    // out_inner evaluation point, so no combine proof or commitment is needed.
 
-    // x_norm1_com: 3 claims — Q/K/V-proj x_claims
+    // x_norm1_com: direct open at the single batched-QKV x_norm1_claim point
     let x_norm1_evals = mat_evals(&witness.ln1_wit.y, t, d);
-    let (x_norm1_combine, _) = prove_combine(
-        &x_norm1_evals,
-        &x_norm1_com,
-        &[q_x_claim, k_x_claim, v_x_claim],
-        td_num_vars,
-        transcript,
-    );
+    let x_norm1_open = hyrax_open(&x_norm1_evals, &x_norm1_claim.point, nu_td, sigma_td);
 
-    // out_attn_com: 1 claim (O-proj y_claim)
+    // out_attn_com: direct open at O-proj y_claim point
     let out_attn_evals = mat_evals(&witness.o_proj_wit.y, t, d);
-    let (out_attn_combine, _) =
-        prove_combine(&out_attn_evals, &out_attn_com, &[o_y_claim], td_num_vars, transcript);
+    let out_attn_open = hyrax_open(&out_attn_evals, &o_y_claim.point, nu_td, sigma_td);
 
-    // x_norm2_com: 1 claim (FFN x_claim — input to FFN = output of LN2)
+    // x_norm2_com: direct open at FFN x_claim point
     let x_norm2_evals = mat_evals(&witness.ln2_wit.y, t, d);
-    let (x_norm2_combine, _) =
-        prove_combine(&x_norm2_evals, &x_norm2_com, &[ffn_x_claim], td_num_vars, transcript);
+    let x_norm2_open = hyrax_open(&x_norm2_evals, &ffn_x_claim.point, nu_td, sigma_td);
 
-    // out_ffn_com: 1 claim (FFN y_claim — output of FFN)
+    // out_ffn_com: direct open at FFN y_claim point
     let out_ffn_evals = mat_evals(&witness.ffn_wit.y, t, d);
-    let (out_ffn_combine, _) =
-        prove_combine(&out_ffn_evals, &out_ffn_com, &[ffn_y_claim], td_num_vars, transcript);
+    let out_ffn_open = hyrax_open(&out_ffn_evals, &ffn_y_claim.point, nu_td, sigma_td);
 
     // Advance transcript to match verifier's hyrax_verify_multi_point lambda challenge.
     // (hyrax_open is transcript-free, so we just burn one field challenge here.)
@@ -274,29 +308,28 @@ pub fn prove_transformer_block(
 
     Ok(TransformerBlockProof {
         ln1_proof,
-        q_proj_proof,
-        k_proj_proof,
-        v_proj_proof,
+        qkv_proj_proof,
+        o_proj_proof,  // O_proj before attn (GKR backward)
         attn_proof,
-        o_proj_proof,
         ln2_proof,
         ffn_proof,
         x_norm1_com,
         q_com,
         k_com,
         v_com,
-        out_inner_com,
+        // out_inner_com: eliminated via GKR backward fusion
         out_attn_com,
         x_norm2_com,
         out_ffn_com,
-        q_combine,
-        k_combine,
+        q_open,
+        k_open,
         v_combine,
-        out_inner_combine,
-        x_norm1_combine,
-        out_attn_combine,
-        x_norm2_combine,
-        out_ffn_combine,
+        // out_inner_combine: eliminated via GKR backward fusion
+        x_norm1_open,
+        out_attn_open,
+        x_norm2_open,
+        out_ffn_open,
+        block_range_m,
     })
 }
 
@@ -341,6 +374,10 @@ pub struct TransformerModelProof {
     /// Single batched Lasso proof covering all activation lookups across all layers.
     /// Order per block: [FFN_i, Q_i, K_i].
     pub all_lasso_proof: LassoMultiProof,
+
+    /// Shared multiplicity commitment for the final LayerNorm range proofs
+    /// (final_ln_sigma, final_ln_y).  One m_com instead of 2.
+    pub final_range_m: GlobalRangeM,
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +432,15 @@ pub fn prove(
         block_proofs.push(block_proof);
     }
 
-    // 3. Final LayerNorm
+    // 3. Final LayerNorm — global range batch for final_ln (sigma + y)
+    let final_rw = compute_range_witnesses(&witness.final_ln_wit, &pk.vk.final_ln_vk);
+    let (mut final_range_proofs, final_range_m, final_r_vs) = prove_range_batched(
+        &[&final_rw.sigma_witness, &final_rw.y_witness],
+        32,
+        transcript,
+    )?;
+    let final_y_rp   = final_range_proofs.remove(1);
+    let final_sig_rp = final_range_proofs.remove(0);
     let final_ln_out_com = commit_mat(&witness.final_ln_wit.y, t, d);
     let ln_io = LayerNormIOCommitments {
         x_com: current_x_com.clone(),
@@ -405,22 +450,27 @@ pub fn prove(
         &witness.final_ln_wit,
         &ln_io,
         &pk.vk.final_ln_vk,
+        (final_sig_rp, final_r_vs[0].clone()),
+        (final_y_rp, final_r_vs[1].clone()),
         transcript,
     )?;
 
     // 4. LM Head (Final Projection to Vocab Size)
     let logits_com = commit_mat(&witness.lm_head_wit.y, t, v);
-    let lm_io = ProjectionIOCommitments { x_com: final_ln_out_com.clone() };
+    let lm_io = ProjectionIOCommitments { x_com: Some(final_ln_out_com.clone()) };
     let (lm_head_proof, _, _) =
         prove_projection(&pk.lm_head_pk, &witness.lm_head_wit, &lm_io, transcript)?;
 
-    // Advance transcript to match verifier's 6 accumulator finalizations.
+    // Advance transcript to match verifier's 9 accumulator finalizations.
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // ln_acc_t
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // ln_acc_td
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // proj_acc_w (QKVO)
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // proj_acc_b (QKVO)
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // lmh_acc_w
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // lmh_acc_b
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // acc_range_sig
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // acc_range_y
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // acc_range_m
 
     // 5. Global batched Lasso: one proof for all activation lookups across all layers.
     // Instance order per block: [FFN_i, Q_i, K_i].
@@ -429,17 +479,21 @@ pub fn prove(
     let mut global_nu = 0usize;
     for i in 0..pk.vk.num_blocks {
         let bpk = &pk.block_pks[i];
-        all_lasso_instances.push(inst_ffn.activation_lasso.clone());
+
+        // FFN activation Lasso now runs inside prove_ffn (GKR backward ordering).
+        // Only Q/K attention Lassos remain in the global batched proof.
         all_lasso_instances.push(inst_attn.q_lasso.clone());
         all_lasso_instances.push(inst_attn.k_lasso.clone());
-        all_instance_coms.push(bpk.ffn_pk.activation_lasso_pk.table_coms.clone());
         all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
         all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
-        global_nu = bpk.ffn_pk.activation_lasso_pk.nu;
+        global_nu = bpk.attn_pk.qk_lasso_pk.nu;
+        // phi_q/phi_k output bindings eliminated (verified via MLE of public Lasso outputs
+        // in attention verifier). FFN a_com/m_com eliminated via GKR backward (Lasso
+        // runs inside prove_ffn; a_eval/m_eval verified from public Lasso outputs/query_indices).
     }
     let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
     let global_lasso_pk = LassoMultiProvingKey { instance_table_coms: all_instance_coms, nu: global_nu };
-    let all_lasso_proof = prove_lasso_multi(&global_multi_inst, &global_lasso_pk, transcript, lasso_params);
+    let all_lasso_proof = prove_lasso_multi(&global_multi_inst, &global_lasso_pk, &[], transcript, lasso_params);
 
     Ok(TransformerModelProof {
         x_in_com,
@@ -449,6 +503,7 @@ pub fn prove(
         final_ln_out_com,
         logits_com,
         all_lasso_proof,
+        final_range_m,
     })
 }
 
@@ -854,6 +909,9 @@ mod tests {
         let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -867,6 +925,9 @@ mod tests {
             &mut ln_acc_td,
             &mut proj_acc_w,
             &mut proj_acc_b,
+            &mut acc_range_sig,
+            &mut acc_range_y,
+            &mut acc_range_m,
         );
         assert!(
             result.is_ok(),
@@ -911,6 +972,9 @@ mod tests {
         let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -924,6 +988,9 @@ mod tests {
             &mut ln_acc_td,
             &mut proj_acc_w,
             &mut proj_acc_b,
+            &mut acc_range_sig,
+            &mut acc_range_y,
+            &mut acc_range_m,
         );
         assert!(result.is_err(), "Should reject wrong x_out_com");
     }
@@ -960,6 +1027,9 @@ mod tests {
         let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -973,6 +1043,9 @@ mod tests {
             &mut ln_acc_td,
             &mut proj_acc_w,
             &mut proj_acc_b,
+            &mut acc_range_sig,
+            &mut acc_range_y,
+            &mut acc_range_m,
         );
         assert!(result.is_err(), "Should reject tampered LN1 proof");
     }
@@ -1016,6 +1089,9 @@ mod tests {
         let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
         let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -1029,6 +1105,9 @@ mod tests {
             &mut ln_acc_td,
             &mut proj_acc_w,
             &mut proj_acc_b,
+            &mut acc_range_sig,
+            &mut acc_range_y,
+            &mut acc_range_m,
         );
         assert!(result.is_err(), "Should reject tampered x_norm1_com");
     }

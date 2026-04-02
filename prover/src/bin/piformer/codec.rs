@@ -13,7 +13,7 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate
 use piformer_prover::{
     attention::{
         attention::{
-            AttentionInternalCommitments, AttentionOpenings, AttentionProvingKey,
+            AttentionOpenings, AttentionProvingKey,
             AttentionSumcheckProof, AttentionVerifyingKey, LinearAttentionInstance,
             LinearAttentionProof,
         },
@@ -21,18 +21,19 @@ use piformer_prover::{
             LayerNormInternalCommitments, LayerNormOpenings, LayerNormProof, LayerNormVerifyingKey,
         },
         projection::{
-            ProjectionOpenings, ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey,
+            BatchedQKVProjectionOpenings, BatchedQKVProjectionProof, ProjectionOpenings,
+            ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey,
         },
     },
     ffn::ffn::{
-        FFNInstance, FFNInternalCommitments, FFNOpenings, FFNProof, FFNProvingKey, FFNVerifyingKey,
+        FFNInstance, FFNOpenings, FFNProof, FFNProvingKey, FFNVerifyingKey,
     },
     lookup::{
         lasso::{
             LassoInstance, LassoMultiProof, LassoMultiProvingKey, LassoMultiVerifyingKey,
             LassoProof, LassoProvingKey, LassoVerifyingKey,
         },
-        range::RangeProof,
+        range::{GlobalRangeM, RangeProof, RangeWitnessProof},
     },
     pcs::{HyraxCommitment, HyraxProof},
     poly::utils::TernaryValue,
@@ -42,7 +43,10 @@ use piformer_prover::{
     },
     subprotocols::{
         combine::CombineProof,
-        sumcheck::{RoundPoly, SumcheckProof, SumcheckProofMulti},
+        sumcheck::{
+            CubicRoundPoly, RoundPoly, SumcheckCubicProof, SumcheckCubicProofMulti, SumcheckProof,
+            SumcheckProofMulti,
+        },
     },
     verifier::TransformerBlockVerifyingKey,
     F,
@@ -274,11 +278,57 @@ fn read_sumcheck_proof_multi<R: Read>(r: &mut R) -> io::Result<SumcheckProofMult
     })
 }
 
+fn write_cubic_round_poly<W: Write>(w: &mut W, rp: &CubicRoundPoly) -> io::Result<()> {
+    write_f(w, &rp.evals[0])?;
+    write_f(w, &rp.evals[1])?;
+    write_f(w, &rp.evals[2])?;
+    write_f(w, &rp.evals[3])
+}
+fn read_cubic_round_poly<R: Read>(r: &mut R) -> io::Result<CubicRoundPoly> {
+    Ok(CubicRoundPoly {
+        evals: [read_f(r)?, read_f(r)?, read_f(r)?, read_f(r)?],
+    })
+}
+
+fn write_sumcheck_cubic_proof<W: Write>(w: &mut W, p: &SumcheckCubicProof) -> io::Result<()> {
+    write_vec(w, &p.round_polys, write_cubic_round_poly)?;
+    write_f(w, &p.final_eval_f)?;
+    write_f(w, &p.final_eval_g)?;
+    write_f(w, &p.final_eval_h)
+}
+fn read_sumcheck_cubic_proof<R: Read>(r: &mut R) -> io::Result<SumcheckCubicProof> {
+    Ok(SumcheckCubicProof {
+        round_polys: read_vec(r, read_cubic_round_poly)?,
+        final_eval_f: read_f(r)?,
+        final_eval_g: read_f(r)?,
+        final_eval_h: read_f(r)?,
+    })
+}
+
+fn write_sumcheck_cubic_proof_multi<W: Write>(
+    w: &mut W,
+    p: &SumcheckCubicProofMulti,
+) -> io::Result<()> {
+    write_vec(w, &p.round_polys, write_cubic_round_poly)?;
+    write_vec_f(w, &p.final_evals_f)?;
+    write_vec_f(w, &p.final_evals_g)?;
+    write_vec_f(w, &p.final_evals_h)
+}
+fn read_sumcheck_cubic_proof_multi<R: Read>(r: &mut R) -> io::Result<SumcheckCubicProofMulti> {
+    Ok(SumcheckCubicProofMulti {
+        round_polys: read_vec(r, read_cubic_round_poly)?,
+        final_evals_f: read_vec_f(r)?,
+        final_evals_g: read_vec_f(r)?,
+        final_evals_h: read_vec_f(r)?,
+    })
+}
+
 fn write_lasso_multi_proof<W: Write>(w: &mut W, p: &LassoMultiProof) -> io::Result<()> {
     write_f(w, &p.combined_grand_sum)?;
     write_sumcheck_proof_multi(w, &p.combined_sumcheck_proof)?;
     write_vec(w, &p.table_openings, |w, v: &Vec<F>| write_vec_f(w, v))?;
-    write_hyrax_proof(w, &p.hyrax_proof)
+    write_hyrax_proof(w, &p.hyrax_proof)?;
+    write_vec(w, &p.output_opening_proofs, write_hyrax_proof)
 }
 fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
     Ok(LassoMultiProof {
@@ -286,6 +336,7 @@ fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
         combined_sumcheck_proof: read_sumcheck_proof_multi(r)?,
         table_openings: read_vec(r, |r| read_vec_f(r))?,
         hyrax_proof: read_hyrax_proof(r)?,
+        output_opening_proofs: read_vec(r, read_hyrax_proof)?,
     })
 }
 
@@ -312,28 +363,56 @@ fn read_range_proof<R: Read>(r: &mut R) -> io::Result<RangeProof> {
     })
 }
 
+fn write_range_witness_proof<W: Write>(w: &mut W, p: &RangeWitnessProof) -> io::Result<()> {
+    write_sumcheck_proof(w, &p.sumcheck)?;
+    write_f(w, &p.claim_v)?;
+    write_vec(w, &p.chunk_coms, write_hyrax_commitment)?;
+    write_vec_f(w, &p.chunk_evals)?;
+    write_hyrax_proof(w, &p.chunk_batch_proof)
+}
+fn read_range_witness_proof<R: Read>(r: &mut R) -> io::Result<RangeWitnessProof> {
+    Ok(RangeWitnessProof {
+        sumcheck: read_sumcheck_proof(r)?,
+        claim_v: read_f(r)?,
+        chunk_coms: read_vec(r, read_hyrax_commitment)?,
+        chunk_evals: read_vec_f(r)?,
+        chunk_batch_proof: read_hyrax_proof(r)?,
+    })
+}
+
+fn write_global_range_m<W: Write>(w: &mut W, m: &GlobalRangeM) -> io::Result<()> {
+    write_hyrax_commitment(w, &m.m_com)?;
+    write_f(w, &m.m_eval)?;
+    write_hyrax_proof(w, &m.m_open)
+}
+fn read_global_range_m<R: Read>(r: &mut R) -> io::Result<GlobalRangeM> {
+    Ok(GlobalRangeM {
+        m_com: read_hyrax_commitment(r)?,
+        m_eval: read_f(r)?,
+        m_open: read_hyrax_proof(r)?,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // LayerNorm proof
 // ---------------------------------------------------------------------------
 
 fn write_ln_internal_coms<W: Write>(w: &mut W, c: &LayerNormInternalCommitments) -> io::Result<()> {
     write_hyrax_commitment(w, &c.sum_x_com)?;
-    write_hyrax_commitment(w, &c.sq_sum_x_com)?;
-    write_hyrax_commitment(w, &c.sum_x_sq_com)?;
-    write_hyrax_commitment(w, &c.sigma_com)?;
-    write_hyrax_commitment(w, &c.sigma_sq_com)?;
-    write_hyrax_commitment(w, &c.sigma_y_com)?;
-    write_hyrax_commitment(w, &c.gamma_x_com)
+    //write_hyrax_commitment(w, &c.sum_x_sq_com)?;
+    write_hyrax_commitment(w, &c.sigma_com)
+    //write_hyrax_commitment(w, &c.sigma_sq_com)?;
+    // write_hyrax_commitment(w, &c.sigma_y_com)?;
+    // write_hyrax_commitment(w, &c.gamma_x_com)
 }
 fn read_ln_internal_coms<R: Read>(r: &mut R) -> io::Result<LayerNormInternalCommitments> {
     Ok(LayerNormInternalCommitments {
         sum_x_com: read_hyrax_commitment(r)?,
-        sq_sum_x_com: read_hyrax_commitment(r)?,
-        sum_x_sq_com: read_hyrax_commitment(r)?,
+        //sum_x_sq_com: read_hyrax_commitment(r)?,
         sigma_com: read_hyrax_commitment(r)?,
-        sigma_sq_com: read_hyrax_commitment(r)?,
-        sigma_y_com: read_hyrax_commitment(r)?,
-        gamma_x_com: read_hyrax_commitment(r)?,
+        // sigma_sq_com: read_hyrax_commitment(r)?,
+        // sigma_y_com: read_hyrax_commitment(r)?,
+        // gamma_x_com: read_hyrax_commitment(r)?,
     })
 }
 
@@ -344,8 +423,9 @@ fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<(
     write_hyrax_proof(w, &o.rt_batch_proof)?;
     // Individual: x at combine(r_t, r_d_mean)
     write_ep!(w, &o.x_at_rt_rmean, &o.x_rt_rmean_proof);
+    // Individual: x at r_final_q
+    write_ep!(w, &o.x_at_r_final_q, &o.x_at_r_final_q_proof);
     // Group 2: at r_sig_t
-    write_f(w, &o.sum_x_at_rsig)?;
     write_f(w, &o.sq_sum_x_at_rsig)?;
     write_f(w, &o.sigma_at_rsig)?;
     write_f(w, &o.sigma_sq_at_rsig)?;
@@ -360,7 +440,14 @@ fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<(
     // Group 4: at r_y_t
     write_f(w, &o.sum_x_at_ryt)?;
     write_f(w, &o.sigma_at_ryt)?;
-    write_hyrax_proof(w, &o.ryt_batch_proof)
+    write_hyrax_proof(w, &o.ryt_batch_proof)?;
+    // Group 5: at r_f_gx
+    write_ep!(w, &o.x_at_rf_gx, &o.x_at_rf_gx_proof);
+    // Group 6: at r_f_sy
+    write_ep!(w, &o.y_at_rf_sy, &o.y_at_rf_sy_proof);
+    write_ep!(w, &o.sigma_at_rf_sy_t, &o.sigma_at_rf_sy_t_proof);
+    write_ep!(w, &o.sum_x_at_rf_sig, &o.sum_x_at_rf_sig_proof);
+    Ok(())
 }
 fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
     // Group 1: at r_t
@@ -369,8 +456,9 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
     let rt_batch_proof = read_hyrax_proof(r)?;
     // Individual: x at combine(r_t, r_d_mean)
     let (x_at_rt_rmean, x_rt_rmean_proof) = read_ep!(r);
+    // Individual: x at r_final_q
+    let (x_at_r_final_q, x_at_r_final_q_proof) = read_ep!(r);
     // Group 2: at r_sig_t
-    let sum_x_at_rsig = read_f(r)?;
     let sq_sum_x_at_rsig = read_f(r)?;
     let sigma_at_rsig = read_f(r)?;
     let sigma_sq_at_rsig = read_f(r)?;
@@ -386,13 +474,20 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
     let sum_x_at_ryt = read_f(r)?;
     let sigma_at_ryt = read_f(r)?;
     let ryt_batch_proof = read_hyrax_proof(r)?;
+    // Group 5: at r_f_gx
+    let (x_at_rf_gx, x_at_rf_gx_proof) = read_ep!(r);
+    // Group 6: at r_f_sy
+    let (y_at_rf_sy, y_at_rf_sy_proof) = read_ep!(r);
+    let (sigma_at_rf_sy_t, sigma_at_rf_sy_t_proof) = read_ep!(r);
+    let (sum_x_at_rf_sig, sum_x_at_rf_sig_proof) = read_ep!(r);
     Ok(LayerNormOpenings {
         sum_x_at_rt,
         sq_sum_x_at_rt,
         rt_batch_proof,
         x_at_rt_rmean,
         x_rt_rmean_proof,
-        sum_x_at_rsig,
+        x_at_r_final_q,
+        x_at_r_final_q_proof,
         sq_sum_x_at_rsig,
         sigma_at_rsig,
         sigma_sq_at_rsig,
@@ -406,22 +501,36 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
         sum_x_at_ryt,
         sigma_at_ryt,
         ryt_batch_proof,
+        x_at_rf_gx,
+        x_at_rf_gx_proof,
+        y_at_rf_sy,
+        y_at_rf_sy_proof,
+        sigma_at_rf_sy_t,
+        sigma_at_rf_sy_t_proof,
+        sum_x_at_rf_sig,
+        sum_x_at_rf_sig_proof,
     })
 }
 
 fn write_ln_proof<W: Write>(w: &mut W, p: &LayerNormProof) -> io::Result<()> {
     write_ln_internal_coms(w, &p.internal_coms)?;
     write_sumcheck_proof(w, &p.mean_sumcheck)?;
-    write_range_proof(w, &p.sigma_range_proof)?;
-    write_range_proof(w, &p.y_range_proof)?;
+    write_sumcheck_cubic_proof(w, &p.sq_sum_sumcheck)?;
+    write_sumcheck_cubic_proof(w, &p.sum_x_sq_sumcheck)?;
+    write_sumcheck_cubic_proof_multi(w, &p.gamma_sigma_sumcheck)?;
+    write_range_witness_proof(w, &p.sigma_range_proof)?;
+    write_range_witness_proof(w, &p.y_range_proof)?;
     write_ln_openings(w, &p.openings)
 }
 fn read_ln_proof<R: Read>(r: &mut R) -> io::Result<LayerNormProof> {
     Ok(LayerNormProof {
         internal_coms: read_ln_internal_coms(r)?,
         mean_sumcheck: read_sumcheck_proof(r)?,
-        sigma_range_proof: read_range_proof(r)?,
-        y_range_proof: read_range_proof(r)?,
+        sq_sum_sumcheck: read_sumcheck_cubic_proof(r)?,
+        sum_x_sq_sumcheck: read_sumcheck_cubic_proof(r)?,
+        gamma_sigma_sumcheck: read_sumcheck_cubic_proof_multi(r)?,
+        sigma_range_proof: read_range_witness_proof(r)?,
+        y_range_proof: read_range_witness_proof(r)?,
         openings: read_ln_openings(r)?,
     })
 }
@@ -463,25 +572,69 @@ fn read_proj_proof<R: Read>(r: &mut R) -> io::Result<ProjectionProof> {
     })
 }
 
+fn write_batched_qkv_openings<W: Write>(
+    w: &mut W,
+    o: &BatchedQKVProjectionOpenings,
+) -> io::Result<()> {
+    write_f(w, &o.q_eval)?;
+    write_f(w, &o.k_eval)?;
+    write_f(w, &o.v_eval)?;
+    write_f(w, &o.x_eval)?;
+    write_ep!(w, &o.w_q_eval, &o.w_q_open);
+    write_ep!(w, &o.w_k_eval, &o.w_k_open);
+    write_ep!(w, &o.w_v_eval, &o.w_v_open);
+    write_ep!(w, &o.bias_q_eval, &o.bias_q_open);
+    write_ep!(w, &o.bias_k_eval, &o.bias_k_open);
+    write_ep!(w, &o.bias_v_eval, &o.bias_v_open);
+    Ok(())
+}
+fn read_batched_qkv_openings<R: Read>(r: &mut R) -> io::Result<BatchedQKVProjectionOpenings> {
+    let q_eval = read_f(r)?;
+    let k_eval = read_f(r)?;
+    let v_eval = read_f(r)?;
+    let x_eval = read_f(r)?;
+    let (w_q_eval, w_q_open) = read_ep!(r);
+    let (w_k_eval, w_k_open) = read_ep!(r);
+    let (w_v_eval, w_v_open) = read_ep!(r);
+    let (bias_q_eval, bias_q_open) = read_ep!(r);
+    let (bias_k_eval, bias_k_open) = read_ep!(r);
+    let (bias_v_eval, bias_v_open) = read_ep!(r);
+    Ok(BatchedQKVProjectionOpenings {
+        q_eval,
+        k_eval,
+        v_eval,
+        x_eval,
+        w_q_eval,
+        w_k_eval,
+        w_v_eval,
+        bias_q_eval,
+        bias_k_eval,
+        bias_v_eval,
+        w_q_open,
+        w_k_open,
+        w_v_open,
+        bias_q_open,
+        bias_k_open,
+        bias_v_open,
+    })
+}
+fn write_batched_qkv_proof<W: Write>(
+    w: &mut W,
+    p: &BatchedQKVProjectionProof,
+) -> io::Result<()> {
+    write_sumcheck_proof(w, &p.sumcheck)?;
+    write_batched_qkv_openings(w, &p.openings)
+}
+fn read_batched_qkv_proof<R: Read>(r: &mut R) -> io::Result<BatchedQKVProjectionProof> {
+    Ok(BatchedQKVProjectionProof {
+        sumcheck: read_sumcheck_proof(r)?,
+        openings: read_batched_qkv_openings(r)?,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Attention proof
 // ---------------------------------------------------------------------------
-
-fn write_attn_internal_coms<W: Write>(
-    w: &mut W,
-    c: &AttentionInternalCommitments,
-) -> io::Result<()> {
-    write_hyrax_commitment(w, &c.phi_q_com)?;
-    write_hyrax_commitment(w, &c.phi_k_com)
-    //write_hyrax_commitment(w, &c.context_com)
-}
-fn read_attn_internal_coms<R: Read>(r: &mut R) -> io::Result<AttentionInternalCommitments> {
-    Ok(AttentionInternalCommitments {
-        phi_q_com: read_hyrax_commitment(r)?,
-        phi_k_com: read_hyrax_commitment(r)?,
-        //context_com: read_hyrax_commitment(r)?,
-    })
-}
 
 fn write_attn_openings<W: Write>(w: &mut W, o: &AttentionOpenings) -> io::Result<()> {
     write_f(w, &o.out_eval)?;
@@ -500,7 +653,6 @@ fn read_attn_openings<R: Read>(r: &mut R) -> io::Result<AttentionOpenings> {
 }
 
 fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result<()> {
-    write_attn_internal_coms(w, &p.internal_coms)?;
     match &p.sumcheck {
         AttentionSumcheckProof::Batched { proof, ctx_eval } => {
             w.write_all(&[0u8])?; // tag: Batched
@@ -516,12 +668,9 @@ fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result
             write_sumcheck_proof(w, context_sumcheck)?;
         }
     }
-    write_attn_openings(w, &p.openings)?;
-    write_combine_proof(w, &p.phi_q_combine)?;
-    write_combine_proof(w, &p.phi_k_combine)
+    write_attn_openings(w, &p.openings)
 }
 fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
-    let internal_coms = read_attn_internal_coms(r)?;
     let mut tag = [0u8; 1];
     r.read_exact(&mut tag)?;
     let sumcheck = match tag[0] {
@@ -541,28 +690,14 @@ fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
         }
     };
     Ok(LinearAttentionProof {
-        internal_coms,
         sumcheck,
         openings: read_attn_openings(r)?,
-        phi_q_combine: read_combine_proof(r)?,
-        phi_k_combine: read_combine_proof(r)?,
     })
 }
 
 // ---------------------------------------------------------------------------
 // FFN proof
 // ---------------------------------------------------------------------------
-
-fn write_ffn_internal_coms<W: Write>(w: &mut W, c: &FFNInternalCommitments) -> io::Result<()> {
-    write_hyrax_commitment(w, &c.m_com)?;
-    write_hyrax_commitment(w, &c.a_com)
-}
-fn read_ffn_internal_coms<R: Read>(r: &mut R) -> io::Result<FFNInternalCommitments> {
-    Ok(FFNInternalCommitments {
-        m_com: read_hyrax_commitment(r)?,
-        a_com: read_hyrax_commitment(r)?,
-    })
-}
 
 fn write_ffn_openings<W: Write>(w: &mut W, o: &FFNOpenings) -> io::Result<()> {
     write_f(w, &o.y_eval)?;
@@ -580,25 +715,34 @@ fn read_ffn_openings<R: Read>(r: &mut R) -> io::Result<FFNOpenings> {
     let (w2_eval, w2_open) = read_ep!(r);
     let m_eval = read_f(r)?;
     let (w1_eval, w1_open) = read_ep!(r);
-    Ok(FFNOpenings { y_eval, x_eval, a_eval, w2_eval, w2_open, m_eval, w1_eval, w1_open })
+    Ok(FFNOpenings {
+        y_eval,
+        x_eval,
+        a_eval,
+        w2_eval,
+        w2_open,
+        m_eval,
+        w1_eval,
+        w1_open,
+    })
 }
 
 fn write_ffn_proof<W: Write>(w: &mut W, p: &FFNProof) -> io::Result<()> {
-    write_ffn_internal_coms(w, &p.internal_coms)?;
+    write_lasso_proof(w, &p.activation_lasso_proof)?;
+    write_hyrax_commitment(w, &p.m_com)?;
     write_sumcheck_proof(w, &p.y_sumcheck)?;
     write_sumcheck_proof(w, &p.m_sumcheck)?;
     write_ffn_openings(w, &p.openings)?;
-    write_combine_proof(w, &p.m_combine)?;
-    write_combine_proof(w, &p.a_combine)
+    write_hyrax_proof(w, &p.m_open)
 }
 fn read_ffn_proof<R: Read>(r: &mut R) -> io::Result<FFNProof> {
     Ok(FFNProof {
-        internal_coms: read_ffn_internal_coms(r)?,
+        activation_lasso_proof: read_lasso_proof(r)?,
+        m_com: read_hyrax_commitment(r)?,
         y_sumcheck: read_sumcheck_proof(r)?,
         m_sumcheck: read_sumcheck_proof(r)?,
         openings: read_ffn_openings(r)?,
-        m_combine: read_combine_proof(r)?,
-        a_combine: read_combine_proof(r)?,
+        m_open: read_hyrax_proof(r)?,
     })
 }
 
@@ -625,56 +769,56 @@ fn read_combine_proof<R: Read>(r: &mut R) -> io::Result<CombineProof> {
 
 fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Result<()> {
     write_ln_proof(w, &p.ln1_proof)?;
-    write_proj_proof(w, &p.q_proj_proof)?;
-    write_proj_proof(w, &p.k_proj_proof)?;
-    write_proj_proof(w, &p.v_proj_proof)?;
-    write_attn_proof(w, &p.attn_proof)?;
+    write_batched_qkv_proof(w, &p.qkv_proj_proof)?;
+    // GKR backward: O_proj written before attn (transcript order matches prover)
     write_proj_proof(w, &p.o_proj_proof)?;
+    write_attn_proof(w, &p.attn_proof)?;
     write_ln_proof(w, &p.ln2_proof)?;
     write_ffn_proof(w, &p.ffn_proof)?;
     write_hyrax_commitment(w, &p.x_norm1_com)?;
     write_hyrax_commitment(w, &p.q_com)?;
     write_hyrax_commitment(w, &p.k_com)?;
     write_hyrax_commitment(w, &p.v_com)?;
-    write_hyrax_commitment(w, &p.out_inner_com)?;
+    // out_inner_com: eliminated via GKR backward fusion (no field to write)
     write_hyrax_commitment(w, &p.out_attn_com)?;
     write_hyrax_commitment(w, &p.x_norm2_com)?;
     write_hyrax_commitment(w, &p.out_ffn_com)?;
-    write_combine_proof(w, &p.q_combine)?;
-    write_combine_proof(w, &p.k_combine)?;
+    write_hyrax_proof(w, &p.q_open)?;
+    write_hyrax_proof(w, &p.k_open)?;
     write_combine_proof(w, &p.v_combine)?;
-    write_combine_proof(w, &p.out_inner_combine)?;
-    write_combine_proof(w, &p.x_norm1_combine)?;
-    write_combine_proof(w, &p.out_attn_combine)?;
-    write_combine_proof(w, &p.x_norm2_combine)?;
-    write_combine_proof(w, &p.out_ffn_combine)
+    // out_inner_combine: eliminated via GKR backward fusion (no field to write)
+    write_hyrax_proof(w, &p.x_norm1_open)?;
+    write_hyrax_proof(w, &p.out_attn_open)?;
+    write_hyrax_proof(w, &p.x_norm2_open)?;
+    write_hyrax_proof(w, &p.out_ffn_open)?;
+    write_global_range_m(w, &p.block_range_m)
 }
 fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
     Ok(TransformerBlockProof {
         ln1_proof: read_ln_proof(r)?,
-        q_proj_proof: read_proj_proof(r)?,
-        k_proj_proof: read_proj_proof(r)?,
-        v_proj_proof: read_proj_proof(r)?,
-        attn_proof: read_attn_proof(r)?,
+        qkv_proj_proof: read_batched_qkv_proof(r)?,
+        // GKR backward: O_proj read before attn
         o_proj_proof: read_proj_proof(r)?,
+        attn_proof: read_attn_proof(r)?,
         ln2_proof: read_ln_proof(r)?,
         ffn_proof: read_ffn_proof(r)?,
         x_norm1_com: read_hyrax_commitment(r)?,
         q_com: read_hyrax_commitment(r)?,
         k_com: read_hyrax_commitment(r)?,
         v_com: read_hyrax_commitment(r)?,
-        out_inner_com: read_hyrax_commitment(r)?,
+        // out_inner_com: eliminated via GKR backward fusion
         out_attn_com: read_hyrax_commitment(r)?,
         x_norm2_com: read_hyrax_commitment(r)?,
         out_ffn_com: read_hyrax_commitment(r)?,
-        q_combine: read_combine_proof(r)?,
-        k_combine: read_combine_proof(r)?,
+        q_open: read_hyrax_proof(r)?,
+        k_open: read_hyrax_proof(r)?,
         v_combine: read_combine_proof(r)?,
-        out_inner_combine: read_combine_proof(r)?,
-        x_norm1_combine: read_combine_proof(r)?,
-        out_attn_combine: read_combine_proof(r)?,
-        x_norm2_combine: read_combine_proof(r)?,
-        out_ffn_combine: read_combine_proof(r)?,
+        // out_inner_combine: eliminated via GKR backward fusion
+        x_norm1_open: read_hyrax_proof(r)?,
+        out_attn_open: read_hyrax_proof(r)?,
+        x_norm2_open: read_hyrax_proof(r)?,
+        out_ffn_open: read_hyrax_proof(r)?,
+        block_range_m: read_global_range_m(r)?,
     })
 }
 
@@ -685,7 +829,8 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_proj_proof(w, &p.lm_head_proof)?;
     write_hyrax_commitment(w, &p.final_ln_out_com)?;
     write_hyrax_commitment(w, &p.logits_com)?;
-    write_lasso_multi_proof(w, &p.all_lasso_proof)
+    write_lasso_multi_proof(w, &p.all_lasso_proof)?;
+    write_global_range_m(w, &p.final_range_m)
 }
 fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
     Ok(TransformerModelProof {
@@ -696,6 +841,7 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         final_ln_out_com: read_hyrax_commitment(r)?,
         logits_com: read_hyrax_commitment(r)?,
         all_lasso_proof: read_lasso_multi_proof(r)?,
+        final_range_m: read_global_range_m(r)?,
     })
 }
 

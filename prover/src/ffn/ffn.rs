@@ -13,19 +13,17 @@
 
 use crate::field::F;
 use crate::lookup::lasso::{
-    precommit_lasso_tables,
-    LassoInstance, LassoProvingKey, LassoVerifyingKey,
+    precommit_lasso_tables, prove_lasso, verify_lasso,
+    LassoInstance, LassoProof, LassoProvingKey, LassoVerifyingKey,
 };
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment,
     HyraxParams, HyraxProof,
 };
+use ark_ff::Field;
 use crate::poly::utils::{combine, convert_tm_to_fm, eval_cols, eval_rows, mat_to_mle, TernaryValue};
 use crate::poly::DenseMLPoly;
-use crate::subprotocols::{
-    prove_combine, prove_sumcheck, verify_combine, verify_sumcheck, CombineProof, EvalClaim,
-    SumcheckProof,
-};
+use crate::subprotocols::{prove_sumcheck, verify_sumcheck, EvalClaim, SumcheckProof};
 use crate::transcript::{challenge_vec, Transcript};
 
 // ---------------------------------------------------------------------------
@@ -114,32 +112,31 @@ pub fn preprocess_ffn(
 // Proof types
 // ---------------------------------------------------------------------------
 
-pub struct FFNInternalCommitments {
-    pub m_com: HyraxCommitment,
-    pub a_com: HyraxCommitment,
-}
-
 pub struct FFNOpenings {
     /// y_eval / x_eval deferred to block-level combine proofs (no direct opens).
     pub y_eval: F,
     pub x_eval: F,
+    /// a_eval = A_MLE(rx_y, r_k); verified against public Lasso outputs (no a_com needed).
     pub a_eval: F,
     pub w2_eval: F,
     pub w2_open: HyraxProof,
+    /// m_eval = M_MLE(rx_m, ry_m); verified via m_open against m_com.
     pub m_eval: F,
     pub w1_eval: F,
     pub w1_open: HyraxProof,
 }
 
 pub struct FFNProof {
-    pub internal_coms: FFNInternalCommitments,
+    /// GKR backward: Lasso runs first, committing A (outputs) before rx_y is sampled.
+    /// Eliminates a_com and a_open — verifier checks a_eval from public Lasso outputs MLE.
+    /// m_com and m_open are kept because M = X·W1 can have negative field-element values
+    /// that differ from their masked integer query_indices representations.
+    pub activation_lasso_proof: LassoProof,
+    pub m_com: HyraxCommitment,
     pub y_sumcheck: SumcheckProof,
     pub m_sumcheck: SumcheckProof,
     pub openings: FFNOpenings,
-    /// GKR combine proof for m_com (replaces direct m_open).
-    pub m_combine: CombineProof,
-    /// GKR combine proof for a_com (replaces direct a_open).
-    pub a_combine: CombineProof,
+    pub m_open: HyraxProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,13 +147,18 @@ pub struct FFNProof {
 ///
 /// `y_claim` = EvalClaim on the output y at (rx_y, ry_y) — deferred to block-level combine.
 /// `x_claim` = EvalClaim on the input x at (rx_m, r_j)  — deferred to block-level combine.
+///
+/// GKR backward: Lasso runs first (before rx_y is sampled), committing A (outputs) to the
+/// transcript. This eliminates a_com and a_open — the verifier checks a_eval directly from
+/// the public Lasso outputs MLE. m_com is kept because M = X·W1 can be negative in the field,
+/// making M_field[j] ≠ F::from(query_indices[j]) for out-of-range values.
 pub fn prove_ffn(
     pk: &FFNProvingKey,
     witness: &FFNWitness,
-    _inst: &FFNInstance,
+    inst: &FFNInstance,
     io_coms: &FFNIOCommitments,
     transcript: &mut Transcript,
-    _lasso_params: &HyraxParams,
+    lasso_params: &HyraxParams,
 ) -> Result<(FFNProof, EvalClaim, EvalClaim), String> {
     let t = pk.vk.seq_len;
     let d = pk.vk.d_model;
@@ -173,10 +175,9 @@ pub fn prove_ffn(
     let w1_mle = mat_to_mle(&convert_tm_to_fm(&pk.w1), d, f);
     let w2_mle = mat_to_mle(&convert_tm_to_fm(&pk.w2), f, d);
 
-    let (nu_x, sigma_x, _params_x) = params_from_vars(t_bits + d_bits);
     let (nu_m, sigma_m, params_m) = params_from_vars(t_bits + f_bits);
-    let (nu_w1, sigma_w1, _params_w1) = params_from_vars(d_bits + f_bits);
-    let (nu_w2, sigma_w2, _params_w2) = params_from_vars(f_bits + d_bits);
+    let (nu_w1, sigma_w1, _) = params_from_vars(d_bits + f_bits);
+    let (nu_w2, sigma_w2, _) = params_from_vars(f_bits + d_bits);
 
     // 1. Absorb Trusted IO & VK Commitments
     absorb_com(transcript, b"w1_com", &pk.vk.w1_com);
@@ -184,13 +185,20 @@ pub fn prove_ffn(
     absorb_com(transcript, b"x_com", &io_coms.x_com);
     absorb_com(transcript, b"y_com", &io_coms.y_com);
 
-    // 2. Commit to Internal Variables (M and A)
-    let m_com = hyrax_commit(&m_mle.evaluations, nu_m, &params_m);
-    let a_com = hyrax_commit(&a_mle.evaluations, nu_m, &params_m);
-    absorb_com(transcript, b"m_com", &m_com);
-    absorb_com(transcript, b"a_com", &a_com);
+    // 2. GKR backward: run Lasso FIRST to commit A (outputs) before rx_y is sampled.
+    //    Eliminates a_com — verifier checks a_eval from public outputs MLE.
+    let activation_lasso_proof = prove_lasso(
+        &inst.activation_lasso,
+        &pk.activation_lasso_pk,
+        transcript,
+        lasso_params,
+    );
 
-    // 3. Sumcheck 1: Y = A · W2
+    // 3. Commit M (m_com kept: M field values can be negative, diverging from query_indices).
+    let m_com = hyrax_commit(&m_mle.evaluations, nu_m, &params_m);
+    absorb_com(transcript, b"m_com", &m_com);
+
+    // 4. Sumcheck 1: Y = A · W2
     let rx_y = challenge_vec(transcript, t_bits, b"ffn_rx_y");
     let ry_y = challenge_vec(transcript, d_bits, b"ffn_ry_y");
     let y_eval = y_mle.evaluate(&combine(&rx_y, &ry_y));
@@ -220,15 +228,8 @@ pub fn prove_ffn(
     let w2_open = hyrax_open(&w2_mle.evaluations, &combine(&r_k, &ry_y), nu_w2, sigma_w2);
     let w1_open = hyrax_open(&w1_mle.evaluations, &combine(&r_j, &ry_m), nu_w1, sigma_w1);
 
-    // 7. GKR combine proofs for internal polynomials m and a (replaces direct opens).
-    let tf_num_vars = t_bits + f_bits;
-    let m_claim = EvalClaim { point: combine(&rx_m, &ry_m), value: m_eval };
-    let (m_combine, _) =
-        prove_combine(&m_mle.evaluations, &m_com, &[m_claim], tf_num_vars, transcript);
-
-    let a_claim_inner = EvalClaim { point: combine(&rx_y, &r_k), value: a_eval };
-    let (a_combine, _) =
-        prove_combine(&a_mle.evaluations, &a_com, &[a_claim_inner], tf_num_vars, transcript);
+    // 7. Direct Hyrax opening for M (kept — verifier cannot recover m_eval from query_indices).
+    let m_open = hyrax_open(&m_mle.evaluations, &combine(&rx_m, &ry_m), nu_m, sigma_m);
 
     // 8. IO EvalClaims returned to block level — no direct opens for x and y.
     let y_claim = EvalClaim { point: combine(&rx_y, &ry_y), value: y_eval };
@@ -236,7 +237,8 @@ pub fn prove_ffn(
 
     Ok((
         FFNProof {
-            internal_coms: FFNInternalCommitments { m_com, a_com },
+            activation_lasso_proof,
+            m_com,
             y_sumcheck,
             m_sumcheck,
             openings: FFNOpenings {
@@ -249,8 +251,7 @@ pub fn prove_ffn(
                 w1_eval,
                 w1_open,
             },
-            m_combine,
-            a_combine,
+            m_open,
         },
         y_claim,
         x_claim,
@@ -263,11 +264,11 @@ pub fn prove_ffn(
 
 pub fn verify_ffn(
     proof: &FFNProof,
-    _inst: &FFNInstance,
+    inst: &FFNInstance,
     vk: &FFNVerifyingKey,
     io_coms: &FFNIOCommitments,
     transcript: &mut Transcript,
-    _lasso_params: &HyraxParams,
+    lasso_params: &HyraxParams,
 ) -> Result<(EvalClaim, EvalClaim), String> {
     let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
     let d_bits = vk.d_model.next_power_of_two().trailing_zeros() as usize;
@@ -276,15 +277,27 @@ pub fn verify_ffn(
     let (_, _, params_w1) = params_from_vars(d_bits + f_bits);
     let (_, _, params_w2) = params_from_vars(f_bits + d_bits);
 
-    // 1. Absorb Cryptographic Commitments
+    let (_, _, params_mf) = params_from_vars(t_bits + f_bits);
+
+    // 1. Absorb Trusted IO & VK Commitments (no a_com — GKR backward eliminates it)
     absorb_com(transcript, b"w1_com", &vk.w1_com);
     absorb_com(transcript, b"w2_com", &vk.w2_com);
     absorb_com(transcript, b"x_com", &io_coms.x_com);
     absorb_com(transcript, b"y_com", &io_coms.y_com);
-    absorb_com(transcript, b"m_com", &proof.internal_coms.m_com);
-    absorb_com(transcript, b"a_com", &proof.internal_coms.a_com);
 
-    // 2. Verify Y Sumcheck
+    // 2. GKR backward: verify Lasso FIRST to bind A (outputs) before rx_y is sampled.
+    verify_lasso(
+        &proof.activation_lasso_proof,
+        &inst.activation_lasso,
+        &vk.activation_lasso_vk,
+        transcript,
+        lasso_params,
+    )?;
+
+    // 3. Absorb m_com (M binding — kept because M field values can differ from query_indices).
+    absorb_com(transcript, b"m_com", &proof.m_com);
+
+    // 4. Verify Y Sumcheck: Y = A · W2
     let rx_y = challenge_vec(transcript, t_bits, b"ffn_rx_y");
     let ry_y = challenge_vec(transcript, d_bits, b"ffn_ry_y");
     transcript.append_field(b"claim_y", &proof.openings.y_eval);
@@ -295,7 +308,20 @@ pub fn verify_ffn(
         return Err("Y Sumcheck mismatch".into());
     }
 
-    // 3. Verify M Sumcheck
+    // 5. GKR backward: verify a_eval against public Lasso outputs MLE (eliminates a_com/a_open).
+    {
+        let padded_len = 1usize << (t_bits + f_bits);
+        let mut a_buf = vec![F::ZERO; padded_len];
+        for (j, &out) in inst.activation_lasso.outputs.iter().enumerate() {
+            a_buf[j] = out;
+        }
+        let a_eval_expected = DenseMLPoly::new(a_buf).evaluate(&combine(&rx_y, &r_k));
+        if a_eval_expected != proof.openings.a_eval {
+            return Err("FFN a_eval mismatch with Lasso outputs MLE".into());
+        }
+    }
+
+    // 6. Verify M Sumcheck: M = X · W1
     let rx_m = challenge_vec(transcript, t_bits, b"ffn_rx_m");
     let ry_m = challenge_vec(transcript, f_bits, b"ffn_ry_m");
     transcript.append_field(b"claim_m", &proof.openings.m_eval);
@@ -306,7 +332,7 @@ pub fn verify_ffn(
         return Err("M Sumcheck mismatch".into());
     }
 
-    // 4. Static weight openings (w1 and w2 are public model weights).
+    // 7. Static weight openings (w1 and w2 are public model weights — must keep).
     hyrax_verify(
         &vk.w2_com,
         proof.openings.w2_eval,
@@ -322,29 +348,17 @@ pub fn verify_ffn(
         &params_w1,
     )?;
 
-    // 5. Internal GKR combine proofs for m and a (replaces direct opens).
-    let tf_num_vars = t_bits + f_bits;
-    let m_claim = EvalClaim { point: combine(&rx_m, &ry_m), value: proof.openings.m_eval };
-    verify_combine(
-        &proof.m_combine,
-        &proof.internal_coms.m_com,
-        &[m_claim],
-        tf_num_vars,
-        transcript,
+    // 8. Hyrax opening for M (kept).
+    hyrax_verify(
+        &proof.m_com,
+        proof.openings.m_eval,
+        &combine(&rx_m, &ry_m),
+        &proof.m_open,
+        &params_mf,
     )
-    .map_err(|e| format!("FFN m_combine: {e}"))?;
+    .map_err(|e| format!("FFN m_open: {e}"))?;
 
-    let a_claim_inner = EvalClaim { point: combine(&rx_y, &r_k), value: proof.openings.a_eval };
-    verify_combine(
-        &proof.a_combine,
-        &proof.internal_coms.a_com,
-        &[a_claim_inner],
-        tf_num_vars,
-        transcript,
-    )
-    .map_err(|e| format!("FFN a_combine: {e}"))?;
-
-    // 6. Return IO EvalClaims for block-level combine — no direct opens for x and y.
+    // 8. Return IO EvalClaims for block-level combine — no direct opens for x and y.
     let y_claim = EvalClaim { point: combine(&rx_y, &ry_y), value: proof.openings.y_eval };
     let x_claim = EvalClaim { point: combine(&rx_m, &r_j), value: proof.openings.x_eval };
     Ok((y_claim, x_claim))
@@ -365,8 +379,10 @@ mod ffn_tests {
         let t = 2usize;
         let d = 2usize;
         let f_dim = 4usize;
+        // All-positive W1: ensures M = X·W1 entries are non-negative and fit in
+        // the 4-bit Lasso table [0, 15], so M_field[j] == F::from(query_indices[j]).
         let w1 = vec![
-            vec![TernaryValue::ONE, TernaryValue::ZERO, TernaryValue::MINUSONE, TernaryValue::ONE],
+            vec![TernaryValue::ONE, TernaryValue::ZERO, TernaryValue::ONE, TernaryValue::ONE],
             vec![TernaryValue::ZERO, TernaryValue::ONE, TernaryValue::ONE, TernaryValue::ZERO],
         ];
         let w2 = vec![
@@ -396,15 +412,18 @@ mod ffn_tests {
         let table_size = 16usize;
         let m_bits = 4usize;
         let table: Vec<F> = (0..table_size).map(|i| F::from(i as u64)).collect();
-        let a = m.clone(); // Identity for test
 
+        // Build query_indices and outputs from M, then derive a from the Lasso outputs
+        // so that witness.a is consistent with inst.activation_lasso.outputs (GKR backward).
         let mut query_indices = Vec::new();
         let mut outputs = Vec::new();
-        for row in &m {
-            for &v in row {
+        let mut a = vec![vec![F::ZERO; f_dim]; t];
+        for (i, row) in m.iter().enumerate() {
+            for (j, &v) in row.iter().enumerate() {
                 let idx = (v.into_bigint().as_ref()[0] as usize) & (table_size - 1);
                 query_indices.push(idx);
                 outputs.push(F::from(idx as u64));
+                a[i][j] = F::from(idx as u64); // A = φ(M), consistent with Lasso outputs
             }
         }
         let activation_lasso = LassoInstance {

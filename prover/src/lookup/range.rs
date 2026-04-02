@@ -10,7 +10,8 @@
 use crate::field::F;
 use crate::pcs::{
     hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch,
-    hyrax_verify_multi_point, params_from_vars, HyraxCommitment, HyraxParams, HyraxProof,
+    hyrax_verify_multi_point, params_from_vars, HyraxBatchAccumulator, HyraxCommitment,
+    HyraxParams, HyraxProof,
 };
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
@@ -307,6 +308,231 @@ pub fn verify_range_m_batch(
 /// Useful when callers need to pre-fetch the params once rather than on every call.
 pub fn range_m_params() -> HyraxParams {
     params_from_vars(CHUNK_BITS).2
+}
+
+// ---------------------------------------------------------------------------
+// Globally-batched range proof (one shared m_com for K witnesses)
+// ---------------------------------------------------------------------------
+
+/// Per-witness portion of a globally-batched range proof.
+/// Does NOT contain m_com / m_eval / m_open — those live in `GlobalRangeM`.
+pub struct RangeWitnessProof {
+    pub chunk_coms: Vec<HyraxCommitment>,
+    pub chunk_evals: Vec<F>,
+    pub chunk_batch_proof: HyraxProof,
+    pub sumcheck: SumcheckProof,
+    pub claim_v: F,
+}
+
+/// Shared multiplicity proof covering all witnesses in the global batch.
+pub struct GlobalRangeM {
+    pub m_com: HyraxCommitment,
+    pub m_eval: F,
+    pub m_open: HyraxProof,
+}
+
+/// Prove that every value in every witness is in [0, 2^bits) using a single
+/// shared multiplicity commitment.
+///
+/// Transcript ordering:
+///   Phase 1  — for each witness in order: absorb chunk_coms
+///   Commit   — absorb shared m_com (merged across all witnesses)
+///   Phase 2  — for each witness in order: append claim_v, run sumcheck, open chunks
+///   M-open   — derive r_m, open shared m
+///
+/// Returns `(per_witness_proofs, global_m, r_vs)` where `r_vs[i]` is the MLE
+/// evaluation point for witness i (used by the LayerNorm prover to bind
+/// subsequent constraints).
+pub fn prove_range_batched(
+    witnesses: &[&RangeProofWitness],
+    bits: usize,
+    transcript: &mut Transcript,
+) -> Result<(Vec<RangeWitnessProof>, GlobalRangeM, Vec<Vec<F>>), String> {
+    let num_chunks = (bits + CHUNK_BITS - 1) / CHUNK_BITS;
+    let (nu_m, sigma_m, params_m) = params_from_vars(CHUNK_BITS);
+
+    // ---- Phase 1: chunk decomposition + chunk_com commitments per witness ----
+    let mut all_chunk_mles: Vec<Vec<DenseMLPoly>> = Vec::with_capacity(witnesses.len());
+    let mut all_v_mles: Vec<DenseMLPoly> = Vec::with_capacity(witnesses.len());
+    let mut all_chunk_coms: Vec<Vec<HyraxCommitment>> = Vec::with_capacity(witnesses.len());
+    let mut all_nu_c: Vec<usize> = Vec::with_capacity(witnesses.len());
+    let mut all_sigma_c: Vec<usize> = Vec::with_capacity(witnesses.len());
+
+    // Global multiplicity table (merged from all witnesses)
+    let mut m_global = vec![F::ZERO; CHUNK_SIZE];
+
+    for witness in witnesses {
+        let n = witness.values.len();
+        let num_vars = n.next_power_of_two().trailing_zeros() as usize;
+        let (nu_c, sigma_c, params_c) = params_from_vars(num_vars);
+
+        let mut chunks = vec![vec![F::ZERO; n]; num_chunks];
+        for (i, &v) in witness.values.iter().enumerate() {
+            let val_u64 = v.into_bigint().as_ref()[0];
+            for c in 0..num_chunks {
+                let cv = (val_u64 >> (c * CHUNK_BITS)) & ((1 << CHUNK_BITS) - 1);
+                chunks[c][i] = F::from(cv as u64);
+                m_global[cv as usize] += F::ONE;
+            }
+        }
+
+        let mut chunk_mles = Vec::with_capacity(num_chunks);
+        let mut chunk_coms = Vec::with_capacity(num_chunks);
+        for c in 0..num_chunks {
+            let mle = vec_to_mle(&chunks[c], n);
+            let com = hyrax_commit(&mle.evaluations, nu_c, &params_c);
+            absorb_com(transcript, b"chunk_com", &com);
+            chunk_coms.push(com);
+            chunk_mles.push(mle);
+        }
+
+        let v_mle = vec_to_mle(&witness.values, n);
+
+        all_chunk_mles.push(chunk_mles);
+        all_v_mles.push(v_mle);
+        all_chunk_coms.push(chunk_coms);
+        all_nu_c.push(nu_c);
+        all_sigma_c.push(sigma_c);
+    }
+
+    // ---- Commit merged m ----
+    let m_mle = vec_to_mle(&m_global, CHUNK_SIZE);
+    let m_com = hyrax_commit(&m_mle.evaluations, nu_m, &params_m);
+    absorb_com(transcript, b"logup_m_com", &m_com);
+
+    // ---- Phase 2: per-witness sumcheck + chunk opening ----
+    let mut witness_proofs: Vec<RangeWitnessProof> = Vec::with_capacity(witnesses.len());
+    let mut r_vs: Vec<Vec<F>> = Vec::with_capacity(witnesses.len());
+
+    for i in 0..witnesses.len() {
+        let v_mle = &all_v_mles[i];
+        let ones = DenseMLPoly::new(vec![F::ONE; v_mle.evaluations.len()]);
+        let claim_v = v_mle.evaluations.iter().sum::<F>();
+        transcript.append_field(b"claim_v", &claim_v);
+
+        let (sumcheck, r_v) = prove_sumcheck(v_mle, &ones, claim_v, transcript);
+
+        let chunk_evals: Vec<F> = all_chunk_mles[i].iter().map(|m| m.evaluate(&r_v)).collect();
+        let chunk_slices: Vec<&[F]> = all_chunk_mles[i].iter().map(|m| m.evaluations.as_slice()).collect();
+        let chunk_batch_proof = hyrax_open_batch(&chunk_slices, &r_v, all_nu_c[i], all_sigma_c[i], transcript);
+
+        witness_proofs.push(RangeWitnessProof {
+            chunk_coms: all_chunk_coms[i].clone(),
+            chunk_evals,
+            chunk_batch_proof,
+            sumcheck,
+            claim_v,
+        });
+        r_vs.push(r_v);
+    }
+
+    // ---- Open shared m ----
+    let r_m = challenge_vec(transcript, CHUNK_BITS, b"logup_rm");
+    let m_eval = m_mle.evaluate(&r_m);
+    let m_open = hyrax_open(&m_mle.evaluations, &r_m, nu_m, sigma_m);
+
+    Ok((witness_proofs, GlobalRangeM { m_com, m_eval, m_open }, r_vs))
+}
+
+/// Verifier side of globally-batched range proofs.
+///
+/// Transcript ordering must exactly mirror `prove_range_batched`:
+///   Phase 1  — absorb chunk_coms for each witness
+///   Absorb m — absorb shared m_com
+///   Phase 2  — for each witness: run sumcheck + chunk fusion check
+///   M-open   — derive r_m, verify shared m opening
+///
+/// `num_vars_list[i]` is the num_vars for witness i (= ceil(log2(n_i))).
+/// Returns `(r_vs, r_m)` — the per-witness evaluation points and the
+/// multiplicity evaluation point.
+/// Verifier side of globally-batched range proofs.
+///
+/// Hyrax MSMs are deferred via two chunk accumulators and one m accumulator:
+///   - `acc_small`: receives chunk openings for witnesses with the smallest num_vars
+///                  (the sigma witnesses in LayerNorm).
+///   - `acc_large`: receives chunk openings for all other witnesses (y witnesses).
+///   - `acc_m`:     receives the single shared m_com opening.
+///
+/// The routing rule: a witness whose `num_vars == min(num_vars_list)` goes to
+/// `acc_small`; all other witnesses go to `acc_large`.  When every witness has
+/// the same `num_vars`, they all go to `acc_small` and `acc_large` is untouched.
+///
+/// All three accumulators must be finalised by the caller AFTER all
+/// `verify_range_batched` calls, in the order (acc_small, acc_large, acc_m).
+/// The corresponding prover-side burns must appear in the same order.
+pub fn verify_range_batched(
+    witness_proofs: &[&RangeWitnessProof],
+    global_m: &GlobalRangeM,
+    num_vars_list: &[usize],
+    bits: usize,
+    transcript: &mut Transcript,
+    acc_small: &mut HyraxBatchAccumulator,
+    acc_large: &mut HyraxBatchAccumulator,
+    acc_m: &mut HyraxBatchAccumulator,
+) -> Result<(Vec<Vec<F>>, Vec<F>), String> {
+    let num_chunks = (bits + CHUNK_BITS - 1) / CHUNK_BITS;
+
+    let min_nv = num_vars_list.iter().copied().min().unwrap_or(0);
+
+    // Phase 1: absorb chunk_coms for each witness
+    for proof in witness_proofs {
+        for com in &proof.chunk_coms {
+            absorb_com(transcript, b"chunk_com", com);
+        }
+    }
+
+    // Absorb shared m_com
+    absorb_com(transcript, b"logup_m_com", &global_m.m_com);
+
+    // Phase 2: per-witness sumcheck + deferred chunk opening
+    let mut r_vs: Vec<Vec<F>> = Vec::with_capacity(witness_proofs.len());
+    for (i, proof) in witness_proofs.iter().enumerate() {
+        let num_vars = num_vars_list[i];
+
+        transcript.append_field(b"claim_v", &proof.claim_v);
+        let (r_v, final_val) =
+            verify_sumcheck(&proof.sumcheck, proof.claim_v, num_vars, transcript)
+                .map_err(|e| format!("GlobalRange witness {i} sumcheck: {e}"))?;
+
+        // Route chunk opening to the right accumulator based on num_vars.
+        let acc_chunk = if num_vars == min_nv { &mut *acc_small } else { &mut *acc_large };
+        acc_chunk
+            .add_verify_batch(
+                &proof.chunk_coms,
+                &proof.chunk_evals,
+                &r_v,
+                &proof.chunk_batch_proof,
+                transcript,
+            )
+            .map_err(|e| format!("GlobalRange witness {i} chunk opening (deferred): {e}"))?;
+
+        // Algebraic fusion: V(r_v) = Σ_c chunk_eval[c] * 2^(16c)
+        let mut expected = F::ZERO;
+        let mut shift = F::ONE;
+        let shift_mult = F::from(1u64 << CHUNK_BITS);
+        for c in 0..num_chunks {
+            expected += proof.chunk_evals[c] * shift;
+            shift *= shift_mult;
+        }
+        if final_val != expected {
+            return Err(format!("GlobalRange witness {i}: chunk fusion mismatch"));
+        }
+
+        r_vs.push(r_v);
+    }
+
+    // Derive r_m and defer shared m opening
+    let r_m = challenge_vec(transcript, CHUNK_BITS, b"logup_rm");
+    acc_m
+        .add_verify(
+            &global_m.m_com,
+            global_m.m_eval,
+            &r_m,
+            &global_m.m_open,
+        )
+        .map_err(|e| format!("GlobalRange m opening (deferred): {e}"))?;
+
+    Ok((r_vs, r_m))
 }
 
 // ---------------------------------------------------------------------------

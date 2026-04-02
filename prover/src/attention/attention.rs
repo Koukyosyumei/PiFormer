@@ -18,15 +18,13 @@ use crate::lookup::lasso::{
     precommit_lasso_multi_tables, LassoInstance, LassoMultiInstance, LassoMultiProvingKey,
     LassoMultiVerifyingKey,
 };
-use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_n, poly_hyrax, HyraxCommitment,
-    HyraxParams, HyraxProof,
-};
+use ark_ff::Field;
+use crate::pcs::{absorb_com, HyraxCommitment, HyraxParams};
 use crate::poly::utils::{combine, eval_cols, eval_rows, mat_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{
-    prove_combine, prove_sumcheck, prove_sumcheck_multi_batched, verify_combine, verify_sumcheck,
-    verify_sumcheck_multi_batched, CombineProof, EvalClaim, SumcheckProof, SumcheckProofMulti,
+    prove_sumcheck, prove_sumcheck_multi_batched, verify_sumcheck,
+    verify_sumcheck_multi_batched, EvalClaim, SumcheckProof, SumcheckProofMulti,
 };
 use crate::transcript::{challenge_vec, Transcript};
 
@@ -73,11 +71,13 @@ pub fn precommit_attention_tables(
 
 /// Trusted IO Commitments provided by the Global Pipeline Verifier.
 /// The Verifier MUST NOT accept these from the Prover's proof.
+///
+/// GKR backward fusion: out_com is eliminated. out_inner is not committed
+/// independently — it is bound by the shared sumcheck claim with O_proj.
 pub struct AttentionIOCommitments {
     pub q_com: HyraxCommitment,
     pub k_com: HyraxCommitment,
     pub v_com: HyraxCommitment,
-    pub out_com: HyraxCommitment,
 }
 
 /// Private witness data. ONLY the Prover holds this.
@@ -102,13 +102,6 @@ pub struct LinearAttentionInstance {
 // ---------------------------------------------------------------------------
 // Proof structures
 // ---------------------------------------------------------------------------
-
-/// Commitments to intermediate states generated EXCLUSIVELY inside this layer.
-pub struct AttentionInternalCommitments {
-    pub phi_q_com: HyraxCommitment,
-    pub phi_k_com: HyraxCommitment,
-    // context_com を削除
-}
 
 pub struct AttentionOpenings {
     /// Claimed out eval at (rx, ry). Deferred to block-level combine proof.
@@ -136,13 +129,8 @@ pub enum AttentionSumcheckProof {
 }
 
 pub struct LinearAttentionProof {
-    pub internal_coms: AttentionInternalCommitments,
     pub sumcheck: AttentionSumcheckProof,
     pub openings: AttentionOpenings,
-    /// Single Hyrax opening for phi_q_com via GKR combine (replaces direct phi_q_open).
-    pub phi_q_combine: CombineProof,
-    /// Single Hyrax opening for phi_k_com via GKR combine (replaces direct phi_k_open).
-    pub phi_k_combine: CombineProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,13 +139,19 @@ pub struct LinearAttentionProof {
 
 /// Returns (proof, out_claim, v_claim).
 ///
-/// `out_claim` = EvalClaim on out at (rx, ry) — deferred to block-level combine.
+/// `out_claim` = EvalClaim on out at (rx, ry).
 /// `v_claim`   = EvalClaim on v at v_point — deferred to block-level combine.
+///
+/// GKR backward fusion: when `external_out_claim` is Some, the output evaluation
+/// point (rx, ry) comes from the O_proj x_claim instead of being sampled from the
+/// transcript. This eliminates out_inner_com — the binding is provided by both the
+/// O_proj and attention sumchecks agreeing on the same point and value.
 pub fn prove_linear_attention(
     witness: &LinearAttentionWitness,
     inst: &LinearAttentionInstance,
     _pk: &AttentionProvingKey,
     io_coms: &AttentionIOCommitments,
+    external_out_claim: Option<EvalClaim>,
     transcript: &mut Transcript,
     _lasso_params: &HyraxParams,
 ) -> (LinearAttentionProof, EvalClaim, EvalClaim) {
@@ -172,27 +166,27 @@ pub fn prove_linear_attention(
     let ctx_mle = mat_to_mle(&witness.context, d, d);
     let out_mle = mat_to_mle(&witness.out, t, d);
 
-    // 1. 公開コミットメントの吸収
+    // 1. Absorb IO commitments. out_com eliminated via GKR backward (no out_inner_com).
     absorb_com(transcript, b"q_com", &io_coms.q_com);
     absorb_com(transcript, b"k_com", &io_coms.k_com);
     absorb_com(transcript, b"v_com", &io_coms.v_com);
-    absorb_com(transcript, b"out_com", &io_coms.out_com);
 
-    let (nu_td, sigma_td, params_td) = poly_hyrax(&phi_q_mle);
-    let (nu_dd, sigma_dd, params_dd) = poly_hyrax(&ctx_mle);
+    // 2. Determine (rx, ry): sampled from transcript, or externally supplied (GKR backward).
+    let (rx, ry, out_eval) = if let Some(ref claim) = external_out_claim {
+        // GKR backward: O_proj's x_claim provides the out_inner evaluation point.
+        // rx = first t_bits, ry = last d_bits of claim.point.
+        let rx = claim.point[..t_bits].to_vec();
+        let ry = claim.point[t_bits..].to_vec();
+        (rx, ry, claim.value)
+    } else {
+        // Forward mode: sample from transcript, compute out_eval from witness.
+        let rx = challenge_vec(transcript, t_bits, b"rx_out");
+        let ry = challenge_vec(transcript, d_bits, b"ry_out");
+        let out_eval = out_mle.evaluate(&combine(&rx, &ry));
+        (rx, ry, out_eval)
+    };
 
-    // 2. 内部活性化行列のみコミット (Contextはスキップ)
-    let phi_q_com = hyrax_commit(&phi_q_mle.evaluations, nu_td, &params_td);
-    let phi_k_com = hyrax_commit(&phi_k_mle.evaluations, nu_td, &params_td);
-
-    absorb_com(transcript, b"phi_q_com", &phi_q_com);
-    absorb_com(transcript, b"phi_k_com", &phi_k_com);
-
-    let rx = challenge_vec(transcript, t_bits, b"rx_out");
-    let ry = challenge_vec(transcript, d_bits, b"ry_out");
-    let out_eval = out_mle.evaluate(&combine(&rx, &ry));
-
-    let (sumcheck, phi_q_eval, phi_k_eval, v_eval, phi_q_point, phi_k_point, v_point) =
+    let (sumcheck, phi_q_eval, phi_k_eval, v_eval, _phi_q_point, _phi_k_point, v_point) =
         if t_bits == d_bits {
             // 3a. Batched Sumcheck — seq_len == d_head, both pairs share the same variable count.
             transcript.append_field(b"claimed_out", &out_eval);
@@ -221,8 +215,8 @@ pub fn prove_linear_attention(
             let phi_k_eval = proof.final_evals_f[1];
             let v_eval = proof.final_evals_g[1];
 
-            let phi_q_point = combine(&rx, &batch_r);
-            let phi_k_point = combine(&batch_r, &r_i);
+            let _phi_q_point = combine(&rx, &batch_r);
+            let _phi_k_point = combine(&batch_r, &r_i);
             let v_point = combine(&batch_r, &ry);
 
             (
@@ -230,8 +224,8 @@ pub fn prove_linear_attention(
                 phi_q_eval,
                 phi_k_eval,
                 v_eval,
-                phi_q_point,
-                phi_k_point,
+                _phi_q_point,
+                _phi_k_point,
                 v_point,
             )
         } else {
@@ -257,8 +251,8 @@ pub fn prove_linear_attention(
             let phi_k_eval = context_sumcheck.final_eval_f;
             let v_eval = context_sumcheck.final_eval_g;
 
-            let phi_q_point = combine(&rx, &batch_r_out);
-            let phi_k_point = combine(&batch_r_ctx, &batch_r_out);
+            let _phi_q_point = combine(&rx, &batch_r_out);
+            let _phi_k_point = combine(&batch_r_ctx, &batch_r_out);
             let v_point = combine(&batch_r_ctx, &ry);
 
             (
@@ -269,29 +263,15 @@ pub fn prove_linear_attention(
                 phi_q_eval,
                 phi_k_eval,
                 v_eval,
-                phi_q_point,
-                phi_k_point,
+                _phi_q_point,
+                _phi_k_point,
                 v_point,
             )
         };
 
-    let td_num_vars = phi_q_mle.num_vars;
-
-    // Replace direct Hyrax opens with internal GKR combine proofs.
-    let phi_q_claim = EvalClaim { point: phi_q_point, value: phi_q_eval };
-    let (phi_q_combine, _) =
-        prove_combine(&phi_q_mle.evaluations, &phi_q_com, &[phi_q_claim], td_num_vars, transcript);
-
-    let phi_k_claim = EvalClaim { point: phi_k_point, value: phi_k_eval };
-    let (phi_k_combine, _) =
-        prove_combine(&phi_k_mle.evaluations, &phi_k_com, &[phi_k_claim], td_num_vars, transcript);
-
     let proof = LinearAttentionProof {
-        internal_coms: AttentionInternalCommitments { phi_q_com, phi_k_com },
         sumcheck,
         openings: AttentionOpenings { out_eval, phi_q_eval, phi_k_eval, v_eval },
-        phi_q_combine,
-        phi_k_combine,
     };
 
     let out_claim = EvalClaim { point: combine(&rx, &ry), value: out_eval };
@@ -310,30 +290,37 @@ pub fn prove_linear_attention(
 /// 1. $O(\sqrt{N})$ computation. No `hyrax_commit` is executed here.
 /// 2. Cryptographic binding against the external `io_coms`.
 /// Returns (out_claim, v_claim) for block-level combine verification.
+///
+/// GKR backward fusion: when `external_out_claim` is Some (= O_proj's x_claim),
+/// (rx, ry) are taken from that claim instead of being sampled. out_inner_com is
+/// not committed; soundness is provided by both sumchecks sharing the same eval point.
 pub fn verify_linear_attention(
     proof: &LinearAttentionProof,
     inst: &LinearAttentionInstance,
     io_coms: &AttentionIOCommitments,
+    external_out_claim: Option<EvalClaim>,
     transcript: &mut Transcript,
 ) -> Result<(EvalClaim, EvalClaim), String> {
     let t = inst.seq_len;
     let d = inst.d_head;
     let t_bits = t.next_power_of_two().trailing_zeros() as usize;
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
-    let n_td = t.next_power_of_two().max(1) * d.next_power_of_two().max(1);
-    let (_, _, params_td) = params_from_n(n_td);
 
-    // 1. コミットメントの吸収
+    // 1. Absorb IO commitments (out_com removed — GKR backward, no out_inner_com).
     absorb_com(transcript, b"q_com", &io_coms.q_com);
     absorb_com(transcript, b"k_com", &io_coms.k_com);
     absorb_com(transcript, b"v_com", &io_coms.v_com);
-    absorb_com(transcript, b"out_com", &io_coms.out_com);
-    absorb_com(transcript, b"phi_q_com", &proof.internal_coms.phi_q_com);
-    absorb_com(transcript, b"phi_k_com", &proof.internal_coms.phi_k_com);
 
-    // 2. Reproduce challenge points
-    let rx = challenge_vec(transcript, t_bits, b"rx_out");
-    let ry = challenge_vec(transcript, d_bits, b"ry_out");
+    // 2. Reproduce challenge points (or use external if GKR backward).
+    let (rx, ry) = if let Some(ref claim) = external_out_claim {
+        let rx = claim.point[..t_bits].to_vec();
+        let ry = claim.point[t_bits..].to_vec();
+        (rx, ry)
+    } else {
+        let rx = challenge_vec(transcript, t_bits, b"rx_out");
+        let ry = challenge_vec(transcript, d_bits, b"ry_out");
+        (rx, ry)
+    };
 
     // 3. Verify sumcheck (variant selected by the prover at proof time)
     let (phi_q_point, phi_k_point, v_point) = match &proof.sumcheck {
@@ -405,28 +392,25 @@ pub fn verify_linear_attention(
         }
     };
 
-    // 4. Verify phi_q/phi_k via internal GKR combine proofs (replaces direct Hyrax opens).
-    let td_num_vars = (t.next_power_of_two().trailing_zeros()
-        + d.next_power_of_two().trailing_zeros()) as usize;
-    let phi_q_claim = EvalClaim { point: phi_q_point, value: proof.openings.phi_q_eval };
-    verify_combine(
-        &proof.phi_q_combine,
-        &proof.internal_coms.phi_q_com,
-        &[phi_q_claim],
-        td_num_vars,
-        transcript,
-    )
-    .map_err(|e| format!("phi_q combine: {e}"))?;
+    // 4. Verify phi_q/phi_k directly against public Lasso outputs MLE.
+    let padded_len = 1usize << (t_bits + d_bits);
+    let mut phi_q_evals = vec![F::ZERO; padded_len];
+    for (j, &out) in inst.q_lasso.outputs.iter().enumerate() {
+        phi_q_evals[j] = out;
+    }
+    let phi_q_eval_expected = DenseMLPoly::new(phi_q_evals).evaluate(&phi_q_point);
+    if phi_q_eval_expected != proof.openings.phi_q_eval {
+        return Err("phi_q eval mismatch with Lasso outputs MLE".into());
+    }
 
-    let phi_k_claim = EvalClaim { point: phi_k_point, value: proof.openings.phi_k_eval };
-    verify_combine(
-        &proof.phi_k_combine,
-        &proof.internal_coms.phi_k_com,
-        &[phi_k_claim],
-        td_num_vars,
-        transcript,
-    )
-    .map_err(|e| format!("phi_k combine: {e}"))?;
+    let mut phi_k_evals = vec![F::ZERO; padded_len];
+    for (j, &out) in inst.k_lasso.outputs.iter().enumerate() {
+        phi_k_evals[j] = out;
+    }
+    let phi_k_eval_expected = DenseMLPoly::new(phi_k_evals).evaluate(&phi_k_point);
+    if phi_k_eval_expected != proof.openings.phi_k_eval {
+        return Err("phi_k eval mismatch with Lasso outputs MLE".into());
+    }
 
     // out_com and v_com deferred to block-level combine proof
     let out_claim = EvalClaim { point: combine(&rx, &ry), value: proof.openings.out_eval };
@@ -446,7 +430,7 @@ pub fn verify_linear_attention(
 #[cfg(test)]
 mod linear_attention_tests {
     use super::*;
-    use crate::pcs::HyraxParams;
+    use crate::pcs::{hyrax_commit, poly_hyrax, HyraxParams};
     use crate::transcript::Transcript;
     use ark_ff::{One, PrimeField, Zero};
 
@@ -557,18 +541,9 @@ mod linear_attention_tests {
             &params_td,
         );
         let v_com = hyrax_commit(&v_mle.evaluations, nu_td, &params_td);
-        let out_com = hyrax_commit(
-            &mat_to_mle(&out, seq_len, d_head).evaluations,
-            nu_td,
-            &params_td,
-        );
 
-        let io_coms = AttentionIOCommitments {
-            q_com,
-            k_com,
-            v_com,
-            out_com,
-        };
+        // GKR backward: out_com removed from AttentionIOCommitments.
+        let io_coms = AttentionIOCommitments { q_com, k_com, v_com };
 
         let lp = lasso_params();
         let pk = precommit_attention_tables(&inst.q_lasso, &inst.k_lasso, &lp);
@@ -580,17 +555,39 @@ mod linear_attention_tests {
         HyraxParams::new(2) // 4-bit table: sigma=4-2=2
     }
 
+    /// In GKR backward mode there is no out_com.  Instead, the caller (O_proj) provides
+    /// an EvalClaim on out_inner at a specific MLE point.  For tests we simulate this by
+    /// evaluating out_mle at a reproducible random point sampled from a separate transcript.
+    fn make_external_out_claim(
+        out: &[Vec<F>],
+        seq_len: usize,
+        d_head: usize,
+        label: &[u8],
+    ) -> EvalClaim {
+        use crate::subprotocols::EvalClaim;
+        let t_bits = seq_len.next_power_of_two().trailing_zeros() as usize;
+        let d_bits = d_head.next_power_of_two().trailing_zeros() as usize;
+        let out_mle = mat_to_mle(out, seq_len, d_head);
+        let mut ext_t = crate::transcript::Transcript::new(label);
+        let rx = challenge_vec(&mut ext_t, t_bits, b"ext_rx");
+        let ry = challenge_vec(&mut ext_t, d_bits, b"ext_ry");
+        let point = combine(&rx, &ry);
+        let value = out_mle.evaluate(&point);
+        EvalClaim { point, value }
+    }
+
     #[test]
     fn test_linear_attention_succinct_e2e_success() {
         let (witness, inst, io_coms, pk) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
+        let ext_claim = make_external_out_claim(&witness.out, 2, 2, b"ext_out");
 
         let mut pt = Transcript::new(b"linear_attn_test");
         let (proof, _out_claim, _v_claim) =
-            prove_linear_attention(&witness, &inst, &pk, &io_coms, &mut pt, &lp);
+            prove_linear_attention(&witness, &inst, &pk, &io_coms, Some(ext_claim.clone()), &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt);
+        let result = verify_linear_attention(&proof, &inst, &io_coms, Some(ext_claim), &mut vt);
         assert!(
             result.is_ok(),
             "Succinct verification failed: {:?}",
@@ -600,21 +597,21 @@ mod linear_attention_tests {
 
     // --- Soundness Tests ---
     // Sumcheck algebraically catches inconsistencies between witness and sumcheck claim.
-    // Note: out_com and v_com opening is now deferred to block-level combine proof.
 
     #[test]
     fn test_rejects_tampered_context_matrix() {
         let (mut witness, inst, io_coms, pk) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
+        let ext_claim = make_external_out_claim(&witness.out, 2, 2, b"ext_ctx_tamper");
 
         witness.context[0][0] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_tamper_ctx");
         let (proof, _, _) =
-            prove_linear_attention(&witness, &inst, &pk, &io_coms, &mut pt, &lp);
+            prove_linear_attention(&witness, &inst, &pk, &io_coms, Some(ext_claim.clone()), &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_tamper_ctx");
-        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt);
+        let result = verify_linear_attention(&proof, &inst, &io_coms, Some(ext_claim), &mut vt);
         assert!(result.is_err(), "should reject tampered context");
     }
 
@@ -623,15 +620,17 @@ mod linear_attention_tests {
         let (mut witness, inst, io_coms, pk) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
 
-        // Tamper out: changes out_eval, making the sumcheck target inconsistent.
+        // Tamper out FIRST, then compute external claim from tampered matrix so that
+        // claim.value ≠ phi_q * ctx, which causes the sumcheck to fail.
         witness.out[1][1] += F::one();
+        let ext_claim = make_external_out_claim(&witness.out, 2, 2, b"ext_out_tamper");
 
         let mut pt = Transcript::new(b"linear_attn_test");
         let (proof, _, _) =
-            prove_linear_attention(&witness, &inst, &pk, &io_coms, &mut pt, &lp);
+            prove_linear_attention(&witness, &inst, &pk, &io_coms, Some(ext_claim.clone()), &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt);
+        let result = verify_linear_attention(&proof, &inst, &io_coms, Some(ext_claim), &mut vt);
         assert!(result.is_err(), "should reject tampered out (sumcheck mismatch)");
     }
 
@@ -639,15 +638,16 @@ mod linear_attention_tests {
     fn test_rejects_tampered_phi_q_matrix() {
         let (mut witness, inst, io_coms, pk) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
+        let ext_claim = make_external_out_claim(&witness.out, 2, 2, b"ext_phiq_tamper");
 
         witness.phi_q[1][0] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_test");
         let (proof, _, _) =
-            prove_linear_attention(&witness, &inst, &pk, &io_coms, &mut pt, &lp);
+            prove_linear_attention(&witness, &inst, &pk, &io_coms, Some(ext_claim.clone()), &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt);
+        let result = verify_linear_attention(&proof, &inst, &io_coms, Some(ext_claim), &mut vt);
         assert!(result.is_err(), "should reject tampered phi_q");
     }
 
@@ -655,16 +655,17 @@ mod linear_attention_tests {
     fn test_rejects_tampered_v_matrix() {
         let (mut witness, inst, io_coms, pk) = setup_test_pipeline(2, 2);
         let lp = lasso_params();
+        let ext_claim = make_external_out_claim(&witness.out, 2, 2, b"ext_v_tamper");
 
         // Tamper v: changes the context sumcheck sum, causing mismatch with target.
         witness.v[0][1] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_test");
         let (proof, _, _) =
-            prove_linear_attention(&witness, &inst, &pk, &io_coms, &mut pt, &lp);
+            prove_linear_attention(&witness, &inst, &pk, &io_coms, Some(ext_claim.clone()), &mut pt, &lp);
 
         let mut vt = Transcript::new(b"linear_attn_test");
-        let result = verify_linear_attention(&proof, &inst, &io_coms, &mut vt);
+        let result = verify_linear_attention(&proof, &inst, &io_coms, Some(ext_claim), &mut vt);
         assert!(result.is_err(), "should reject tampered v (context sumcheck mismatch)");
     }
 }

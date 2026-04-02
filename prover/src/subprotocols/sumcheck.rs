@@ -15,7 +15,6 @@ use crate::transcript::Transcript;
 use ark_ff::Field;
 use rayon::prelude::*;
 
-
 /// A round polynomial g_i(X) given by its values at X = 0, 1, 2.
 #[derive(Clone, Debug)]
 pub struct RoundPoly {
@@ -38,6 +37,39 @@ impl RoundPoly {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct CubicRoundPoly {
+    /// 3次多項式を特定するための 4 つの評価点 [S(0), S(1), S(2), S(3)]
+    pub evals: [F; 4],
+}
+
+impl CubicRoundPoly {
+    /// ラグランジュ補間を用いて、任意の点 r における 3 次多項式の値を計算する
+    pub fn evaluate(&self, r: F) -> F {
+        let [y0, y1, y2, y3] = self.evals;
+
+        // ラグランジュ基底多項式の計算
+        // L0(r) = (r-1)(r-2)(r-3) / (-6)
+        // L1(r) = r(r-2)(r-3) / 2
+        // L2(r) = r(r-1)(r-3) / (-2)
+        // L3(r) = r(r-1)(r-2) / 6
+
+        let r_minus_1 = r - F::ONE;
+        let r_minus_2 = r - F::from(2u64);
+        let r_minus_3 = r - F::from(3u64);
+
+        let inv2 = F::from(2u64).inverse().unwrap();
+        let inv6 = F::from(6u64).inverse().unwrap();
+
+        let l0 = r_minus_1 * r_minus_2 * r_minus_3 * (-inv6);
+        let l1 = r * r_minus_2 * r_minus_3 * inv2;
+        let l2 = r * r_minus_1 * r_minus_3 * (-inv2);
+        let l3 = r * r_minus_1 * r_minus_2 * inv6;
+
+        y0 * l0 + y1 * l1 + y2 * l2 + y3 * l3
+    }
+}
+
 /// A complete sumcheck proof: one `RoundPoly` per variable, plus the prover's
 /// final opening claims f(r) and g(r) which the verifier must check externally
 /// (e.g. via a polynomial commitment opening).
@@ -48,6 +80,14 @@ pub struct SumcheckProof {
     pub final_eval_f: F,
     /// Prover's claim: g evaluated at the final random point r.
     pub final_eval_g: F,
+}
+
+#[derive(Clone, Debug)]
+pub struct SumcheckCubicProof {
+    pub round_polys: Vec<CubicRoundPoly>,
+    pub final_eval_f: F,
+    pub final_eval_g: F,
+    pub final_eval_h: F,
 }
 
 /// Prove Σ_{x ∈ {0,1}^n} f(x)·g(x) = `claim`.
@@ -138,6 +178,73 @@ pub fn prove_sumcheck(
     )
 }
 
+pub fn prove_sumcheck_cubic(
+    f: &DenseMLPoly,
+    g: &DenseMLPoly,
+    h: &DenseMLPoly,
+    claim: F,
+    transcript: &mut Transcript,
+) -> (SumcheckCubicProof, Vec<F>) {
+    let n = f.num_vars;
+    transcript.append_field(b"sc_claim", &claim);
+
+    let mut f_cur = f.clone();
+    let mut g_cur = g.clone();
+    let mut h_cur = h.clone();
+    let mut round_polys = Vec::with_capacity(n);
+    let mut challenges = Vec::with_capacity(n);
+
+    for _ in 0..n {
+        let half = f_cur.evaluations.len() >> 1;
+        let mut e = [F::ZERO; 4];
+
+        for i in 0..half {
+            let f0 = f_cur.evaluations[i];
+            let f1 = f_cur.evaluations[i + half];
+            let g0 = g_cur.evaluations[i];
+            let g1 = g_cur.evaluations[i + half];
+            let h0 = h_cur.evaluations[i];
+            let h1 = h_cur.evaluations[i + half];
+
+            // 線形延長を用いて x=2, x=3 の値を外挿
+            let f2 = f1 + f1 - f0;
+            let f3 = f2 + f1 - f0;
+            let g2 = g1 + g1 - g0;
+            let g3 = g2 + g1 - g0;
+            let h2 = h1 + h1 - h0;
+            let h3 = h2 + h1 - h0;
+
+            e[0] += f0 * g0 * h0;
+            e[1] += f1 * g1 * h1;
+            e[2] += f2 * g2 * h2;
+            e[3] += f3 * g3 * h3;
+        }
+
+        let rp = CubicRoundPoly { evals: e };
+        for val in &rp.evals {
+            transcript.append_field(b"sc_round", val);
+        }
+
+        let r_i = transcript.challenge_field::<F>(b"sc_challenge");
+        challenges.push(r_i);
+
+        f_cur = f_cur.fix_first_variable(r_i);
+        g_cur = g_cur.fix_first_variable(r_i);
+        h_cur = h_cur.fix_first_variable(r_i);
+        round_polys.push(rp);
+    }
+
+    (
+        SumcheckCubicProof {
+            round_polys,
+            final_eval_f: f_cur.evaluations[0],
+            final_eval_g: g_cur.evaluations[0],
+            final_eval_h: h_cur.evaluations[0],
+        },
+        challenges,
+    )
+}
+
 /// Verify a sumcheck proof.
 ///
 /// On success returns `(r, final_claim)` where `final_claim = final_eval_f * final_eval_g`.
@@ -190,6 +297,184 @@ pub fn verify_sumcheck(
     }
 
     Ok((challenges, final_claim))
+}
+
+pub fn verify_sumcheck_cubic(
+    proof: &SumcheckCubicProof,
+    claim: F,
+    num_vars: usize,
+    transcript: &mut Transcript,
+) -> Result<(Vec<F>, F), String> {
+    if proof.round_polys.len() != num_vars {
+        return Err("Invalid number of rounds".into());
+    }
+
+    transcript.append_field(b"sc_claim", &claim);
+
+    let mut current_claim = claim;
+    let mut challenges = Vec::with_capacity(num_vars);
+
+    for (i, rp) in proof.round_polys.iter().enumerate() {
+        // 1. 和のチェック: S(0) + S(1) == current_claim
+        if rp.evals[0] + rp.evals[1] != current_claim {
+            return Err(format!("Sumcheck round {} failed", i));
+        }
+
+        for val in &rp.evals {
+            transcript.append_field(b"sc_round", val);
+        }
+
+        // 2. チャレンジ取得と評価値の更新
+        let r_i = transcript.challenge_field::<F>(b"sc_challenge");
+        challenges.push(r_i);
+        current_claim = rp.evaluate(r_i);
+    }
+
+    // 3. 最終的な積のチェック
+    let final_eval = proof.final_eval_f * proof.final_eval_g * proof.final_eval_h;
+    if final_eval != current_claim {
+        return Err("Sumcheck final consistency check failed".into());
+    }
+
+    Ok((challenges, final_eval))
+}
+
+/// バッチ化された3積 Sumcheck 証明
+#[derive(Clone, Debug)]
+pub struct SumcheckCubicProofMulti {
+    pub round_polys: Vec<CubicRoundPoly>,
+    /// 点 r における各 f_i の評価値
+    pub final_evals_f: Vec<F>,
+    /// 点 r における各 g_i の評価値
+    pub final_evals_g: Vec<F>,
+    /// 点 r における各 h_i の評価値
+    pub final_evals_h: Vec<F>,
+}
+
+/// Σ_k weights[k] · (Σ_{x ∈ {0,1}^n} f_k(x)·g_k(x)·h_k(x)) = `claim` を証明する。
+pub fn prove_sumcheck_cubic_multi_batched(
+    fs: &[DenseMLPoly],
+    gs: &[DenseMLPoly],
+    hs: &[DenseMLPoly],
+    weights: &[F],
+    claim: F,
+    transcript: &mut Transcript,
+) -> (SumcheckCubicProofMulti, Vec<F>) {
+    let num_triples = fs.len();
+    assert_eq!(gs.len(), num_triples);
+    assert_eq!(hs.len(), num_triples);
+    assert_eq!(weights.len(), num_triples);
+
+    let n = fs[0].num_vars;
+    for k in 1..num_triples {
+        assert_eq!(fs[k].num_vars, n);
+        assert_eq!(gs[k].num_vars, n);
+        assert_eq!(hs[k].num_vars, n);
+    }
+
+    transcript.append_field(b"sc_claim", &claim);
+
+    let mut fs_cur: Vec<DenseMLPoly> = fs.to_vec();
+    let mut gs_cur: Vec<DenseMLPoly> = gs.to_vec();
+    let mut hs_cur: Vec<DenseMLPoly> = hs.to_vec();
+    let mut round_polys = Vec::with_capacity(n);
+    let mut challenges = Vec::with_capacity(n);
+
+    for _ in 0..n {
+        let half = fs_cur[0].evaluations.len() >> 1;
+        let mut e = [F::ZERO; 4];
+
+        for i in 0..half {
+            for k in 0..num_triples {
+                let f0 = fs_cur[k].evaluations[i];
+                let f1 = fs_cur[k].evaluations[i + half];
+                let g0 = gs_cur[k].evaluations[i];
+                let g1 = gs_cur[k].evaluations[i + half];
+                let h0 = hs_cur[k].evaluations[i];
+                let h1 = hs_cur[k].evaluations[i + half];
+                let f2 = f1 + f1 - f0;
+                let f3 = f2 + f1 - f0;
+                let g2 = g1 + g1 - g0;
+                let g3 = g2 + g1 - g0;
+                let h2 = h1 + h1 - h0;
+                let h3 = h2 + h1 - h0;
+                e[0] += weights[k] * (f0 * g0 * h0);
+                e[1] += weights[k] * (f1 * g1 * h1);
+                e[2] += weights[k] * (f2 * g2 * h2);
+                e[3] += weights[k] * (f3 * g3 * h3);
+            }
+        }
+
+        let rp = CubicRoundPoly { evals: e };
+        for val in &rp.evals {
+            transcript.append_field(b"sc_round", val);
+        }
+        let r_i = transcript.challenge_field::<F>(b"sc_challenge");
+        challenges.push(r_i);
+
+        for k in 0..num_triples {
+            fs_cur[k] = fs_cur[k].fix_first_variable(r_i);
+            gs_cur[k] = gs_cur[k].fix_first_variable(r_i);
+            hs_cur[k] = hs_cur[k].fix_first_variable(r_i);
+        }
+        round_polys.push(rp);
+    }
+
+    let final_evals_f = fs_cur.iter().map(|p| p.evaluations[0]).collect();
+    let final_evals_g = gs_cur.iter().map(|p| p.evaluations[0]).collect();
+    let final_evals_h = hs_cur.iter().map(|p| p.evaluations[0]).collect();
+
+    (
+        SumcheckCubicProofMulti {
+            round_polys,
+            final_evals_f,
+            final_evals_g,
+            final_evals_h,
+        },
+        challenges,
+    )
+}
+
+/// バッチ版 3積 Sumcheck プロトコルの検証
+pub fn verify_sumcheck_cubic_multi_batched(
+    proof: &SumcheckCubicProofMulti,
+    weights: &[F],
+    claim: F,
+    num_vars: usize,
+    transcript: &mut Transcript,
+) -> Result<(Vec<F>, F), String> {
+    if proof.round_polys.len() != num_vars {
+        return Err("Wrong number of round polys".into());
+    }
+
+    transcript.append_field(b"sc_claim", &claim);
+    let mut current = claim;
+    let mut challenges = Vec::with_capacity(num_vars);
+
+    for (i, rp) in proof.round_polys.iter().enumerate() {
+        if rp.evals[0] + rp.evals[1] != current {
+            return Err(format!("Cubic multi sumcheck round {i} consistency failed"));
+        }
+        for val in &rp.evals {
+            transcript.append_field(b"sc_round", val);
+        }
+        let r_i = transcript.challenge_field::<F>(b"sc_challenge");
+        challenges.push(r_i);
+        current = rp.evaluate(r_i);
+    }
+
+    let n = proof.final_evals_f.len();
+    let mut final_combination = F::ZERO;
+    for k in 0..n {
+        final_combination +=
+            weights[k] * proof.final_evals_f[k] * proof.final_evals_g[k] * proof.final_evals_h[k];
+    }
+
+    if final_combination != current {
+        return Err("Cubic multi sumcheck final check failed".into());
+    }
+
+    Ok((challenges, current))
 }
 
 /// バッチ化されたSumcheck証明
