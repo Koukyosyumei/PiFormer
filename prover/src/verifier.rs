@@ -336,10 +336,10 @@ pub fn verify(
     for i in 0..vk.num_blocks {
         let bvk = &vk.block_vks[i];
 
-        all_lasso_instances.push(inst_ffn.activation_lasso.clone());
+        // FFN activation Lasso now runs inside verify_ffn (GKR backward ordering).
+        // Only Q/K attention Lassos remain in the global batched proof.
         all_lasso_instances.push(inst_attn.q_lasso.clone());
         all_lasso_instances.push(inst_attn.k_lasso.clone());
-        all_instance_coms.push(bvk.ffn_vk.activation_lasso_vk.table_coms.clone());
         all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
         all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
     }

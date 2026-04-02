@@ -26,7 +26,7 @@ use piformer_prover::{
         },
     },
     ffn::ffn::{
-        FFNInstance, FFNInternalCommitments, FFNOpenings, FFNProof, FFNProvingKey, FFNVerifyingKey,
+        FFNInstance, FFNOpenings, FFNProof, FFNProvingKey, FFNVerifyingKey,
     },
     lookup::{
         lasso::{
@@ -669,17 +669,6 @@ fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
 // FFN proof
 // ---------------------------------------------------------------------------
 
-fn write_ffn_internal_coms<W: Write>(w: &mut W, c: &FFNInternalCommitments) -> io::Result<()> {
-    write_hyrax_commitment(w, &c.m_com)?;
-    write_hyrax_commitment(w, &c.a_com)
-}
-fn read_ffn_internal_coms<R: Read>(r: &mut R) -> io::Result<FFNInternalCommitments> {
-    Ok(FFNInternalCommitments {
-        m_com: read_hyrax_commitment(r)?,
-        a_com: read_hyrax_commitment(r)?,
-    })
-}
-
 fn write_ffn_openings<W: Write>(w: &mut W, o: &FFNOpenings) -> io::Result<()> {
     write_f(w, &o.y_eval)?;
     write_f(w, &o.x_eval)?;
@@ -709,21 +698,21 @@ fn read_ffn_openings<R: Read>(r: &mut R) -> io::Result<FFNOpenings> {
 }
 
 fn write_ffn_proof<W: Write>(w: &mut W, p: &FFNProof) -> io::Result<()> {
-    write_ffn_internal_coms(w, &p.internal_coms)?;
+    write_lasso_proof(w, &p.activation_lasso_proof)?;
+    write_hyrax_commitment(w, &p.m_com)?;
     write_sumcheck_proof(w, &p.y_sumcheck)?;
     write_sumcheck_proof(w, &p.m_sumcheck)?;
     write_ffn_openings(w, &p.openings)?;
-    write_hyrax_proof(w, &p.m_open)?;
-    write_hyrax_proof(w, &p.a_open)
+    write_hyrax_proof(w, &p.m_open)
 }
 fn read_ffn_proof<R: Read>(r: &mut R) -> io::Result<FFNProof> {
     Ok(FFNProof {
-        internal_coms: read_ffn_internal_coms(r)?,
+        activation_lasso_proof: read_lasso_proof(r)?,
+        m_com: read_hyrax_commitment(r)?,
         y_sumcheck: read_sumcheck_proof(r)?,
         m_sumcheck: read_sumcheck_proof(r)?,
         openings: read_ffn_openings(r)?,
         m_open: read_hyrax_proof(r)?,
-        a_open: read_hyrax_proof(r)?,
     })
 }
 

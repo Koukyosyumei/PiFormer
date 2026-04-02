@@ -411,15 +411,16 @@ pub fn prove(
     for i in 0..pk.vk.num_blocks {
         let bpk = &pk.block_pks[i];
 
-        all_lasso_instances.push(inst_ffn.activation_lasso.clone());
+        // FFN activation Lasso now runs inside prove_ffn (GKR backward ordering).
+        // Only Q/K attention Lassos remain in the global batched proof.
         all_lasso_instances.push(inst_attn.q_lasso.clone());
         all_lasso_instances.push(inst_attn.k_lasso.clone());
-        all_instance_coms.push(bpk.ffn_pk.activation_lasso_pk.table_coms.clone());
         all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
         all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
-        global_nu = bpk.ffn_pk.activation_lasso_pk.nu;
+        global_nu = bpk.attn_pk.qk_lasso_pk.nu;
         // phi_q/phi_k output bindings eliminated (verified via MLE of public Lasso outputs
-        // in attention verifier). FFN a_com deferred to block-level combine proof.
+        // in attention verifier). FFN a_com/m_com eliminated via GKR backward (Lasso
+        // runs inside prove_ffn; a_eval/m_eval verified from public Lasso outputs/query_indices).
     }
     let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
     let global_lasso_pk = LassoMultiProvingKey { instance_table_coms: all_instance_coms, nu: global_nu };
