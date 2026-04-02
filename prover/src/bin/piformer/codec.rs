@@ -42,7 +42,7 @@ use piformer_prover::{
     },
     subprotocols::{
         combine::CombineProof,
-        sumcheck::{RoundPoly, SumcheckProof, SumcheckProofMulti},
+        sumcheck::{CubicRoundPoly, RoundPoly, SumcheckCubicProof, SumcheckProof, SumcheckProofMulti},
     },
     verifier::TransformerBlockVerifyingKey,
     F,
@@ -274,6 +274,33 @@ fn read_sumcheck_proof_multi<R: Read>(r: &mut R) -> io::Result<SumcheckProofMult
     })
 }
 
+fn write_cubic_round_poly<W: Write>(w: &mut W, rp: &CubicRoundPoly) -> io::Result<()> {
+    write_f(w, &rp.evals[0])?;
+    write_f(w, &rp.evals[1])?;
+    write_f(w, &rp.evals[2])?;
+    write_f(w, &rp.evals[3])
+}
+fn read_cubic_round_poly<R: Read>(r: &mut R) -> io::Result<CubicRoundPoly> {
+    Ok(CubicRoundPoly {
+        evals: [read_f(r)?, read_f(r)?, read_f(r)?, read_f(r)?],
+    })
+}
+
+fn write_sumcheck_cubic_proof<W: Write>(w: &mut W, p: &SumcheckCubicProof) -> io::Result<()> {
+    write_vec(w, &p.round_polys, write_cubic_round_poly)?;
+    write_f(w, &p.final_eval_f)?;
+    write_f(w, &p.final_eval_g)?;
+    write_f(w, &p.final_eval_h)
+}
+fn read_sumcheck_cubic_proof<R: Read>(r: &mut R) -> io::Result<SumcheckCubicProof> {
+    Ok(SumcheckCubicProof {
+        round_polys: read_vec(r, read_cubic_round_poly)?,
+        final_eval_f: read_f(r)?,
+        final_eval_g: read_f(r)?,
+        final_eval_h: read_f(r)?,
+    })
+}
+
 fn write_lasso_multi_proof<W: Write>(w: &mut W, p: &LassoMultiProof) -> io::Result<()> {
     write_f(w, &p.combined_grand_sum)?;
     write_sumcheck_proof_multi(w, &p.combined_sumcheck_proof)?;
@@ -344,6 +371,8 @@ fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<(
     write_hyrax_proof(w, &o.rt_batch_proof)?;
     // Individual: x at combine(r_t, r_d_mean)
     write_ep!(w, &o.x_at_rt_rmean, &o.x_rt_rmean_proof);
+    // Individual: x at r_final_q
+    write_ep!(w, &o.x_at_r_final_q, &o.x_at_r_final_q_proof);
     // Group 2: at r_sig_t
     write_f(w, &o.sum_x_at_rsig)?;
     write_f(w, &o.sq_sum_x_at_rsig)?;
@@ -360,7 +389,14 @@ fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<(
     // Group 4: at r_y_t
     write_f(w, &o.sum_x_at_ryt)?;
     write_f(w, &o.sigma_at_ryt)?;
-    write_hyrax_proof(w, &o.ryt_batch_proof)
+    write_hyrax_proof(w, &o.ryt_batch_proof)?;
+    // Group 5: at r_f_gx
+    write_ep!(w, &o.x_at_rf_gx, &o.x_at_rf_gx_proof);
+    // Group 6: at r_f_sy
+    write_ep!(w, &o.y_at_rf_sy, &o.y_at_rf_sy_proof);
+    write_ep!(w, &o.sigma_at_rf_sy_t, &o.sigma_at_rf_sy_t_proof);
+    write_ep!(w, &o.sum_x_at_rf_sig, &o.sum_x_at_rf_sig_proof);
+    Ok(())
 }
 fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
     // Group 1: at r_t
@@ -369,6 +405,8 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
     let rt_batch_proof = read_hyrax_proof(r)?;
     // Individual: x at combine(r_t, r_d_mean)
     let (x_at_rt_rmean, x_rt_rmean_proof) = read_ep!(r);
+    // Individual: x at r_final_q
+    let (x_at_r_final_q, x_at_r_final_q_proof) = read_ep!(r);
     // Group 2: at r_sig_t
     let sum_x_at_rsig = read_f(r)?;
     let sq_sum_x_at_rsig = read_f(r)?;
@@ -386,12 +424,20 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
     let sum_x_at_ryt = read_f(r)?;
     let sigma_at_ryt = read_f(r)?;
     let ryt_batch_proof = read_hyrax_proof(r)?;
+    // Group 5: at r_f_gx
+    let (x_at_rf_gx, x_at_rf_gx_proof) = read_ep!(r);
+    // Group 6: at r_f_sy
+    let (y_at_rf_sy, y_at_rf_sy_proof) = read_ep!(r);
+    let (sigma_at_rf_sy_t, sigma_at_rf_sy_t_proof) = read_ep!(r);
+    let (sum_x_at_rf_sig, sum_x_at_rf_sig_proof) = read_ep!(r);
     Ok(LayerNormOpenings {
         sum_x_at_rt,
         sq_sum_x_at_rt,
         rt_batch_proof,
         x_at_rt_rmean,
         x_rt_rmean_proof,
+        x_at_r_final_q,
+        x_at_r_final_q_proof,
         sum_x_at_rsig,
         sq_sum_x_at_rsig,
         sigma_at_rsig,
@@ -406,22 +452,24 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
         sum_x_at_ryt,
         sigma_at_ryt,
         ryt_batch_proof,
-        x_at_r_final_q: todo!(),
-        x_at_r_final_q_proof: todo!(),
-        x_at_rf_gx: todo!(),
-        x_at_rf_gx_proof: todo!(),
-        y_at_rf_sy: todo!(),
-        y_at_rf_sy_proof: todo!(),
-        sigma_at_rf_sy_t: todo!(),
-        sigma_at_rf_sy_t_proof: todo!(),
-        sum_x_at_rf_sig: todo!(),
-        sum_x_at_rf_sig_proof: todo!(),
+        x_at_rf_gx,
+        x_at_rf_gx_proof,
+        y_at_rf_sy,
+        y_at_rf_sy_proof,
+        sigma_at_rf_sy_t,
+        sigma_at_rf_sy_t_proof,
+        sum_x_at_rf_sig,
+        sum_x_at_rf_sig_proof,
     })
 }
 
 fn write_ln_proof<W: Write>(w: &mut W, p: &LayerNormProof) -> io::Result<()> {
     write_ln_internal_coms(w, &p.internal_coms)?;
     write_sumcheck_proof(w, &p.mean_sumcheck)?;
+    write_sumcheck_cubic_proof(w, &p.sq_sum_sumcheck)?;
+    write_sumcheck_cubic_proof(w, &p.sum_x_sq_sumcheck)?;
+    write_sumcheck_cubic_proof(w, &p.gamma_x_sumcheck)?;
+    write_sumcheck_cubic_proof(w, &p.sigma_y_sumcheck)?;
     write_range_proof(w, &p.sigma_range_proof)?;
     write_range_proof(w, &p.y_range_proof)?;
     write_ln_openings(w, &p.openings)
@@ -430,13 +478,13 @@ fn read_ln_proof<R: Read>(r: &mut R) -> io::Result<LayerNormProof> {
     Ok(LayerNormProof {
         internal_coms: read_ln_internal_coms(r)?,
         mean_sumcheck: read_sumcheck_proof(r)?,
+        sq_sum_sumcheck: read_sumcheck_cubic_proof(r)?,
+        sum_x_sq_sumcheck: read_sumcheck_cubic_proof(r)?,
+        gamma_x_sumcheck: read_sumcheck_cubic_proof(r)?,
+        sigma_y_sumcheck: read_sumcheck_cubic_proof(r)?,
         sigma_range_proof: read_range_proof(r)?,
         y_range_proof: read_range_proof(r)?,
         openings: read_ln_openings(r)?,
-        sq_sum_sumcheck: todo!(),
-        sum_x_sq_sumcheck: todo!(),
-        gamma_x_sumcheck: todo!(),
-        sigma_y_sumcheck: todo!(),
     })
 }
 
