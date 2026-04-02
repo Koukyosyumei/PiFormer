@@ -9,7 +9,7 @@
 
 use crate::lookup::lasso::{verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey};
 use crate::pcs::{absorb_com, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams};
-use crate::subprotocols::{verify_combine_deferred, EvalClaim};
+use crate::subprotocols::verify_combine_deferred;
 use crate::pcs::hyrax_verify_multi_point;
 use crate::transcript::Transcript;
 
@@ -21,7 +21,8 @@ use crate::attention::layernorm::{
     verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey,
 };
 use crate::attention::projection::{
-    verify_projection, ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
+    verify_projection, verify_qkv_projections, BatchedQKVProjectionIOCommitments,
+    ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
 };
 use crate::ffn::ffn::{verify_ffn, FFNInstance, FFNProvingKey, FFNVerifyingKey};
 use ark_ec::{AffineRepr, CurveGroup}; // Arkworks 0.4.0+ の正しいトレイト
@@ -96,18 +97,14 @@ pub fn verify_transformer_block(
 
     let _ = td_params; // ensure td_params isn't flagged unused
 
-    // --- 2. Projections (Q, K, V) — returns (y_claim, x_claim) for combine ---
-    let q_io = ProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
-    let _t = Instant::now(); let (q_y_claim, q_x_claim) = verify_projection(&proof.q_proj_proof, &vk.q_vk, &q_io, transcript, proj_acc_w, proj_acc_b)?;
-    eprintln!("[block] q_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
-
-    let k_io = ProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
-    let _t = Instant::now(); let (k_y_claim, k_x_claim) = verify_projection(&proof.k_proj_proof, &vk.k_vk, &k_io, transcript, proj_acc_w, proj_acc_b)?;
-    eprintln!("[block] k_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
-
-    let v_io = ProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
-    let _t = Instant::now(); let (v_y_claim, v_x_claim) = verify_projection(&proof.v_proj_proof, &vk.v_vk, &v_io, transcript, proj_acc_w, proj_acc_b)?;
-    eprintln!("[block] v_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
+    // --- 2. Batched Q, K, V Projections — single sumcheck, single r_k ---
+    let qkv_io = BatchedQKVProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
+    let _t = Instant::now();
+    let (q_y_claim, k_y_claim, v_y_claim, x_norm1_claim) = verify_qkv_projections(
+        &proof.qkv_proj_proof, &vk.q_vk, &vk.k_vk, &vk.v_vk,
+        &qkv_io, transcript, proj_acc_w, proj_acc_b,
+    )?;
+    eprintln!("[block] qkv_proj:   {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // --- 3. Linear Attention — returns (out_claim, v_claim) for combine ---
     let attn_io = crate::attention::attention::AttentionIOCommitments {
@@ -166,23 +163,18 @@ pub fn verify_transformer_block(
         &proof.out_inner_combine, &proof.out_inner_com,
         &[attn_out_claim.clone(), o_x_claim.clone()], td_num_vars, transcript,
     ).map_err(|e| format!("out_inner_combine: {e}"))?;
-    let (n1_r, n1_f) = verify_combine_deferred(
-        &proof.x_norm1_combine, &proof.x_norm1_com,
-        &[q_x_claim.clone(), k_x_claim.clone(), v_x_claim.clone()], td_num_vars, transcript,
-    ).map_err(|e| format!("x_norm1_combine: {e}"))?;
-
-    // Batch all 8 Hyrax openings: 5 direct opens + 3 deferred combine opens
+    // Batch all 8 Hyrax openings: 6 direct opens + 2 deferred combine opens
     let (_, _, combine_params) = params_from_vars(td_num_vars);
     hyrax_verify_multi_point(
         &[
-            (&proof.q_com,         q_y_claim.value,   &q_y_claim.point,   &proof.q_open),
-            (&proof.k_com,         k_y_claim.value,   &k_y_claim.point,   &proof.k_open),
-            (&proof.out_attn_com,  o_y_claim.value,   &o_y_claim.point,   &proof.out_attn_open),
-            (&proof.x_norm2_com,   ffn_x_claim.value, &ffn_x_claim.point, &proof.x_norm2_open),
-            (&proof.out_ffn_com,   ffn_y_claim.value, &ffn_y_claim.point, &proof.out_ffn_open),
+            (&proof.q_com,         q_y_claim.value,       &q_y_claim.point,       &proof.q_open),
+            (&proof.k_com,         k_y_claim.value,       &k_y_claim.point,       &proof.k_open),
+            (&proof.x_norm1_com,   x_norm1_claim.value,   &x_norm1_claim.point,   &proof.x_norm1_open),
+            (&proof.out_attn_com,  o_y_claim.value,       &o_y_claim.point,       &proof.out_attn_open),
+            (&proof.x_norm2_com,   ffn_x_claim.value,     &ffn_x_claim.point,     &proof.x_norm2_open),
+            (&proof.out_ffn_com,   ffn_y_claim.value,     &ffn_y_claim.point,     &proof.out_ffn_open),
             (&proof.v_com,         v_f,  &v_r,  &proof.v_combine.hyrax_proof),
             (&proof.out_inner_com, oi_f, &oi_r, &proof.out_inner_combine.hyrax_proof),
-            (&proof.x_norm1_com,   n1_f, &n1_r, &proof.x_norm1_combine.hyrax_proof),
         ],
         &combine_params,
         transcript,

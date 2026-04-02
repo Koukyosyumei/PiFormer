@@ -21,7 +21,8 @@ use piformer_prover::{
             LayerNormInternalCommitments, LayerNormOpenings, LayerNormProof, LayerNormVerifyingKey,
         },
         projection::{
-            ProjectionOpenings, ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey,
+            BatchedQKVProjectionOpenings, BatchedQKVProjectionProof, ProjectionOpenings,
+            ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey,
         },
     },
     ffn::ffn::{
@@ -541,6 +542,66 @@ fn read_proj_proof<R: Read>(r: &mut R) -> io::Result<ProjectionProof> {
     })
 }
 
+fn write_batched_qkv_openings<W: Write>(
+    w: &mut W,
+    o: &BatchedQKVProjectionOpenings,
+) -> io::Result<()> {
+    write_f(w, &o.q_eval)?;
+    write_f(w, &o.k_eval)?;
+    write_f(w, &o.v_eval)?;
+    write_f(w, &o.x_eval)?;
+    write_ep!(w, &o.w_q_eval, &o.w_q_open);
+    write_ep!(w, &o.w_k_eval, &o.w_k_open);
+    write_ep!(w, &o.w_v_eval, &o.w_v_open);
+    write_ep!(w, &o.bias_q_eval, &o.bias_q_open);
+    write_ep!(w, &o.bias_k_eval, &o.bias_k_open);
+    write_ep!(w, &o.bias_v_eval, &o.bias_v_open);
+    Ok(())
+}
+fn read_batched_qkv_openings<R: Read>(r: &mut R) -> io::Result<BatchedQKVProjectionOpenings> {
+    let q_eval = read_f(r)?;
+    let k_eval = read_f(r)?;
+    let v_eval = read_f(r)?;
+    let x_eval = read_f(r)?;
+    let (w_q_eval, w_q_open) = read_ep!(r);
+    let (w_k_eval, w_k_open) = read_ep!(r);
+    let (w_v_eval, w_v_open) = read_ep!(r);
+    let (bias_q_eval, bias_q_open) = read_ep!(r);
+    let (bias_k_eval, bias_k_open) = read_ep!(r);
+    let (bias_v_eval, bias_v_open) = read_ep!(r);
+    Ok(BatchedQKVProjectionOpenings {
+        q_eval,
+        k_eval,
+        v_eval,
+        x_eval,
+        w_q_eval,
+        w_k_eval,
+        w_v_eval,
+        bias_q_eval,
+        bias_k_eval,
+        bias_v_eval,
+        w_q_open,
+        w_k_open,
+        w_v_open,
+        bias_q_open,
+        bias_k_open,
+        bias_v_open,
+    })
+}
+fn write_batched_qkv_proof<W: Write>(
+    w: &mut W,
+    p: &BatchedQKVProjectionProof,
+) -> io::Result<()> {
+    write_sumcheck_proof(w, &p.sumcheck)?;
+    write_batched_qkv_openings(w, &p.openings)
+}
+fn read_batched_qkv_proof<R: Read>(r: &mut R) -> io::Result<BatchedQKVProjectionProof> {
+    Ok(BatchedQKVProjectionProof {
+        sumcheck: read_sumcheck_proof(r)?,
+        openings: read_batched_qkv_openings(r)?,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Attention proof
 // ---------------------------------------------------------------------------
@@ -712,9 +773,7 @@ fn read_combine_proof<R: Read>(r: &mut R) -> io::Result<CombineProof> {
 
 fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Result<()> {
     write_ln_proof(w, &p.ln1_proof)?;
-    write_proj_proof(w, &p.q_proj_proof)?;
-    write_proj_proof(w, &p.k_proj_proof)?;
-    write_proj_proof(w, &p.v_proj_proof)?;
+    write_batched_qkv_proof(w, &p.qkv_proj_proof)?;
     write_attn_proof(w, &p.attn_proof)?;
     write_proj_proof(w, &p.o_proj_proof)?;
     write_ln_proof(w, &p.ln2_proof)?;
@@ -731,7 +790,7 @@ fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Resu
     write_hyrax_proof(w, &p.k_open)?;
     write_combine_proof(w, &p.v_combine)?;
     write_combine_proof(w, &p.out_inner_combine)?;
-    write_combine_proof(w, &p.x_norm1_combine)?;
+    write_hyrax_proof(w, &p.x_norm1_open)?;
     write_hyrax_proof(w, &p.out_attn_open)?;
     write_hyrax_proof(w, &p.x_norm2_open)?;
     write_hyrax_proof(w, &p.out_ffn_open)
@@ -739,9 +798,7 @@ fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Resu
 fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
     Ok(TransformerBlockProof {
         ln1_proof: read_ln_proof(r)?,
-        q_proj_proof: read_proj_proof(r)?,
-        k_proj_proof: read_proj_proof(r)?,
-        v_proj_proof: read_proj_proof(r)?,
+        qkv_proj_proof: read_batched_qkv_proof(r)?,
         attn_proof: read_attn_proof(r)?,
         o_proj_proof: read_proj_proof(r)?,
         ln2_proof: read_ln_proof(r)?,
@@ -758,7 +815,7 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
         k_open: read_hyrax_proof(r)?,
         v_combine: read_combine_proof(r)?,
         out_inner_combine: read_combine_proof(r)?,
-        x_norm1_combine: read_combine_proof(r)?,
+        x_norm1_open: read_hyrax_proof(r)?,
         out_attn_open: read_hyrax_proof(r)?,
         x_norm2_open: read_hyrax_proof(r)?,
         out_ffn_open: read_hyrax_proof(r)?,

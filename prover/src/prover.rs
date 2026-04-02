@@ -31,8 +31,9 @@ use crate::attention::layernorm::{
     LayerNormWitness,
 };
 use crate::attention::projection::{
-    prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionProvingKey,
-    ProjectionVerifyingKey, ProjectionWitness,
+    prove_projection, prove_qkv_projections, BatchedQKVProjectionIOCommitments,
+    BatchedQKVProjectionProof, BatchedQKVProjectionWitness, ProjectionIOCommitments,
+    ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey, ProjectionWitness,
 };
 use crate::ffn::ffn::{prove_ffn, FFNIOCommitments, FFNInstance, FFNProof, FFNWitness};
 use crate::lookup::lasso::{
@@ -49,9 +50,7 @@ use crate::verifier::{add_commitments, TransformerBlockVerifyingKey}; // Importe
 pub struct TransformerBlockProof {
     // Sub-proofs
     pub ln1_proof: LayerNormProof,
-    pub q_proj_proof: ProjectionProof,
-    pub k_proj_proof: ProjectionProof,
-    pub v_proj_proof: ProjectionProof,
+    pub qkv_proj_proof: BatchedQKVProjectionProof,
     pub attn_proof: LinearAttentionProof,
     pub o_proj_proof: ProjectionProof,
     pub ln2_proof: LayerNormProof,
@@ -75,8 +74,8 @@ pub struct TransformerBlockProof {
     pub v_combine: CombineProof,
     /// Verifies out_inner_com: 2 claims — attention out_claim + O-projection x_claim.
     pub out_inner_combine: CombineProof,
-    /// Verifies x_norm1_com: 3 claims — Q/K/V-projection x_claims.
-    pub x_norm1_combine: CombineProof,
+    /// Direct Hyrax opening of x_norm1_com at the shared batched-QKV x_claim point.
+    pub x_norm1_open: HyraxProof,
     /// Direct Hyrax opening of out_attn_com at the O-projection y_claim point.
     pub out_attn_open: HyraxProof,
     /// Direct Hyrax opening of x_norm2_com at the FFN x_claim point.
@@ -152,18 +151,16 @@ pub fn prove_transformer_block(
     };
     let ln1_proof = prove_layernorm(&witness.ln1_wit, &ln1_io, &pk.ln1_vk, transcript)?;
 
-    // --- Q, K, V Projections — return (proof, y_claim, x_claim) ---
-    let q_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
-    let (q_proj_proof, q_y_claim, q_x_claim) =
-        prove_projection(&pk.q_pk, &witness.q_proj_wit, &q_io, transcript)?;
-
-    let k_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
-    let (k_proj_proof, k_y_claim, k_x_claim) =
-        prove_projection(&pk.k_pk, &witness.k_proj_wit, &k_io, transcript)?;
-
-    let v_io = ProjectionIOCommitments { x_com: x_norm1_com.clone() };
-    let (v_proj_proof, v_y_claim, v_x_claim) =
-        prove_projection(&pk.v_pk, &witness.v_proj_wit, &v_io, transcript)?;
+    // --- Batched Q, K, V Projections — one sumcheck, single r_k ---
+    let qkv_wit = BatchedQKVProjectionWitness {
+        x: witness.ln1_wit.y.clone(),
+        q: witness.q_proj_wit.y.clone(),
+        k: witness.k_proj_wit.y.clone(),
+        v: witness.v_proj_wit.y.clone(),
+    };
+    let qkv_io = BatchedQKVProjectionIOCommitments { x_com: x_norm1_com.clone() };
+    let (qkv_proj_proof, q_y_claim, k_y_claim, v_y_claim, x_norm1_claim) =
+        prove_qkv_projections(&pk.q_pk, &pk.k_pk, &pk.v_pk, &qkv_wit, &qkv_io, transcript)?;
 
     // --- Linear Attention — returns (proof, out_claim, v_claim) ---
     let attn_io = AttentionIOCommitments {
@@ -239,15 +236,9 @@ pub fn prove_transformer_block(
         transcript,
     );
 
-    // x_norm1_com: 3 claims — Q/K/V-proj x_claims
+    // x_norm1_com: direct open at the single batched-QKV x_norm1_claim point
     let x_norm1_evals = mat_evals(&witness.ln1_wit.y, t, d);
-    let (x_norm1_combine, _) = prove_combine(
-        &x_norm1_evals,
-        &x_norm1_com,
-        &[q_x_claim, k_x_claim, v_x_claim],
-        td_num_vars,
-        transcript,
-    );
+    let x_norm1_open = hyrax_open(&x_norm1_evals, &x_norm1_claim.point, nu_td, sigma_td);
 
     // out_attn_com: direct open at O-proj y_claim point
     let out_attn_evals = mat_evals(&witness.o_proj_wit.y, t, d);
@@ -267,9 +258,7 @@ pub fn prove_transformer_block(
 
     Ok(TransformerBlockProof {
         ln1_proof,
-        q_proj_proof,
-        k_proj_proof,
-        v_proj_proof,
+        qkv_proj_proof,
         attn_proof,
         o_proj_proof,
         ln2_proof,
@@ -286,7 +275,7 @@ pub fn prove_transformer_block(
         k_open,
         v_combine,
         out_inner_combine,
-        x_norm1_combine,
+        x_norm1_open,
         out_attn_open,
         x_norm2_open,
         out_ffn_open,
