@@ -22,10 +22,7 @@ use crate::pcs::{
 };
 use crate::poly::utils::{combine, convert_tm_to_fm, eval_cols, eval_rows, mat_to_mle, TernaryValue};
 use crate::poly::DenseMLPoly;
-use crate::subprotocols::{
-    prove_combine, prove_sumcheck, verify_combine, verify_sumcheck, CombineProof, EvalClaim,
-    SumcheckProof,
-};
+use crate::subprotocols::{prove_sumcheck, verify_sumcheck, EvalClaim, SumcheckProof};
 use crate::transcript::{challenge_vec, Transcript};
 
 // ---------------------------------------------------------------------------
@@ -136,10 +133,8 @@ pub struct FFNProof {
     pub y_sumcheck: SumcheckProof,
     pub m_sumcheck: SumcheckProof,
     pub openings: FFNOpenings,
-    /// GKR combine proof for m_com (replaces direct m_open).
-    pub m_combine: CombineProof,
-    /// GKR combine proof for a_com (replaces direct a_open).
-    pub a_combine: CombineProof,
+    pub m_open: HyraxProof,
+    pub a_open: HyraxProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -220,15 +215,9 @@ pub fn prove_ffn(
     let w2_open = hyrax_open(&w2_mle.evaluations, &combine(&r_k, &ry_y), nu_w2, sigma_w2);
     let w1_open = hyrax_open(&w1_mle.evaluations, &combine(&r_j, &ry_m), nu_w1, sigma_w1);
 
-    // 7. GKR combine proofs for internal polynomials m and a (replaces direct opens).
-    let tf_num_vars = t_bits + f_bits;
-    let m_claim = EvalClaim { point: combine(&rx_m, &ry_m), value: m_eval };
-    let (m_combine, _) =
-        prove_combine(&m_mle.evaluations, &m_com, &[m_claim], tf_num_vars, transcript);
-
-    let a_claim_inner = EvalClaim { point: combine(&rx_y, &r_k), value: a_eval };
-    let (a_combine, _) =
-        prove_combine(&a_mle.evaluations, &a_com, &[a_claim_inner], tf_num_vars, transcript);
+    // 7. Direct Hyrax openings for internal polynomials m and a.
+    let m_open = hyrax_open(&m_mle.evaluations, &combine(&rx_m, &ry_m), nu_m, sigma_m);
+    let a_open = hyrax_open(&a_mle.evaluations, &combine(&rx_y, &r_k), nu_m, sigma_m);
 
     // 8. IO EvalClaims returned to block level — no direct opens for x and y.
     let y_claim = EvalClaim { point: combine(&rx_y, &ry_y), value: y_eval };
@@ -249,8 +238,8 @@ pub fn prove_ffn(
                 w1_eval,
                 w1_open,
             },
-            m_combine,
-            a_combine,
+            m_open,
+            a_open,
         },
         y_claim,
         x_claim,
@@ -322,27 +311,24 @@ pub fn verify_ffn(
         &params_w1,
     )?;
 
-    // 5. Internal GKR combine proofs for m and a (replaces direct opens).
-    let tf_num_vars = t_bits + f_bits;
-    let m_claim = EvalClaim { point: combine(&rx_m, &ry_m), value: proof.openings.m_eval };
-    verify_combine(
-        &proof.m_combine,
+    // 5. Direct Hyrax openings for internal polynomials m and a.
+    let (_, _, params_mf) = params_from_vars(t_bits + f_bits);
+    hyrax_verify(
         &proof.internal_coms.m_com,
-        &[m_claim],
-        tf_num_vars,
-        transcript,
+        proof.openings.m_eval,
+        &combine(&rx_m, &ry_m),
+        &proof.m_open,
+        &params_mf,
     )
-    .map_err(|e| format!("FFN m_combine: {e}"))?;
-
-    let a_claim_inner = EvalClaim { point: combine(&rx_y, &r_k), value: proof.openings.a_eval };
-    verify_combine(
-        &proof.a_combine,
+    .map_err(|e| format!("FFN m_open: {e}"))?;
+    hyrax_verify(
         &proof.internal_coms.a_com,
-        &[a_claim_inner],
-        tf_num_vars,
-        transcript,
+        proof.openings.a_eval,
+        &combine(&rx_y, &r_k),
+        &proof.a_open,
+        &params_mf,
     )
-    .map_err(|e| format!("FFN a_combine: {e}"))?;
+    .map_err(|e| format!("FFN a_open: {e}"))?;
 
     // 6. Return IO EvalClaims for block-level combine — no direct opens for x and y.
     let y_claim = EvalClaim { point: combine(&rx_y, &ry_y), value: proof.openings.y_eval };

@@ -16,7 +16,7 @@
 //!   X_out = X_mid + Out_ffn   <-- Residual 2
 
 use crate::field::F;
-use crate::pcs::{absorb_com, hyrax_commit, params_from_vars, HyraxCommitment, HyraxParams};
+use crate::pcs::{absorb_com, hyrax_commit, hyrax_open, params_from_vars, HyraxCommitment, HyraxParams, HyraxProof};
 use crate::poly::utils::mat_to_mle;
 use crate::subprotocols::{prove_combine, CombineProof};
 use crate::transcript::Transcript;
@@ -67,24 +67,22 @@ pub struct TransformerBlockProof {
     pub x_norm2_com: HyraxCommitment,
     pub out_ffn_com: HyraxCommitment,
 
-    // GKR combine proofs — each bundles multiple eval claims on the same
-    // intermediate commitment into a single Hyrax opening.
-    /// Verifies q_com: 1 claim from Q-projection y_claim.
-    pub q_combine: CombineProof,
-    /// Verifies k_com: 1 claim from K-projection y_claim.
-    pub k_combine: CombineProof,
+    /// Direct Hyrax opening of q_com at the Q-projection y_claim point.
+    pub q_open: HyraxProof,
+    /// Direct Hyrax opening of k_com at the K-projection y_claim point.
+    pub k_open: HyraxProof,
     /// Verifies v_com: 2 claims — V-projection y_claim + attention v_claim.
     pub v_combine: CombineProof,
     /// Verifies out_inner_com: 2 claims — attention out_claim + O-projection x_claim.
     pub out_inner_combine: CombineProof,
     /// Verifies x_norm1_com: 3 claims — Q/K/V-projection x_claims.
     pub x_norm1_combine: CombineProof,
-    /// Verifies out_attn_com: 1 claim from O-projection y_claim.
-    pub out_attn_combine: CombineProof,
-    /// Verifies x_norm2_com: 1 claim from FFN x_claim (input to FFN).
-    pub x_norm2_combine: CombineProof,
-    /// Verifies out_ffn_com: 1 claim from FFN y_claim (output of FFN).
-    pub out_ffn_combine: CombineProof,
+    /// Direct Hyrax opening of out_attn_com at the O-projection y_claim point.
+    pub out_attn_open: HyraxProof,
+    /// Direct Hyrax opening of x_norm2_com at the FFN x_claim point.
+    pub x_norm2_open: HyraxProof,
+    /// Direct Hyrax opening of out_ffn_com at the FFN y_claim point.
+    pub out_ffn_open: HyraxProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,17 +215,14 @@ pub fn prove_transformer_block(
     };
 
     let (nu_td, sigma_td, _) = params_from_vars(td_num_vars);
-    let _ = (nu_td, sigma_td); // used implicitly by prove_combine
 
-    // q_com: 1 claim (Q-proj y_claim)
+    // q_com: direct open at Q-proj y_claim point
     let q_evals = mat_evals(&witness.attn_wit.q, t, d);
-    let (q_combine, _) =
-        prove_combine(&q_evals, &q_com, &[q_y_claim], td_num_vars, transcript);
+    let q_open = hyrax_open(&q_evals, &q_y_claim.point, nu_td, sigma_td);
 
-    // k_com: 1 claim (K-proj y_claim)
+    // k_com: direct open at K-proj y_claim point
     let k_evals = mat_evals(&witness.attn_wit.k, t, d);
-    let (k_combine, _) =
-        prove_combine(&k_evals, &k_com, &[k_y_claim], td_num_vars, transcript);
+    let k_open = hyrax_open(&k_evals, &k_y_claim.point, nu_td, sigma_td);
 
     // v_com: 2 claims — V-proj y_claim + attention v_claim
     let v_evals = mat_evals(&witness.attn_wit.v, t, d);
@@ -254,20 +249,17 @@ pub fn prove_transformer_block(
         transcript,
     );
 
-    // out_attn_com: 1 claim (O-proj y_claim)
+    // out_attn_com: direct open at O-proj y_claim point
     let out_attn_evals = mat_evals(&witness.o_proj_wit.y, t, d);
-    let (out_attn_combine, _) =
-        prove_combine(&out_attn_evals, &out_attn_com, &[o_y_claim], td_num_vars, transcript);
+    let out_attn_open = hyrax_open(&out_attn_evals, &o_y_claim.point, nu_td, sigma_td);
 
-    // x_norm2_com: 1 claim (FFN x_claim — input to FFN = output of LN2)
+    // x_norm2_com: direct open at FFN x_claim point
     let x_norm2_evals = mat_evals(&witness.ln2_wit.y, t, d);
-    let (x_norm2_combine, _) =
-        prove_combine(&x_norm2_evals, &x_norm2_com, &[ffn_x_claim], td_num_vars, transcript);
+    let x_norm2_open = hyrax_open(&x_norm2_evals, &ffn_x_claim.point, nu_td, sigma_td);
 
-    // out_ffn_com: 1 claim (FFN y_claim — output of FFN)
+    // out_ffn_com: direct open at FFN y_claim point
     let out_ffn_evals = mat_evals(&witness.ffn_wit.y, t, d);
-    let (out_ffn_combine, _) =
-        prove_combine(&out_ffn_evals, &out_ffn_com, &[ffn_y_claim], td_num_vars, transcript);
+    let out_ffn_open = hyrax_open(&out_ffn_evals, &ffn_y_claim.point, nu_td, sigma_td);
 
     // Advance transcript to match verifier's hyrax_verify_multi_point lambda challenge.
     // (hyrax_open is transcript-free, so we just burn one field challenge here.)
@@ -290,14 +282,14 @@ pub fn prove_transformer_block(
         out_attn_com,
         x_norm2_com,
         out_ffn_com,
-        q_combine,
-        k_combine,
+        q_open,
+        k_open,
         v_combine,
         out_inner_combine,
         x_norm1_combine,
-        out_attn_combine,
-        x_norm2_combine,
-        out_ffn_combine,
+        out_attn_open,
+        x_norm2_open,
+        out_ffn_open,
     })
 }
 

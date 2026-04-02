@@ -395,7 +395,6 @@ fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<(
     // Individual: x at r_final_q
     write_ep!(w, &o.x_at_r_final_q, &o.x_at_r_final_q_proof);
     // Group 2: at r_sig_t
-    write_f(w, &o.sum_x_at_rsig)?;
     write_f(w, &o.sq_sum_x_at_rsig)?;
     write_f(w, &o.sigma_at_rsig)?;
     write_f(w, &o.sigma_sq_at_rsig)?;
@@ -429,7 +428,6 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
     // Individual: x at r_final_q
     let (x_at_r_final_q, x_at_r_final_q_proof) = read_ep!(r);
     // Group 2: at r_sig_t
-    let sum_x_at_rsig = read_f(r)?;
     let sq_sum_x_at_rsig = read_f(r)?;
     let sigma_at_rsig = read_f(r)?;
     let sigma_sq_at_rsig = read_f(r)?;
@@ -459,7 +457,6 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
         x_rt_rmean_proof,
         x_at_r_final_q,
         x_at_r_final_q_proof,
-        sum_x_at_rsig,
         sq_sum_x_at_rsig,
         sigma_at_rsig,
         sigma_sq_at_rsig,
@@ -598,8 +595,8 @@ fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result
         }
     }
     write_attn_openings(w, &p.openings)?;
-    write_combine_proof(w, &p.phi_q_combine)?;
-    write_combine_proof(w, &p.phi_k_combine)
+    write_hyrax_proof(w, &p.phi_q_open)?;
+    write_hyrax_proof(w, &p.phi_k_open)
 }
 fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
     let internal_coms = read_attn_internal_coms(r)?;
@@ -625,8 +622,8 @@ fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
         internal_coms,
         sumcheck,
         openings: read_attn_openings(r)?,
-        phi_q_combine: read_combine_proof(r)?,
-        phi_k_combine: read_combine_proof(r)?,
+        phi_q_open: read_hyrax_proof(r)?,
+        phi_k_open: read_hyrax_proof(r)?,
     })
 }
 
@@ -678,8 +675,8 @@ fn write_ffn_proof<W: Write>(w: &mut W, p: &FFNProof) -> io::Result<()> {
     write_sumcheck_proof(w, &p.y_sumcheck)?;
     write_sumcheck_proof(w, &p.m_sumcheck)?;
     write_ffn_openings(w, &p.openings)?;
-    write_combine_proof(w, &p.m_combine)?;
-    write_combine_proof(w, &p.a_combine)
+    write_hyrax_proof(w, &p.m_open)?;
+    write_hyrax_proof(w, &p.a_open)
 }
 fn read_ffn_proof<R: Read>(r: &mut R) -> io::Result<FFNProof> {
     Ok(FFNProof {
@@ -687,8 +684,8 @@ fn read_ffn_proof<R: Read>(r: &mut R) -> io::Result<FFNProof> {
         y_sumcheck: read_sumcheck_proof(r)?,
         m_sumcheck: read_sumcheck_proof(r)?,
         openings: read_ffn_openings(r)?,
-        m_combine: read_combine_proof(r)?,
-        a_combine: read_combine_proof(r)?,
+        m_open: read_hyrax_proof(r)?,
+        a_open: read_hyrax_proof(r)?,
     })
 }
 
@@ -730,14 +727,14 @@ fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Resu
     write_hyrax_commitment(w, &p.out_attn_com)?;
     write_hyrax_commitment(w, &p.x_norm2_com)?;
     write_hyrax_commitment(w, &p.out_ffn_com)?;
-    write_combine_proof(w, &p.q_combine)?;
-    write_combine_proof(w, &p.k_combine)?;
+    write_hyrax_proof(w, &p.q_open)?;
+    write_hyrax_proof(w, &p.k_open)?;
     write_combine_proof(w, &p.v_combine)?;
     write_combine_proof(w, &p.out_inner_combine)?;
     write_combine_proof(w, &p.x_norm1_combine)?;
-    write_combine_proof(w, &p.out_attn_combine)?;
-    write_combine_proof(w, &p.x_norm2_combine)?;
-    write_combine_proof(w, &p.out_ffn_combine)
+    write_hyrax_proof(w, &p.out_attn_open)?;
+    write_hyrax_proof(w, &p.x_norm2_open)?;
+    write_hyrax_proof(w, &p.out_ffn_open)
 }
 fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
     Ok(TransformerBlockProof {
@@ -757,14 +754,14 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
         out_attn_com: read_hyrax_commitment(r)?,
         x_norm2_com: read_hyrax_commitment(r)?,
         out_ffn_com: read_hyrax_commitment(r)?,
-        q_combine: read_combine_proof(r)?,
-        k_combine: read_combine_proof(r)?,
+        q_open: read_hyrax_proof(r)?,
+        k_open: read_hyrax_proof(r)?,
         v_combine: read_combine_proof(r)?,
         out_inner_combine: read_combine_proof(r)?,
         x_norm1_combine: read_combine_proof(r)?,
-        out_attn_combine: read_combine_proof(r)?,
-        x_norm2_combine: read_combine_proof(r)?,
-        out_ffn_combine: read_combine_proof(r)?,
+        out_attn_open: read_hyrax_proof(r)?,
+        x_norm2_open: read_hyrax_proof(r)?,
+        out_ffn_open: read_hyrax_proof(r)?,
     })
 }
 

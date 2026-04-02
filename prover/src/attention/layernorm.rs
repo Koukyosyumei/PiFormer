@@ -81,7 +81,6 @@ pub struct LayerNormOpenings {
     pub x_at_r_final_q: F,
     pub x_at_r_final_q_proof: HyraxProof,
 
-    pub sum_x_at_rsig: F,
     pub sq_sum_x_at_rsig: F,
     pub sigma_at_rsig: F,
     pub sigma_sq_at_rsig: F, // 評価値のみ（コミットなし）
@@ -335,13 +334,12 @@ pub fn prove_layernorm(
                 nu_td,
                 sigma_td,
             ),
-            sum_x_at_rsig: sum_x_mle.evaluate(&r_sig_t),
             sq_sum_x_at_rsig: sq_sum_x_mle.evaluate(&r_sig_t),
             sigma_at_rsig: sigma_mle.evaluate(&r_sig_t),
             sigma_sq_at_rsig: sigma_sq_mle.evaluate(&r_sig_t),
             sum_x_sq_at_rsig: claim_x_sq,
             rsig_batch_proof: hyrax_open_batch(
-                &[&sum_x_mle.evaluations, &sigma_mle.evaluations],
+                &[&sigma_mle.evaluations],
                 &r_sig_t,
                 nu_t,
                 sigma_t,
@@ -558,11 +556,8 @@ pub fn verify_layernorm(
 
     // 3. rsig_batch_proof (Group 2)
     acc_t.add_verify_batch(
-        &[
-            proof.internal_coms.sum_x_com.clone(),
-            proof.internal_coms.sigma_com.clone(),
-        ],
-        &[proof.openings.sum_x_at_rsig, proof.openings.sigma_at_rsig],
+        &[proof.internal_coms.sigma_com.clone()],
+        &[proof.openings.sigma_at_rsig],
         &r_sig_t,
         &proof.openings.rsig_batch_proof,
         transcript,

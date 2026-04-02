@@ -9,7 +9,7 @@
 
 use crate::lookup::lasso::{verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey};
 use crate::pcs::{absorb_com, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams};
-use crate::subprotocols::verify_combine_deferred;
+use crate::subprotocols::{verify_combine_deferred, EvalClaim};
 use crate::pcs::hyrax_verify_multi_point;
 use crate::transcript::Transcript;
 
@@ -153,43 +153,36 @@ pub fn verify_transformer_block(
     )?;
     eprintln!("[block] ffn:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
-    // --- 7. GKR Combine Proofs ---
-    // Run sumcheck + leaf-check for all 8 combines, defer Hyrax openings.
+    // --- 7. GKR Combine Proofs (multi-claim) + Direct Opens (single-claim) ---
+    // For 3 multi-claim combines, defer sumcheck + Hyrax openings.
+    // For 5 single-claim opens, use claim point directly.
     // Then batch all 8 openings into 2 MSMs via hyrax_verify_multi_point.
     let _t = Instant::now();
-    let (q_r, q_f) = verify_combine_deferred(&proof.q_combine, &proof.q_com, &[q_y_claim], td_num_vars, transcript)
-        .map_err(|e| format!("q_combine: {e}"))?;
-    let (k_r, k_f) = verify_combine_deferred(&proof.k_combine, &proof.k_com, &[k_y_claim], td_num_vars, transcript)
-        .map_err(|e| format!("k_combine: {e}"))?;
-    let (v_r, v_f) = verify_combine_deferred(&proof.v_combine, &proof.v_com, &[v_y_claim, attn_v_claim], td_num_vars, transcript)
-        .map_err(|e| format!("v_combine: {e}"))?;
+    let (v_r, v_f) = verify_combine_deferred(
+        &proof.v_combine, &proof.v_com,
+        &[v_y_claim.clone(), attn_v_claim.clone()], td_num_vars, transcript,
+    ).map_err(|e| format!("v_combine: {e}"))?;
     let (oi_r, oi_f) = verify_combine_deferred(
         &proof.out_inner_combine, &proof.out_inner_com,
-        &[attn_out_claim, o_x_claim], td_num_vars, transcript,
+        &[attn_out_claim.clone(), o_x_claim.clone()], td_num_vars, transcript,
     ).map_err(|e| format!("out_inner_combine: {e}"))?;
     let (n1_r, n1_f) = verify_combine_deferred(
         &proof.x_norm1_combine, &proof.x_norm1_com,
-        &[q_x_claim, k_x_claim, v_x_claim], td_num_vars, transcript,
+        &[q_x_claim.clone(), k_x_claim.clone(), v_x_claim.clone()], td_num_vars, transcript,
     ).map_err(|e| format!("x_norm1_combine: {e}"))?;
-    let (oa_r, oa_f) = verify_combine_deferred(&proof.out_attn_combine, &proof.out_attn_com, &[o_y_claim], td_num_vars, transcript)
-        .map_err(|e| format!("out_attn_combine: {e}"))?;
-    let (n2_r, n2_f) = verify_combine_deferred(&proof.x_norm2_combine, &proof.x_norm2_com, &[ffn_x_claim], td_num_vars, transcript)
-        .map_err(|e| format!("x_norm2_combine: {e}"))?;
-    let (of_r, of_f) = verify_combine_deferred(&proof.out_ffn_combine, &proof.out_ffn_com, &[ffn_y_claim], td_num_vars, transcript)
-        .map_err(|e| format!("out_ffn_combine: {e}"))?;
 
-    // Batch all 8 Hyrax openings: 2 MSMs instead of 16
+    // Batch all 8 Hyrax openings: 5 direct opens + 3 deferred combine opens
     let (_, _, combine_params) = params_from_vars(td_num_vars);
     hyrax_verify_multi_point(
         &[
-            (&proof.q_com,          q_f,  &q_r,  &proof.q_combine.hyrax_proof),
-            (&proof.k_com,          k_f,  &k_r,  &proof.k_combine.hyrax_proof),
-            (&proof.v_com,          v_f,  &v_r,  &proof.v_combine.hyrax_proof),
-            (&proof.out_inner_com,  oi_f, &oi_r, &proof.out_inner_combine.hyrax_proof),
-            (&proof.x_norm1_com,    n1_f, &n1_r, &proof.x_norm1_combine.hyrax_proof),
-            (&proof.out_attn_com,   oa_f, &oa_r, &proof.out_attn_combine.hyrax_proof),
-            (&proof.x_norm2_com,    n2_f, &n2_r, &proof.x_norm2_combine.hyrax_proof),
-            (&proof.out_ffn_com,    of_f, &of_r, &proof.out_ffn_combine.hyrax_proof),
+            (&proof.q_com,         q_y_claim.value,   &q_y_claim.point,   &proof.q_open),
+            (&proof.k_com,         k_y_claim.value,   &k_y_claim.point,   &proof.k_open),
+            (&proof.out_attn_com,  o_y_claim.value,   &o_y_claim.point,   &proof.out_attn_open),
+            (&proof.x_norm2_com,   ffn_x_claim.value, &ffn_x_claim.point, &proof.x_norm2_open),
+            (&proof.out_ffn_com,   ffn_y_claim.value, &ffn_y_claim.point, &proof.out_ffn_open),
+            (&proof.v_com,         v_f,  &v_r,  &proof.v_combine.hyrax_proof),
+            (&proof.out_inner_com, oi_f, &oi_r, &proof.out_inner_combine.hyrax_proof),
+            (&proof.x_norm1_com,   n1_f, &n1_r, &proof.x_norm1_combine.hyrax_proof),
         ],
         &combine_params,
         transcript,
