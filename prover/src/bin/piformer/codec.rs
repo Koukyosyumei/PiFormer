@@ -42,7 +42,9 @@ use piformer_prover::{
     },
     subprotocols::{
         combine::CombineProof,
-        sumcheck::{CubicRoundPoly, RoundPoly, SumcheckCubicProof, SumcheckProof, SumcheckProofMulti},
+        sumcheck::{
+            CubicRoundPoly, RoundPoly, SumcheckCubicProof, SumcheckProof, SumcheckProofMulti,
+        },
     },
     verifier::TransformerBlockVerifyingKey,
     F,
@@ -345,7 +347,6 @@ fn read_range_proof<R: Read>(r: &mut R) -> io::Result<RangeProof> {
 
 fn write_ln_internal_coms<W: Write>(w: &mut W, c: &LayerNormInternalCommitments) -> io::Result<()> {
     write_hyrax_commitment(w, &c.sum_x_com)?;
-    write_hyrax_commitment(w, &c.sq_sum_x_com)?;
     //write_hyrax_commitment(w, &c.sum_x_sq_com)?;
     write_hyrax_commitment(w, &c.sigma_com)
     //write_hyrax_commitment(w, &c.sigma_sq_com)?;
@@ -355,7 +356,6 @@ fn write_ln_internal_coms<W: Write>(w: &mut W, c: &LayerNormInternalCommitments)
 fn read_ln_internal_coms<R: Read>(r: &mut R) -> io::Result<LayerNormInternalCommitments> {
     Ok(LayerNormInternalCommitments {
         sum_x_com: read_hyrax_commitment(r)?,
-        sq_sum_x_com: read_hyrax_commitment(r)?,
         //sum_x_sq_com: read_hyrax_commitment(r)?,
         sigma_com: read_hyrax_commitment(r)?,
         // sigma_sq_com: read_hyrax_commitment(r)?,

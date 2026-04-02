@@ -66,7 +66,6 @@ pub struct LayerNormInternalCommitments {
     // 統計量(row-level)のコミットメントは RangeProof との紐付けに必要だが、
     // 積や二乗 (sum_x_sq, sigma_sq, sigma_y, gamma_x) は削除。
     pub sum_x_com: HyraxCommitment,
-    pub sq_sum_x_com: HyraxCommitment,
     pub sigma_com: HyraxCommitment,
 }
 
@@ -187,11 +186,9 @@ pub fn prove_layernorm(
     absorb_com(transcript, b"y_com", &io_coms.y_com);
 
     let sum_x_com = hyrax_commit(&sum_x_mle.evaluations, nu_t, &params_t);
-    let sq_sum_x_com = hyrax_commit(&sq_sum_x_mle.evaluations, nu_t, &params_t);
     let sigma_com = hyrax_commit(&sigma_mle.evaluations, nu_t, &params_t);
 
     absorb_com(transcript, b"sum_x_com", &sum_x_com);
-    absorb_com(transcript, b"sq_sum_x_com", &sq_sum_x_com);
     absorb_com(transcript, b"sigma_com", &sigma_com);
 
     let r_t = challenge_vec(transcript, t_bits, b"layernorm_rt");
@@ -303,7 +300,6 @@ pub fn prove_layernorm(
     Ok(LayerNormProof {
         internal_coms: LayerNormInternalCommitments {
             sum_x_com,
-            sq_sum_x_com,
             sigma_com,
         },
         mean_sumcheck,
@@ -317,7 +313,7 @@ pub fn prove_layernorm(
             sum_x_at_rt: claim_s,
             sq_sum_x_at_rt: claim_q,
             rt_batch_proof: hyrax_open_batch(
-                &[&sum_x_mle.evaluations, &sq_sum_x_mle.evaluations],
+                &[&sum_x_mle.evaluations],
                 &r_t,
                 nu_t,
                 sigma_t,
@@ -336,11 +332,7 @@ pub fn prove_layernorm(
             sigma_sq_at_rsig: sigma_sq_mle.evaluate(&r_sig_t),
             sum_x_sq_at_rsig: claim_x_sq,
             rsig_batch_proof: hyrax_open_batch(
-                &[
-                    &sum_x_mle.evaluations,
-                    &sq_sum_x_mle.evaluations,
-                    &sigma_mle.evaluations,
-                ],
+                &[&sum_x_mle.evaluations, &sigma_mle.evaluations],
                 &r_sig_t,
                 nu_t,
                 sigma_t,
@@ -400,11 +392,6 @@ pub fn verify_layernorm(
     absorb_com(transcript, b"x_com", &io_coms.x_com);
     absorb_com(transcript, b"y_com", &io_coms.y_com);
     absorb_com(transcript, b"sum_x_com", &proof.internal_coms.sum_x_com);
-    absorb_com(
-        transcript,
-        b"sq_sum_x_com",
-        &proof.internal_coms.sq_sum_x_com,
-    );
     absorb_com(transcript, b"sigma_com", &proof.internal_coms.sigma_com);
 
     // 2. Row Audit Challenge
@@ -538,11 +525,8 @@ pub fn verify_layernorm(
 
     // 1. rt_batch_proof (Group 1)
     acc_t.add_verify_batch(
-        &[
-            proof.internal_coms.sum_x_com.clone(),
-            proof.internal_coms.sq_sum_x_com.clone(),
-        ],
-        &[proof.openings.sum_x_at_rt, proof.openings.sq_sum_x_at_rt],
+        &[proof.internal_coms.sum_x_com.clone()],
+        &[proof.openings.sum_x_at_rt],
         &r_t,
         &proof.openings.rt_batch_proof,
         transcript,
@@ -560,14 +544,9 @@ pub fn verify_layernorm(
     acc_t.add_verify_batch(
         &[
             proof.internal_coms.sum_x_com.clone(),
-            proof.internal_coms.sq_sum_x_com.clone(),
             proof.internal_coms.sigma_com.clone(),
         ],
-        &[
-            proof.openings.sum_x_at_rsig,
-            proof.openings.sq_sum_x_at_rsig,
-            proof.openings.sigma_at_rsig,
-        ],
+        &[proof.openings.sum_x_at_rsig, proof.openings.sigma_at_rsig],
         &r_sig_t,
         &proof.openings.rsig_batch_proof,
         transcript,

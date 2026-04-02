@@ -339,6 +339,144 @@ pub fn verify_sumcheck_cubic(
     Ok((challenges, final_eval))
 }
 
+/// バッチ化された3積 Sumcheck 証明
+#[derive(Clone, Debug)]
+pub struct SumcheckCubicProofMulti {
+    pub round_polys: Vec<CubicRoundPoly>,
+    /// 点 r における各 f_i の評価値
+    pub final_evals_f: Vec<F>,
+    /// 点 r における各 g_i の評価値
+    pub final_evals_g: Vec<F>,
+    /// 点 r における各 h_i の評価値
+    pub final_evals_h: Vec<F>,
+}
+
+/// Σ_k weights[k] · (Σ_{x ∈ {0,1}^n} f_k(x)·g_k(x)·h_k(x)) = `claim` を証明する。
+pub fn prove_sumcheck_cubic_multi_batched(
+    fs: &[DenseMLPoly],
+    gs: &[DenseMLPoly],
+    hs: &[DenseMLPoly],
+    weights: &[F],
+    claim: F,
+    transcript: &mut Transcript,
+) -> (SumcheckCubicProofMulti, Vec<F>) {
+    let num_triples = fs.len();
+    assert_eq!(gs.len(), num_triples);
+    assert_eq!(hs.len(), num_triples);
+    assert_eq!(weights.len(), num_triples);
+
+    let n = fs[0].num_vars;
+    for k in 1..num_triples {
+        assert_eq!(fs[k].num_vars, n);
+        assert_eq!(gs[k].num_vars, n);
+        assert_eq!(hs[k].num_vars, n);
+    }
+
+    transcript.append_field(b"sc_claim", &claim);
+
+    let mut fs_cur: Vec<DenseMLPoly> = fs.to_vec();
+    let mut gs_cur: Vec<DenseMLPoly> = gs.to_vec();
+    let mut hs_cur: Vec<DenseMLPoly> = hs.to_vec();
+    let mut round_polys = Vec::with_capacity(n);
+    let mut challenges = Vec::with_capacity(n);
+
+    for _ in 0..n {
+        let half = fs_cur[0].evaluations.len() >> 1;
+        let mut e = [F::ZERO; 4];
+
+        for i in 0..half {
+            for k in 0..num_triples {
+                let f0 = fs_cur[k].evaluations[i];
+                let f1 = fs_cur[k].evaluations[i + half];
+                let g0 = gs_cur[k].evaluations[i];
+                let g1 = gs_cur[k].evaluations[i + half];
+                let h0 = hs_cur[k].evaluations[i];
+                let h1 = hs_cur[k].evaluations[i + half];
+                let f2 = f1 + f1 - f0;
+                let f3 = f2 + f1 - f0;
+                let g2 = g1 + g1 - g0;
+                let g3 = g2 + g1 - g0;
+                let h2 = h1 + h1 - h0;
+                let h3 = h2 + h1 - h0;
+                e[0] += weights[k] * (f0 * g0 * h0);
+                e[1] += weights[k] * (f1 * g1 * h1);
+                e[2] += weights[k] * (f2 * g2 * h2);
+                e[3] += weights[k] * (f3 * g3 * h3);
+            }
+        }
+
+        let rp = CubicRoundPoly { evals: e };
+        for val in &rp.evals {
+            transcript.append_field(b"sc_round", val);
+        }
+        let r_i = transcript.challenge_field::<F>(b"sc_challenge");
+        challenges.push(r_i);
+
+        for k in 0..num_triples {
+            fs_cur[k] = fs_cur[k].fix_first_variable(r_i);
+            gs_cur[k] = gs_cur[k].fix_first_variable(r_i);
+            hs_cur[k] = hs_cur[k].fix_first_variable(r_i);
+        }
+        round_polys.push(rp);
+    }
+
+    let final_evals_f = fs_cur.iter().map(|p| p.evaluations[0]).collect();
+    let final_evals_g = gs_cur.iter().map(|p| p.evaluations[0]).collect();
+    let final_evals_h = hs_cur.iter().map(|p| p.evaluations[0]).collect();
+
+    (
+        SumcheckCubicProofMulti {
+            round_polys,
+            final_evals_f,
+            final_evals_g,
+            final_evals_h,
+        },
+        challenges,
+    )
+}
+
+/// バッチ版 3積 Sumcheck プロトコルの検証
+pub fn verify_sumcheck_cubic_multi_batched(
+    proof: &SumcheckCubicProofMulti,
+    weights: &[F],
+    claim: F,
+    num_vars: usize,
+    transcript: &mut Transcript,
+) -> Result<(Vec<F>, F), String> {
+    if proof.round_polys.len() != num_vars {
+        return Err("Wrong number of round polys".into());
+    }
+
+    transcript.append_field(b"sc_claim", &claim);
+    let mut current = claim;
+    let mut challenges = Vec::with_capacity(num_vars);
+
+    for (i, rp) in proof.round_polys.iter().enumerate() {
+        if rp.evals[0] + rp.evals[1] != current {
+            return Err(format!("Cubic multi sumcheck round {i} consistency failed"));
+        }
+        for val in &rp.evals {
+            transcript.append_field(b"sc_round", val);
+        }
+        let r_i = transcript.challenge_field::<F>(b"sc_challenge");
+        challenges.push(r_i);
+        current = rp.evaluate(r_i);
+    }
+
+    let n = proof.final_evals_f.len();
+    let mut final_combination = F::ZERO;
+    for k in 0..n {
+        final_combination +=
+            weights[k] * proof.final_evals_f[k] * proof.final_evals_g[k] * proof.final_evals_h[k];
+    }
+
+    if final_combination != current {
+        return Err("Cubic multi sumcheck final check failed".into());
+    }
+
+    Ok((challenges, current))
+}
+
 /// バッチ化されたSumcheck証明
 #[derive(Clone, Debug)]
 pub struct SumcheckProofMulti {
