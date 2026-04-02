@@ -326,7 +326,8 @@ fn write_lasso_multi_proof<W: Write>(w: &mut W, p: &LassoMultiProof) -> io::Resu
     write_f(w, &p.combined_grand_sum)?;
     write_sumcheck_proof_multi(w, &p.combined_sumcheck_proof)?;
     write_vec(w, &p.table_openings, |w, v: &Vec<F>| write_vec_f(w, v))?;
-    write_hyrax_proof(w, &p.hyrax_proof)
+    write_hyrax_proof(w, &p.hyrax_proof)?;
+    write_vec(w, &p.output_opening_proofs, write_hyrax_proof)
 }
 fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
     Ok(LassoMultiProof {
@@ -334,6 +335,7 @@ fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
         combined_sumcheck_proof: read_sumcheck_proof_multi(r)?,
         table_openings: read_vec(r, |r| read_vec_f(r))?,
         hyrax_proof: read_hyrax_proof(r)?,
+        output_opening_proofs: read_vec(r, read_hyrax_proof)?,
     })
 }
 

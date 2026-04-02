@@ -23,14 +23,14 @@ use crate::field::F;
 use crate::poly::utils::compute_eq_evals;
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch,
-    HyraxCommitment, HyraxParams, HyraxProof,
+    params_from_vars, HyraxCommitment, HyraxParams, HyraxProof,
 };
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::sumcheck::{
     prove_sumcheck_multi_batched, verify_sumcheck_multi_batched, SumcheckProofMulti,
 };
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
-use crate::transcript::Transcript;
+use crate::transcript::{challenge_vec, Transcript};
 use ark_ff::Field;
 
 /// Precomputed table commitments — computed once at setup, not per proof.
@@ -279,6 +279,22 @@ pub fn verify_lasso(
     Ok(())
 }
 
+/// Binding between a Lasso instance's outputs and the polynomial commitment
+/// used in the sub-module proof (a_com for FFN, phi_q_com / phi_k_com for attention).
+///
+/// Without this binding, a cheating prover could commit to a different `a` in
+/// `a_com` while providing the correct activation values in `LassoInstance::outputs`,
+/// bypassing the activation constraint entirely.
+pub struct LassoOutputBinding {
+    /// The Hyrax commitment that was created from this instance's output polynomial
+    /// (e.g. a_com, phi_q_com, phi_k_com).
+    pub com: HyraxCommitment,
+    /// Number of MLE variables: t_bits + f_bits (FFN) or t_bits + d_bits (attention).
+    pub num_vars: usize,
+    /// Padded MLE evaluations — same layout used when `com` was created via hyrax_commit.
+    pub mle_evals: Vec<F>,
+}
+
 /// Precomputed table commitments for multi-instance Lasso (setup phase).
 #[derive(Clone)]
 pub struct LassoMultiProvingKey {
@@ -339,11 +355,18 @@ pub struct LassoMultiProof {
     pub table_openings: Vec<Vec<F>>,
     /// 全評価値を一括で証明するバッチHyrax証明
     pub hyrax_proof: HyraxProof,
+    /// Output binding: one Hyrax opening per instance binding output_com to
+    /// the MLE of instance.outputs at a Fiat-Shamir challenge point.
+    /// Order matches `output_bindings` passed to `prove_lasso_multi`.
+    pub output_opening_proofs: Vec<HyraxProof>,
 }
 
 pub fn prove_lasso_multi(
     multi_instance: &LassoMultiInstance,
     pk: &LassoMultiProvingKey,
+    // One binding per instance (same order as multi_instance.instances).
+    // Binds a_com / phi_q_com / phi_k_com to the outputs field of each LassoInstance.
+    output_bindings: &[LassoOutputBinding],
     transcript: &mut Transcript,
     params: &HyraxParams,
 ) -> LassoMultiProof {
@@ -443,11 +466,32 @@ pub fn prove_lasso_multi(
         transcript, // 5th argument
     );
 
+    // --- OUTPUT BINDING ---
+    // For each instance, open the module-level output commitment at a fresh
+    // Fiat-Shamir challenge point and verify it matches the MLE of instance.outputs.
+    // This binds a_com / phi_q_com / phi_k_com to the outputs used above.
+    // Empty slice means no binding (used in unit tests that don't have real commitments).
+    let mut output_opening_proofs = Vec::new();
+    if !output_bindings.is_empty() {
+        assert_eq!(
+            output_bindings.len(),
+            multi_instance.instances.len(),
+            "output_bindings length must equal number of Lasso instances"
+        );
+        for binding in output_bindings {
+            let r_out = challenge_vec(transcript, binding.num_vars, b"lasso_output_r");
+            let (nu, sigma, _) = params_from_vars(binding.num_vars);
+            let hp = hyrax_open(&binding.mle_evals, &r_out, nu, sigma);
+            output_opening_proofs.push(hp);
+        }
+    }
+
     LassoMultiProof {
         combined_grand_sum,
         combined_sumcheck_proof,
         table_openings,
         hyrax_proof,
+        output_opening_proofs,
     }
 }
 
@@ -455,6 +499,9 @@ pub fn verify_lasso_multi(
     proof: &LassoMultiProof,
     multi_instance: &LassoMultiInstance,
     vk: &LassoMultiVerifyingKey,
+    // One (commitment, num_vars) pair per instance, same order as instances.
+    // Pass &[] to skip output binding (e.g. in unit tests).
+    output_coms: &[(HyraxCommitment, usize)],
     transcript: &mut Transcript,
     params: &HyraxParams,
 ) -> Result<(), String> {
@@ -557,7 +604,44 @@ pub fn verify_lasso_multi(
         &proof.hyrax_proof,
         params,
         transcript,
-    )
+    )?;
+
+    // --- OUTPUT BINDING verification ---
+    // If output_coms is non-empty, verify that each instance's output commitment
+    // opens correctly to the MLE of instance.outputs at a fresh random point.
+    if !output_coms.is_empty() {
+        if output_coms.len() != multi_instance.instances.len() {
+            return Err(format!(
+                "output_coms length {} does not match instance count {}",
+                output_coms.len(),
+                multi_instance.instances.len()
+            ));
+        }
+        if proof.output_opening_proofs.len() != output_coms.len() {
+            return Err("output_opening_proofs count mismatch in proof".into());
+        }
+        for (((com, num_vars), hp), instance) in output_coms
+            .iter()
+            .zip(proof.output_opening_proofs.iter())
+            .zip(multi_instance.instances.iter())
+        {
+            let r_out = challenge_vec(transcript, *num_vars, b"lasso_output_r");
+            let (_, _, params_out) = params_from_vars(*num_vars);
+
+            // Compute expected eval: MLE of instance.outputs (zero-padded) at r_out
+            let padded_len = 1usize << num_vars;
+            let mut padded = vec![F::ZERO; padded_len];
+            for (j, &out) in instance.outputs.iter().enumerate() {
+                padded[j] = out;
+            }
+            let expected_eval = DenseMLPoly::new(padded).evaluate(&r_out);
+
+            hyrax_verify(com, expected_eval, &r_out, hp, &params_out)
+                .map_err(|e| format!("Output binding Hyrax failed: {e}"))?;
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -878,7 +962,7 @@ mod lasso_multi_tests {
 
         // Prover
         let mut prover_transcript = Transcript::new(b"multi-lasso-test");
-        let proof = prove_lasso_multi(&multi_instance, &pk, &mut prover_transcript, &params);
+        let proof = prove_lasso_multi(&multi_instance, &pk, &[], &mut prover_transcript, &params);
 
         // Verifier
         let mut verifier_transcript = Transcript::new(b"multi-lasso-test");
@@ -886,6 +970,7 @@ mod lasso_multi_tests {
             &proof,
             &multi_instance,
             &vk,
+            &[],
             &mut verifier_transcript,
             &params,
         );
@@ -911,10 +996,10 @@ mod lasso_multi_tests {
         multi_instance.instances[1].outputs[0] = F::from(999u64);
 
         let mut pt = Transcript::new(b"multi-lasso-test");
-        let proof = prove_lasso_multi(&multi_instance, &pk, &mut pt, &params);
+        let proof = prove_lasso_multi(&multi_instance, &pk, &[], &mut pt, &params);
 
         let mut vt = Transcript::new(b"multi-lasso-test");
-        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &mut vt, &params);
+        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &[], &mut vt, &params);
 
         // 検証側で expected_final_eval と sumcheck の主張が一致しなくなるため失敗する
         assert!(result.is_err(), "Should reject due to wrong public output");
@@ -931,13 +1016,13 @@ mod lasso_multi_tests {
         let vk = pk.vk();
 
         let mut pt = Transcript::new(b"multi-lasso-test");
-        let mut proof = prove_lasso_multi(&multi_instance, &pk, &mut pt, &params);
+        let mut proof = prove_lasso_multi(&multi_instance, &pk, &[], &mut pt, &params);
 
         // 統合Sumcheckのラウンド多項式を改ざん
         proof.combined_sumcheck_proof.round_polys[0].evals[0] += F::one();
 
         let mut vt = Transcript::new(b"multi-lasso-test");
-        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &mut vt, &params);
+        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &[], &mut vt, &params);
 
         assert!(result.is_err(), "Should reject tampered sumcheck proof");
     }
@@ -953,10 +1038,10 @@ mod lasso_multi_tests {
         let vk = pk.vk();
 
         let mut pt = Transcript::new(b"domain-A");
-        let proof = prove_lasso_multi(&multi_instance, &pk, &mut pt, &params);
+        let proof = prove_lasso_multi(&multi_instance, &pk, &[], &mut pt, &params);
 
         let mut vt = Transcript::new(b"domain-B"); // ラベルが異なる
-        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &mut vt, &params);
+        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &[], &mut vt, &params);
 
         assert!(
             result.is_err(),
@@ -975,13 +1060,13 @@ mod lasso_multi_tests {
         let vk = pk.vk();
 
         let mut pt = Transcript::new(b"multi-lasso-test");
-        let mut proof = prove_lasso_multi(&multi_instance, &pk, &mut pt, &params);
+        let mut proof = prove_lasso_multi(&multi_instance, &pk, &[], &mut pt, &params);
 
         // 個別の評価値 table_openings を改ざん
         proof.table_openings[0][0] += F::one();
 
         let mut vt = Transcript::new(b"multi-lasso-test");
-        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &mut vt, &params);
+        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &[], &mut vt, &params);
 
         // expected_final_eval の計算に不整合が生じるか、Hyraxのバッチ検証で失敗する
         assert!(result.is_err(), "Should reject tampered table opening");
@@ -1000,10 +1085,10 @@ mod lasso_multi_tests {
         let vk = pk.vk();
 
         let mut pt = Transcript::new(b"single-in-multi");
-        let proof = prove_lasso_multi(&multi_instance, &pk, &mut pt, &params);
+        let proof = prove_lasso_multi(&multi_instance, &pk, &[], &mut pt, &params);
 
         let mut vt = Transcript::new(b"single-in-multi");
-        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &mut vt, &params);
+        let result = verify_lasso_multi(&proof, &multi_instance, &vk, &[], &mut vt, &params);
 
         assert!(
             result.is_ok(),
