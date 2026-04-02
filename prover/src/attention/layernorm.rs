@@ -518,6 +518,12 @@ pub fn verify_layernorm(
     let expected_var_x = d_f * (d_f * proof.openings.sq_sum_x_at_rbind
         - proof.openings.sum_x_sq_at_rbind);
     if var_x_at_rbind != expected_var_x {
+        eprintln!("[DEBUG var_x binding] t={} d={}", t, d);
+        eprintln!("[DEBUG] lasso_query_indices = {:?}", &proof.lasso_query_indices);
+        eprintln!("[DEBUG] sq_sum_x_at_rbind = {:?}", proof.openings.sq_sum_x_at_rbind);
+        eprintln!("[DEBUG] sum_x_sq_at_rbind = {:?}", proof.openings.sum_x_sq_at_rbind);
+        eprintln!("[DEBUG] var_x_at_rbind    = {:?}", var_x_at_rbind);
+        eprintln!("[DEBUG] expected_var_x    = {:?}", expected_var_x);
         return Err("var_x binding mismatch: query indices inconsistent with committed sq_sum_x/sum_x_sq".into());
     }
 
