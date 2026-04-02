@@ -740,22 +740,23 @@ fn read_combine_proof<R: Read>(r: &mut R) -> io::Result<CombineProof> {
 fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Result<()> {
     write_ln_proof(w, &p.ln1_proof)?;
     write_batched_qkv_proof(w, &p.qkv_proj_proof)?;
-    write_attn_proof(w, &p.attn_proof)?;
+    // GKR backward: O_proj written before attn (transcript order matches prover)
     write_proj_proof(w, &p.o_proj_proof)?;
+    write_attn_proof(w, &p.attn_proof)?;
     write_ln_proof(w, &p.ln2_proof)?;
     write_ffn_proof(w, &p.ffn_proof)?;
     write_hyrax_commitment(w, &p.x_norm1_com)?;
     write_hyrax_commitment(w, &p.q_com)?;
     write_hyrax_commitment(w, &p.k_com)?;
     write_hyrax_commitment(w, &p.v_com)?;
-    write_hyrax_commitment(w, &p.out_inner_com)?;
+    // out_inner_com: eliminated via GKR backward fusion (no field to write)
     write_hyrax_commitment(w, &p.out_attn_com)?;
     write_hyrax_commitment(w, &p.x_norm2_com)?;
     write_hyrax_commitment(w, &p.out_ffn_com)?;
     write_hyrax_proof(w, &p.q_open)?;
     write_hyrax_proof(w, &p.k_open)?;
     write_combine_proof(w, &p.v_combine)?;
-    write_combine_proof(w, &p.out_inner_combine)?;
+    // out_inner_combine: eliminated via GKR backward fusion (no field to write)
     write_hyrax_proof(w, &p.x_norm1_open)?;
     write_hyrax_proof(w, &p.out_attn_open)?;
     write_hyrax_proof(w, &p.x_norm2_open)?;
@@ -765,22 +766,23 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
     Ok(TransformerBlockProof {
         ln1_proof: read_ln_proof(r)?,
         qkv_proj_proof: read_batched_qkv_proof(r)?,
-        attn_proof: read_attn_proof(r)?,
+        // GKR backward: O_proj read before attn
         o_proj_proof: read_proj_proof(r)?,
+        attn_proof: read_attn_proof(r)?,
         ln2_proof: read_ln_proof(r)?,
         ffn_proof: read_ffn_proof(r)?,
         x_norm1_com: read_hyrax_commitment(r)?,
         q_com: read_hyrax_commitment(r)?,
         k_com: read_hyrax_commitment(r)?,
         v_com: read_hyrax_commitment(r)?,
-        out_inner_com: read_hyrax_commitment(r)?,
+        // out_inner_com: eliminated via GKR backward fusion
         out_attn_com: read_hyrax_commitment(r)?,
         x_norm2_com: read_hyrax_commitment(r)?,
         out_ffn_com: read_hyrax_commitment(r)?,
         q_open: read_hyrax_proof(r)?,
         k_open: read_hyrax_proof(r)?,
         v_combine: read_combine_proof(r)?,
-        out_inner_combine: read_combine_proof(r)?,
+        // out_inner_combine: eliminated via GKR backward fusion
         x_norm1_open: read_hyrax_proof(r)?,
         out_attn_open: read_hyrax_proof(r)?,
         x_norm2_open: read_hyrax_proof(r)?,

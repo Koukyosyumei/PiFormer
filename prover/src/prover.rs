@@ -46,21 +46,28 @@ use crate::verifier::{add_commitments, TransformerBlockVerifyingKey}; // Importe
 // ---------------------------------------------------------------------------
 
 /// The complete ZK Proof for one Transformer Block.
+///
+/// GKR backward fusion (out_inner elimination):
+/// O_proj runs before attention in the transcript. O_proj's x_claim is passed as
+/// the external out_inner evaluation point to attention. Both sub-provers reference
+/// the same out_inner evaluation, eliminating the need for out_inner_com or
+/// out_inner_combine. Soundness holds because the two sumchecks together pin down
+/// out_inner at the shared evaluation point.
 pub struct TransformerBlockProof {
-    // Sub-proofs
+    // Sub-proofs (O_proj runs before attention in transcript order)
     pub ln1_proof: LayerNormProof,
     pub qkv_proj_proof: BatchedQKVProjectionProof,
+    pub o_proj_proof: ProjectionProof,  // runs before attn (GKR backward)
     pub attn_proof: LinearAttentionProof,
-    pub o_proj_proof: ProjectionProof,
     pub ln2_proof: LayerNormProof,
     pub ffn_proof: FFNProof,
 
-    // Intermediate IO Commitments (Passed to Verifier to stitch the pipeline)
+    // Intermediate IO Commitments (out_inner_com eliminated via GKR backward fusion)
     pub x_norm1_com: HyraxCommitment,
     pub q_com: HyraxCommitment,
     pub k_com: HyraxCommitment,
     pub v_com: HyraxCommitment,
-    pub out_inner_com: HyraxCommitment,
+    // out_inner_com: eliminated — out_inner bound by shared sumcheck claim
     pub out_attn_com: HyraxCommitment,
     pub x_norm2_com: HyraxCommitment,
     pub out_ffn_com: HyraxCommitment,
@@ -71,8 +78,7 @@ pub struct TransformerBlockProof {
     pub k_open: HyraxProof,
     /// Verifies v_com: 2 claims — V-projection y_claim + attention v_claim.
     pub v_combine: CombineProof,
-    /// Verifies out_inner_com: 2 claims — attention out_claim + O-projection x_claim.
-    pub out_inner_combine: CombineProof,
+    // out_inner_combine: eliminated — no out_inner_com to combine
     /// Direct Hyrax opening of x_norm1_com at the shared batched-QKV x_claim point.
     pub x_norm1_open: HyraxProof,
     /// Direct Hyrax opening of out_attn_com at the O-projection y_claim point.
@@ -127,12 +133,12 @@ pub fn prove_transformer_block(
         hyrax_commit(&mle.evaluations, nu, &HyraxParams::new(sigma))
     };
 
-    // 1. Generate all Intermediate IO Commitments (O(N) operations done ONLY ONCE)
+    // 1. Generate Intermediate IO Commitments (out_inner_com eliminated via GKR backward)
     let x_norm1_com = commit_mat(&witness.ln1_wit.y, t, d);
     let q_com = commit_mat(&witness.attn_wit.q, t, d);
     let k_com = commit_mat(&witness.attn_wit.k, t, d);
     let v_com = commit_mat(&witness.attn_wit.v, t, d);
-    let out_inner_com = commit_mat(&witness.attn_wit.out, t, d);
+    // out_inner_com: NOT committed — bound by shared sumcheck claim (GKR backward)
     let out_attn_com = commit_mat(&witness.o_proj_wit.y, t, d);
     let x_norm2_com = commit_mat(&witness.ln2_wit.y, t, d);
     let out_ffn_com = commit_mat(&witness.ffn_wit.y, t, d);
@@ -161,26 +167,29 @@ pub fn prove_transformer_block(
     let (qkv_proj_proof, q_y_claim, k_y_claim, v_y_claim, x_norm1_claim) =
         prove_qkv_projections(&pk.q_pk, &pk.k_pk, &pk.v_pk, &qkv_wit, &qkv_io, transcript)?;
 
-    // --- Linear Attention — returns (proof, out_claim, v_claim) ---
+    // --- GKR backward fusion: O_proj runs BEFORE attention ---
+    // O_proj's x_claim gives an evaluation of out_inner at a transcript-derived point.
+    // out_inner is NOT committed; x_com is None (GKR backward, no out_inner_com).
+    let o_io = ProjectionIOCommitments { x_com: None };
+    let (o_proj_proof, o_y_claim, o_x_claim) =
+        prove_projection(&pk.o_pk, &witness.o_proj_wit, &o_io, transcript)?;
+
+    // --- Linear Attention — receives O_proj's x_claim as the external out_inner claim ---
+    // out_com removed from IO; both sub-provers reference the same out_inner eval point.
     let attn_io = AttentionIOCommitments {
         q_com: q_com.clone(),
         k_com: k_com.clone(),
         v_com: v_com.clone(),
-        out_com: out_inner_com.clone(),
     };
-    let (attn_proof, attn_out_claim, attn_v_claim) = prove_linear_attention(
+    let (attn_proof, _attn_out_claim, attn_v_claim) = prove_linear_attention(
         &witness.attn_wit,
         inst_attn,
         &pk.attn_pk,
         &attn_io,
+        Some(o_x_claim.clone()),  // GKR backward: out_inner eval from O_proj
         transcript,
         lasso_params,
     );
-
-    // --- Output Projection — returns (proof, y_claim, x_claim) ---
-    let o_io = ProjectionIOCommitments { x_com: out_inner_com.clone() };
-    let (o_proj_proof, o_y_claim, o_x_claim) =
-        prove_projection(&pk.o_pk, &witness.o_proj_wit, &o_io, transcript)?;
 
     // --- LayerNorm 2 ---
     let x_mid_com = add_commitments(x_in_com, &out_attn_com);
@@ -225,15 +234,9 @@ pub fn prove_transformer_block(
     let (v_combine, _) =
         prove_combine(&v_evals, &v_com, &[v_y_claim, attn_v_claim], td_num_vars, transcript);
 
-    // out_inner_com: 2 claims — attention out_claim + O-proj x_claim
-    let out_inner_evals = mat_evals(&witness.attn_wit.out, t, d);
-    let (out_inner_combine, _) = prove_combine(
-        &out_inner_evals,
-        &out_inner_com,
-        &[attn_out_claim, o_x_claim],
-        td_num_vars,
-        transcript,
-    );
+    // out_inner_com: ELIMINATED via GKR backward fusion.
+    // O_proj's x_claim and attention's external_out_claim both reference the same
+    // out_inner evaluation point, so no combine proof or commitment is needed.
 
     // x_norm1_com: direct open at the single batched-QKV x_norm1_claim point
     let x_norm1_evals = mat_evals(&witness.ln1_wit.y, t, d);
@@ -258,22 +261,22 @@ pub fn prove_transformer_block(
     Ok(TransformerBlockProof {
         ln1_proof,
         qkv_proj_proof,
+        o_proj_proof,  // O_proj before attn (GKR backward)
         attn_proof,
-        o_proj_proof,
         ln2_proof,
         ffn_proof,
         x_norm1_com,
         q_com,
         k_com,
         v_com,
-        out_inner_com,
+        // out_inner_com: eliminated via GKR backward fusion
         out_attn_com,
         x_norm2_com,
         out_ffn_com,
         q_open,
         k_open,
         v_combine,
-        out_inner_combine,
+        // out_inner_combine: eliminated via GKR backward fusion
         x_norm1_open,
         out_attn_open,
         x_norm2_open,
@@ -391,7 +394,7 @@ pub fn prove(
 
     // 4. LM Head (Final Projection to Vocab Size)
     let logits_com = commit_mat(&witness.lm_head_wit.y, t, v);
-    let lm_io = ProjectionIOCommitments { x_com: final_ln_out_com.clone() };
+    let lm_io = ProjectionIOCommitments { x_com: Some(final_ln_out_com.clone()) };
     let (lm_head_proof, _, _) =
         prove_projection(&pk.lm_head_pk, &witness.lm_head_wit, &lm_io, transcript)?;
 

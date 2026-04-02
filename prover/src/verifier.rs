@@ -106,21 +106,22 @@ pub fn verify_transformer_block(
     )?;
     eprintln!("[block] qkv_proj:   {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
-    // --- 3. Linear Attention — returns (out_claim, v_claim) for combine ---
+    // --- 3. Output Projection (GKR backward: runs before attention) ---
+    // out_inner is not committed; O_proj's x_claim serves as the shared eval point.
+    let o_io = ProjectionIOCommitments { x_com: None };
+    let _t = Instant::now(); let (o_y_claim, o_x_claim) = verify_projection(&proof.o_proj_proof, &vk.o_vk, &o_io, transcript, proj_acc_w, proj_acc_b)?;
+    eprintln!("[block] o_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
+
+    // --- 4. Linear Attention — receives O_proj's x_claim as external out_inner claim ---
+    // out_com removed from IO; both sumchecks reference the same out_inner eval point.
     let attn_io = crate::attention::attention::AttentionIOCommitments {
         q_com: proof.q_com.clone(),
         k_com: proof.k_com.clone(),
         v_com: proof.v_com.clone(),
-        out_com: proof.out_inner_com.clone(),
     };
-    let _t = Instant::now(); let (attn_out_claim, attn_v_claim) =
-        verify_linear_attention(&proof.attn_proof, inst_attn, &attn_io, transcript)?;
+    let _t = Instant::now(); let (_attn_out_claim, attn_v_claim) =
+        verify_linear_attention(&proof.attn_proof, inst_attn, &attn_io, Some(o_x_claim.clone()), transcript)?;
     eprintln!("[block] attn:       {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
-
-    // --- 4. Output Projection ---
-    let o_io = ProjectionIOCommitments { x_com: proof.out_inner_com.clone() };
-    let _t = Instant::now(); let (o_y_claim, o_x_claim) = verify_projection(&proof.o_proj_proof, &vk.o_vk, &o_io, transcript, proj_acc_w, proj_acc_b)?;
-    eprintln!("[block] o_proj:     {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // =========================================================================
     // Residual Connection 1: X_mid = X_in + Out_attn (homomorphic, no transcript)
@@ -151,19 +152,15 @@ pub fn verify_transformer_block(
     eprintln!("[block] ffn:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // --- 7. GKR Combine Proofs (multi-claim) + Direct Opens (single-claim) ---
-    // For 3 multi-claim combines, defer sumcheck + Hyrax openings.
-    // For 5 single-claim opens, use claim point directly.
-    // Then batch all 8 openings into 2 MSMs via hyrax_verify_multi_point.
+    // out_inner_com and out_inner_combine are ELIMINATED via GKR backward fusion:
+    // O_proj's x_claim and attention's external_out_claim share the same eval point.
+    // Remaining: 1 combine (v_com) + 6 direct opens = 7 total Hyrax ops.
     let _t = Instant::now();
     let (v_r, v_f) = verify_combine_deferred(
         &proof.v_combine, &proof.v_com,
         &[v_y_claim.clone(), attn_v_claim.clone()], td_num_vars, transcript,
     ).map_err(|e| format!("v_combine: {e}"))?;
-    let (oi_r, oi_f) = verify_combine_deferred(
-        &proof.out_inner_combine, &proof.out_inner_com,
-        &[attn_out_claim.clone(), o_x_claim.clone()], td_num_vars, transcript,
-    ).map_err(|e| format!("out_inner_combine: {e}"))?;
-    // Batch all 8 Hyrax openings: 6 direct opens + 2 deferred combine opens
+    // Batch 7 Hyrax openings: 6 direct opens + 1 deferred combine open
     let (_, _, combine_params) = params_from_vars(td_num_vars);
     hyrax_verify_multi_point(
         &[
@@ -174,7 +171,6 @@ pub fn verify_transformer_block(
             (&proof.x_norm2_com,   ffn_x_claim.value,     &ffn_x_claim.point,     &proof.x_norm2_open),
             (&proof.out_ffn_com,   ffn_y_claim.value,     &ffn_y_claim.point,     &proof.out_ffn_open),
             (&proof.v_com,         v_f,  &v_r,  &proof.v_combine.hyrax_proof),
-            (&proof.out_inner_com, oi_f, &oi_r, &proof.out_inner_combine.hyrax_proof),
         ],
         &combine_params,
         transcript,
@@ -313,7 +309,7 @@ pub fn verify(
 
     // 4. LM Head Verification
     let _t = Instant::now();
-    let lm_io = ProjectionIOCommitments { x_com: proof.final_ln_out_com.clone() };
+    let lm_io = ProjectionIOCommitments { x_com: Some(proof.final_ln_out_com.clone()) };
     verify_projection(&proof.lm_head_proof, &vk.lm_head_vk, &lm_io, transcript, &mut lmh_acc_w, &mut lmh_acc_b)
         .map_err(|e| format!("LM Head failed: {}", e))?;
     eprintln!("[model] lm_head:    {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);

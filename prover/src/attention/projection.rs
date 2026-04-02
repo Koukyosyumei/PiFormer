@@ -29,9 +29,10 @@ use crate::transcript::{challenge_vec, Transcript};
 // ---------------------------------------------------------------------------
 
 /// IO Commitments for the projection layer.
-/// Only x_com is needed — y is verified via GKR claim threading.
+/// x_com is optional: when None (GKR backward mode), the input is not committed
+/// independently — the binding comes from the sumcheck argument itself.
 pub struct ProjectionIOCommitments {
-    pub x_com: HyraxCommitment,
+    pub x_com: Option<HyraxCommitment>,
 }
 
 /// Preprocessing Key for the Verifier.
@@ -153,9 +154,12 @@ pub fn prove_projection(
     let (nu_w, sigma_w, _) = params_from_vars(in_bits + out_bits);
     let (nu_b, sigma_b, _) = params_from_vars(out_bits);
 
-    // 1. Absorb (y_com removed — y is verified via combine)
+    // 1. Absorb static weight commitments. x_com is only absorbed if present
+    //    (GKR backward: when x_com is None, x is bound by the sumcheck itself).
     absorb_com(transcript, b"w_com", &pk.vk.w_com);
-    absorb_com(transcript, b"x_com", &io_coms.x_com);
+    if let Some(ref xc) = io_coms.x_com {
+        absorb_com(transcript, b"x_com", xc);
+    }
     transcript.append_field(b"alpha", &pk.vk.alpha);
     absorb_com(transcript, b"bias_com", &pk.vk.bias_com);
 
@@ -219,9 +223,11 @@ pub fn verify_projection(
     let in_bits = vk.d_in.next_power_of_two().trailing_zeros() as usize;
     let out_bits = vk.d_out.next_power_of_two().trailing_zeros() as usize;
 
-    // 1. Absorb (mirrors prover — y_com removed)
+    // 1. Absorb (mirrors prover — y_com removed; x_com optional in GKR backward mode)
     absorb_com(transcript, b"w_com", &vk.w_com);
-    absorb_com(transcript, b"x_com", &io_coms.x_com);
+    if let Some(ref xc) = io_coms.x_com {
+        absorb_com(transcript, b"x_com", xc);
+    }
     transcript.append_field(b"alpha", &vk.alpha);
     absorb_com(transcript, b"bias_com", &vk.bias_com);
 
@@ -560,11 +566,11 @@ mod projection_full_tests {
             ProjectionProvingKey { vk, w, bias },
             ProjectionWitness { x, y },
             ProjectionIOCommitments {
-                x_com: hyrax_commit(
+                x_com: Some(hyrax_commit(
                     &x_mle.evaluations,
                     params_from_vars(x_mle.num_vars).0,
                     &params_from_vars(x_mle.num_vars).2,
-                ),
+                )),
             },
         )
     }
