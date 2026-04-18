@@ -302,10 +302,6 @@ pub fn prove_transformer_block(
     let out_ffn_evals = mat_evals(&witness.ffn_wit.y, t, d);
     let out_ffn_open = hyrax_open(&out_ffn_evals, &ffn_y_claim.point, nu_td, sigma_td);
 
-    // Advance transcript to match verifier's hyrax_verify_multi_point lambda challenge.
-    // (hyrax_open is transcript-free, so we just burn one field challenge here.)
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_mp_lambda");
-
     Ok(TransformerBlockProof {
         ln1_proof,
         qkv_proj_proof,
@@ -461,7 +457,9 @@ pub fn prove(
     let (lm_head_proof, _, _) =
         prove_projection(&pk.lm_head_pk, &witness.lm_head_wit, &lm_io, transcript)?;
 
-    // Advance transcript to match verifier's 9 accumulator finalizations.
+    // Advance transcript to match verifier's 10 accumulator finalizations.
+    // inter_acc (layer-folded intermediate opens) is finalized BEFORE the weight accs.
+    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // inter_acc (layer folding)
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // ln_acc_t
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // ln_acc_td
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // proj_acc_w (QKVO)
@@ -912,6 +910,7 @@ mod tests {
         let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
+        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -928,12 +927,15 @@ mod tests {
             &mut acc_range_sig,
             &mut acc_range_y,
             &mut acc_range_m,
+            &mut inter_acc,
         );
-        assert!(
-            result.is_ok(),
-            "Block verification failed: {:?}",
-            result.err()
-        );
+        assert!(result.is_ok(), "Block verification failed: {:?}", result.err());
+        // Finalize layer-folding accumulator to run the deferred MSM check.
+        let t_bits = T.next_power_of_two().trailing_zeros() as usize;
+        let d_bits = D.next_power_of_two().trailing_zeros() as usize;
+        let (_, _, params_td) = crate::pcs::params_from_vars(t_bits + d_bits);
+        inter_acc.finalize(&params_td, &mut vt)
+            .expect("inter_acc finalize failed");
     }
 
     /// Passing the wrong x_out_com must trigger the residual-connection binding check.
@@ -975,6 +977,7 @@ mod tests {
         let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
+        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -991,7 +994,9 @@ mod tests {
             &mut acc_range_sig,
             &mut acc_range_y,
             &mut acc_range_m,
+            &mut inter_acc,
         );
+        // Error comes from the residual commitment check, before inter_acc is finalized.
         assert!(result.is_err(), "Should reject wrong x_out_com");
     }
 
@@ -1030,6 +1035,7 @@ mod tests {
         let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
+        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -1046,7 +1052,9 @@ mod tests {
             &mut acc_range_sig,
             &mut acc_range_y,
             &mut acc_range_m,
+            &mut inter_acc,
         );
+        // Error comes from LN1 sub-verifier (step 1), before any inter_acc entries.
         assert!(result.is_err(), "Should reject tampered LN1 proof");
     }
 
@@ -1092,6 +1100,7 @@ mod tests {
         let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
+        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -1108,8 +1117,16 @@ mod tests {
             &mut acc_range_sig,
             &mut acc_range_y,
             &mut acc_range_m,
+            &mut inter_acc,
         );
-        assert!(result.is_err(), "Should reject tampered x_norm1_com");
+        // The inner-product check in add_verify passes (w' is from the original data),
+        // but the MSM check is deferred to finalize — that is where the tampered
+        // commitment is caught.
+        let t_bits = T.next_power_of_two().trailing_zeros() as usize;
+        let d_bits = D.next_power_of_two().trailing_zeros() as usize;
+        let (_, _, params_td) = crate::pcs::params_from_vars(t_bits + d_bits);
+        let final_result = result.and_then(|_| inter_acc.finalize(&params_td, &mut vt));
+        assert!(final_result.is_err(), "Should reject tampered x_norm1_com");
     }
 
     // -----------------------------------------------------------------------

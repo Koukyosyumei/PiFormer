@@ -11,7 +11,6 @@ use crate::lookup::lasso::{verify_lasso_multi, LassoMultiInstance, LassoMultiVer
 use crate::lookup::range::verify_range_batched;
 use crate::pcs::{absorb_com, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams};
 use crate::subprotocols::verify_combine_deferred;
-use crate::pcs::hyrax_verify_multi_point;
 use crate::transcript::Transcript;
 
 // Sub-module keys and verifiers
@@ -80,6 +79,9 @@ pub fn verify_transformer_block(
     acc_range_sig: &mut HyraxBatchAccumulator,
     acc_range_y: &mut HyraxBatchAccumulator,
     acc_range_m: &mut HyraxBatchAccumulator,
+    // Layer-folding accumulator: collects all 7 intermediate opens across all blocks.
+    // Caller must finalize once after all blocks are verified (2 MSMs total vs 2L).
+    inter_acc: &mut HyraxBatchAccumulator,
 ) -> Result<(), String> {
     // =========================================================================
     // Pipeline Stitching (The Binding of IO Commitments)
@@ -185,30 +187,29 @@ pub fn verify_transformer_block(
     )?;
     eprintln!("[block] ffn:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
-    // --- 7. GKR Combine Proofs (multi-claim) + Direct Opens (single-claim) ---
-    // out_inner_com and out_inner_combine are ELIMINATED via GKR backward fusion:
-    // O_proj's x_claim and attention's external_out_claim share the same eval point.
-    // Remaining: 1 combine (v_com) + 6 direct opens = 7 total Hyrax ops.
+    // --- 7. Layer-folded intermediate opens ---
+    // All 7 per-block openings (6 direct + 1 deferred combine) are accumulated into
+    // `inter_acc` instead of being batch-verified immediately with hyrax_verify_multi_point.
+    // The caller finalizes inter_acc once after all blocks, reducing 2L MSMs → 2 MSMs.
     let _t = Instant::now();
     let (v_r, v_f) = verify_combine_deferred(
         &proof.v_combine, &proof.v_com,
         &[v_y_claim.clone(), attn_v_claim.clone()], td_num_vars, transcript,
     ).map_err(|e| format!("v_combine: {e}"))?;
-    // Batch 7 Hyrax openings: 6 direct opens + 1 deferred combine open
-    let (_, _, combine_params) = params_from_vars(td_num_vars);
-    hyrax_verify_multi_point(
-        &[
-            (&proof.q_com,         q_y_claim.value,       &q_y_claim.point,       &proof.q_open),
-            (&proof.k_com,         k_y_claim.value,       &k_y_claim.point,       &proof.k_open),
-            (&proof.x_norm1_com,   x_norm1_claim.value,   &x_norm1_claim.point,   &proof.x_norm1_open),
-            (&proof.out_attn_com,  o_y_claim.value,       &o_y_claim.point,       &proof.out_attn_open),
-            (&proof.x_norm2_com,   ffn_x_claim.value,     &ffn_x_claim.point,     &proof.x_norm2_open),
-            (&proof.out_ffn_com,   ffn_y_claim.value,     &ffn_y_claim.point,     &proof.out_ffn_open),
-            (&proof.v_com,         v_f,  &v_r,  &proof.v_combine.hyrax_proof),
-        ],
-        &combine_params,
-        transcript,
-    ).map_err(|e| format!("combine batch: {e}"))?;
+    inter_acc.add_verify(&proof.q_com,        q_y_claim.value,     &q_y_claim.point,     &proof.q_open)
+        .map_err(|e| format!("q_open inter: {e}"))?;
+    inter_acc.add_verify(&proof.k_com,        k_y_claim.value,     &k_y_claim.point,     &proof.k_open)
+        .map_err(|e| format!("k_open inter: {e}"))?;
+    inter_acc.add_verify(&proof.x_norm1_com,  x_norm1_claim.value, &x_norm1_claim.point, &proof.x_norm1_open)
+        .map_err(|e| format!("x_norm1 inter: {e}"))?;
+    inter_acc.add_verify(&proof.out_attn_com, o_y_claim.value,     &o_y_claim.point,     &proof.out_attn_open)
+        .map_err(|e| format!("out_attn inter: {e}"))?;
+    inter_acc.add_verify(&proof.x_norm2_com,  ffn_x_claim.value,   &ffn_x_claim.point,   &proof.x_norm2_open)
+        .map_err(|e| format!("x_norm2 inter: {e}"))?;
+    inter_acc.add_verify(&proof.out_ffn_com,  ffn_y_claim.value,   &ffn_y_claim.point,   &proof.out_ffn_open)
+        .map_err(|e| format!("out_ffn inter: {e}"))?;
+    inter_acc.add_verify(&proof.v_com,        v_f,                 &v_r,                 &proof.v_combine.hyrax_proof)
+        .map_err(|e| format!("v_com inter: {e}"))?;
     eprintln!("[block] combines:   {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // =========================================================================
@@ -308,6 +309,9 @@ pub fn verify(
     let mut acc_range_sig = HyraxBatchAccumulator::new();
     let mut acc_range_y   = HyraxBatchAccumulator::new();
     let mut acc_range_m   = HyraxBatchAccumulator::new();
+    // Layer-folding accumulator: collects 7 intermediate opens per block.
+    // Finalized once after all blocks (2 MSMs total vs 2L).
+    let mut inter_acc = HyraxBatchAccumulator::new();
 
     // 2. Block Verification Chaining
     let mut current_x_com = proof.x_in_com.clone();
@@ -336,6 +340,7 @@ pub fn verify(
             &mut acc_range_sig,
             &mut acc_range_y,
             &mut acc_range_m,
+            &mut inter_acc,
         )
         .map_err(|e| format!("Block {} failed: {}", i, e))?;
 
@@ -389,8 +394,12 @@ pub fn verify(
         .map_err(|e| format!("LM Head failed: {}", e))?;
     eprintln!("[model] lm_head:    {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
-    // Finalize all 9 accumulators (each adds hyrax_group_mu to transcript)
+    // Finalize all 10 accumulators (each adds hyrax_group_mu to transcript).
+    // inter_acc is first — matches the prover's burn order.
     let _tacc = Instant::now();
+    // Layer-folding: 7×L intermediate opens → 2 MSMs total.
+    inter_acc.finalize(&params_td, transcript)
+        .map_err(|e| format!("inter_acc finalize: {e}"))?;
     ln_acc_t.finalize(&params_t, transcript)?;
     ln_acc_td.finalize(&params_td, transcript)?;
     proj_acc_w.finalize(&params_qkvo_w, transcript)?;
