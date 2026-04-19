@@ -827,7 +827,7 @@ mod layernorm_tests {
         let mut pt = Transcript::new(b"layernorm_test");
         let (mut range_proofs, global_m, r_vs) = prove_range_batched(
             &[&rw.sigma_witness, &rw.y_witness],
-            16,
+            32,
             &mut pt,
         )
         .unwrap();
@@ -859,7 +859,7 @@ mod layernorm_tests {
             &[sigma_rp_ref, y_rp_ref],
             &global_m,
             &[sigma_n_vars, y_n_vars],
-            16,
+            32,
             &mut vt,
             &mut acc_range_sig,
             &mut acc_range_y,
@@ -915,7 +915,7 @@ mod layernorm_tests {
         let y_n_vars = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
         let mut pt = Transcript::new(b"layernorm_test");
         let (mut range_proofs, global_m, r_vs) =
-            prove_range_batched(&[&rw.sigma_witness, &rw.y_witness], 16, &mut pt).unwrap();
+            prove_range_batched(&[&rw.sigma_witness, &rw.y_witness], 32, &mut pt).unwrap();
         let y_rp = range_proofs.remove(1);
         let sigma_rp = range_proofs.remove(0);
         if let Ok(proof) = prove_layernorm(
@@ -939,7 +939,7 @@ mod layernorm_tests {
                 &[&proof.sigma_range_proof, &proof.y_range_proof],
                 &global_m,
                 &[sigma_n_vars, y_n_vars],
-                16,
+                32,
                 &mut vt,
                 &mut acc_range_sig,
                 &mut acc_range_y,

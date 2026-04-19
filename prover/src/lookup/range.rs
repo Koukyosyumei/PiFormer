@@ -643,7 +643,6 @@ pub fn verify_range_batched(
 
     // ---- Phase 3: LogUp consistency verification ----
     let alpha = transcript.challenge_field::<F>(b"logup_alpha");
-    let (_, _, params_m) = params_from_vars(CHUNK_BITS);
 
     // Absorb all h_coms before drawing β (mirrors prover ordering)
     for proof in witness_proofs.iter() {
@@ -653,12 +652,16 @@ pub fn verify_range_batched(
     }
     let beta = transcript.challenge_field::<F>(b"logup_beta");
 
-    // Per-witness per-chunk: verify combined sumcheck and algebraic consistency
+    // Per-witness per-chunk: verify combined sumcheck and algebraic consistency.
+    // Hyrax openings are deferred to the existing batch accumulators — inner-product
+    // checks happen immediately (field ops only); G1 MSMs are batched at finalize.
     let mut total_lhs_claim = F::ZERO;
     for (i, proof) in witness_proofs.iter().enumerate() {
         let num_vars = num_vars_list[i];
         let n_padded = 1usize << num_vars;
-        let (_, _, params_c) = params_from_vars(num_vars);
+        // Route LogUp opens to the same accumulator as Phase-2 chunk opens.
+        let acc_logup: &mut HyraxBatchAccumulator =
+            if num_vars == min_nv { &mut *acc_small } else { &mut *acc_large };
 
         for c in 0..num_chunks {
             let combined = proof.logup.combined_claims[c];
@@ -682,10 +685,12 @@ pub fn verify_range_batched(
                 ));
             }
 
-            // Hyrax openings (transcript-free — immediate)
-            hyrax_verify(&proof.logup.h_coms[c], h_val, &r_k, &proof.logup.h_open_proofs[c], &params_c)
+            // Defer Hyrax opening MSMs to batch accumulator (inner-product checked above).
+            acc_logup
+                .add_verify(&proof.logup.h_coms[c], h_val, &r_k, &proof.logup.h_open_proofs[c])
                 .map_err(|e| format!("LogUp witness {i} chunk {c} h opening: {e}"))?;
-            hyrax_verify(&proof.chunk_coms[c], chunk_val, &r_k, &proof.logup.chunk_open_proofs[c], &params_c)
+            acc_logup
+                .add_verify(&proof.chunk_coms[c], chunk_val, &r_k, &proof.logup.chunk_open_proofs[c])
                 .map_err(|e| format!("LogUp witness {i} chunk {c} chunk opening: {e}"))?;
         }
     }
@@ -701,7 +706,9 @@ pub fn verify_range_batched(
         return Err("LogUp RHS sumcheck final check: M(r)*g(r) mismatch".into());
     }
 
-    hyrax_verify(&global_m.m_com, m_at_rm2, &r_m2, &global_m.logup_m_open_rm2, &params_m)
+    // Defer m_com opening at r_m2 to acc_m alongside the Phase-2 m opening.
+    acc_m
+        .add_verify(&global_m.m_com, m_at_rm2, &r_m2, &global_m.logup_m_open_rm2)
         .map_err(|e| format!("LogUp M opening at r_m2: {e}"))?;
 
     // Grand sum check: Σ claim_k == RHS

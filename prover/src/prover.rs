@@ -169,7 +169,7 @@ pub fn prove_transformer_block(
             &ln2_rw.sigma_witness,
             &ln2_rw.y_witness,
         ],
-        16,
+        32,
         transcript,
     )?;
     // Destructure in reverse order to avoid index shifting
@@ -431,7 +431,7 @@ pub fn prove(
     let final_rw = compute_range_witnesses(&witness.final_ln_wit, &pk.vk.final_ln_vk);
     let (mut final_range_proofs, final_range_m, final_r_vs) = prove_range_batched(
         &[&final_rw.sigma_witness, &final_rw.y_witness],
-        16,
+        32,
         transcript,
     )?;
     let final_y_rp   = final_range_proofs.remove(1);
