@@ -1119,6 +1119,205 @@ mod tests {
         assert!(final_result.is_err(), "Should reject tampered x_norm1_com");
     }
 
+    /// Tampering x_norm2_open (the LN2→FFN binding proof) must be detected.
+    /// Mirrors test_block_rejects_tampered_x_norm1_com for the LN2 side.
+    #[test]
+    fn test_block_rejects_tampered_x_norm2_com() {
+        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+        let x_in_com = commit_mat_test(&witness.x_in, T, D);
+
+        let mut pt = Transcript::new(b"block_tamper_xnorm2");
+        let mut proof = prove_transformer_block(
+            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
+        ).unwrap();
+
+        // Swap x_norm2_open with an unrelated proof so inter_acc MSM fails.
+        proof.x_norm2_open = proof.k_open.clone();
+
+        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
+        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
+
+        let mut vt = Transcript::new(b"block_tamper_xnorm2");
+        let mut ln_acc_t   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td  = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut inter_acc  = crate::pcs::HyraxBatchAccumulator::new();
+        let result = verify_transformer_block(
+            &proof, &x_in_com, &x_out_com, &pk.block_pks[0], &inst_attn, &inst_ffn,
+            &mut vt, &lp, &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
+            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
+        );
+        let t_bits = T.next_power_of_two().trailing_zeros() as usize;
+        let d_bits = D.next_power_of_two().trailing_zeros() as usize;
+        let (_, _, params_td) = crate::pcs::params_from_vars(t_bits + d_bits);
+        let final_result = result.and_then(|_| inter_acc.finalize(&params_td, &mut vt));
+        assert!(final_result.is_err(), "Should reject tampered x_norm2_open");
+    }
+
+    /// Replacing x_norm1_com with a commitment to a different matrix must be rejected.
+    /// Simulates a prover that commits a fraudulent LN1 output to downstream sub-provers.
+    /// The mismatch is caught inside verify_layernorm because y_com (= x_norm1_com) is
+    /// absorbed into the transcript, causing all subsequent challenges to diverge.
+    #[test]
+    fn test_block_rejects_fraudulent_ln1_output() {
+        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+        let x_in_com = commit_mat_test(&witness.x_in, T, D);
+
+        let mut pt = Transcript::new(b"block_fraud_ln1");
+        let mut proof = prove_transformer_block(
+            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
+        ).unwrap();
+
+        // Replace x_norm1_com with a commitment to different values.
+        proof.x_norm1_com = commit_mat_test(
+            &vec![vec![F::from(1u64), F::from(2u64)]; T], T, D,
+        );
+
+        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
+        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
+
+        let mut vt = Transcript::new(b"block_fraud_ln1");
+        let mut ln_acc_t   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td  = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut inter_acc  = crate::pcs::HyraxBatchAccumulator::new();
+        // Transcript diverges at LN1's y_com absorption → sub-verifier fails immediately.
+        let result = verify_transformer_block(
+            &proof, &x_in_com, &x_out_com, &pk.block_pks[0], &inst_attn, &inst_ffn,
+            &mut vt, &lp, &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
+            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
+        );
+        assert!(result.is_err(), "Should reject fraudulent LN1 output commitment");
+    }
+
+    /// Replacing x_norm2_com with a different commitment must be rejected.
+    /// Simulates a prover that commits a fraudulent LN2 output to the FFN.
+    #[test]
+    fn test_block_rejects_fraudulent_ln2_output() {
+        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+        let x_in_com = commit_mat_test(&witness.x_in, T, D);
+
+        let mut pt = Transcript::new(b"block_fraud_ln2");
+        let mut proof = prove_transformer_block(
+            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
+        ).unwrap();
+
+        // Replace x_norm2_com with a commitment to different values.
+        proof.x_norm2_com = commit_mat_test(
+            &vec![vec![F::from(3u64), F::from(4u64)]; T], T, D,
+        );
+
+        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
+        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
+
+        let mut vt = Transcript::new(b"block_fraud_ln2");
+        let mut ln_acc_t   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td  = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut inter_acc  = crate::pcs::HyraxBatchAccumulator::new();
+        // Transcript diverges at LN2's y_com absorption → sub-verifier fails immediately.
+        let result = verify_transformer_block(
+            &proof, &x_in_com, &x_out_com, &pk.block_pks[0], &inst_attn, &inst_ffn,
+            &mut vt, &lp, &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
+            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
+        );
+        assert!(result.is_err(), "Should reject fraudulent LN2 output commitment");
+    }
+
+    /// Tampering the y opening inside the LN1 sub-proof must trigger "sigma_y binding failed".
+    /// This catches the core soundness bug fixed by sigma_y_com: a prover that inflates y
+    /// to pass range checks but provides the wrong sigma*y product in the sumcheck.
+    #[test]
+    fn test_block_rejects_tampered_ln1_sigma_y_binding() {
+        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+        let x_in_com = commit_mat_test(&witness.x_in, T, D);
+
+        let mut pt = Transcript::new(b"block_tamper_sy_ln1");
+        let mut proof = prove_transformer_block(
+            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
+        ).unwrap();
+
+        // Perturb the y_at_rf_sy opening: sigma_y_at_rf_val = sigma * (y+1) ≠ correct product.
+        proof.ln1_proof.openings.y_at_rf_sy =
+            proof.ln1_proof.openings.y_at_rf_sy.map(|v| v + F::ONE);
+
+        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
+        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
+
+        let mut vt = Transcript::new(b"block_tamper_sy_ln1");
+        let mut ln_acc_t   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td  = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut inter_acc  = crate::pcs::HyraxBatchAccumulator::new();
+        let result = verify_transformer_block(
+            &proof, &x_in_com, &x_out_com, &pk.block_pks[0], &inst_attn, &inst_ffn,
+            &mut vt, &lp, &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
+            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
+        );
+        assert!(result.is_err(), "Should reject tampered y_at_rf_sy (sigma_y binding)");
+    }
+
+    /// Tampering the QKV x_eval must fail the algebraic relation check.
+    /// This catches a prover that claims a wrong x_norm1 value for the QKV sumcheck.
+    #[test]
+    fn test_block_rejects_tampered_qkv_x_eval() {
+        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+        let x_in_com = commit_mat_test(&witness.x_in, T, D);
+
+        let mut pt = Transcript::new(b"block_tamper_qkv_x");
+        let mut proof = prove_transformer_block(
+            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
+        ).unwrap();
+
+        // Shift x_eval: final_val = x_eval * combined_w no longer holds.
+        proof.qkv_proj_proof.openings.x_eval += F::ONE;
+
+        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
+        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
+
+        let mut vt = Transcript::new(b"block_tamper_qkv_x");
+        let mut ln_acc_t   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut ln_acc_td  = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
+        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_y   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut acc_range_m   = crate::pcs::HyraxBatchAccumulator::new();
+        let mut inter_acc  = crate::pcs::HyraxBatchAccumulator::new();
+        let result = verify_transformer_block(
+            &proof, &x_in_com, &x_out_com, &pk.block_pks[0], &inst_attn, &inst_ffn,
+            &mut vt, &lp, &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
+            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
+        );
+        assert!(result.is_err(), "Should reject tampered QKV x_eval");
+    }
+
     // -----------------------------------------------------------------------
     // prove (model-level) / verify (model-level) tests
     // -----------------------------------------------------------------------
