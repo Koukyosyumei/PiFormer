@@ -275,7 +275,9 @@ pub struct BatchedQKVProjectionWitness {
 }
 
 pub struct BatchedQKVProjectionIOCommitments {
-    pub x_com: HyraxCommitment,
+    /// None = GKR backward mode: x_norm1 is not committed externally; binding comes
+    /// from the downstream LayerNorm proof that opens y_com at the returned x_norm1_claim.
+    pub x_com: Option<HyraxCommitment>,
 }
 
 pub struct BatchedQKVProjectionOpenings {
@@ -336,11 +338,13 @@ pub fn prove_qkv_projections(
     let (nu_w, sigma_w, _) = params_from_vars(in_bits + out_bits);
     let (nu_b, sigma_b, _) = params_from_vars(out_bits);
 
-    // 1. Absorb all static commitments
+    // 1. Absorb all static commitments (x_com optional: None = GKR backward mode)
     absorb_com(transcript, b"qkv_w_q_com", &pk_q.vk.w_com);
     absorb_com(transcript, b"qkv_w_k_com", &pk_k.vk.w_com);
     absorb_com(transcript, b"qkv_w_v_com", &pk_v.vk.w_com);
-    absorb_com(transcript, b"qkv_x_com", &io_coms.x_com);
+    if let Some(ref xc) = io_coms.x_com {
+        absorb_com(transcript, b"qkv_x_com", xc);
+    }
     transcript.append_field(b"qkv_alpha_q", &pk_q.vk.alpha);
     transcript.append_field(b"qkv_alpha_k", &pk_k.vk.alpha);
     transcript.append_field(b"qkv_alpha_v", &pk_v.vk.alpha);
@@ -445,11 +449,13 @@ pub fn verify_qkv_projections(
     let in_bits = vk_q.d_in.next_power_of_two().trailing_zeros() as usize;
     let out_bits = vk_q.d_out.next_power_of_two().trailing_zeros() as usize;
 
-    // 1. Absorb (mirrors prover)
+    // 1. Absorb (mirrors prover — x_com optional in GKR backward mode)
     absorb_com(transcript, b"qkv_w_q_com", &vk_q.w_com);
     absorb_com(transcript, b"qkv_w_k_com", &vk_k.w_com);
     absorb_com(transcript, b"qkv_w_v_com", &vk_v.w_com);
-    absorb_com(transcript, b"qkv_x_com", &io_coms.x_com);
+    if let Some(ref xc) = io_coms.x_com {
+        absorb_com(transcript, b"qkv_x_com", xc);
+    }
     transcript.append_field(b"qkv_alpha_q", &vk_q.alpha);
     transcript.append_field(b"qkv_alpha_k", &vk_k.alpha);
     transcript.append_field(b"qkv_alpha_v", &vk_v.alpha);

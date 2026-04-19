@@ -32,7 +32,9 @@ use crate::transcript::{challenge_vec, Transcript};
 
 /// Trusted IO Commitments provided by the Global Pipeline Verifier.
 pub struct FFNIOCommitments {
-    pub x_com: HyraxCommitment,
+    /// None = GKR backward mode: x_norm2 not committed externally; binding comes from
+    /// the downstream LayerNorm that opens y_com at the returned x_claim.
+    pub x_com: Option<HyraxCommitment>,
     pub y_com: HyraxCommitment,
 }
 
@@ -179,10 +181,12 @@ pub fn prove_ffn(
     let (nu_w1, sigma_w1, _) = params_from_vars(d_bits + f_bits);
     let (nu_w2, sigma_w2, _) = params_from_vars(f_bits + d_bits);
 
-    // 1. Absorb Trusted IO & VK Commitments
+    // 1. Absorb Trusted IO & VK Commitments (x_com optional: None = GKR backward mode)
     absorb_com(transcript, b"w1_com", &pk.vk.w1_com);
     absorb_com(transcript, b"w2_com", &pk.vk.w2_com);
-    absorb_com(transcript, b"x_com", &io_coms.x_com);
+    if let Some(ref xc) = io_coms.x_com {
+        absorb_com(transcript, b"x_com", xc);
+    }
     absorb_com(transcript, b"y_com", &io_coms.y_com);
 
     // 2. GKR backward: run Lasso FIRST to commit A (outputs) before rx_y is sampled.
@@ -279,10 +283,12 @@ pub fn verify_ffn(
 
     let (_, _, params_mf) = params_from_vars(t_bits + f_bits);
 
-    // 1. Absorb Trusted IO & VK Commitments (no a_com — GKR backward eliminates it)
+    // 1. Absorb Trusted IO & VK Commitments (x_com optional in GKR backward mode)
     absorb_com(transcript, b"w1_com", &vk.w1_com);
     absorb_com(transcript, b"w2_com", &vk.w2_com);
-    absorb_com(transcript, b"x_com", &io_coms.x_com);
+    if let Some(ref xc) = io_coms.x_com {
+        absorb_com(transcript, b"x_com", xc);
+    }
     absorb_com(transcript, b"y_com", &io_coms.y_com);
 
     // 2. GKR backward: verify Lasso FIRST to bind A (outputs) before rx_y is sampled.
@@ -445,7 +451,7 @@ mod ffn_tests {
                 + d.next_power_of_two().trailing_zeros() as usize,
         );
         let io_coms = FFNIOCommitments {
-            x_com: hyrax_commit(&x_mle.evaluations, nu_x, &params_x),
+            x_com: Some(hyrax_commit(&x_mle.evaluations, nu_x, &params_x)),
             y_com: hyrax_commit(&y_mle.evaluations, nu_x, &params_x),
         };
 

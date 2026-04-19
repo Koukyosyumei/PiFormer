@@ -431,13 +431,26 @@ fn read_global_range_m<R: Read>(r: &mut R) -> io::Result<GlobalRangeM> {
 fn write_ln_internal_coms<W: Write>(w: &mut W, c: &LayerNormInternalCommitments) -> io::Result<()> {
     write_hyrax_commitment(w, &c.sum_x_com)?;
     write_hyrax_commitment(w, &c.sigma_com)?;
-    write_hyrax_commitment(w, &c.sq_sum_x_com)
+    write_hyrax_commitment(w, &c.sq_sum_x_com)?;
+    // y_com: present only in GKR backward mode (io_coms.y_com was None)
+    let has_y = c.y_com.is_some();
+    write_bool(w, has_y)?;
+    if let Some(ref yc) = c.y_com {
+        write_hyrax_commitment(w, yc)?;
+    }
+    Ok(())
 }
 fn read_ln_internal_coms<R: Read>(r: &mut R) -> io::Result<LayerNormInternalCommitments> {
+    let sum_x_com = read_hyrax_commitment(r)?;
+    let sigma_com = read_hyrax_commitment(r)?;
+    let sq_sum_x_com = read_hyrax_commitment(r)?;
+    let has_y = read_bool(r)?;
+    let y_com = if has_y { Some(read_hyrax_commitment(r)?) } else { None };
     Ok(LayerNormInternalCommitments {
-        sum_x_com: read_hyrax_commitment(r)?,
-        sigma_com: read_hyrax_commitment(r)?,
-        sq_sum_x_com: read_hyrax_commitment(r)?,
+        sum_x_com,
+        sigma_com,
+        sq_sum_x_com,
+        y_com,
     })
 }
 
@@ -474,6 +487,13 @@ fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<(
     write_ep!(w, &o.sum_x_at_rf_sig, &o.sum_x_at_rf_sig_proof);
     // sigma_sq binding
     write_ep!(w, &o.sigma_at_rf_sigma_sq, &o.sigma_at_rf_sigma_sq_proof);
+    // GKR backward: optional external y opening
+    let has_ext = o.external_y_eval.is_some();
+    write_bool(w, has_ext)?;
+    if has_ext {
+        write_f(w, o.external_y_eval.as_ref().unwrap())?;
+        write_hyrax_proof(w, o.external_y_proof.as_ref().unwrap())?;
+    }
     Ok(())
 }
 fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
@@ -508,6 +528,12 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
     let (sigma_at_rf_sy_t, sigma_at_rf_sy_t_proof) = read_ep!(r);
     let (sum_x_at_rf_sig, sum_x_at_rf_sig_proof) = read_ep!(r);
     let (sigma_at_rf_sigma_sq, sigma_at_rf_sigma_sq_proof) = read_ep!(r);
+    let has_ext = read_bool(r)?;
+    let (external_y_eval, external_y_proof) = if has_ext {
+        (Some(read_f(r)?), Some(read_hyrax_proof(r)?))
+    } else {
+        (None, None)
+    };
     Ok(LayerNormOpenings {
         sum_x_at_rt,
         sq_sum_x_at_rt,
@@ -539,6 +565,8 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
         sum_x_at_rf_sig_proof,
         sigma_at_rf_sigma_sq,
         sigma_at_rf_sigma_sq_proof,
+        external_y_eval,
+        external_y_proof,
     })
 }
 
@@ -808,55 +836,55 @@ fn read_combine_proof<R: Read>(r: &mut R) -> io::Result<CombineProof> {
 // ---------------------------------------------------------------------------
 
 fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Result<()> {
-    write_ln_proof(w, &p.ln1_proof)?;
+    // GKR backward ordering: QKV before LN1, FFN before LN2
     write_batched_qkv_proof(w, &p.qkv_proj_proof)?;
+    write_ln_proof(w, &p.ln1_proof)?;
     // GKR backward: O_proj written before attn (transcript order matches prover)
     write_proj_proof(w, &p.o_proj_proof)?;
     write_attn_proof(w, &p.attn_proof)?;
-    write_ln_proof(w, &p.ln2_proof)?;
     write_ffn_proof(w, &p.ffn_proof)?;
-    write_hyrax_commitment(w, &p.x_norm1_com)?;
+    write_ln_proof(w, &p.ln2_proof)?;
+    // x_norm1_com: eliminated — binding via LN1 internal y_com
     write_hyrax_commitment(w, &p.q_com)?;
     write_hyrax_commitment(w, &p.k_com)?;
     write_hyrax_commitment(w, &p.v_com)?;
-    // out_inner_com: eliminated via GKR backward fusion (no field to write)
+    // out_inner_com: eliminated via GKR backward fusion
     write_hyrax_commitment(w, &p.out_attn_com)?;
-    write_hyrax_commitment(w, &p.x_norm2_com)?;
+    // x_norm2_com: eliminated — binding via LN2 internal y_com
     write_hyrax_commitment(w, &p.out_ffn_com)?;
     write_hyrax_proof(w, &p.q_open)?;
     write_hyrax_proof(w, &p.k_open)?;
     write_combine_proof(w, &p.v_combine)?;
-    // out_inner_combine: eliminated via GKR backward fusion (no field to write)
-    write_hyrax_proof(w, &p.x_norm1_open)?;
+    // x_norm1_open: eliminated
     write_hyrax_proof(w, &p.out_attn_open)?;
-    write_hyrax_proof(w, &p.x_norm2_open)?;
+    // x_norm2_open: eliminated
     write_hyrax_proof(w, &p.out_ffn_open)?;
     write_global_range_m(w, &p.block_range_m)
 }
 fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
     Ok(TransformerBlockProof {
-        ln1_proof: read_ln_proof(r)?,
+        // GKR backward ordering: QKV before LN1, FFN before LN2
         qkv_proj_proof: read_batched_qkv_proof(r)?,
+        ln1_proof: read_ln_proof(r)?,
         // GKR backward: O_proj read before attn
         o_proj_proof: read_proj_proof(r)?,
         attn_proof: read_attn_proof(r)?,
-        ln2_proof: read_ln_proof(r)?,
         ffn_proof: read_ffn_proof(r)?,
-        x_norm1_com: read_hyrax_commitment(r)?,
+        ln2_proof: read_ln_proof(r)?,
+        // x_norm1_com: eliminated
         q_com: read_hyrax_commitment(r)?,
         k_com: read_hyrax_commitment(r)?,
         v_com: read_hyrax_commitment(r)?,
         // out_inner_com: eliminated via GKR backward fusion
         out_attn_com: read_hyrax_commitment(r)?,
-        x_norm2_com: read_hyrax_commitment(r)?,
+        // x_norm2_com: eliminated
         out_ffn_com: read_hyrax_commitment(r)?,
         q_open: read_hyrax_proof(r)?,
         k_open: read_hyrax_proof(r)?,
         v_combine: read_combine_proof(r)?,
-        // out_inner_combine: eliminated via GKR backward fusion
-        x_norm1_open: read_hyrax_proof(r)?,
+        // x_norm1_open: eliminated
         out_attn_open: read_hyrax_proof(r)?,
-        x_norm2_open: read_hyrax_proof(r)?,
+        // x_norm2_open: eliminated
         out_ffn_open: read_hyrax_proof(r)?,
         block_range_m: read_global_range_m(r)?,
     })

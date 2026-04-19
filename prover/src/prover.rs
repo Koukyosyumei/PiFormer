@@ -65,14 +65,14 @@ pub struct TransformerBlockProof {
     pub ln2_proof: LayerNormProof,
     pub ffn_proof: FFNProof,
 
-    // Intermediate IO Commitments (out_inner_com eliminated via GKR backward fusion)
-    pub x_norm1_com: HyraxCommitment,
+    // Intermediate IO Commitments
+    // x_norm1_com: eliminated — LN1 commits y internally (GKR backward from QKV)
     pub q_com: HyraxCommitment,
     pub k_com: HyraxCommitment,
     pub v_com: HyraxCommitment,
     // out_inner_com: eliminated — out_inner bound by shared sumcheck claim
     pub out_attn_com: HyraxCommitment,
-    pub x_norm2_com: HyraxCommitment,
+    // x_norm2_com: eliminated — LN2 commits y internally (GKR backward from FFN)
     pub out_ffn_com: HyraxCommitment,
 
     /// Direct Hyrax opening of q_com at the Q-projection y_claim point.
@@ -82,12 +82,10 @@ pub struct TransformerBlockProof {
     /// Verifies v_com: 2 claims — V-projection y_claim + attention v_claim.
     pub v_combine: CombineProof,
     // out_inner_combine: eliminated — no out_inner_com to combine
-    /// Direct Hyrax opening of x_norm1_com at the shared batched-QKV x_claim point.
-    pub x_norm1_open: HyraxProof,
+    // x_norm1_open: eliminated — LN1 internally opens its y_com at QKV's x_norm1_claim
     /// Direct Hyrax opening of out_attn_com at the O-projection y_claim point.
     pub out_attn_open: HyraxProof,
-    /// Direct Hyrax opening of x_norm2_com at the FFN x_claim point.
-    pub x_norm2_open: HyraxProof,
+    // x_norm2_open: eliminated — LN2 internally opens its y_com at FFN's x_norm2_claim
     /// Direct Hyrax opening of out_ffn_com at the FFN y_claim point.
     pub out_ffn_open: HyraxProof,
 
@@ -139,14 +137,14 @@ pub fn prove_transformer_block(
         hyrax_commit(&mle.evaluations, nu, &params)
     };
 
-    // 1. Generate Intermediate IO Commitments (out_inner_com eliminated via GKR backward)
-    let x_norm1_com = commit_mat(&witness.ln1_wit.y, t, d);
+    // 1. Generate Intermediate IO Commitments
+    // x_norm1_com: NOT committed — LN1 commits y internally (GKR backward from QKV)
     let q_com = commit_mat(&witness.attn_wit.q, t, d);
     let k_com = commit_mat(&witness.attn_wit.k, t, d);
     let v_com = commit_mat(&witness.attn_wit.v, t, d);
     // out_inner_com: NOT committed — bound by shared sumcheck claim (GKR backward)
     let out_attn_com = commit_mat(&witness.o_proj_wit.y, t, d);
-    let x_norm2_com = commit_mat(&witness.ln2_wit.y, t, d);
+    // x_norm2_com: NOT committed — LN2 commits y internally (GKR backward from FFN)
     let out_ffn_com = commit_mat(&witness.ffn_wit.y, t, d);
 
     // Helper: variables for t×d matrices
@@ -182,11 +180,26 @@ pub fn prove_transformer_block(
     let ln1_sig_rv  = block_r_vs[0].clone();
     let _ = (ln1_sigma_n, ln1_y_n); // used only for verifier num_vars
 
-    // 3. Execute Sub-Provers with strictly bound IO Commitments
-    // --- LayerNorm 1 ---
+    // 3. Execute Sub-Provers with strictly bound IO Commitments.
+    //    GKR backward ordering: QKV runs before LN1 (produces x_norm1_claim),
+    //    FFN runs before LN2 (produces x_norm2_claim = ffn_x_claim).
+
+    // --- Batched Q, K, V Projections (runs FIRST — GKR backward for x_norm1) ---
+    // x_com is None: x_norm1 is not committed externally; LN1 will commit and open y.
+    let qkv_wit = BatchedQKVProjectionWitness {
+        x: witness.ln1_wit.y.clone(),
+        q: witness.q_proj_wit.y.clone(),
+        k: witness.k_proj_wit.y.clone(),
+        v: witness.v_proj_wit.y.clone(),
+    };
+    let qkv_io = BatchedQKVProjectionIOCommitments { x_com: None };
+    let (qkv_proj_proof, q_y_claim, k_y_claim, v_y_claim, x_norm1_claim) =
+        prove_qkv_projections(&pk.q_pk, &pk.k_pk, &pk.v_pk, &qkv_wit, &qkv_io, transcript)?;
+
+    // --- LayerNorm 1 (runs SECOND — proves y = x_norm1 and y(x_norm1_claim.point) = claim.value) ---
     let ln1_io = LayerNormIOCommitments {
         x_com: x_in_com.clone(),
-        y_com: x_norm1_com.clone(),
+        y_com: None, // committed internally; GKR backward from QKV
     };
     let ln1_proof = prove_layernorm(
         &witness.ln1_wit,
@@ -194,19 +207,9 @@ pub fn prove_transformer_block(
         &pk.ln1_vk,
         (ln1_sig_rp, ln1_sig_rv),
         (ln1_y_rp, ln1_y_rv),
+        Some(x_norm1_claim.clone()),
         transcript,
     )?;
-
-    // --- Batched Q, K, V Projections — one sumcheck, single r_k ---
-    let qkv_wit = BatchedQKVProjectionWitness {
-        x: witness.ln1_wit.y.clone(),
-        q: witness.q_proj_wit.y.clone(),
-        k: witness.k_proj_wit.y.clone(),
-        v: witness.v_proj_wit.y.clone(),
-    };
-    let qkv_io = BatchedQKVProjectionIOCommitments { x_com: x_norm1_com.clone() };
-    let (qkv_proj_proof, q_y_claim, k_y_claim, v_y_claim, x_norm1_claim) =
-        prove_qkv_projections(&pk.q_pk, &pk.k_pk, &pk.v_pk, &qkv_wit, &qkv_io, transcript)?;
 
     // --- GKR backward fusion: O_proj runs BEFORE attention ---
     // O_proj's x_claim gives an evaluation of out_inner at a transcript-derived point.
@@ -232,24 +235,11 @@ pub fn prove_transformer_block(
         lasso_params,
     );
 
-    // --- LayerNorm 2 ---
+    // --- FFN (runs FIRST — GKR backward for x_norm2) ---
+    // x_com is None: x_norm2 is not committed externally; LN2 will commit and open y.
     let x_mid_com = add_commitments(x_in_com, &out_attn_com);
-    let ln2_io = LayerNormIOCommitments {
-        x_com: x_mid_com.clone(),
-        y_com: x_norm2_com.clone(),
-    };
-    let ln2_proof = prove_layernorm(
-        &witness.ln2_wit,
-        &ln2_io,
-        &pk.ln2_vk,
-        (ln2_sig_rp, ln2_sig_rv),
-        (ln2_y_rp, ln2_y_rv),
-        transcript,
-    )?;
-
-    // --- FFN — returns (proof, y_claim, x_claim) ---
     let ffn_io = FFNIOCommitments {
-        x_com: x_norm2_com.clone(),
+        x_com: None, // GKR backward: LN2 binds x_norm2 via external_y_claim
         y_com: out_ffn_com.clone(),
     };
     let (ffn_proof, ffn_y_claim, ffn_x_claim) = prove_ffn(
@@ -259,6 +249,21 @@ pub fn prove_transformer_block(
         &ffn_io,
         transcript,
         lasso_params,
+    )?;
+
+    // --- LayerNorm 2 (runs SECOND — proves y = x_norm2 and y(ffn_x_claim.point) = claim.value) ---
+    let ln2_io = LayerNormIOCommitments {
+        x_com: x_mid_com.clone(),
+        y_com: None, // committed internally; GKR backward from FFN
+    };
+    let ln2_proof = prove_layernorm(
+        &witness.ln2_wit,
+        &ln2_io,
+        &pk.ln2_vk,
+        (ln2_sig_rp, ln2_sig_rv),
+        (ln2_y_rp, ln2_y_rv),
+        Some(ffn_x_claim.clone()),
+        transcript,
     )?;
 
     // --- GKR Combine Proofs ---
@@ -283,20 +288,12 @@ pub fn prove_transformer_block(
         prove_combine(&v_evals, &v_com, &[v_y_claim, attn_v_claim], td_num_vars, transcript);
 
     // out_inner_com: ELIMINATED via GKR backward fusion.
-    // O_proj's x_claim and attention's external_out_claim both reference the same
-    // out_inner evaluation point, so no combine proof or commitment is needed.
-
-    // x_norm1_com: direct open at the single batched-QKV x_norm1_claim point
-    let x_norm1_evals = mat_evals(&witness.ln1_wit.y, t, d);
-    let x_norm1_open = hyrax_open(&x_norm1_evals, &x_norm1_claim.point, nu_td, sigma_td);
+    // x_norm1_com: ELIMINATED — LN1 internally commits y and opens at QKV's x_norm1_claim.
+    // x_norm2_com: ELIMINATED — LN2 internally commits y and opens at FFN's x_norm2_claim.
 
     // out_attn_com: direct open at O-proj y_claim point
     let out_attn_evals = mat_evals(&witness.o_proj_wit.y, t, d);
     let out_attn_open = hyrax_open(&out_attn_evals, &o_y_claim.point, nu_td, sigma_td);
-
-    // x_norm2_com: direct open at FFN x_claim point
-    let x_norm2_evals = mat_evals(&witness.ln2_wit.y, t, d);
-    let x_norm2_open = hyrax_open(&x_norm2_evals, &ffn_x_claim.point, nu_td, sigma_td);
 
     // out_ffn_com: direct open at FFN y_claim point
     let out_ffn_evals = mat_evals(&witness.ffn_wit.y, t, d);
@@ -305,25 +302,24 @@ pub fn prove_transformer_block(
     Ok(TransformerBlockProof {
         ln1_proof,
         qkv_proj_proof,
-        o_proj_proof,  // O_proj before attn (GKR backward)
+        o_proj_proof,
         attn_proof,
         ln2_proof,
         ffn_proof,
-        x_norm1_com,
+        // x_norm1_com: eliminated — LN1 commits y internally
         q_com,
         k_com,
         v_com,
         // out_inner_com: eliminated via GKR backward fusion
         out_attn_com,
-        x_norm2_com,
+        // x_norm2_com: eliminated — LN2 commits y internally
         out_ffn_com,
         q_open,
         k_open,
         v_combine,
-        // out_inner_combine: eliminated via GKR backward fusion
-        x_norm1_open,
+        // x_norm1_open: eliminated — LN1 internally opens y_com at x_norm1_claim
         out_attn_open,
-        x_norm2_open,
+        // x_norm2_open: eliminated — LN2 internally opens y_com at x_norm2_claim
         out_ffn_open,
         block_range_m,
     })
@@ -437,7 +433,7 @@ pub fn prove(
     let final_ln_out_com = commit_mat(&witness.final_ln_wit.y, t, d);
     let ln_io = LayerNormIOCommitments {
         x_com: current_x_com.clone(),
-        y_com: final_ln_out_com.clone(),
+        y_com: Some(final_ln_out_com.clone()), // final LN still commits externally (used by LM head)
     };
     let final_ln_proof = prove_layernorm(
         &witness.final_ln_wit,
@@ -445,6 +441,7 @@ pub fn prove(
         &pk.vk.final_ln_vk,
         (final_sig_rp, final_r_vs[0].clone()),
         (final_y_rp, final_r_vs[1].clone()),
+        None,
         transcript,
     )?;
 
@@ -1095,15 +1092,16 @@ mod tests {
         )
         .unwrap();
 
-        // Swap x_norm1_com for a commitment to a different matrix.
-        proof.x_norm1_com = commit_mat_test(
+        // Swap LN1's internal y_com for a commitment to a different matrix.
+        // In the GKR backward scheme, x_norm1 is now bound by LN1's internal y_com.
+        proof.ln1_proof.internal_coms.y_com = Some(commit_mat_test(
             &vec![
                 vec![F::from(99u64), F::from(99u64)],
                 vec![F::from(99u64), F::from(99u64)],
             ],
             T,
             D,
-        );
+        ));
 
         let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
         let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
@@ -1135,14 +1133,13 @@ mod tests {
             &mut acc_range_m,
             &mut inter_acc,
         );
-        // The inner-product check in add_verify passes (w' is from the original data),
-        // but the MSM check is deferred to finalize — that is where the tampered
-        // commitment is caught.
+        // Tampered y_com causes a transcript divergence (different challenge) so the
+        // LN1 sub-verifier will reject, or the deferred MSM will catch the commitment mismatch.
         let t_bits = T.next_power_of_two().trailing_zeros() as usize;
         let d_bits = D.next_power_of_two().trailing_zeros() as usize;
         let (_, _, params_td) = crate::pcs::params_from_vars(t_bits + d_bits);
         let final_result = result.and_then(|_| inter_acc.finalize(&params_td, &mut vt));
-        assert!(final_result.is_err(), "Should reject tampered x_norm1_com");
+        assert!(final_result.is_err(), "Should reject tampered LN1 internal y_com");
     }
 
     // -----------------------------------------------------------------------

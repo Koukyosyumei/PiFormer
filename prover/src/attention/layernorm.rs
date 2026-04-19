@@ -22,7 +22,7 @@ use crate::subprotocols::sumcheck::{
     prove_sumcheck_cubic, prove_sumcheck_cubic_multi_batched, verify_sumcheck_cubic,
     verify_sumcheck_cubic_multi_batched, SumcheckCubicProof, SumcheckCubicProofMulti,
 };
-use crate::subprotocols::{eq_poly_eval, prove_sumcheck, verify_sumcheck, SumcheckProof};
+use crate::subprotocols::{eq_poly_eval, prove_sumcheck, verify_sumcheck, EvalClaim, SumcheckProof};
 use crate::transcript::{challenge_vec, Transcript};
 use ark_ff::Field;
 use ark_ff::One;
@@ -34,7 +34,8 @@ use ark_ff::Zero;
 
 pub struct LayerNormIOCommitments {
     pub x_com: HyraxCommitment,
-    pub y_com: HyraxCommitment,
+    /// None = GKR backward mode: LN commits y internally and proves external_y_claim.
+    pub y_com: Option<HyraxCommitment>,
 }
 
 #[derive(Clone)]
@@ -65,6 +66,8 @@ pub struct LayerNormInternalCommitments {
     pub sum_x_com: HyraxCommitment,
     pub sigma_com: HyraxCommitment,
     pub sq_sum_x_com: HyraxCommitment,
+    /// Populated when io_coms.y_com is None (GKR backward): LN commits y internally.
+    pub y_com: Option<HyraxCommitment>,
 }
 
 pub struct LayerNormOpenings {
@@ -110,6 +113,10 @@ pub struct LayerNormOpenings {
 
     pub sum_x_at_rf_sig: F,
     pub sum_x_at_rf_sig_proof: HyraxProof,
+
+    /// GKR backward: opening of y_com at the external claim point from downstream.
+    pub external_y_eval: Option<F>,
+    pub external_y_proof: Option<HyraxProof>,
 }
 
 pub struct LayerNormProof {
@@ -217,12 +224,18 @@ pub fn compute_range_witnesses(
 ///
 /// `sigma_range = (proof, r_v)` where `r_v` came from `prove_range_batched`.
 /// `y_range     = (proof, r_v)` likewise.
+/// Prove a LayerNorm step using pre-supplied range proofs from the global batch.
+///
+/// `external_y_claim`: GKR backward claim from the downstream sub-protocol (e.g. QKV
+/// or FFN).  When Some, io_coms.y_com must be None — LN will commit y internally and
+/// prove y_MLE(claim.point) == claim.value.  When None, io_coms.y_com must be Some.
 pub fn prove_layernorm(
     witness: &LayerNormWitness,
     io_coms: &LayerNormIOCommitments,
     vk: &LayerNormVerifyingKey,
     sigma_range: (RangeWitnessProof, Vec<F>),
     y_range: (RangeWitnessProof, Vec<F>),
+    external_y_claim: Option<EvalClaim>,
     transcript: &mut Transcript,
 ) -> Result<LayerNormProof, String> {
     let t = vk.seq_len;
@@ -246,11 +259,17 @@ pub fn prove_layernorm(
     // sigma_sq_mle[i] = (d * sigma[i])^2; MLE for correct sumcheck claim
     let sigma_sq_mle = vec_to_mle(&witness.sigma_sq_scaled, t);
 
-    let (nu_td, sigma_td, _params_td) = poly_hyrax(&x_mle);
+    let (nu_td, sigma_td, params_td) = poly_hyrax(&x_mle);
     let (nu_t, sigma_t, params_t) = poly_hyrax(&sum_x_mle);
 
+    // Resolve y_com: either trusted external or committed internally (GKR backward).
+    let (y_com, y_com_is_internal) = match &io_coms.y_com {
+        Some(yc) => (yc.clone(), false),
+        None => (hyrax_commit(&y_mle.evaluations, nu_td, &params_td), true),
+    };
+
     absorb_com(transcript, b"x_com", &io_coms.x_com);
-    absorb_com(transcript, b"y_com", &io_coms.y_com);
+    absorb_com(transcript, b"y_com", &y_com);
 
     let sum_x_com = hyrax_commit(&sum_x_mle.evaluations, nu_t, &params_t);
     let sigma_com = hyrax_commit(&sigma_mle.evaluations, nu_t, &params_t);
@@ -356,11 +375,22 @@ pub fn prove_layernorm(
     let sigma_at_rf_sy_t = sigma_mle.evaluate(r_f_sy_t);
     let sigma_at_rf_sy_t_proof = hyrax_open(&sigma_mle.evaluations, r_f_sy_t, nu_t, sigma_t);
 
+    // GKR backward: open y at the external claim point from the downstream sub-protocol.
+    let (external_y_eval, external_y_proof) = match external_y_claim {
+        Some(ref claim) => {
+            let ev = y_mle.evaluate(&claim.point);
+            let pf = hyrax_open(&y_mle.evaluations, &claim.point, nu_td, sigma_td);
+            (Some(ev), Some(pf))
+        }
+        None => (None, None),
+    };
+
     Ok(LayerNormProof {
         internal_coms: LayerNormInternalCommitments {
             sum_x_com,
             sigma_com,
             sq_sum_x_com,
+            y_com: if y_com_is_internal { Some(y_com.clone()) } else { None },
         },
         mean_sumcheck,
         sq_sum_sumcheck,
@@ -435,6 +465,8 @@ pub fn prove_layernorm(
                 nu_t,
                 sigma_t,
             ),
+            external_y_eval,
+            external_y_proof,
         },
     })
 }
@@ -448,12 +480,17 @@ pub fn prove_layernorm(
 /// `sigma_r_v` and `y_r_v` must be the `r_v` values returned by the
 /// matching `prove_range_batched` call (verified separately via
 /// `verify_range_batched`).
+///
+/// `external_y_claim`: when Some, io_coms.y_com must be None.  The verifier
+/// checks that the internally-committed y_com (from the proof) opens to
+/// external_y_claim.value at external_y_claim.point.
 pub fn verify_layernorm(
     proof: &LayerNormProof,
     io_coms: &LayerNormIOCommitments,
     vk: &LayerNormVerifyingKey,
     sigma_r_v: &[F],
     y_r_v: &[F],
+    external_y_claim: Option<&EvalClaim>,
     transcript: &mut Transcript,
     acc_t: &mut HyraxBatchAccumulator,
     acc_td: &mut HyraxBatchAccumulator,
@@ -462,9 +499,17 @@ pub fn verify_layernorm(
     let d_bits = vk.d_head.next_power_of_two().trailing_zeros() as usize;
     let d_f = F::from(vk.d_head as u64);
 
+    // Resolve y_com: either trusted external IO or internally committed (GKR backward).
+    let y_com = match &io_coms.y_com {
+        Some(yc) => yc.clone(),
+        None => proof.internal_coms.y_com.as_ref()
+            .ok_or_else(|| "GKR backward: internal y_com missing from proof".to_string())?
+            .clone(),
+    };
+
     // 1. Absorb IO & Internal Commitments
     absorb_com(transcript, b"x_com", &io_coms.x_com);
-    absorb_com(transcript, b"y_com", &io_coms.y_com);
+    absorb_com(transcript, b"y_com", &y_com);
     absorb_com(transcript, b"sum_x_com", &proof.internal_coms.sum_x_com);
     absorb_com(transcript, b"sigma_com", &proof.internal_coms.sigma_com);
     absorb_com(transcript, b"sq_sum_x_com", &proof.internal_coms.sq_sum_x_com);
@@ -663,7 +708,7 @@ pub fn verify_layernorm(
 
     // 4. ry_td_batch_proof (Group 3)
     acc_td.add_verify_batch(
-        &[io_coms.x_com.clone(), io_coms.y_com.clone()],
+        &[io_coms.x_com.clone(), y_com.clone()],
         &[proof.openings.x_at_ry, proof.openings.y_at_ry],
         &ry_td,
         &proof.openings.ry_td_batch_proof,
@@ -699,7 +744,7 @@ pub fn verify_layernorm(
     )?;
 
     acc_td.add_verify(
-        &io_coms.y_com,
+        &y_com,
         proof.openings.y_at_rf_sy,
         &r_f_sy,
         &proof.openings.y_at_rf_sy_proof,
@@ -726,6 +771,21 @@ pub fn verify_layernorm(
         &r_f_sigma_sq,
         &proof.openings.sigma_at_rf_sigma_sq_proof,
     )?;
+
+    // GKR backward: verify opening of y_com at the external claim point.
+    if let Some(claim) = external_y_claim {
+        let ext_eval = proof.openings.external_y_eval
+            .ok_or("GKR backward: external_y_eval missing from proof")?;
+        let ext_proof = proof.openings.external_y_proof.as_ref()
+            .ok_or("GKR backward: external_y_proof missing from proof")?;
+        if ext_eval != claim.value {
+            return Err(format!(
+                "GKR backward: external y eval mismatch: prover says {}, claim says {}",
+                ext_eval, claim.value
+            ));
+        }
+        acc_td.add_verify(&y_com, ext_eval, &claim.point, ext_proof)?;
+    }
 
     Ok(())
 }
@@ -806,7 +866,7 @@ mod layernorm_tests {
         let (nu_td, _, params_td) = poly_hyrax(&x_mle);
         let io_coms = LayerNormIOCommitments {
             x_com: hyrax_commit(&x_mle.evaluations, nu_td, &params_td),
-            y_com: hyrax_commit(&y_mle.evaluations, nu_td, &params_td),
+            y_com: Some(hyrax_commit(&y_mle.evaluations, nu_td, &params_td)),
         };
         (witness, io_coms, vk)
     }
@@ -839,6 +899,7 @@ mod layernorm_tests {
             vk,
             (sigma_rp, r_vs[0].clone()),
             (y_rp, r_vs[1].clone()),
+            None,
             &mut pt,
         )
         .unwrap();
@@ -875,6 +936,7 @@ mod layernorm_tests {
             vk,
             &rv_v[0],
             &rv_v[1],
+            None,
             &mut vt,
             &mut ln_acc_t,
             &mut ln_acc_td,
@@ -924,6 +986,7 @@ mod layernorm_tests {
             &vk,
             (sigma_rp, r_vs[0].clone()),
             (y_rp, r_vs[1].clone()),
+            None,
             &mut pt,
         ) {
             let _ = pt.challenge_field::<F>(b"hyrax_group_mu"); // ln_acc_t
@@ -954,6 +1017,7 @@ mod layernorm_tests {
                 &vk,
                 &rv_v[0],
                 &rv_v[1],
+                None,
                 &mut vt,
                 &mut ln_acc_t,
                 &mut ln_acc_td,
