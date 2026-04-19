@@ -76,10 +76,14 @@ pub fn precommit_attention_tables(
 ///
 /// GKR backward fusion: out_com is eliminated. out_inner is not committed
 /// independently — it is bound by the shared sumcheck claim with O_proj.
+///
+/// `skip_io_absorb`: when true, q/k/v_com are already in the transcript (Phase 1
+/// absorbs all block commitments before r_td derivation). Avoids double absorption.
 pub struct AttentionIOCommitments {
     pub q_com: HyraxCommitment,
     pub k_com: HyraxCommitment,
     pub v_com: HyraxCommitment,
+    pub skip_io_absorb: bool,
 }
 
 /// Private witness data. ONLY the Prover holds this.
@@ -178,9 +182,12 @@ pub fn prove_linear_attention(
     let out_mle = mat_to_mle(&witness.out, t, d);
 
     // 1. Absorb IO commitments. out_com eliminated via GKR backward (no out_inner_com).
-    absorb_com(transcript, b"q_com", &io_coms.q_com);
-    absorb_com(transcript, b"k_com", &io_coms.k_com);
-    absorb_com(transcript, b"v_com", &io_coms.v_com);
+    // In GKR multi-block mode, q/k/v_com are already in the transcript (Phase 1).
+    if !io_coms.skip_io_absorb {
+        absorb_com(transcript, b"q_com", &io_coms.q_com);
+        absorb_com(transcript, b"k_com", &io_coms.k_com);
+        absorb_com(transcript, b"v_com", &io_coms.v_com);
+    }
 
     // Commit phi_q and phi_k and absorb before any sumcheck challenges.
     // This ensures the sumcheck challenges are drawn after committing to phi_q/phi_k,
@@ -334,9 +341,11 @@ pub fn verify_linear_attention(
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
 
     // 1. Absorb IO commitments (out_com removed — GKR backward, no out_inner_com).
-    absorb_com(transcript, b"q_com", &io_coms.q_com);
-    absorb_com(transcript, b"k_com", &io_coms.k_com);
-    absorb_com(transcript, b"v_com", &io_coms.v_com);
+    if !io_coms.skip_io_absorb {
+        absorb_com(transcript, b"q_com", &io_coms.q_com);
+        absorb_com(transcript, b"k_com", &io_coms.k_com);
+        absorb_com(transcript, b"v_com", &io_coms.v_com);
+    }
 
     // Absorb phi_q_com and phi_k_com (mirrors prover commitment step).
     absorb_com(transcript, b"phi_q_com", &proof.phi_q_com);
@@ -578,7 +587,7 @@ mod linear_attention_tests {
         let v_com = hyrax_commit(&v_mle.evaluations, nu_td, &params_td);
 
         // GKR backward: out_com removed from AttentionIOCommitments.
-        let io_coms = AttentionIOCommitments { q_com, k_com, v_com };
+        let io_coms = AttentionIOCommitments { q_com, k_com, v_com, skip_io_absorb: false };
 
         let lp = lasso_params();
         let pk = precommit_attention_tables(&inst.q_lasso, &inst.k_lasso, &lp);

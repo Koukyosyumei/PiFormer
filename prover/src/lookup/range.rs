@@ -329,6 +329,7 @@ pub fn range_m_params() -> HyraxParams {
 /// At the sumcheck challenge r_k the verifier checks:
 ///   final_val = h_k(r_k) * (1 + β*(α - C_k(r_k)))
 /// using Hyrax openings of h_com and chunk_com.
+#[derive(Clone)]
 pub struct LogUpWitnessProof {
     /// Hyrax commitments to h_k = [1/(α - C_k[i]) for each i], one per chunk.
     pub h_coms: Vec<HyraxCommitment>,
@@ -348,6 +349,7 @@ pub struct LogUpWitnessProof {
 
 /// Per-witness portion of a globally-batched range proof.
 /// Does NOT contain m_com / m_eval / m_open — those live in `GlobalRangeM`.
+#[derive(Clone)]
 pub struct RangeWitnessProof {
     pub chunk_coms: Vec<HyraxCommitment>,
     pub chunk_evals: Vec<F>,
@@ -359,6 +361,7 @@ pub struct RangeWitnessProof {
 }
 
 /// Shared multiplicity proof covering all witnesses in the global batch.
+#[derive(Clone)]
 pub struct GlobalRangeM {
     pub m_com: HyraxCommitment,
     pub m_eval: F,

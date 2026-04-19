@@ -63,6 +63,7 @@ pub struct LayerNormWitness {
 // Proof types
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct LayerNormInternalCommitments {
     pub sum_x_com: HyraxCommitment,
     pub sigma_com: HyraxCommitment,
@@ -72,6 +73,7 @@ pub struct LayerNormInternalCommitments {
     pub sigma_y_com: Option<HyraxCommitment>,
 }
 
+#[derive(Clone)]
 pub struct LayerNormOpenings {
     pub sum_x_at_rt: F,
     pub sq_sum_x_at_rt: F,
@@ -128,6 +130,7 @@ pub struct LayerNormOpenings {
     pub sum_x_at_rf_sig_proof: HyraxProof,
 }
 
+#[derive(Clone)]
 pub struct LayerNormProof {
     pub internal_coms: LayerNormInternalCommitments,
     pub mean_sumcheck: SumcheckProof,

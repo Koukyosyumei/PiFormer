@@ -20,7 +20,6 @@
 //! over BN254 G1, with O(√N) proof size and O(√N) verifier work.
 
 use crate::field::F;
-use crate::poly::utils::compute_eq_evals;
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify, hyrax_verify_batch,
     params_from_vars, HyraxCommitment, HyraxParams, HyraxProof,
@@ -32,6 +31,7 @@ use crate::subprotocols::sumcheck::{
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::{challenge_vec, Transcript};
 use ark_ff::Field;
+use rayon::prelude::*;
 
 /// Precomputed table commitments — computed once at setup, not per proof.
 #[derive(Clone)]
@@ -418,7 +418,35 @@ pub fn prove_lasso_multi(
     let nu = m / 2;
     let sigma = m - nu;
     let alpha_pows = powers_of(alpha, t_count);
-    let mut combined_grand_sum = F::ZERO;
+
+    // All instances share the same query length n; compute rho_pows once.
+    let n = all_query_indices[0].len();
+    debug_assert!(
+        all_query_indices.iter().all(|qi| qi.len() == n),
+        "All query index slices must have the same length"
+    );
+    let rho_pows = powers_of(rho, n);
+
+    // Parallel grand sum: Σ_t α^t Σ_j ρ^j output_{t,j}.
+    // Computed independently from the l_hist construction so the inner dot product
+    // (O(n) per instance) runs in parallel across all L instances.
+    let combined_grand_sum: F = multi_instance
+        .instances
+        .par_iter()
+        .enumerate()
+        .map(|(t, instance)| {
+            let inst_sum: F = instance
+                .outputs
+                .iter()
+                .zip(rho_pows.iter())
+                .map(|(&out, &rp)| rp * out)
+                .sum();
+            alpha_pows[t] * inst_sum
+        })
+        .sum();
+
+    // Sequential l_hist construction: ordering must be deterministic for downstream
+    // poly indices, so we keep this loop sequential.
     let mut all_t_polys = Vec::new();
     let mut all_l_polys = Vec::new();
     let mut flatten_tables = Vec::new();
@@ -427,8 +455,6 @@ pub fn prove_lasso_multi(
 
     for (t, instance) in multi_instance.instances.iter().enumerate() {
         let query_indices = &all_query_indices[t];
-        let n = query_indices.len();
-        let rho_pows = powers_of(rho, n);
         let mut inst_l_hists = Vec::new();
 
         for (k, table_evals) in instance.tables.iter().enumerate() {
@@ -444,9 +470,6 @@ pub fn prove_lasso_multi(
             inst_l_hists.push(l_hist);
         }
         all_l_hists.push(inst_l_hists);
-
-        let instance_out_sum: F = (0..n).map(|j| rho_pows[j] * instance.outputs[j]).sum();
-        combined_grand_sum += alpha_pows[t] * instance_out_sum;
     }
 
     // --- STEP 4: Combined Sumcheck ---
@@ -563,14 +586,24 @@ pub fn verify_lasso_multi(
     let alpha_pows = powers_of(alpha, t_count);
 
     // Grand Sum: Σ_t α^t * Σ_j ρ^j * output_{t,j}
-    // Still O(Σ_t n_t) but unavoidable given public outputs.
-    let mut expected_grand_sum = F::ZERO;
-    for (t, instance) in multi_instance.instances.iter().enumerate() {
-        let n = instance.outputs.len();
-        let rho_pows = powers_of(rho, n);
-        let inst_sum: F = (0..n).map(|j| rho_pows[j] * instance.outputs[j]).sum();
-        expected_grand_sum += alpha_pows[t] * inst_sum;
-    }
+    // Compute rho_pows once (all instances share the same output length n),
+    // then evaluate each instance's weighted sum in parallel via rayon.
+    let n = multi_instance.instances[0].outputs.len();
+    let rho_pows = powers_of(rho, n);
+    let expected_grand_sum: F = multi_instance
+        .instances
+        .par_iter()
+        .enumerate()
+        .map(|(t, instance)| {
+            let inst_sum: F = instance
+                .outputs
+                .iter()
+                .zip(rho_pows.iter())
+                .map(|(&out, &rp)| rp * out)
+                .sum();
+            alpha_pows[t] * inst_sum
+        })
+        .sum();
     if expected_grand_sum != proof.combined_grand_sum {
         return Err("Multi-Lasso Grand Sum mismatch".into());
     }
@@ -635,6 +668,11 @@ pub fn verify_lasso_multi(
     // --- OUTPUT BINDING verification ---
     // If output_coms is non-empty, verify that each instance's output commitment
     // opens correctly to the MLE of instance.outputs at a fresh random point.
+    //
+    // Two-phase design for parallelism:
+    //   Phase 1 (sequential): derive all r_out challenge vectors from transcript.
+    //   Phase 2 (parallel):   compute expected MLE evaluations in parallel.
+    //   Phase 3 (sequential): verify Hyrax proofs against the computed evaluations.
     if !output_coms.is_empty() {
         if output_coms.len() != multi_instance.instances.len() {
             return Err(format!(
@@ -646,23 +684,36 @@ pub fn verify_lasso_multi(
         if proof.output_opening_proofs.len() != output_coms.len() {
             return Err("output_opening_proofs count mismatch in proof".into());
         }
-        for (((com, num_vars), hp), instance) in output_coms
+        let count = output_coms.len();
+
+        // Phase 1: derive all r_out challenge points sequentially (transcript must be sequential).
+        let r_outs: Vec<Vec<F>> = output_coms
             .iter()
-            .zip(proof.output_opening_proofs.iter())
-            .zip(multi_instance.instances.iter())
-        {
-            let r_out = challenge_vec(transcript, *num_vars, b"lasso_output_r");
+            .map(|(_, num_vars)| challenge_vec(transcript, *num_vars, b"lasso_output_r"))
+            .collect();
+
+        // Phase 2: compute expected MLE evaluations in parallel.
+        let expected_evals: Vec<F> = (0..count)
+            .into_par_iter()
+            .map(|i| {
+                let (_, num_vars) = output_coms[i];
+                let instance = &multi_instance.instances[i];
+                let r_out = &r_outs[i];
+                let padded_len = 1usize << num_vars;
+                let mut padded = vec![F::ZERO; padded_len];
+                for (j, &out) in instance.outputs.iter().enumerate() {
+                    padded[j] = out;
+                }
+                DenseMLPoly::new(padded).evaluate(r_out)
+            })
+            .collect();
+
+        // Phase 3: verify Hyrax proofs sequentially (uses only inner-product field ops and deferred MSM).
+        for i in 0..count {
+            let (com, num_vars) = &output_coms[i];
+            let hp = &proof.output_opening_proofs[i];
             let (_, _, params_out) = params_from_vars(*num_vars);
-
-            // Compute expected eval: MLE of instance.outputs (zero-padded) at r_out
-            let padded_len = 1usize << num_vars;
-            let mut padded = vec![F::ZERO; padded_len];
-            for (j, &out) in instance.outputs.iter().enumerate() {
-                padded[j] = out;
-            }
-            let expected_eval = DenseMLPoly::new(padded).evaluate(&r_out);
-
-            hyrax_verify(com, expected_eval, &r_out, hp, &params_out)
+            hyrax_verify(com, expected_evals[i], &r_outs[i], hp, &params_out)
                 .map_err(|e| format!("Output binding Hyrax failed: {e}"))?;
         }
     }
@@ -921,7 +972,7 @@ mod lasso_multi_tests {
     use super::*;
     use crate::transcript::Transcript;
     use crate::{field::F, pcs::setup_hyrax_params};
-    use ark_ff::{One, Zero};
+    use ark_ff::One;
 
     // --- テスト用ヘルパー関数 ---
 
