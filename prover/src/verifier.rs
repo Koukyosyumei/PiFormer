@@ -9,7 +9,7 @@
 
 use crate::lookup::lasso::{verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey};
 use crate::lookup::range::verify_range_batched;
-use crate::pcs::{absorb_com, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams};
+use crate::pcs::{absorb_com, hyrax_verify, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams};
 use crate::subprotocols::verify_combine_deferred;
 use crate::transcript::Transcript;
 
@@ -109,7 +109,7 @@ pub fn verify_transformer_block(
         ],
         &proof.block_range_m,
         &[ln_sigma_n, ln_y_n, ln_sigma_n, ln_y_n],
-        32,
+        16,
         transcript,
         acc_range_sig,
         acc_range_y,
@@ -361,7 +361,7 @@ pub fn verify(
         ],
         &proof.final_range_m,
         &[final_sigma_n, final_y_n],
-        32,
+        16,
         transcript,
         &mut acc_range_sig,
         &mut acc_range_y,
@@ -390,9 +390,15 @@ pub fn verify(
     // 4. LM Head Verification
     let _t = Instant::now();
     let lm_io = ProjectionIOCommitments { x_com: Some(proof.final_ln_out_com.clone()) };
-    verify_projection(&proof.lm_head_proof, &vk.lm_head_vk, &lm_io, transcript, &mut lmh_acc_w, &mut lmh_acc_b)
+    let (lm_y_claim, _) = verify_projection(&proof.lm_head_proof, &vk.lm_head_vk, &lm_io, transcript, &mut lmh_acc_w, &mut lmh_acc_b)
         .map_err(|e| format!("LM Head failed: {}", e))?;
     eprintln!("[model] lm_head:    {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
+    // Verify logits_com opens to lm_y_claim — binds prover's committed logits to LM head output.
+    let t_bits_lm = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
+    let v_bits = vk.vocab_size.next_power_of_two().trailing_zeros() as usize;
+    let (_, _, params_logits) = params_from_vars(t_bits_lm + v_bits);
+    hyrax_verify(&proof.logits_com, lm_y_claim.value, &lm_y_claim.point, &proof.lm_head_logits_open, &params_logits)
+        .map_err(|e| format!("Logits commitment verification failed: {e}"))?;
 
     // Finalize all 10 accumulators (each adds hyrax_group_mu to transcript).
     // inter_acc is first — matches the prover's burn order.
@@ -414,18 +420,21 @@ pub fn verify(
 
     // 5. Global batched Lasso
     let _t = Instant::now();
+    let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
+    let d_bits = vk.d_model.next_power_of_two().trailing_zeros() as usize;
+    let td_num_vars = t_bits + d_bits;
     let mut all_lasso_instances = Vec::new();
     let mut all_instance_coms = Vec::new();
-    // Output commitments for binding (phi_q/phi_k eliminated; verified via MLE of public Lasso outputs).
+    let mut all_output_coms: Vec<(HyraxCommitment, usize)> = Vec::new();
     for i in 0..vk.num_blocks {
         let bvk = &vk.block_vks[i];
-
-        // FFN activation Lasso now runs inside verify_ffn (GKR backward ordering).
-        // Only Q/K attention Lassos remain in the global batched proof.
         all_lasso_instances.push(inst_attn.q_lasso.clone());
         all_lasso_instances.push(inst_attn.k_lasso.clone());
         all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
         all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
+        // phi_q_com/phi_k_com from block proofs bind Lasso outputs to committed activations.
+        all_output_coms.push((proof.block_proofs[i].attn_proof.phi_q_com.clone(), td_num_vars));
+        all_output_coms.push((proof.block_proofs[i].attn_proof.phi_k_com.clone(), td_num_vars));
     }
     let global_multi_inst = LassoMultiInstance {
         instances: all_lasso_instances,
@@ -437,7 +446,7 @@ pub fn verify(
         &proof.all_lasso_proof,
         &global_multi_inst,
         &global_lasso_vk,
-        &[],
+        &all_output_coms,
         transcript,
         lasso_params,
     )

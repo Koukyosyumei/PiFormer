@@ -39,6 +39,7 @@ use crate::attention::projection::{
 use crate::ffn::ffn::{prove_ffn, FFNIOCommitments, FFNInstance, FFNProof, FFNWitness};
 use crate::lookup::lasso::{
     prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
+    LassoOutputBinding,
 };
 use crate::lookup::range::{prove_range_batched, GlobalRangeM};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey}; // Imported from verifier.rs
@@ -168,7 +169,7 @@ pub fn prove_transformer_block(
             &ln2_rw.sigma_witness,
             &ln2_rw.y_witness,
         ],
-        32,
+        16,
         transcript,
     )?;
     // Destructure in reverse order to avoid index shifting
@@ -358,21 +359,18 @@ pub struct TransformerModelWitness {
 }
 
 pub struct TransformerModelProof {
-    pub x_in_com: HyraxCommitment, // コミットされた入力
+    pub x_in_com: HyraxCommitment,
     pub block_proofs: Vec<TransformerBlockProof>,
     pub final_ln_proof: LayerNormProof,
     pub lm_head_proof: ProjectionProof,
 
-    // パイプライン接続用の中間コミットメント
     pub final_ln_out_com: HyraxCommitment,
-    pub logits_com: HyraxCommitment, // 最終出力（Logits）のコミットメント
+    pub logits_com: HyraxCommitment,
+    /// Hyrax opening of logits_com at the LM head sumcheck y_claim point.
+    pub lm_head_logits_open: HyraxProof,
 
-    /// Single batched Lasso proof covering all activation lookups across all layers.
-    /// Order per block: [FFN_i, Q_i, K_i].
     pub all_lasso_proof: LassoMultiProof,
 
-    /// Shared multiplicity commitment for the final LayerNorm range proofs
-    /// (final_ln_sigma, final_ln_y).  One m_com instead of 2.
     pub final_range_m: GlobalRangeM,
 }
 
@@ -391,6 +389,7 @@ pub fn prove(
     let t = pk.vk.seq_len;
     let d = pk.vk.d_model;
     let v = pk.vk.vocab_size;
+    let t_bits = t.next_power_of_two().trailing_zeros() as usize;
 
     let commit_mat = |mat: &[Vec<F>], rows: usize, cols: usize| -> HyraxCommitment {
         let mle = mat_to_mle(mat, rows, cols);
@@ -432,7 +431,7 @@ pub fn prove(
     let final_rw = compute_range_witnesses(&witness.final_ln_wit, &pk.vk.final_ln_vk);
     let (mut final_range_proofs, final_range_m, final_r_vs) = prove_range_batched(
         &[&final_rw.sigma_witness, &final_rw.y_witness],
-        32,
+        16,
         transcript,
     )?;
     let final_y_rp   = final_range_proofs.remove(1);
@@ -452,10 +451,16 @@ pub fn prove(
     )?;
 
     // 4. LM Head (Final Projection to Vocab Size)
+    let logits_mle = mat_to_mle(&witness.lm_head_wit.y, t, v);
     let logits_com = commit_mat(&witness.lm_head_wit.y, t, v);
     let lm_io = ProjectionIOCommitments { x_com: Some(final_ln_out_com.clone()) };
-    let (lm_head_proof, _, _) =
+    let (lm_head_proof, lm_y_claim, _) =
         prove_projection(&pk.lm_head_pk, &witness.lm_head_wit, &lm_io, transcript)?;
+    // Open logits_com at the LM head y_claim point to bind the output commitment.
+    let v_bits = v.next_power_of_two().trailing_zeros() as usize;
+    let lm_logits_num_vars = t_bits + v_bits;
+    let (lm_nu, lm_sigma, _) = params_from_vars(lm_logits_num_vars);
+    let lm_head_logits_open = hyrax_open(&logits_mle.evaluations, &lm_y_claim.point, lm_nu, lm_sigma);
 
     // Advance transcript to match verifier's 10 accumulator finalizations.
     // inter_acc (layer-folded intermediate opens) is finalized BEFORE the weight accs.
@@ -471,27 +476,40 @@ pub fn prove(
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // acc_range_m
 
     // 5. Global batched Lasso: one proof for all activation lookups across all layers.
-    // Instance order per block: [FFN_i, Q_i, K_i].
+    // Instance order per block: [Q_i, K_i].
+    let d_bits = d.next_power_of_two().trailing_zeros() as usize;
+    let td_num_vars = t_bits + d_bits;
     let mut all_lasso_instances: Vec<_> = Vec::new();
     let mut all_instance_coms = Vec::new();
+    let mut all_output_bindings: Vec<LassoOutputBinding> = Vec::new();
     let mut global_nu = 0usize;
     for i in 0..pk.vk.num_blocks {
         let bpk = &pk.block_pks[i];
+        let attn_wit = &witness.block_witnesses[i].attn_wit;
+        let phi_q_mle = mat_to_mle(&attn_wit.phi_q, t, d);
+        let phi_k_mle = mat_to_mle(&attn_wit.phi_k, t, d);
 
-        // FFN activation Lasso now runs inside prove_ffn (GKR backward ordering).
-        // Only Q/K attention Lassos remain in the global batched proof.
         all_lasso_instances.push(inst_attn.q_lasso.clone());
         all_lasso_instances.push(inst_attn.k_lasso.clone());
         all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
         all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
         global_nu = bpk.attn_pk.qk_lasso_pk.nu;
-        // phi_q/phi_k output bindings eliminated (verified via MLE of public Lasso outputs
-        // in attention verifier). FFN a_com/m_com eliminated via GKR backward (Lasso
-        // runs inside prove_ffn; a_eval/m_eval verified from public Lasso outputs/query_indices).
+
+        // Output bindings: link phi_q_com/phi_k_com to Lasso outputs.
+        all_output_bindings.push(LassoOutputBinding {
+            com: block_proofs[i].attn_proof.phi_q_com.clone(),
+            num_vars: td_num_vars,
+            mle_evals: phi_q_mle.evaluations,
+        });
+        all_output_bindings.push(LassoOutputBinding {
+            com: block_proofs[i].attn_proof.phi_k_com.clone(),
+            num_vars: td_num_vars,
+            mle_evals: phi_k_mle.evaluations,
+        });
     }
     let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
     let global_lasso_pk = LassoMultiProvingKey { instance_table_coms: all_instance_coms, nu: global_nu };
-    let all_lasso_proof = prove_lasso_multi(&global_multi_inst, &global_lasso_pk, &[], transcript, lasso_params);
+    let all_lasso_proof = prove_lasso_multi(&global_multi_inst, &global_lasso_pk, &all_output_bindings, transcript, lasso_params);
 
     Ok(TransformerModelProof {
         x_in_com,
@@ -500,6 +518,7 @@ pub fn prove(
         lm_head_proof,
         final_ln_out_com,
         logits_com,
+        lm_head_logits_open,
         all_lasso_proof,
         final_range_m,
     })

@@ -11,11 +11,9 @@
 //!     space at a single random point (r_t, r_d, r_b) in O(1) time.
 
 use crate::field::F;
-use crate::lookup::range::{
-    prove_range_batched, verify_range_batched, GlobalRangeM, RangeProofWitness, RangeWitnessProof,
-};
+use crate::lookup::range::{RangeProofWitness, RangeWitnessProof};
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, params_from_n, params_from_vars,
+    absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch,
     poly_hyrax, HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
 };
 use crate::poly::utils::{combine, eval_rows, mat_to_mle, vec_to_mle};
@@ -64,10 +62,9 @@ pub struct LayerNormWitness {
 // ---------------------------------------------------------------------------
 
 pub struct LayerNormInternalCommitments {
-    // 統計量(row-level)のコミットメントは RangeProof との紐付けに必要だが、
-    // 積や二乗 (sum_x_sq, sigma_sq, sigma_y, gamma_x) は削除。
     pub sum_x_com: HyraxCommitment,
     pub sigma_com: HyraxCommitment,
+    pub sq_sum_x_com: HyraxCommitment,
 }
 
 pub struct LayerNormOpenings {
@@ -83,9 +80,13 @@ pub struct LayerNormOpenings {
 
     pub sq_sum_x_at_rsig: F,
     pub sigma_at_rsig: F,
-    pub sigma_sq_at_rsig: F, // 評価値のみ（コミットなし）
-    pub sum_x_sq_at_rsig: F, // 評価値のみ（コミットなし）
-    pub rsig_batch_proof: HyraxProof,
+    pub sigma_sq_at_rsig: F, // bound by sigma_sq_sumcheck
+    pub sum_x_sq_at_rsig: F,
+    pub rsig_batch_proof: HyraxProof, // opens [sigma_com, sq_sum_x_com] at r_sig_t
+
+    // sigma_sq binding: sigma_at_rf_sigma_sq opened against sigma_com
+    pub sigma_at_rf_sigma_sq: F,
+    pub sigma_at_rf_sigma_sq_proof: HyraxProof,
 
     pub x_at_ry: F,
     pub y_at_ry: F,
@@ -116,6 +117,8 @@ pub struct LayerNormProof {
     pub mean_sumcheck: SumcheckProof,
     pub sq_sum_sumcheck: SumcheckCubicProof,
     pub sum_x_sq_sumcheck: SumcheckCubicProof,
+    /// Proves Σ_i eq(r_sig_t, i) * (d*sigma[i])^2 = sigma_sq_at_rsig, binding sigma_sq to sigma_com.
+    pub sigma_sq_sumcheck: SumcheckCubicProof,
     /// Batched cubic sumcheck for gamma*X and sigma*Y (shared eq_y, same challenge vector)
     pub gamma_sigma_sumcheck: SumcheckCubicProofMulti,
     pub sigma_range_proof: RangeWitnessProof,
@@ -131,7 +134,7 @@ fn gen_eq_poly(r: &[F]) -> DenseMLPoly {
     let n = r.len();
     let mut evals = vec![F::one(); 1 << n];
     for j in 0..n {
-        let bit_size = 1 << j;
+        let _bit_size = 1 << j;
         for i in 0..(1 << n) {
             if (i >> j) & 1 == 1 {
                 evals[i] *= r[n - 1 - j];
@@ -237,9 +240,13 @@ pub fn prove_layernorm(
     let sq_sum_x_mle = vec_to_mle(&witness.sq_sum_x, t);
     let sum_x_sq_mle = vec_to_mle(&witness.sum_x_sq, t);
     let sigma_mle = vec_to_mle(&witness.sigma, t);
+    // d_sigma_mle[i] = d * sigma[i]; used for sigma_sq_sumcheck
+    let d_sigma_evals: Vec<F> = witness.sigma.iter().map(|&s| d_f * s).collect();
+    let d_sigma_mle = vec_to_mle(&d_sigma_evals, t);
+    // sigma_sq_mle[i] = (d * sigma[i])^2; MLE for correct sumcheck claim
     let sigma_sq_mle = vec_to_mle(&witness.sigma_sq_scaled, t);
 
-    let (nu_td, sigma_td, params_td) = poly_hyrax(&x_mle);
+    let (nu_td, sigma_td, _params_td) = poly_hyrax(&x_mle);
     let (nu_t, sigma_t, params_t) = poly_hyrax(&sum_x_mle);
 
     absorb_com(transcript, b"x_com", &io_coms.x_com);
@@ -247,9 +254,11 @@ pub fn prove_layernorm(
 
     let sum_x_com = hyrax_commit(&sum_x_mle.evaluations, nu_t, &params_t);
     let sigma_com = hyrax_commit(&sigma_mle.evaluations, nu_t, &params_t);
+    let sq_sum_x_com = hyrax_commit(&sq_sum_x_mle.evaluations, nu_t, &params_t);
 
     absorb_com(transcript, b"sum_x_com", &sum_x_com);
     absorb_com(transcript, b"sigma_com", &sigma_com);
+    absorb_com(transcript, b"sq_sum_x_com", &sq_sum_x_com);
 
     let r_t = challenge_vec(transcript, t_bits, b"layernorm_rt");
     let claim_s = sum_x_mle.evaluate(&r_t);
@@ -282,6 +291,12 @@ pub fn prove_layernorm(
     let claim_x_sq = sum_x_sq_mle.evaluate(&r_sig_t);
     let (sum_x_sq_sumcheck, r_f_sig) =
         prove_sumcheck_cubic(&eq_sig, &sum_x_mle, &sum_x_mle, claim_x_sq, transcript);
+
+    // Binding: sigma_sq(r_sig_t) = Σ_i eq(r_sig_t,i)*(d*sigma[i])^2  [binds to sigma_com]
+    let claim_sigma_sq = sigma_sq_mle.evaluate(&r_sig_t);
+    let (sigma_sq_sumcheck, r_f_sigma_sq) =
+        prove_sumcheck_cubic(&eq_sig, &d_sigma_mle, &d_sigma_mle, claim_sigma_sq, transcript);
+
     let r_y_t = r_y[0..t_bits].to_vec();
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
     let ry_td = combine(&r_y_t, &r_y_d);
@@ -345,10 +360,12 @@ pub fn prove_layernorm(
         internal_coms: LayerNormInternalCommitments {
             sum_x_com,
             sigma_com,
+            sq_sum_x_com,
         },
         mean_sumcheck,
         sq_sum_sumcheck,
         sum_x_sq_sumcheck,
+        sigma_sq_sumcheck,
         gamma_sigma_sumcheck,
         sigma_range_proof,
         y_range_proof,
@@ -371,10 +388,10 @@ pub fn prove_layernorm(
             ),
             sq_sum_x_at_rsig: sq_sum_x_mle.evaluate(&r_sig_t),
             sigma_at_rsig: sigma_mle.evaluate(&r_sig_t),
-            sigma_sq_at_rsig: sigma_sq_mle.evaluate(&r_sig_t),
+            sigma_sq_at_rsig: claim_sigma_sq,
             sum_x_sq_at_rsig: claim_x_sq,
             rsig_batch_proof: hyrax_open_batch(
-                &[&sigma_mle.evaluations],
+                &[&sigma_mle.evaluations, &sq_sum_x_mle.evaluations],
                 &r_sig_t,
                 nu_t,
                 sigma_t,
@@ -410,6 +427,14 @@ pub fn prove_layernorm(
             sigma_at_rf_sy_t_proof,
             sum_x_at_rf_sig: sum_x_mle.evaluate(&r_f_sig),
             sum_x_at_rf_sig_proof: hyrax_open(&sum_x_mle.evaluations, &r_f_sig, nu_t, sigma_t),
+            // sigma_sq binding: open sigma_com at r_f_sigma_sq
+            sigma_at_rf_sigma_sq: sigma_mle.evaluate(&r_f_sigma_sq),
+            sigma_at_rf_sigma_sq_proof: hyrax_open(
+                &sigma_mle.evaluations,
+                &r_f_sigma_sq,
+                nu_t,
+                sigma_t,
+            ),
         },
     })
 }
@@ -442,6 +467,7 @@ pub fn verify_layernorm(
     absorb_com(transcript, b"y_com", &io_coms.y_com);
     absorb_com(transcript, b"sum_x_com", &proof.internal_coms.sum_x_com);
     absorb_com(transcript, b"sigma_com", &proof.internal_coms.sigma_com);
+    absorb_com(transcript, b"sq_sum_x_com", &proof.internal_coms.sq_sum_x_com);
 
     // 2. Row Audit Challenge
     let r_t = challenge_vec(transcript, t_bits, b"layernorm_rt");
@@ -502,6 +528,19 @@ pub fn verify_layernorm(
         return Err("sum_x_sq binding failed".into());
     }
 
+    // sigma_sq_sumcheck: proves Σ eq(r_sig_t, i) * (d*sigma[i])^2 = sigma_sq_at_rsig
+    let (r_f_sigma_sq, f_sigma_sq) = verify_sumcheck_cubic(
+        &proof.sigma_sq_sumcheck,
+        proof.openings.sigma_sq_at_rsig,
+        t_bits,
+        transcript,
+    )?;
+    let eq_sigma_sq_eval = eq_poly_eval(&r_f_sigma_sq, &r_sig_t);
+    let d_sigma_rf = d_f * proof.openings.sigma_at_rf_sigma_sq;
+    if f_sigma_sq != eq_sigma_sq_eval * d_sigma_rf * d_sigma_rf {
+        return Err("sigma_sq sumcheck binding failed".into());
+    }
+
     // D. Y Range: use pre-supplied evaluation point from global range batch.
     let r_y = y_r_v;
     let y_eval: F = {
@@ -556,6 +595,7 @@ pub fn verify_layernorm(
 
     // --- Sigma Fusion Check ---
     let v_ev = d_f * (d_f * proof.openings.sq_sum_x_at_rsig - proof.openings.sum_x_sq_at_rsig);
+    // sigma_sq_at_rsig is bound by sigma_sq_sumcheck above
     let z_ev = proof.openings.sigma_sq_at_rsig;
     let dsi = d_f * proof.openings.sigma_at_rsig;
 
@@ -609,10 +649,13 @@ pub fn verify_layernorm(
         &proof.openings.x_rt_rmean_proof,
     )?;
 
-    // 3. rsig_batch_proof (Group 2)
+    // 3. rsig_batch_proof (Group 2): opens sigma_com and sq_sum_x_com at r_sig_t
     acc_t.add_verify_batch(
-        &[proof.internal_coms.sigma_com.clone()],
-        &[proof.openings.sigma_at_rsig],
+        &[
+            proof.internal_coms.sigma_com.clone(),
+            proof.internal_coms.sq_sum_x_com.clone(),
+        ],
+        &[proof.openings.sigma_at_rsig, proof.openings.sq_sum_x_at_rsig],
         &r_sig_t,
         &proof.openings.rsig_batch_proof,
         transcript,
@@ -676,6 +719,14 @@ pub fn verify_layernorm(
         &proof.openings.sum_x_at_rf_sig_proof,
     )?;
 
+    // sigma_sq_sumcheck final binding: open sigma_com at r_f_sigma_sq
+    acc_t.add_verify(
+        &proof.internal_coms.sigma_com,
+        proof.openings.sigma_at_rf_sigma_sq,
+        &r_f_sigma_sq,
+        &proof.openings.sigma_at_rf_sigma_sq_proof,
+    )?;
+
     Ok(())
 }
 
@@ -686,6 +737,8 @@ pub fn verify_layernorm(
 mod layernorm_tests {
     use super::*;
     use ark_ff::{One, Zero};
+    use crate::lookup::range::{prove_range_batched, verify_range_batched, GlobalRangeM};
+    use crate::pcs::{params_from_n, params_from_vars};
 
     fn setup_test_pipeline() -> (
         LayerNormWitness,
@@ -774,7 +827,7 @@ mod layernorm_tests {
         let mut pt = Transcript::new(b"layernorm_test");
         let (mut range_proofs, global_m, r_vs) = prove_range_batched(
             &[&rw.sigma_witness, &rw.y_witness],
-            32,
+            16,
             &mut pt,
         )
         .unwrap();
@@ -806,7 +859,7 @@ mod layernorm_tests {
             &[sigma_rp_ref, y_rp_ref],
             &global_m,
             &[sigma_n_vars, y_n_vars],
-            32,
+            16,
             &mut vt,
             &mut acc_range_sig,
             &mut acc_range_y,
@@ -862,7 +915,7 @@ mod layernorm_tests {
         let y_n_vars = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
         let mut pt = Transcript::new(b"layernorm_test");
         let (mut range_proofs, global_m, r_vs) =
-            prove_range_batched(&[&rw.sigma_witness, &rw.y_witness], 32, &mut pt).unwrap();
+            prove_range_batched(&[&rw.sigma_witness, &rw.y_witness], 16, &mut pt).unwrap();
         let y_rp = range_proofs.remove(1);
         let sigma_rp = range_proofs.remove(0);
         if let Ok(proof) = prove_layernorm(
@@ -886,7 +939,7 @@ mod layernorm_tests {
                 &[&proof.sigma_range_proof, &proof.y_range_proof],
                 &global_m,
                 &[sigma_n_vars, y_n_vars],
-                32,
+                16,
                 &mut vt,
                 &mut acc_range_sig,
                 &mut acc_range_y,
