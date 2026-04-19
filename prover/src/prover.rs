@@ -20,8 +20,7 @@ use crate::poly::DenseMLPoly;
 use crate::transcript::{challenge_vec, Transcript};
 
 use crate::attention::attention::{
-    prove_linear_attention, AttentionIOCommitments,
-    LinearAttentionInstance, LinearAttentionProof, LinearAttentionWitness,
+    LinearAttentionInstance, LinearAttentionWitness,
 };
 use crate::attention::layernorm::{
     compute_range_witnesses, prove_layernorm, LayerNormIOCommitments, LayerNormProof,
@@ -50,7 +49,6 @@ use crate::verifier::{add_commitments, TransformerBlockVerifyingKey};
 pub struct TransformerBlockProof {
     pub ln1_proof: LayerNormProof,
     pub ln2_proof: LayerNormProof,
-    pub attn_proof: LinearAttentionProof,
     pub block_range_m: GlobalRangeM,
 
     // FFN per-block: Lasso for activation + M commitment
@@ -88,12 +86,18 @@ pub struct TransformerBlockProof {
     pub oproj_bias_o_eval: F,
 
     // Per-block scalars for batch FFN-M algebraic check
-    // (M_i claimed eval at shared rx_m/ry_m — needed to open ffn_m_com)
     pub ffn_m_eval: F,
 
-    // v_attn: per-block (attention uses a block-specific eval point)
-    pub v_attn_open: HyraxProof,
-    pub v_attn_eval: F,
+    // Attention: phi_q/phi_k commitments (for Lasso binding + cross-block batch opens)
+    pub attn_phi_q_com: HyraxCommitment,
+    pub attn_phi_k_com: HyraxCommitment,
+
+    // Per-block scalars for cross-block attention batch sumchecks
+    pub attn_out_eval: F,    // x_inner_i(r_t, r_k_o) = claim for out sumcheck
+    pub attn_phi_q_eval: F,  // phi_q_i(r_t, batch_r_attn_out) = leaf of batch_attn_out f
+    pub attn_phi_k_eval: F,  // phi_k_i(batch_r_attn_ctx, batch_r_attn_out) = leaf of batch_attn_ctx f
+    pub attn_ctx_eval: F,    // ctx_i(batch_r_attn_out, r_k_o) = leaf of batch_attn_out g
+    pub attn_v_eval: F,      // v_i(batch_r_attn_ctx, r_k_o) = leaf of batch_attn_ctx g
 }
 
 // ---------------------------------------------------------------------------
@@ -279,11 +283,13 @@ pub struct TransformerModelProof {
     pub all_lasso_proof: LassoMultiProof,
     pub final_range_m: GlobalRangeM,
 
-    // Cross-block batch sumchecks (one per projection type)
+    // Cross-block batch sumchecks (one per projection type + attention)
     pub batch_qkv: SumcheckProofMulti,
     pub batch_oproj: SumcheckProofMulti,
     pub batch_ffn_y: SumcheckProofMulti,
     pub batch_ffn_m: SumcheckProofMulti,
+    pub batch_attn_out: SumcheckProofMulti,
+    pub batch_attn_ctx: SumcheckProofMulti,
 
     // Global batch open for 5L intermediate matrices at shared r_td
     pub inter_batch_open: HyraxProof,
@@ -302,6 +308,11 @@ pub struct TransformerModelProof {
     pub w1_batch_open: HyraxProof,
     pub x_norm2_batch_open: HyraxProof,
     pub ffn_m_com_batch_open: HyraxProof,
+
+    // Cross-block batch opens for attention phi_q, phi_k, v (shared eval points)
+    pub phi_q_batch_open: HyraxProof,
+    pub phi_k_batch_open: HyraxProof,
+    pub v_attn_batch_open: HyraxProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -560,54 +571,101 @@ pub fn prove(
     }
 
     // =========================================================================
-    // 6. Per-block Attention (uses x_inner_eval from O-proj batch)
+    // 6. Cross-block Attention batch sumchecks
+    //    6a: Commit phi_q/phi_k per block, absorb. Collect out_evals.
+    //    6b: Cross-block batch out sumcheck → shared batch_r_attn_out.
+    //    6c: Cross-block batch ctx sumcheck → shared batch_r_attn_ctx.
     // =========================================================================
-    let mut attn_proofs: Vec<LinearAttentionProof> = Vec::with_capacity(num_blocks);
-    let mut pb_v_attn_open: Vec<HyraxProof> = Vec::with_capacity(num_blocks);
-    let mut pb_v_attn_eval: Vec<F> = Vec::with_capacity(num_blocks);
+
+    // 6a. Commit phi_q, phi_k per block and absorb into transcript.
+    let mut phi_q_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut phi_k_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut v_mles_attn: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut ctx_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut attn_phi_q_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
+    let mut attn_phi_k_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
+    let mut attn_out_evals: Vec<F> = Vec::with_capacity(num_blocks);
 
     for i in 0..num_blocks {
         let bpk = &pk.block_pks[i];
         let bw = &witness.block_witnesses[i];
-        let p1 = &phase1_data[i];
 
-        // x_inner_eval_i = final_evals_f[i] / alpha_o_i
+        let phi_q_mle = mat_to_mle(&bw.attn_wit.phi_q, t, d);
+        let phi_k_mle = mat_to_mle(&bw.attn_wit.phi_k, t, d);
+        let v_mle = mat_to_mle(&bw.attn_wit.v, t, d);
+        let ctx_mle = mat_to_mle(&bw.attn_wit.context, d, d);
+
+        let phi_q_com = commit_mat(&bw.attn_wit.phi_q, t, d);
+        let phi_k_com = commit_mat(&bw.attn_wit.phi_k, t, d);
+        absorb_com(transcript, b"phi_q_com", &phi_q_com);
+        absorb_com(transcript, b"phi_k_com", &phi_k_com);
+
+        // out_i(r_t, r_k_o) = x_inner_i = batch_oproj.final_evals_f[i] / alpha_o
         let alpha_o = bpk.o_pk.vk.alpha;
-        let x_inner_eval_i = if alpha_o == F::from(0u64) {
+        let out_eval_i = if alpha_o == F::from(0u64) {
             F::from(0u64)
         } else {
             batch_oproj.final_evals_f[i] * alpha_o.inverse().unwrap()
         };
 
-        let o_x_claim = crate::subprotocols::EvalClaim {
-            point: combine(&r_t, &r_k_o),
-            value: x_inner_eval_i,
-        };
-
-        let attn_io = AttentionIOCommitments {
-            q_com: p1.q_com.clone(),
-            k_com: p1.k_com.clone(),
-            v_com: p1.v_com.clone(),
-            skip_io_absorb: true,
-        };
-        let (attn_proof, _attn_out_claim, attn_v_claim) = prove_linear_attention(
-            &bw.attn_wit,
-            inst_attn,
-            &bpk.attn_pk,
-            &attn_io,
-            Some(o_x_claim),
-            transcript,
-            lasso_params,
-        );
-
-        // Per-block v_attn open (different eval point per block)
-        let v_evals = mat_to_mle(&bw.attn_wit.v, t, d).evaluations;
-        let v_attn_open = hyrax_open(&v_evals, &attn_v_claim.point, nu_td, sigma_td);
-
-        attn_proofs.push(attn_proof);
-        pb_v_attn_open.push(v_attn_open);
-        pb_v_attn_eval.push(attn_v_claim.value);
+        phi_q_mles.push(phi_q_mle);
+        phi_k_mles.push(phi_k_mle);
+        v_mles_attn.push(v_mle);
+        ctx_mles.push(ctx_mle);
+        attn_phi_q_coms.push(phi_q_com);
+        attn_phi_k_coms.push(phi_k_com);
+        attn_out_evals.push(out_eval_i);
     }
+
+    // 6b. Batch out sumcheck: out_i(r_t, r_k_o) = Σ_k phi_q_i(r_t,k) · ctx_i(k, r_k_o)
+    let mut fs_attn_out: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut gs_attn_out: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    for i in 0..num_blocks {
+        transcript.append_field(b"attn_out_eval", &attn_out_evals[i]);
+        let f_out = DenseMLPoly::from_vec_padded(eval_rows(&phi_q_mles[i], t_bits, &r_t));
+        let g_out = DenseMLPoly::from_vec_padded(eval_cols(&ctx_mles[i], d_bits, &r_k_o));
+        fs_attn_out.push(f_out);
+        gs_attn_out.push(g_out);
+    }
+    let eta_attn_out: F = transcript.challenge_field(b"batch_eta_attn_out");
+    let weights_attn_out = powers_of(eta_attn_out, num_blocks);
+    let claim_attn_out: F = weights_attn_out
+        .iter()
+        .zip(attn_out_evals.iter())
+        .map(|(w, e)| *w * *e)
+        .sum();
+    let (batch_attn_out, batch_r_attn_out) = prove_sumcheck_multi_batched(
+        &fs_attn_out, &gs_attn_out, &weights_attn_out, claim_attn_out, transcript,
+    );
+    // final_evals_f[i] = phi_q_i(r_t, batch_r_attn_out)
+    // final_evals_g[i] = ctx_i(batch_r_attn_out, r_k_o) = claim for ctx sumcheck
+    let attn_phi_q_evals: Vec<F> = batch_attn_out.final_evals_f.clone();
+    let attn_ctx_evals: Vec<F> = batch_attn_out.final_evals_g.clone();
+
+    // 6c. Batch ctx sumcheck: ctx_i(batch_r_attn_out, r_k_o) = Σ_t phi_k_i(t, batch_r_attn_out) · v_i(t, r_k_o)
+    let mut fs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut gs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    for i in 0..num_blocks {
+        transcript.append_field(b"attn_ctx_eval", &attn_ctx_evals[i]);
+        let f_ctx = DenseMLPoly::from_vec_padded(eval_cols(&phi_k_mles[i], t_bits, &batch_r_attn_out));
+        let g_v = DenseMLPoly::from_vec_padded(eval_cols(&v_mles_attn[i], t_bits, &r_k_o));
+        fs_attn_ctx.push(f_ctx);
+        gs_attn_ctx.push(g_v);
+    }
+    let eta_attn_ctx: F = transcript.challenge_field(b"batch_eta_attn_ctx");
+    let weights_attn_ctx = powers_of(eta_attn_ctx, num_blocks);
+    let claim_attn_ctx: F = weights_attn_ctx
+        .iter()
+        .zip(attn_ctx_evals.iter())
+        .map(|(w, e)| *w * *e)
+        .sum();
+    let (batch_attn_ctx, batch_r_attn_ctx) = prove_sumcheck_multi_batched(
+        &fs_attn_ctx, &gs_attn_ctx, &weights_attn_ctx, claim_attn_ctx, transcript,
+    );
+    // final_evals_f[i] = phi_k_i(batch_r_attn_ctx, batch_r_attn_out)
+    // final_evals_g[i] = v_i(batch_r_attn_ctx, r_k_o)
+    let attn_phi_k_evals: Vec<F> = batch_attn_ctx.final_evals_f.clone();
+    let attn_v_evals: Vec<F> = batch_attn_ctx.final_evals_g.clone();
 
     // =========================================================================
     // 7. Per-block FFN: Lasso + M commit + absorb coms
@@ -741,7 +799,6 @@ pub fn prove(
         block_proofs.push(TransformerBlockProof {
             ln1_proof: p1.ln1_proof.clone(),
             ln2_proof: p1.ln2_proof.clone(),
-            attn_proof: attn_proofs.remove(0),
             block_range_m: p1.block_range_m.clone(),
             ffn_lasso_proof: ffn_lasso_proofs.remove(0),
             ffn_m_com: ffn_m_coms[i].clone(),
@@ -769,8 +826,13 @@ pub fn prove(
             oproj_w_o_eval: pb_w_o_eval[i],
             oproj_bias_o_eval: pb_oproj_bias_o_eval[i],
             ffn_m_eval: pb_ffn_m_eval[i],
-            v_attn_open: pb_v_attn_open.remove(0),
-            v_attn_eval: pb_v_attn_eval[i],
+            attn_phi_q_com: attn_phi_q_coms[i].clone(),
+            attn_phi_k_com: attn_phi_k_coms[i].clone(),
+            attn_out_eval: attn_out_evals[i],
+            attn_phi_q_eval: attn_phi_q_evals[i],
+            attn_phi_k_eval: attn_phi_k_evals[i],
+            attn_ctx_eval: attn_ctx_evals[i],
+            attn_v_eval: attn_v_evals[i],
         });
     }
 
@@ -935,6 +997,27 @@ pub fn prove(
     let ffn_m_com_batch_open =
         hyrax_open_batch(&ffn_m_refs, &ffn_m_point, nu_mff, sigma_mff, transcript);
 
+    // phi_q_batch: L phi_q_i at combine(r_t, batch_r_attn_out) [td_num_vars]
+    let phi_q_attn_point = combine(&r_t, &batch_r_attn_out);
+    let phi_q_evals_vecs: Vec<Vec<F>> = phi_q_mles.iter().map(|m| m.evaluations.clone()).collect();
+    let phi_q_refs: Vec<&[F]> = phi_q_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let phi_q_batch_open =
+        hyrax_open_batch(&phi_q_refs, &phi_q_attn_point, nu_td, sigma_td, transcript);
+
+    // phi_k_batch: L phi_k_i at combine(batch_r_attn_ctx, batch_r_attn_out) [td_num_vars]
+    let phi_k_attn_point = combine(&batch_r_attn_ctx, &batch_r_attn_out);
+    let phi_k_evals_vecs: Vec<Vec<F>> = phi_k_mles.iter().map(|m| m.evaluations.clone()).collect();
+    let phi_k_refs: Vec<&[F]> = phi_k_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let phi_k_batch_open =
+        hyrax_open_batch(&phi_k_refs, &phi_k_attn_point, nu_td, sigma_td, transcript);
+
+    // v_attn_batch: L v_i at combine(batch_r_attn_ctx, r_k_o) [td_num_vars]
+    let v_attn_batch_point = combine(&batch_r_attn_ctx, &r_k_o);
+    let v_attn_evals_vecs: Vec<Vec<F>> = v_mles_attn.iter().map(|m| m.evaluations.clone()).collect();
+    let v_attn_refs: Vec<&[F]> = v_attn_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let v_attn_batch_open =
+        hyrax_open_batch(&v_attn_refs, &v_attn_batch_point, nu_td, sigma_td, transcript);
+
     // =========================================================================
     // 16. Global batched Lasso (attention)
     // =========================================================================
@@ -945,10 +1028,6 @@ pub fn prove(
     let mut global_nu = 0usize;
     for i in 0..num_blocks {
         let bpk = &pk.block_pks[i];
-        let attn_wit = &witness.block_witnesses[i].attn_wit;
-        let phi_q_mle = mat_to_mle(&attn_wit.phi_q, t, d);
-        let phi_k_mle = mat_to_mle(&attn_wit.phi_k, t, d);
-
         all_lasso_instances.push(inst_attn.q_lasso.clone());
         all_lasso_instances.push(inst_attn.k_lasso.clone());
         all_query_indices.push(inst_attn.q_query_indices.clone());
@@ -958,14 +1037,14 @@ pub fn prove(
         global_nu = bpk.attn_pk.qk_lasso_pk.nu;
 
         all_output_bindings.push(LassoOutputBinding {
-            com: block_proofs[i].attn_proof.phi_q_com.clone(),
+            com: block_proofs[i].attn_phi_q_com.clone(),
             num_vars: td_num_vars,
-            mle_evals: phi_q_mle.evaluations,
+            mle_evals: phi_q_mles[i].evaluations.clone(),
         });
         all_output_bindings.push(LassoOutputBinding {
-            com: block_proofs[i].attn_proof.phi_k_com.clone(),
+            com: block_proofs[i].attn_phi_k_com.clone(),
             num_vars: td_num_vars,
-            mle_evals: phi_k_mle.evaluations,
+            mle_evals: phi_k_mles[i].evaluations.clone(),
         });
     }
     let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
@@ -994,6 +1073,8 @@ pub fn prove(
         batch_oproj,
         batch_ffn_y,
         batch_ffn_m,
+        batch_attn_out,
+        batch_attn_ctx,
         inter_batch_open,
         x_norm1_batch_open,
         w_q_batch_open,
@@ -1008,6 +1089,9 @@ pub fn prove(
         w1_batch_open,
         x_norm2_batch_open,
         ffn_m_com_batch_open,
+        phi_q_batch_open,
+        phi_k_batch_open,
+        v_attn_batch_open,
     })
 }
 

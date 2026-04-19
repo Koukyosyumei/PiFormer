@@ -846,7 +846,6 @@ fn read_ffn_proof<R: Read>(r: &mut R) -> io::Result<FFNProof> {
 fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Result<()> {
     write_ln_proof(w, &p.ln1_proof)?;
     write_ln_proof(w, &p.ln2_proof)?;
-    write_attn_proof(w, &p.attn_proof)?;
     write_global_range_m(w, &p.block_range_m)?;
     // FFN per-block
     write_lasso_proof(w, &p.ffn_lasso_proof)?;
@@ -879,15 +878,19 @@ fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Resu
     write_f(w, &p.oproj_bias_o_eval)?;
     // Per-block FFN-M scalar
     write_f(w, &p.ffn_m_eval)?;
-    // v_attn per-block open
-    write_hyrax_proof(w, &p.v_attn_open)?;
-    write_f(w, &p.v_attn_eval)
+    // Attention phi_q/phi_k commitments + scalars
+    write_hyrax_commitment(w, &p.attn_phi_q_com)?;
+    write_hyrax_commitment(w, &p.attn_phi_k_com)?;
+    write_f(w, &p.attn_out_eval)?;
+    write_f(w, &p.attn_phi_q_eval)?;
+    write_f(w, &p.attn_phi_k_eval)?;
+    write_f(w, &p.attn_ctx_eval)?;
+    write_f(w, &p.attn_v_eval)
 }
 fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
     Ok(TransformerBlockProof {
         ln1_proof: read_ln_proof(r)?,
         ln2_proof: read_ln_proof(r)?,
-        attn_proof: read_attn_proof(r)?,
         block_range_m: read_global_range_m(r)?,
         // FFN per-block
         ffn_lasso_proof: read_lasso_proof(r)?,
@@ -920,9 +923,14 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
         oproj_bias_o_eval: read_f(r)?,
         // Per-block FFN-M scalar
         ffn_m_eval: read_f(r)?,
-        // v_attn per-block open
-        v_attn_open: read_hyrax_proof(r)?,
-        v_attn_eval: read_f(r)?,
+        // Attention phi_q/phi_k commitments + scalars
+        attn_phi_q_com: read_hyrax_commitment(r)?,
+        attn_phi_k_com: read_hyrax_commitment(r)?,
+        attn_out_eval: read_f(r)?,
+        attn_phi_q_eval: read_f(r)?,
+        attn_phi_k_eval: read_f(r)?,
+        attn_ctx_eval: read_f(r)?,
+        attn_v_eval: read_f(r)?,
     })
 }
 
@@ -941,6 +949,8 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_sumcheck_proof_multi(w, &p.batch_oproj)?;
     write_sumcheck_proof_multi(w, &p.batch_ffn_y)?;
     write_sumcheck_proof_multi(w, &p.batch_ffn_m)?;
+    write_sumcheck_proof_multi(w, &p.batch_attn_out)?;
+    write_sumcheck_proof_multi(w, &p.batch_attn_ctx)?;
     // Global intermediate batch open
     write_hyrax_proof(w, &p.inter_batch_open)?;
     // 13 cross-block weight/activation batch opens
@@ -956,7 +966,11 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_hyrax_proof(w, &p.w2_batch_open)?;
     write_hyrax_proof(w, &p.w1_batch_open)?;
     write_hyrax_proof(w, &p.x_norm2_batch_open)?;
-    write_hyrax_proof(w, &p.ffn_m_com_batch_open)
+    write_hyrax_proof(w, &p.ffn_m_com_batch_open)?;
+    // 3 attention batch opens
+    write_hyrax_proof(w, &p.phi_q_batch_open)?;
+    write_hyrax_proof(w, &p.phi_k_batch_open)?;
+    write_hyrax_proof(w, &p.v_attn_batch_open)
 }
 fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
     Ok(TransformerModelProof {
@@ -974,6 +988,8 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         batch_oproj: read_sumcheck_proof_multi(r)?,
         batch_ffn_y: read_sumcheck_proof_multi(r)?,
         batch_ffn_m: read_sumcheck_proof_multi(r)?,
+        batch_attn_out: read_sumcheck_proof_multi(r)?,
+        batch_attn_ctx: read_sumcheck_proof_multi(r)?,
         // Global intermediate batch open
         inter_batch_open: read_hyrax_proof(r)?,
         // 13 cross-block weight/activation batch opens
@@ -990,6 +1006,10 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         w1_batch_open: read_hyrax_proof(r)?,
         x_norm2_batch_open: read_hyrax_proof(r)?,
         ffn_m_com_batch_open: read_hyrax_proof(r)?,
+        // 3 attention batch opens
+        phi_q_batch_open: read_hyrax_proof(r)?,
+        phi_k_batch_open: read_hyrax_proof(r)?,
+        v_attn_batch_open: read_hyrax_proof(r)?,
     })
 }
 

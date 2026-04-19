@@ -20,7 +20,7 @@ use crate::subprotocols::verify_sumcheck_multi_batched;
 use crate::transcript::{challenge_vec, Transcript};
 
 use crate::attention::attention::{
-    verify_linear_attention, AttentionIOCommitments, AttentionProvingKey,
+    AttentionProvingKey,
     LinearAttentionInstance,
 };
 use crate::attention::layernorm::{
@@ -327,44 +327,76 @@ pub fn verify(
     eprintln!("[model] batch_oproj:{:>8.3}ms", _to.elapsed().as_secs_f64()*1000.0);
 
     // =========================================================================
-    // 6. Per-block Attention
+    // 6. Cross-block batch attention sumchecks
     // =========================================================================
-    for i in 0..num_blocks {
-        let bvk = &vk.block_vks[i];
-        let bp = &proof.block_proofs[i];
+    let _tattn = Instant::now();
 
-        let alpha_o = bvk.o_vk.alpha;
-        let x_inner_eval = if alpha_o == F::from(0u64) {
+    // 6a. Absorb phi_q_com, phi_k_com per block (mirrors prover step 6a)
+    for i in 0..num_blocks {
+        let bp = &proof.block_proofs[i];
+        absorb_com(transcript, b"phi_q_com", &bp.attn_phi_q_com);
+        absorb_com(transcript, b"phi_k_com", &bp.attn_phi_k_com);
+    }
+
+    // 6b. Verify batch out sumcheck
+    for i in 0..num_blocks {
+        transcript.append_field(b"attn_out_eval", &proof.block_proofs[i].attn_out_eval);
+    }
+    let eta_attn_out: F = transcript.challenge_field(b"batch_eta_attn_out");
+    let weights_attn_out = powers_of(eta_attn_out, num_blocks);
+    let claim_attn_out: F = (0..num_blocks)
+        .map(|i| weights_attn_out[i] * proof.block_proofs[i].attn_out_eval)
+        .sum();
+    let (batch_r_attn_out, _) = verify_sumcheck_multi_batched(
+        &proof.batch_attn_out, &weights_attn_out, claim_attn_out, d_bits, transcript,
+    )?;
+
+    // Algebraic checks: leaves of batch_attn_out match claimed scalars
+    for i in 0..num_blocks {
+        let bp = &proof.block_proofs[i];
+        // Derive expected attn_out_eval from batch_oproj leaf / alpha_o
+        let alpha_o = vk.block_vks[i].o_vk.alpha;
+        let expected_out = if alpha_o == F::from(0u64) {
             F::from(0u64)
         } else {
             proof.batch_oproj.final_evals_f[i] * alpha_o.inverse().unwrap()
         };
-
-        let o_x_claim = crate::subprotocols::EvalClaim {
-            point: combine(&r_t, &r_k_o),
-            value: x_inner_eval,
-        };
-
-        let attn_io = AttentionIOCommitments {
-            q_com: bp.q_com.clone(),
-            k_com: bp.k_com.clone(),
-            v_com: bp.v_com.clone(),
-            skip_io_absorb: true,
-        };
-        let _t0 = Instant::now();
-        let (attn_out_claim, attn_v_claim) = verify_linear_attention(
-            &bp.attn_proof, inst_attn, &attn_io, Some(o_x_claim), transcript,
-        )?;
-        eprintln!("[block {}] attn:{:>8.3}ms", i, _t0.elapsed().as_secs_f64()*1000.0);
-
-        if attn_out_claim.value != bp.out_attn_eval {
-            return Err(format!("Block {i}: attention out_claim mismatch with out_attn_eval"));
+        if bp.attn_out_eval != expected_out {
+            return Err(format!("Block {i}: attn_out_eval mismatch with o_proj leaf"));
         }
-
-        inter_acc
-            .add_verify(&bp.v_com, bp.v_attn_eval, &attn_v_claim.point, &bp.v_attn_open)
-            .map_err(|e| format!("Block {i} v_attn inter: {e}"))?;
+        if proof.batch_attn_out.final_evals_f[i] != bp.attn_phi_q_eval {
+            return Err(format!("Block {i}: batch_attn_out final_f != phi_q_eval"));
+        }
+        if proof.batch_attn_out.final_evals_g[i] != bp.attn_ctx_eval {
+            return Err(format!("Block {i}: batch_attn_out final_g != ctx_eval"));
+        }
     }
+
+    // 6c. Verify batch ctx sumcheck
+    for i in 0..num_blocks {
+        transcript.append_field(b"attn_ctx_eval", &proof.block_proofs[i].attn_ctx_eval);
+    }
+    let eta_attn_ctx: F = transcript.challenge_field(b"batch_eta_attn_ctx");
+    let weights_attn_ctx = powers_of(eta_attn_ctx, num_blocks);
+    let claim_attn_ctx: F = (0..num_blocks)
+        .map(|i| weights_attn_ctx[i] * proof.block_proofs[i].attn_ctx_eval)
+        .sum();
+    let (batch_r_attn_ctx, _) = verify_sumcheck_multi_batched(
+        &proof.batch_attn_ctx, &weights_attn_ctx, claim_attn_ctx, t_bits, transcript,
+    )?;
+
+    // Algebraic checks: leaves of batch_attn_ctx match claimed scalars
+    for i in 0..num_blocks {
+        let bp = &proof.block_proofs[i];
+        if proof.batch_attn_ctx.final_evals_f[i] != bp.attn_phi_k_eval {
+            return Err(format!("Block {i}: batch_attn_ctx final_f != phi_k_eval"));
+        }
+        if proof.batch_attn_ctx.final_evals_g[i] != bp.attn_v_eval {
+            return Err(format!("Block {i}: batch_attn_ctx final_g != v_eval"));
+        }
+    }
+
+    eprintln!("[model] batch_attn:{:>8.3}ms", _tattn.elapsed().as_secs_f64()*1000.0);
 
     // =========================================================================
     // 7. Per-block FFN: Lasso + M absorb
@@ -688,6 +720,39 @@ pub fn verify(
         &proof.ffn_m_com_batch_open, &params_mff, transcript,
     ).map_err(|e| format!("ffn_m_com_batch: {e}"))?;
 
+    // phi_q at combine(r_t, batch_r_attn_out)
+    let phi_q_attn_point = combine(&r_t, &batch_r_attn_out);
+    let phi_q_coms: Vec<HyraxCommitment> =
+        proof.block_proofs.iter().map(|bp| bp.attn_phi_q_com.clone()).collect();
+    let phi_q_evals: Vec<F> =
+        proof.block_proofs.iter().map(|bp| bp.attn_phi_q_eval).collect();
+    hyrax_verify_batch(
+        &phi_q_coms, &phi_q_evals, &phi_q_attn_point,
+        &proof.phi_q_batch_open, &params_td, transcript,
+    ).map_err(|e| format!("phi_q_batch: {e}"))?;
+
+    // phi_k at combine(batch_r_attn_ctx, batch_r_attn_out)
+    let phi_k_attn_point = combine(&batch_r_attn_ctx, &batch_r_attn_out);
+    let phi_k_coms: Vec<HyraxCommitment> =
+        proof.block_proofs.iter().map(|bp| bp.attn_phi_k_com.clone()).collect();
+    let phi_k_evals: Vec<F> =
+        proof.block_proofs.iter().map(|bp| bp.attn_phi_k_eval).collect();
+    hyrax_verify_batch(
+        &phi_k_coms, &phi_k_evals, &phi_k_attn_point,
+        &proof.phi_k_batch_open, &params_td, transcript,
+    ).map_err(|e| format!("phi_k_batch: {e}"))?;
+
+    // v_attn at combine(batch_r_attn_ctx, r_k_o)
+    let v_attn_batch_point = combine(&batch_r_attn_ctx, &r_k_o);
+    let v_attn_coms: Vec<HyraxCommitment> =
+        proof.block_proofs.iter().map(|bp| bp.v_com.clone()).collect();
+    let v_attn_evals: Vec<F> =
+        proof.block_proofs.iter().map(|bp| bp.attn_v_eval).collect();
+    hyrax_verify_batch(
+        &v_attn_coms, &v_attn_evals, &v_attn_batch_point,
+        &proof.v_attn_batch_open, &params_td, transcript,
+    ).map_err(|e| format!("v_attn_batch: {e}"))?;
+
     eprintln!("[model] cross_batch_opens:{:>8.3}ms", _tbatch.elapsed().as_secs_f64()*1000.0);
 
     // =========================================================================
@@ -703,8 +768,8 @@ pub fn verify(
         all_lasso_instances.push(inst_attn.k_lasso.clone());
         all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
         all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
-        all_output_coms.push((proof.block_proofs[i].attn_proof.phi_q_com.clone(), td_num_vars));
-        all_output_coms.push((proof.block_proofs[i].attn_proof.phi_k_com.clone(), td_num_vars));
+        all_output_coms.push((proof.block_proofs[i].attn_phi_q_com.clone(), td_num_vars));
+        all_output_coms.push((proof.block_proofs[i].attn_phi_k_com.clone(), td_num_vars));
     }
     let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
     let global_lasso_vk = LassoMultiVerifyingKey { instance_table_coms: all_instance_coms };
