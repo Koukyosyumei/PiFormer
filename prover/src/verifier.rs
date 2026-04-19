@@ -7,6 +7,7 @@
 //! 3. Commitment Chaining: Intermediate IO commitments passed from the Prover
 //!    are cryptographically bound across adjacent sub-verifiers.
 
+use crate::field::F;
 use crate::lookup::lasso::{verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey};
 use crate::lookup::range::verify_range_batched;
 use crate::pcs::{absorb_com, hyrax_verify, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams};
@@ -91,7 +92,6 @@ pub fn verify_transformer_block(
     let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
     let d_bits = vk.d_model.next_power_of_two().trailing_zeros() as usize;
     let td_num_vars = t_bits + d_bits;
-    let (_, _, td_params) = params_from_vars(td_num_vars);
 
     // --- 0. Global range batch for all 4 range proofs in this block ---
     //    Transcript ordering must match prove_transformer_block: range batch first.
@@ -129,8 +129,6 @@ pub fn verify_transformer_block(
     let _t = Instant::now();
     verify_layernorm(&proof.ln1_proof, &ln1_io, &vk.ln1_vk, ln1_sig_rv, ln1_y_rv, transcript, ln_acc_t, ln_acc_td)?;
     eprintln!("[block] ln1:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
-
-    let _ = td_params; // ensure td_params isn't flagged unused
 
     // --- 2. Batched Q, K, V Projections — single sumcheck, single r_k ---
     let qkv_io = BatchedQKVProjectionIOCommitments { x_com: proof.x_norm1_com.clone() };
@@ -400,23 +398,59 @@ pub fn verify(
     hyrax_verify(&proof.logits_com, lm_y_claim.value, &lm_y_claim.point, &proof.lm_head_logits_open, &params_logits)
         .map_err(|e| format!("Logits commitment verification failed: {e}"))?;
 
-    // Finalize all 10 accumulators (each adds hyrax_group_mu to transcript).
-    // inter_acc is first — matches the prover's burn order.
+    // Finalize all 10 accumulators in two phases:
+    //   Phase 1 (sequential): derive all 10 mu challenges in transcript order.
+    //   Phase 2 (parallel):   run the 2 MSMs inside each finalize concurrently.
+    // This preserves Fiat-Shamir transcript integrity while parallelising the
+    // MSM work (the dominant cost in each finalize call).
     let _tacc = Instant::now();
-    // Layer-folding: 7×L intermediate opens → 2 MSMs total.
-    inter_acc.finalize(&params_td, transcript)
-        .map_err(|e| format!("inter_acc finalize: {e}"))?;
-    ln_acc_t.finalize(&params_t, transcript)?;
-    ln_acc_td.finalize(&params_td, transcript)?;
-    proj_acc_w.finalize(&params_qkvo_w, transcript)?;
-    proj_acc_b.finalize(&params_qkvo_b, transcript)?;
-    lmh_acc_w.finalize(&params_lmh_w, transcript)?;
-    lmh_acc_b.finalize(&params_lmh_b, transcript)?;
-    // Range proof chunk/m accumulators (3 new — must match prover burns)
-    acc_range_sig.finalize(&params_range_sig, transcript)?;
-    acc_range_y.finalize(&params_range_y, transcript)?;
-    acc_range_m.finalize(&params_range_m, transcript)?;
+    let mu_inter    = transcript.challenge_field::<F>(b"hyrax_group_mu"); // inter_acc
+    let mu_ln_t     = transcript.challenge_field::<F>(b"hyrax_group_mu"); // ln_acc_t
+    let mu_ln_td    = transcript.challenge_field::<F>(b"hyrax_group_mu"); // ln_acc_td
+    let mu_proj_w   = transcript.challenge_field::<F>(b"hyrax_group_mu"); // proj_acc_w
+    let mu_proj_b   = transcript.challenge_field::<F>(b"hyrax_group_mu"); // proj_acc_b
+    let mu_lmh_w    = transcript.challenge_field::<F>(b"hyrax_group_mu"); // lmh_acc_w
+    let mu_lmh_b    = transcript.challenge_field::<F>(b"hyrax_group_mu"); // lmh_acc_b
+    let mu_rng_sig  = transcript.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_sig
+    let mu_rng_y    = transcript.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_y
+    let mu_rng_m    = transcript.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_m
+
+    let ((r0, r1), (r2, r3)) = rayon::join(
+        || rayon::join(
+            || inter_acc.finalize_with_mu(&params_td, mu_inter)
+                        .map_err(|e| format!("inter_acc: {e}")),
+            || ln_acc_t.finalize_with_mu(&params_t, mu_ln_t)
+                       .map_err(|e| format!("ln_acc_t: {e}")),
+        ),
+        || rayon::join(
+            || ln_acc_td.finalize_with_mu(&params_td, mu_ln_td)
+                        .map_err(|e| format!("ln_acc_td: {e}")),
+            || proj_acc_w.finalize_with_mu(&params_qkvo_w, mu_proj_w)
+                         .map_err(|e| format!("proj_acc_w: {e}")),
+        ),
+    );
+    let ((r4, r5), (r6, r7)) = rayon::join(
+        || rayon::join(
+            || proj_acc_b.finalize_with_mu(&params_qkvo_b, mu_proj_b)
+                         .map_err(|e| format!("proj_acc_b: {e}")),
+            || lmh_acc_w.finalize_with_mu(&params_lmh_w, mu_lmh_w)
+                        .map_err(|e| format!("lmh_acc_w: {e}")),
+        ),
+        || rayon::join(
+            || lmh_acc_b.finalize_with_mu(&params_lmh_b, mu_lmh_b)
+                        .map_err(|e| format!("lmh_acc_b: {e}")),
+            || acc_range_sig.finalize_with_mu(&params_range_sig, mu_rng_sig)
+                            .map_err(|e| format!("acc_range_sig: {e}")),
+        ),
+    );
+    let (r8, r9) = rayon::join(
+        || acc_range_y.finalize_with_mu(&params_range_y, mu_rng_y)
+                      .map_err(|e| format!("acc_range_y: {e}")),
+        || acc_range_m.finalize_with_mu(&params_range_m, mu_rng_m)
+                      .map_err(|e| format!("acc_range_m: {e}")),
+    );
     eprintln!("[model] acc_finalize:{:>8.3}ms", _tacc.elapsed().as_secs_f64()*1000.0);
+    r0?; r1?; r2?; r3?; r4?; r5?; r6?; r7?; r8?; r9?;
 
     // 5. Global batched Lasso
     let _t = Instant::now();

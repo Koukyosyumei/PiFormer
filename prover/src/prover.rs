@@ -130,14 +130,13 @@ pub fn prove_transformer_block(
     let t = pk.seq_len;
     let d = pk.d_model;
 
-    // Helper to commit to a matrix
+    // Helper to commit to a matrix (uses global params cache — avoids re-generating generators)
     let commit_mat = |mat: &[Vec<F>], rows: usize, cols: usize| -> HyraxCommitment {
-        let mle = mat_to_mle(mat, rows, cols); // Implement mat_to_mle as usual
+        let mle = mat_to_mle(mat, rows, cols);
         let total_vars =
             rows.next_power_of_two().trailing_zeros() + cols.next_power_of_two().trailing_zeros();
-        let nu = total_vars as usize / 2;
-        let sigma = (total_vars as usize - nu).max(1);
-        hyrax_commit(&mle.evaluations, nu, &HyraxParams::new(sigma))
+        let (nu, _, params) = params_from_vars(total_vars as usize);
+        hyrax_commit(&mle.evaluations, nu, &params)
     };
 
     // 1. Generate Intermediate IO Commitments (out_inner_com eliminated via GKR backward)
@@ -395,9 +394,8 @@ pub fn prove(
         let mle = mat_to_mle(mat, rows, cols);
         let vars =
             rows.next_power_of_two().trailing_zeros() + cols.next_power_of_two().trailing_zeros();
-        let nu = vars as usize / 2;
-        let sigma = (vars as usize - nu).max(1);
-        hyrax_commit(&mle.evaluations, nu, &HyraxParams::new(sigma))
+        let (nu, _, params) = params_from_vars(vars as usize);
+        hyrax_commit(&mle.evaluations, nu, &params)
     };
 
     // 1. Initial Input Commitment
@@ -641,9 +639,8 @@ mod tests {
         let mle = mat_to_mle(mat, rows, cols);
         let total_vars = rows.next_power_of_two().trailing_zeros() as usize
             + cols.next_power_of_two().trailing_zeros() as usize;
-        let nu = total_vars / 2;
-        let sigma = (total_vars - nu).max(1);
-        hyrax_commit(&mle.evaluations, nu, &HyraxParams::new(sigma))
+        let (nu, _, params) = crate::pcs::params_from_vars(total_vars);
+        hyrax_commit(&mle.evaluations, nu, &params)
     }
 
     /// LN witness for x_in = [[10,20],[30,40]], gamma=[2,2], beta=[5,5].
