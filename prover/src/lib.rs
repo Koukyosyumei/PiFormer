@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod cross_layer;
 pub mod ffn;
 pub mod field;
 pub mod lookup;

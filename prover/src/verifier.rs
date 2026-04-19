@@ -80,6 +80,9 @@ pub fn verify_transformer_block(
     acc_range_sig: &mut HyraxBatchAccumulator,
     acc_range_y: &mut HyraxBatchAccumulator,
     acc_range_m: &mut HyraxBatchAccumulator,
+    // FFN weight and M accumulators — deferred from 3 inline MSMs per block.
+    ffn_acc_w: &mut HyraxBatchAccumulator,
+    ffn_acc_m: &mut HyraxBatchAccumulator,
     // Layer-folding accumulator: collects all 7 intermediate opens across all blocks.
     // Caller must finalize once after all blocks are verified (2 MSMs total vs 2L).
     inter_acc: &mut HyraxBatchAccumulator,
@@ -182,6 +185,8 @@ pub fn verify_transformer_block(
         &ffn_io,
         transcript,
         lasso_params,
+        ffn_acc_w,
+        ffn_acc_m,
     )?;
     eprintln!("[block] ffn:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
@@ -308,6 +313,15 @@ pub fn verify(
     let mut acc_range_sig = HyraxBatchAccumulator::new();
     let mut acc_range_y   = HyraxBatchAccumulator::new();
     let mut acc_range_m   = HyraxBatchAccumulator::new();
+    // FFN weight and M accumulators (was 3 inline MSMs per block).
+    let ffn_vk0 = &vk.block_vks[0].ffn_vk;
+    let ffn_in_bits = ffn_vk0.d_model.next_power_of_two().trailing_zeros() as usize;
+    let ffn_out_bits = ffn_vk0.d_ff.next_power_of_two().trailing_zeros() as usize;
+    let t_bits_ffn = ffn_vk0.seq_len.next_power_of_two().trailing_zeros() as usize;
+    let params_ffn_w = params_from_vars(ffn_in_bits + ffn_out_bits).2;
+    let params_ffn_m = params_from_vars(t_bits_ffn + ffn_out_bits).2;
+    let mut ffn_acc_w = HyraxBatchAccumulator::new();
+    let mut ffn_acc_m = HyraxBatchAccumulator::new();
     // Layer-folding accumulator: collects 7 intermediate opens per block.
     // Finalized once after all blocks (2 MSMs total vs 2L).
     let mut inter_acc = HyraxBatchAccumulator::new();
@@ -339,6 +353,8 @@ pub fn verify(
             &mut acc_range_sig,
             &mut acc_range_y,
             &mut acc_range_m,
+            &mut ffn_acc_w,
+            &mut ffn_acc_m,
             &mut inter_acc,
         )
         .map_err(|e| format!("Block {} failed: {}", i, e))?;
@@ -415,6 +431,8 @@ pub fn verify(
     let mu_rng_sig  = transcript.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_sig
     let mu_rng_y    = transcript.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_y
     let mu_rng_m    = transcript.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_m
+    let mu_ffn_w    = transcript.challenge_field::<F>(b"hyrax_group_mu"); // ffn_acc_w
+    let mu_ffn_m    = transcript.challenge_field::<F>(b"hyrax_group_mu"); // ffn_acc_m
 
     let ((r0, r1), (r2, r3)) = rayon::join(
         || rayon::join(
@@ -444,14 +462,22 @@ pub fn verify(
                             .map_err(|e| format!("acc_range_sig: {e}")),
         ),
     );
-    let (r8, r9) = rayon::join(
-        || acc_range_y.finalize_with_mu(&params_range_y, mu_rng_y)
-                      .map_err(|e| format!("acc_range_y: {e}")),
-        || acc_range_m.finalize_with_mu(&params_range_m, mu_rng_m)
-                      .map_err(|e| format!("acc_range_m: {e}")),
+    let ((r8, r9), (r10, r11)) = rayon::join(
+        || rayon::join(
+            || acc_range_y.finalize_with_mu(&params_range_y, mu_rng_y)
+                          .map_err(|e| format!("acc_range_y: {e}")),
+            || acc_range_m.finalize_with_mu(&params_range_m, mu_rng_m)
+                          .map_err(|e| format!("acc_range_m: {e}")),
+        ),
+        || rayon::join(
+            || ffn_acc_w.finalize_with_mu(&params_ffn_w, mu_ffn_w)
+                        .map_err(|e| format!("ffn_acc_w: {e}")),
+            || ffn_acc_m.finalize_with_mu(&params_ffn_m, mu_ffn_m)
+                        .map_err(|e| format!("ffn_acc_m: {e}")),
+        ),
     );
     eprintln!("[model] acc_finalize:{:>8.3}ms", _tacc.elapsed().as_secs_f64()*1000.0);
-    r0?; r1?; r2?; r3?; r4?; r5?; r6?; r7?; r8?; r9?;
+    r0?; r1?; r2?; r3?; r4?; r5?; r6?; r7?; r8?; r9?; r10?; r11?;
 
     // 5. Global batched Lasso
     let _t = Instant::now();
