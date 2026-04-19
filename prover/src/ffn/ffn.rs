@@ -31,9 +31,9 @@ use crate::transcript::{challenge_vec, Transcript};
 // ---------------------------------------------------------------------------
 
 /// Trusted IO Commitments provided by the Global Pipeline Verifier.
+/// x_com is None in GKR mode: x (= LN2.y) is not committed; binding comes
+/// from the block-level GKR check using LN2's internal commitments.
 pub struct FFNIOCommitments {
-    /// None = GKR backward mode: x_norm2 not committed externally; binding comes from
-    /// the downstream LayerNorm that opens y_com at the returned x_claim.
     pub x_com: Option<HyraxCommitment>,
     pub y_com: HyraxCommitment,
 }
@@ -181,7 +181,7 @@ pub fn prove_ffn(
     let (nu_w1, sigma_w1, _) = params_from_vars(d_bits + f_bits);
     let (nu_w2, sigma_w2, _) = params_from_vars(f_bits + d_bits);
 
-    // 1. Absorb Trusted IO & VK Commitments (x_com optional: None = GKR backward mode)
+    // 1. Absorb Trusted IO & VK Commitments
     absorb_com(transcript, b"w1_com", &pk.vk.w1_com);
     absorb_com(transcript, b"w2_com", &pk.vk.w2_com);
     if let Some(ref xc) = io_coms.x_com {
@@ -283,7 +283,7 @@ pub fn verify_ffn(
 
     let (_, _, params_mf) = params_from_vars(t_bits + f_bits);
 
-    // 1. Absorb Trusted IO & VK Commitments (x_com optional in GKR backward mode)
+    // 1. Absorb Trusted IO & VK Commitments (no a_com — GKR backward eliminates it)
     absorb_com(transcript, b"w1_com", &vk.w1_com);
     absorb_com(transcript, b"w2_com", &vk.w2_com);
     if let Some(ref xc) = io_coms.x_com {

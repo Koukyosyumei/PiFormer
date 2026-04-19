@@ -121,24 +121,23 @@ pub fn verify_transformer_block(
     let ln2_sig_rv = &block_r_vs[2];
     let ln2_y_rv   = &block_r_vs[3];
 
-    // --- 1. Batched Q, K, V Projections (GKR backward: runs BEFORE LN1) ---
-    // x_com is None: x_norm1 not committed externally; LN1 proves it via external_y_claim.
-    let qkv_io = BatchedQKVProjectionIOCommitments { x_com: None };
+    // --- 1. LayerNorm 1 (conventional mode: y_com = Some(x_norm1_com)) ---
+    let ln1_io = LayerNormIOCommitments {
+        x_com: x_in_com.clone(),
+        y_com: Some(proof.x_norm1_com.clone()),
+    };
+    let _t = Instant::now();
+    verify_layernorm(&proof.ln1_proof, &ln1_io, &vk.ln1_vk, ln1_sig_rv, ln1_y_rv, transcript, ln_acc_t, ln_acc_td)?;
+    eprintln!("[block] ln1:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
+
+    // --- 2. Batched Q, K, V Projections (conventional mode: x_com = Some(x_norm1_com)) ---
+    let qkv_io = BatchedQKVProjectionIOCommitments { x_com: Some(proof.x_norm1_com.clone()) };
     let _t = Instant::now();
     let (q_y_claim, k_y_claim, v_y_claim, x_norm1_claim) = verify_qkv_projections(
         &proof.qkv_proj_proof, &vk.q_vk, &vk.k_vk, &vk.v_vk,
         &qkv_io, transcript, proj_acc_w, proj_acc_b,
     )?;
     eprintln!("[block] qkv_proj:   {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
-
-    // --- 2. LayerNorm 1 (GKR backward: runs AFTER QKV, proves y = x_norm1) ---
-    let ln1_io = LayerNormIOCommitments {
-        x_com: x_in_com.clone(),
-        y_com: None, // committed internally by LN1 prover; binding via external_y_claim
-    };
-    let _t = Instant::now();
-    verify_layernorm(&proof.ln1_proof, &ln1_io, &vk.ln1_vk, ln1_sig_rv, ln1_y_rv, Some(&x_norm1_claim), transcript, ln_acc_t, ln_acc_td)?;
-    eprintln!("[block] ln1:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // --- 3. Output Projection (GKR backward: runs before attention) ---
     // out_inner is not committed; O_proj's x_claim serves as the shared eval point.
@@ -162,10 +161,18 @@ pub fn verify_transformer_block(
     // =========================================================================
     let x_mid_com = add_commitments(x_in_com, &proof.out_attn_com);
 
-    // --- 5. FFN (GKR backward: runs BEFORE LN2) ---
-    // x_com is None: x_norm2 not committed externally; LN2 proves it via external_y_claim.
+    // --- 5. LayerNorm 2 (conventional mode: y_com = Some(x_norm2_com)) ---
+    let ln2_io = LayerNormIOCommitments {
+        x_com: x_mid_com.clone(),
+        y_com: Some(proof.x_norm2_com.clone()),
+    };
+    let _t = Instant::now();
+    verify_layernorm(&proof.ln2_proof, &ln2_io, &vk.ln2_vk, ln2_sig_rv, ln2_y_rv, transcript, ln_acc_t, ln_acc_td)?;
+    eprintln!("[block] ln2:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
+
+    // --- 6. FFN (conventional mode: x_com = Some(x_norm2_com)) ---
     let ffn_io = crate::ffn::ffn::FFNIOCommitments {
-        x_com: None, // GKR backward: LN2 binds x_norm2 via external_y_claim
+        x_com: Some(proof.x_norm2_com.clone()),
         y_com: proof.out_ffn_com.clone(),
     };
     let _t = Instant::now(); let (ffn_y_claim, ffn_x_claim) = verify_ffn(
@@ -178,36 +185,30 @@ pub fn verify_transformer_block(
     )?;
     eprintln!("[block] ffn:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
-    // --- 6. LayerNorm 2 (GKR backward: runs AFTER FFN, proves y = x_norm2) ---
-    let ln2_io = LayerNormIOCommitments {
-        x_com: x_mid_com.clone(),
-        y_com: None, // committed internally by LN2 prover; binding via external_y_claim
-    };
-    let _t = Instant::now();
-    verify_layernorm(&proof.ln2_proof, &ln2_io, &vk.ln2_vk, ln2_sig_rv, ln2_y_rv, Some(&ffn_x_claim), transcript, ln_acc_t, ln_acc_td)?;
-    eprintln!("[block] ln2:        {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
-
-    // --- 7. Layer-folded intermediate opens ---
-    // All 7 per-block openings (6 direct + 1 deferred combine) are accumulated into
-    // `inter_acc` instead of being batch-verified immediately with hyrax_verify_multi_point.
-    // The caller finalizes inter_acc once after all blocks, reducing 2L MSMs → 2 MSMs.
+    // --- 7. Layer-folded intermediate opens + conventional bindings ---
     let _t = Instant::now();
     let (v_r, v_f) = verify_combine_deferred(
         &proof.v_combine, &proof.v_com,
         &[v_y_claim.clone(), attn_v_claim.clone()], td_num_vars, transcript,
     ).map_err(|e| format!("v_combine: {e}"))?;
-    inter_acc.add_verify(&proof.q_com,        q_y_claim.value,     &q_y_claim.point,     &proof.q_open)
+    inter_acc.add_verify(&proof.q_com,        q_y_claim.value,  &q_y_claim.point,  &proof.q_open)
         .map_err(|e| format!("q_open inter: {e}"))?;
-    inter_acc.add_verify(&proof.k_com,        k_y_claim.value,     &k_y_claim.point,     &proof.k_open)
+    inter_acc.add_verify(&proof.k_com,        k_y_claim.value,  &k_y_claim.point,  &proof.k_open)
         .map_err(|e| format!("k_open inter: {e}"))?;
-    // x_norm1_com: eliminated — binding now via LN1's internal y_com opening
-    inter_acc.add_verify(&proof.out_attn_com, o_y_claim.value,     &o_y_claim.point,     &proof.out_attn_open)
+    inter_acc.add_verify(&proof.out_attn_com, o_y_claim.value,  &o_y_claim.point,  &proof.out_attn_open)
         .map_err(|e| format!("out_attn inter: {e}"))?;
-    // x_norm2_com: eliminated — binding now via LN2's internal y_com opening
-    inter_acc.add_verify(&proof.out_ffn_com,  ffn_y_claim.value,   &ffn_y_claim.point,   &proof.out_ffn_open)
+    inter_acc.add_verify(&proof.out_ffn_com,  ffn_y_claim.value, &ffn_y_claim.point, &proof.out_ffn_open)
         .map_err(|e| format!("out_ffn inter: {e}"))?;
-    inter_acc.add_verify(&proof.v_com,        v_f,                 &v_r,                 &proof.v_combine.hyrax_proof)
+    inter_acc.add_verify(&proof.v_com, v_f, &v_r, &proof.v_combine.hyrax_proof)
         .map_err(|e| format!("v_com inter: {e}"))?;
+
+    // Conventional binding LN1: open x_norm1_com at the QKV x_norm1_claim point.
+    inter_acc.add_verify(&proof.x_norm1_com, x_norm1_claim.value, &x_norm1_claim.point, &proof.x_norm1_open)
+        .map_err(|e| format!("x_norm1 inter: {e}"))?;
+
+    // Conventional binding LN2: open x_norm2_com at the FFN x_claim point.
+    inter_acc.add_verify(&proof.x_norm2_com, ffn_x_claim.value, &ffn_x_claim.point, &proof.x_norm2_open)
+        .map_err(|e| format!("x_norm2 inter: {e}"))?;
     eprintln!("[block] combines:   {:>8.3}ms", _t.elapsed().as_secs_f64()*1000.0);
 
     // =========================================================================
@@ -370,7 +371,7 @@ pub fn verify(
     let _t = Instant::now();
     let ln_io = LayerNormIOCommitments {
         x_com: current_x_com.clone(),
-        y_com: Some(proof.final_ln_out_com.clone()), // final LN committed externally (used by LM head)
+        y_com: Some(proof.final_ln_out_com.clone()),
     };
     verify_layernorm(
         &proof.final_ln_proof,
@@ -378,7 +379,6 @@ pub fn verify(
         &vk.final_ln_vk,
         &final_r_vs[0],
         &final_r_vs[1],
-        None,
         transcript,
         &mut ln_acc_t,
         &mut ln_acc_td,
