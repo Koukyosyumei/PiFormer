@@ -845,11 +845,12 @@ fn read_ffn_proof<R: Read>(r: &mut R) -> io::Result<FFNProof> {
 
 fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Result<()> {
     write_ln_proof(w, &p.ln1_proof)?;
-    write_batched_qkv_proof(w, &p.qkv_proj_proof)?;
-    write_proj_proof(w, &p.o_proj_proof)?;
-    write_attn_proof(w, &p.attn_proof)?;
     write_ln_proof(w, &p.ln2_proof)?;
-    write_ffn_proof(w, &p.ffn_proof)?;
+    write_attn_proof(w, &p.attn_proof)?;
+    write_global_range_m(w, &p.block_range_m)?;
+    // FFN per-block
+    write_lasso_proof(w, &p.ffn_lasso_proof)?;
+    write_hyrax_commitment(w, &p.ffn_m_com)?;
     // Committed intermediate matrices
     write_hyrax_commitment(w, &p.x_norm1_com)?;
     write_hyrax_commitment(w, &p.q_com)?;
@@ -864,21 +865,33 @@ fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Resu
     write_f(w, &p.v_eval_rtd)?;
     write_f(w, &p.out_attn_eval)?;
     write_f(w, &p.out_ffn_eval)?;
-    // Per-block opens at block-specific points
-    write_hyrax_proof(w, &p.x_norm1_open)?;
-    write_hyrax_proof(w, &p.x_norm2_open)?;
+    // Per-block QKV batch scalars
+    write_f(w, &p.qkv_lambda)?;
+    write_f(w, &p.qkv_mu)?;
+    write_f(w, &p.qkv_w_q_eval)?;
+    write_f(w, &p.qkv_w_k_eval)?;
+    write_f(w, &p.qkv_w_v_eval)?;
+    write_f(w, &p.qkv_bias_q_eval)?;
+    write_f(w, &p.qkv_bias_k_eval)?;
+    write_f(w, &p.qkv_bias_v_eval)?;
+    // Per-block O-proj batch scalars
+    write_f(w, &p.oproj_w_o_eval)?;
+    write_f(w, &p.oproj_bias_o_eval)?;
+    // Per-block FFN-M scalar
+    write_f(w, &p.ffn_m_eval)?;
+    // v_attn per-block open
     write_hyrax_proof(w, &p.v_attn_open)?;
-    write_f(w, &p.v_attn_eval)?;
-    write_global_range_m(w, &p.block_range_m)
+    write_f(w, &p.v_attn_eval)
 }
 fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
     Ok(TransformerBlockProof {
         ln1_proof: read_ln_proof(r)?,
-        qkv_proj_proof: read_batched_qkv_proof(r)?,
-        o_proj_proof: read_proj_proof(r)?,
-        attn_proof: read_attn_proof(r)?,
         ln2_proof: read_ln_proof(r)?,
-        ffn_proof: read_ffn_proof(r)?,
+        attn_proof: read_attn_proof(r)?,
+        block_range_m: read_global_range_m(r)?,
+        // FFN per-block
+        ffn_lasso_proof: read_lasso_proof(r)?,
+        ffn_m_com: read_hyrax_commitment(r)?,
         // Committed intermediate matrices
         x_norm1_com: read_hyrax_commitment(r)?,
         q_com: read_hyrax_commitment(r)?,
@@ -893,12 +906,23 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
         v_eval_rtd: read_f(r)?,
         out_attn_eval: read_f(r)?,
         out_ffn_eval: read_f(r)?,
-        // Per-block opens at block-specific points
-        x_norm1_open: read_hyrax_proof(r)?,
-        x_norm2_open: read_hyrax_proof(r)?,
+        // Per-block QKV batch scalars
+        qkv_lambda: read_f(r)?,
+        qkv_mu: read_f(r)?,
+        qkv_w_q_eval: read_f(r)?,
+        qkv_w_k_eval: read_f(r)?,
+        qkv_w_v_eval: read_f(r)?,
+        qkv_bias_q_eval: read_f(r)?,
+        qkv_bias_k_eval: read_f(r)?,
+        qkv_bias_v_eval: read_f(r)?,
+        // Per-block O-proj batch scalars
+        oproj_w_o_eval: read_f(r)?,
+        oproj_bias_o_eval: read_f(r)?,
+        // Per-block FFN-M scalar
+        ffn_m_eval: read_f(r)?,
+        // v_attn per-block open
         v_attn_open: read_hyrax_proof(r)?,
         v_attn_eval: read_f(r)?,
-        block_range_m: read_global_range_m(r)?,
     })
 }
 
@@ -912,7 +936,27 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_hyrax_proof(w, &p.lm_head_logits_open)?;
     write_lasso_multi_proof(w, &p.all_lasso_proof)?;
     write_global_range_m(w, &p.final_range_m)?;
-    write_hyrax_proof(w, &p.inter_batch_open)
+    // Cross-block batch sumchecks
+    write_sumcheck_proof_multi(w, &p.batch_qkv)?;
+    write_sumcheck_proof_multi(w, &p.batch_oproj)?;
+    write_sumcheck_proof_multi(w, &p.batch_ffn_y)?;
+    write_sumcheck_proof_multi(w, &p.batch_ffn_m)?;
+    // Global intermediate batch open
+    write_hyrax_proof(w, &p.inter_batch_open)?;
+    // 13 cross-block weight/activation batch opens
+    write_hyrax_proof(w, &p.x_norm1_batch_open)?;
+    write_hyrax_proof(w, &p.w_q_batch_open)?;
+    write_hyrax_proof(w, &p.w_k_batch_open)?;
+    write_hyrax_proof(w, &p.w_v_batch_open)?;
+    write_hyrax_proof(w, &p.bias_q_batch_open)?;
+    write_hyrax_proof(w, &p.bias_k_batch_open)?;
+    write_hyrax_proof(w, &p.bias_v_batch_open)?;
+    write_hyrax_proof(w, &p.w_o_batch_open)?;
+    write_hyrax_proof(w, &p.bias_o_batch_open)?;
+    write_hyrax_proof(w, &p.w2_batch_open)?;
+    write_hyrax_proof(w, &p.w1_batch_open)?;
+    write_hyrax_proof(w, &p.x_norm2_batch_open)?;
+    write_hyrax_proof(w, &p.ffn_m_com_batch_open)
 }
 fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
     Ok(TransformerModelProof {
@@ -925,7 +969,27 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         lm_head_logits_open: read_hyrax_proof(r)?,
         all_lasso_proof: read_lasso_multi_proof(r)?,
         final_range_m: read_global_range_m(r)?,
+        // Cross-block batch sumchecks
+        batch_qkv: read_sumcheck_proof_multi(r)?,
+        batch_oproj: read_sumcheck_proof_multi(r)?,
+        batch_ffn_y: read_sumcheck_proof_multi(r)?,
+        batch_ffn_m: read_sumcheck_proof_multi(r)?,
+        // Global intermediate batch open
         inter_batch_open: read_hyrax_proof(r)?,
+        // 13 cross-block weight/activation batch opens
+        x_norm1_batch_open: read_hyrax_proof(r)?,
+        w_q_batch_open: read_hyrax_proof(r)?,
+        w_k_batch_open: read_hyrax_proof(r)?,
+        w_v_batch_open: read_hyrax_proof(r)?,
+        bias_q_batch_open: read_hyrax_proof(r)?,
+        bias_k_batch_open: read_hyrax_proof(r)?,
+        bias_v_batch_open: read_hyrax_proof(r)?,
+        w_o_batch_open: read_hyrax_proof(r)?,
+        bias_o_batch_open: read_hyrax_proof(r)?,
+        w2_batch_open: read_hyrax_proof(r)?,
+        w1_batch_open: read_hyrax_proof(r)?,
+        x_norm2_batch_open: read_hyrax_proof(r)?,
+        ffn_m_com_batch_open: read_hyrax_proof(r)?,
     })
 }
 

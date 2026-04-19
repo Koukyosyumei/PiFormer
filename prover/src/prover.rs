@@ -1,19 +1,22 @@
-//! Global Prover for a full Transformer Block.
+//! Global Prover for a full Transformer Model.
 //!
-//! **GKR-style Two-Phase Architecture:**
-//! Phase 1 (per block): commit all 7 intermediate matrices, absorb into transcript,
-//!   run range proofs + LN1 + LN2 sub-provers.
-//! Phase 2 (per block, after global r_td is derived): run QKV/O-proj/Attn/FFN
-//!   sumchecks, all using r_td as the shared output eval point.
-//! Global: ONE hyrax_open_batch at r_td for all 5L intermediate matrices
-//!   (Q, K, V, out_attn, out_ffn across all L blocks) — reduces 5L MSMs to 1.
+//! **Cross-block Batch Sumcheck Architecture:**
+//! Phase 1 (all L blocks): commit 7 intermediate matrices per block, run LN proofs.
+//! Phase 2 (model-level batch): four cross-block SumcheckProofMulti (QKV, O-proj, FFN-Y, FFN-M)
+//!   share a single r_k per type across all L blocks → O(1) batch Hyrax opens per weight type.
+//! Global: 5L intermediate matrices opened at shared r_td (inter_batch_open),
+//!   plus 13 cross-block weight/activation batch opens.
 
+use ark_ff::Field;
 use crate::field::F;
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, params_from_vars,
     HyraxCommitment, HyraxParams, HyraxProof,
 };
-use crate::poly::utils::mat_to_mle;
+use crate::poly::utils::{
+    combine, convert_tm_to_fm, eval_cols, eval_cols_ternary, eval_rows, mat_to_mle, vec_to_mle,
+};
+use crate::poly::DenseMLPoly;
 use crate::transcript::{challenge_vec, Transcript};
 
 use crate::attention::attention::{
@@ -25,38 +28,36 @@ use crate::attention::layernorm::{
     LayerNormVerifyingKey, LayerNormWitness,
 };
 use crate::attention::projection::{
-    prove_projection, prove_qkv_projections, BatchedQKVProjectionIOCommitments,
-    BatchedQKVProjectionProof, BatchedQKVProjectionWitness, ProjectionIOCommitments,
+    prove_projection, ProjectionIOCommitments,
     ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey, ProjectionWitness,
 };
-use crate::ffn::ffn::{prove_ffn, FFNIOCommitments, FFNInstance, FFNProof, FFNWitness};
+use crate::ffn::ffn::{FFNInstance, FFNWitness};
 use crate::lookup::lasso::{
-    prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
-    LassoOutputBinding,
+    prove_lasso, prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
+    LassoOutputBinding, LassoProof,
 };
 use crate::lookup::range::{prove_range_batched, GlobalRangeM};
+use crate::subprotocols::{prove_sumcheck_multi_batched, SumcheckProofMulti};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey};
 
 // ---------------------------------------------------------------------------
 // Proof Structures
 // ---------------------------------------------------------------------------
 
-/// ZK Proof for one Transformer Block.
+/// ZK Proof for one Transformer Block (per-block data only).
 ///
-/// Intermediate openings strategy (GKR-style):
-///   - q_eval, k_eval, v_eval_rtd, out_attn_eval, out_ffn_eval: evals at shared r_td,
-///     proven by the model-level global hyrax_open_batch (TransformerModelProof.inter_batch_open).
-///   - x_norm1_open, x_norm2_open: per-block opens at block-specific sumcheck reduction points.
-///   - v_attn_open: per-block open of v_com at attention's internal eval point.
+/// The cross-block sumchecks and batch opens live in TransformerModelProof.
 pub struct TransformerBlockProof {
     pub ln1_proof: LayerNormProof,
-    pub qkv_proj_proof: BatchedQKVProjectionProof,
-    pub o_proj_proof: ProjectionProof,
-    pub attn_proof: LinearAttentionProof,
     pub ln2_proof: LayerNormProof,
-    pub ffn_proof: FFNProof,
+    pub attn_proof: LinearAttentionProof,
+    pub block_range_m: GlobalRangeM,
 
-    // Committed intermediate matrices
+    // FFN per-block: Lasso for activation + M commitment
+    pub ffn_lasso_proof: LassoProof,
+    pub ffn_m_com: HyraxCommitment,
+
+    // Committed intermediate matrices (7 per block)
     pub x_norm1_com: HyraxCommitment,
     pub q_com: HyraxCommitment,
     pub k_com: HyraxCommitment,
@@ -72,13 +73,27 @@ pub struct TransformerBlockProof {
     pub out_attn_eval: F,
     pub out_ffn_eval: F,
 
-    // Per-block opens at points that differ per block
-    pub x_norm1_open: HyraxProof,
-    pub x_norm2_open: HyraxProof,
+    // Per-block scalars for batch QKV algebraic check
+    pub qkv_lambda: F,
+    pub qkv_mu: F,
+    pub qkv_w_q_eval: F,
+    pub qkv_w_k_eval: F,
+    pub qkv_w_v_eval: F,
+    pub qkv_bias_q_eval: F,
+    pub qkv_bias_k_eval: F,
+    pub qkv_bias_v_eval: F,
+
+    // Per-block scalars for batch O-proj algebraic check
+    pub oproj_w_o_eval: F,
+    pub oproj_bias_o_eval: F,
+
+    // Per-block scalars for batch FFN-M algebraic check
+    // (M_i claimed eval at shared rx_m/ry_m — needed to open ffn_m_com)
+    pub ffn_m_eval: F,
+
+    // v_attn: per-block (attention uses a block-specific eval point)
     pub v_attn_open: HyraxProof,
     pub v_attn_eval: F,
-
-    pub block_range_m: GlobalRangeM,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +199,6 @@ fn commit_block_phase1(
     )?;
 
     // Explicitly absorb q/k/v_com with the same labels attention uses.
-    // This ensures skip_io_absorb=true in Phase 2 results in consistent transcript.
     absorb_com(transcript, b"q_com", &q_com);
     absorb_com(transcript, b"k_com", &k_com);
     absorb_com(transcript, b"v_com", &v_com);
@@ -208,7 +222,7 @@ fn commit_block_phase1(
         transcript,
     )?;
 
-    // Absorb out_ffn_com with FFN's y_com label so FFN Phase 2 can skip it.
+    // Absorb out_ffn_com so transcript stays consistent with Phase 1.
     absorb_com(transcript, b"y_com", &out_ffn_com);
 
     Ok(BlockPhase1Data {
@@ -224,209 +238,6 @@ fn commit_block_phase1(
         out_ffn_com,
         x_mid_com,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Phase 2: sumchecks with shared r_td
-// ---------------------------------------------------------------------------
-
-struct BlockPhase2Result {
-    qkv_proj_proof: BatchedQKVProjectionProof,
-    o_proj_proof: ProjectionProof,
-    attn_proof: LinearAttentionProof,
-    ffn_proof: FFNProof,
-    q_eval: F,
-    k_eval: F,
-    v_eval_rtd: F,
-    out_attn_eval: F,
-    out_ffn_eval: F,
-    x_norm1_open: HyraxProof,
-    x_norm2_open: HyraxProof,
-    v_attn_open: HyraxProof,
-    v_attn_eval: F,
-}
-
-fn prove_block_phase2(
-    witness: &TransformerBlockWitness,
-    phase1: &BlockPhase1Data,
-    pk: &TransformerBlockVerifyingKey,
-    inst_attn: &LinearAttentionInstance,
-    inst_ffn: &FFNInstance,
-    transcript: &mut Transcript,
-    lasso_params: &HyraxParams,
-    r_td: &[F],
-) -> Result<BlockPhase2Result, String> {
-    let t = pk.seq_len;
-    let d = pk.d_model;
-    let t_bits = t.next_power_of_two().trailing_zeros() as usize;
-    let d_bits = d.next_power_of_two().trailing_zeros() as usize;
-    let td_num_vars = t_bits + d_bits;
-    let (nu_td, sigma_td, _) = params_from_vars(td_num_vars);
-
-    // QKV projections: x_com=None (x_norm1_com already in transcript from LN1 Phase 1)
-    let qkv_wit = BatchedQKVProjectionWitness {
-        x: witness.ln1_wit.y.clone(),
-        q: witness.q_proj_wit.y.clone(),
-        k: witness.k_proj_wit.y.clone(),
-        v: witness.v_proj_wit.y.clone(),
-    };
-    let qkv_io = BatchedQKVProjectionIOCommitments { x_com: None };
-    let (qkv_proj_proof, q_y_claim, k_y_claim, v_y_claim, x_norm1_claim) =
-        prove_qkv_projections(&pk.q_pk, &pk.k_pk, &pk.v_pk, &qkv_wit, &qkv_io, transcript, r_td)?;
-
-    // O-proj: x_com=None (GKR backward, out_inner not committed)
-    let o_io = ProjectionIOCommitments { x_com: None };
-    let (o_proj_proof, o_y_claim, o_x_claim) =
-        prove_projection(&pk.o_pk, &witness.o_proj_wit, &o_io, transcript, Some(r_td))?;
-
-    // Attention: skip_io_absorb=true (q/k/v_com absorbed in Phase 1)
-    let attn_io = AttentionIOCommitments {
-        q_com: phase1.q_com.clone(),
-        k_com: phase1.k_com.clone(),
-        v_com: phase1.v_com.clone(),
-        skip_io_absorb: true,
-    };
-    let (attn_proof, _attn_out_claim, attn_v_claim) = prove_linear_attention(
-        &witness.attn_wit,
-        inst_attn,
-        &pk.attn_pk,
-        &attn_io,
-        Some(o_x_claim.clone()),
-        transcript,
-        lasso_params,
-    );
-
-    // FFN: x_com=Some(x_norm2_com), y_com=None (out_ffn_com absorbed in Phase 1)
-    let ffn_io = FFNIOCommitments {
-        x_com: Some(phase1.x_norm2_com.clone()),
-        y_com: None,
-    };
-    let (ffn_proof, ffn_y_claim, ffn_x_claim) = prove_ffn(
-        &pk.ffn_pk,
-        &witness.ffn_wit,
-        inst_ffn,
-        &ffn_io,
-        transcript,
-        lasso_params,
-        Some(r_td),
-    )?;
-
-    // Evals at r_td (from respective sumchecks)
-    let q_eval = q_y_claim.value;
-    let k_eval = k_y_claim.value;
-    let v_eval_rtd = v_y_claim.value;
-    let out_attn_eval = o_y_claim.value;
-    let out_ffn_eval = ffn_y_claim.value;
-
-    // Per-block opens at block-specific eval points
-    let x_norm1_evals = mat_to_mle(&witness.ln1_wit.y, t, d).evaluations;
-    let x_norm1_open = hyrax_open(&x_norm1_evals, &x_norm1_claim.point, nu_td, sigma_td);
-
-    let x_norm2_evals = mat_to_mle(&witness.ln2_wit.y, t, d).evaluations;
-    let x_norm2_open = hyrax_open(&x_norm2_evals, &ffn_x_claim.point, nu_td, sigma_td);
-
-    let v_evals = mat_to_mle(&witness.attn_wit.v, t, d).evaluations;
-    let v_attn_open = hyrax_open(&v_evals, &attn_v_claim.point, nu_td, sigma_td);
-    let v_attn_eval = attn_v_claim.value;
-
-    Ok(BlockPhase2Result {
-        qkv_proj_proof,
-        o_proj_proof,
-        attn_proof,
-        ffn_proof,
-        q_eval,
-        k_eval,
-        v_eval_rtd,
-        out_attn_eval,
-        out_ffn_eval,
-        x_norm1_open,
-        x_norm2_open,
-        v_attn_open,
-        v_attn_eval,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Block-level prover (self-contained, for testing)
-// ---------------------------------------------------------------------------
-
-/// Prove a single transformer block. Derives r_td locally (from single-block Phase 1).
-/// Returns (block_proof, inter_batch_open) where inter_batch_open is the batch
-/// Hyrax proof for the 5 intermediate matrices at r_td.
-pub fn prove_transformer_block(
-    witness: &TransformerBlockWitness,
-    x_in_com: &HyraxCommitment,
-    pk: &TransformerBlockVerifyingKey,
-    inst_attn: &LinearAttentionInstance,
-    inst_ffn: &FFNInstance,
-    transcript: &mut Transcript,
-    lasso_params: &HyraxParams,
-) -> Result<(TransformerBlockProof, HyraxProof), String> {
-    let t = pk.seq_len;
-    let d = pk.d_model;
-    let t_bits = t.next_power_of_two().trailing_zeros() as usize;
-    let d_bits = d.next_power_of_two().trailing_zeros() as usize;
-    let td_num_vars = t_bits + d_bits;
-
-    // Phase 1
-    let phase1 = commit_block_phase1(witness, x_in_com, pk, transcript)?;
-
-    // Derive local r_td after single-block Phase 1
-    let r_td = challenge_vec(transcript, td_num_vars, b"gkr_r_td");
-
-    // Phase 2
-    let p2 = prove_block_phase2(
-        witness, &phase1, pk, inst_attn, inst_ffn, transcript, lasso_params, &r_td,
-    )?;
-
-    // Per-block batch open at r_td for 5 intermediate matrices
-    let (nu_td, sigma_td, _) = params_from_vars(td_num_vars);
-    let q_evals = mat_to_mle(&witness.attn_wit.q, t, d).evaluations;
-    let k_evals = mat_to_mle(&witness.attn_wit.k, t, d).evaluations;
-    let v_evals = mat_to_mle(&witness.attn_wit.v, t, d).evaluations;
-    let out_attn_evals = mat_to_mle(&witness.o_proj_wit.y, t, d).evaluations;
-    let out_ffn_evals = mat_to_mle(&witness.ffn_wit.y, t, d).evaluations;
-    let inter_batch_open = hyrax_open_batch(
-        &[
-            q_evals.as_slice(),
-            k_evals.as_slice(),
-            v_evals.as_slice(),
-            out_attn_evals.as_slice(),
-            out_ffn_evals.as_slice(),
-        ],
-        &r_td,
-        nu_td,
-        sigma_td,
-        transcript,
-    );
-
-    let block_proof = TransformerBlockProof {
-        ln1_proof: phase1.ln1_proof,
-        qkv_proj_proof: p2.qkv_proj_proof,
-        o_proj_proof: p2.o_proj_proof,
-        attn_proof: p2.attn_proof,
-        ln2_proof: phase1.ln2_proof,
-        ffn_proof: p2.ffn_proof,
-        x_norm1_com: phase1.x_norm1_com,
-        q_com: phase1.q_com,
-        k_com: phase1.k_com,
-        v_com: phase1.v_com,
-        out_attn_com: phase1.out_attn_com,
-        x_norm2_com: phase1.x_norm2_com,
-        out_ffn_com: phase1.out_ffn_com,
-        q_eval: p2.q_eval,
-        k_eval: p2.k_eval,
-        v_eval_rtd: p2.v_eval_rtd,
-        out_attn_eval: p2.out_attn_eval,
-        out_ffn_eval: p2.out_ffn_eval,
-        x_norm1_open: p2.x_norm1_open,
-        x_norm2_open: p2.x_norm2_open,
-        v_attn_open: p2.v_attn_open,
-        v_attn_eval: p2.v_attn_eval,
-        block_range_m: phase1.block_range_m,
-    };
-
-    Ok((block_proof, inter_batch_open))
 }
 
 // ---------------------------------------------------------------------------
@@ -467,12 +278,48 @@ pub struct TransformerModelProof {
     pub lm_head_logits_open: HyraxProof,
     pub all_lasso_proof: LassoMultiProof,
     pub final_range_m: GlobalRangeM,
-    /// Single Hyrax batch proof for all 5L intermediate matrices at shared r_td.
+
+    // Cross-block batch sumchecks (one per projection type)
+    pub batch_qkv: SumcheckProofMulti,
+    pub batch_oproj: SumcheckProofMulti,
+    pub batch_ffn_y: SumcheckProofMulti,
+    pub batch_ffn_m: SumcheckProofMulti,
+
+    // Global batch open for 5L intermediate matrices at shared r_td
     pub inter_batch_open: HyraxProof,
+
+    // Cross-block batch opens (13 total, one per weight/activation type)
+    pub x_norm1_batch_open: HyraxProof,
+    pub w_q_batch_open: HyraxProof,
+    pub w_k_batch_open: HyraxProof,
+    pub w_v_batch_open: HyraxProof,
+    pub bias_q_batch_open: HyraxProof,
+    pub bias_k_batch_open: HyraxProof,
+    pub bias_v_batch_open: HyraxProof,
+    pub w_o_batch_open: HyraxProof,
+    pub bias_o_batch_open: HyraxProof,
+    pub w2_batch_open: HyraxProof,
+    pub w1_batch_open: HyraxProof,
+    pub x_norm2_batch_open: HyraxProof,
+    pub ffn_m_com_batch_open: HyraxProof,
 }
 
 // ---------------------------------------------------------------------------
-// Model Prover (E2E) — two-phase loop for 7L → L MSM reduction
+// Helper: compute powers of a field element
+// ---------------------------------------------------------------------------
+
+fn powers_of(base: F, n: usize) -> Vec<F> {
+    let mut v = Vec::with_capacity(n);
+    let mut cur = F::from(1u64);
+    for _ in 0..n {
+        v.push(cur);
+        cur *= base;
+    }
+    v
+}
+
+// ---------------------------------------------------------------------------
+// Model Prover (E2E) — cross-block batch sumcheck Phase 2
 // ---------------------------------------------------------------------------
 
 pub fn prove(
@@ -483,12 +330,20 @@ pub fn prove(
     transcript: &mut Transcript,
     lasso_params: &HyraxParams,
 ) -> Result<TransformerModelProof, String> {
+    let num_blocks = pk.vk.num_blocks;
     let t = pk.vk.seq_len;
     let d = pk.vk.d_model;
     let v = pk.vk.vocab_size;
     let t_bits = t.next_power_of_two().trailing_zeros() as usize;
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
     let td_num_vars = t_bits + d_bits;
+    let d_ff = pk.block_pks[0].ffn_pk.vk.d_ff;
+    let f_bits = d_ff.next_power_of_two().trailing_zeros() as usize;
+    let (nu_td, sigma_td, _) = params_from_vars(td_num_vars);
+    let (nu_w, sigma_w, _) = params_from_vars(d_bits + d_bits);
+    let (nu_b, sigma_b, _) = params_from_vars(d_bits);
+    let (nu_wff, sigma_wff, _) = params_from_vars(f_bits + d_bits);
+    let (nu_mff, sigma_mff, _) = params_from_vars(t_bits + f_bits);
 
     let commit_mat = |mat: &[Vec<F>], rows: usize, cols: usize| -> HyraxCommitment {
         let mle = mat_to_mle(mat, rows, cols);
@@ -498,15 +353,19 @@ pub fn prove(
         hyrax_commit(&mle.evaluations, nu, &params)
     };
 
+    // =========================================================================
     // 1. Initial input commitment
+    // =========================================================================
     let x_in_com = commit_mat(&witness.x_in, t, d);
     absorb_com(transcript, b"x_in_com", &x_in_com);
 
+    // =========================================================================
     // 2. Phase 1: commit all blocks' intermediates + run LN proofs
-    let mut phase1_data: Vec<BlockPhase1Data> = Vec::with_capacity(pk.vk.num_blocks);
+    // =========================================================================
+    let mut phase1_data: Vec<BlockPhase1Data> = Vec::with_capacity(num_blocks);
     let mut current_x_com = x_in_com.clone();
 
-    for i in 0..pk.vk.num_blocks {
+    for i in 0..num_blocks {
         let p1 = commit_block_phase1(
             &witness.block_witnesses[i],
             &current_x_com,
@@ -519,32 +378,373 @@ pub fn prove(
         phase1_data.push(p1);
     }
 
+    // =========================================================================
     // 3. Derive global r_td after ALL blocks' Phase 1 commitments
+    // =========================================================================
     let r_td = challenge_vec(transcript, td_num_vars, b"gkr_r_td");
+    let r_t = r_td[..t_bits].to_vec();
+    let r_out = r_td[t_bits..].to_vec();
 
-    // 4. Phase 2: sumchecks for all blocks using shared r_td
-    let mut block_proofs: Vec<TransformerBlockProof> = Vec::with_capacity(pk.vk.num_blocks);
+    // =========================================================================
+    // 4. Batch QKV: absorb per-block coms, derive lambda/mu, build polys
+    // =========================================================================
+    let mut fs_qkv: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut gs_qkv: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut qkv_targets: Vec<F> = Vec::with_capacity(num_blocks);
+    // Per-block QKV data needed for proof construction
+    let mut pb_qkv_lambda: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut pb_qkv_mu: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut pb_q_eval: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut pb_k_eval: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut pb_v_eval: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut pb_bias_q_eval: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut pb_bias_k_eval: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut pb_bias_v_eval: Vec<F> = Vec::with_capacity(num_blocks);
 
-    for i in 0..pk.vk.num_blocks {
-        let p2 = prove_block_phase2(
-            &witness.block_witnesses[i],
-            &phase1_data[i],
-            &pk.block_pks[i],
+    for i in 0..num_blocks {
+        let bpk = &pk.block_pks[i];
+        let bw = &witness.block_witnesses[i];
+
+        // Absorb QKV weight/bias commitments (mirrors verify_qkv_projections)
+        absorb_com(transcript, b"qkv_w_q_com", &bpk.q_pk.vk.w_com);
+        absorb_com(transcript, b"qkv_w_k_com", &bpk.k_pk.vk.w_com);
+        absorb_com(transcript, b"qkv_w_v_com", &bpk.v_pk.vk.w_com);
+        transcript.append_field(b"qkv_alpha_q", &bpk.q_pk.vk.alpha);
+        transcript.append_field(b"qkv_alpha_k", &bpk.k_pk.vk.alpha);
+        transcript.append_field(b"qkv_alpha_v", &bpk.v_pk.vk.alpha);
+        absorb_com(transcript, b"qkv_bias_q_com", &bpk.q_pk.vk.bias_com);
+        absorb_com(transcript, b"qkv_bias_k_com", &bpk.k_pk.vk.bias_com);
+        absorb_com(transcript, b"qkv_bias_v_com", &bpk.v_pk.vk.bias_com);
+
+        let lambda: F = transcript.challenge_field(b"qkv_lambda");
+        let mu: F = transcript.challenge_field(b"qkv_mu");
+
+        // Evaluate outputs and biases at challenge points
+        let x_mle = mat_to_mle(&bw.ln1_wit.y, t, d);
+        let q_mle = mat_to_mle(&bw.attn_wit.q, t, d);
+        let k_mle = mat_to_mle(&bw.attn_wit.k, t, d);
+        let v_mle = mat_to_mle(&bw.attn_wit.v, t, d);
+        let bias_q_mle = vec_to_mle(&bpk.q_pk.bias, d);
+        let bias_k_mle = vec_to_mle(&bpk.k_pk.bias, d);
+        let bias_v_mle = vec_to_mle(&bpk.v_pk.bias, d);
+
+        let q_eval = q_mle.evaluate(&combine(&r_t, &r_out));
+        let k_eval = k_mle.evaluate(&combine(&r_t, &r_out));
+        let v_eval = v_mle.evaluate(&combine(&r_t, &r_out));
+        let bias_q_eval = bias_q_mle.evaluate(&r_out);
+        let bias_k_eval = bias_k_mle.evaluate(&r_out);
+        let bias_v_eval = bias_v_mle.evaluate(&r_out);
+
+        // Build f_i(k) = X_norm1_i[r_t, k]
+        let f_x = eval_rows(&x_mle, t_bits, &r_t);
+
+        // Build g_i(k) = lambda*alpha_q*Wq[k,r_out] + mu*alpha_k*Wk[k,r_out] + alpha_v*Wv[k,r_out]
+        let g_wq = eval_cols_ternary(&bpk.q_pk.w, &r_out, d, d);
+        let g_wk = eval_cols_ternary(&bpk.k_pk.w, &r_out, d, d);
+        let g_wv = eval_cols_ternary(&bpk.v_pk.w, &r_out, d, d);
+        let n_pad = d.next_power_of_two();
+        let g_combined: Vec<F> = (0..n_pad)
+            .map(|k| {
+                lambda * bpk.q_pk.vk.alpha * g_wq[k]
+                    + mu * bpk.k_pk.vk.alpha * g_wk[k]
+                    + bpk.v_pk.vk.alpha * g_wv[k]
+            })
+            .collect();
+
+        let target =
+            lambda * (q_eval - bias_q_eval) + mu * (k_eval - bias_k_eval) + (v_eval - bias_v_eval);
+
+        // Bind QKV output evals to transcript (before batch eta challenge)
+        transcript.append_field(b"qkv_q_eval", &q_eval);
+        transcript.append_field(b"qkv_k_eval", &k_eval);
+        transcript.append_field(b"qkv_v_eval", &v_eval);
+
+        fs_qkv.push(DenseMLPoly::from_vec_padded(f_x));
+        gs_qkv.push(DenseMLPoly::from_vec_padded(g_combined));
+        qkv_targets.push(target);
+        pb_qkv_lambda.push(lambda);
+        pb_qkv_mu.push(mu);
+        pb_q_eval.push(q_eval);
+        pb_k_eval.push(k_eval);
+        pb_v_eval.push(v_eval);
+        pb_bias_q_eval.push(bias_q_eval);
+        pb_bias_k_eval.push(bias_k_eval);
+        pb_bias_v_eval.push(bias_v_eval);
+    }
+
+    // Cross-block QKV batch sumcheck
+    let eta_qkv: F = transcript.challenge_field(b"batch_eta_qkv");
+    let weights_qkv = powers_of(eta_qkv, num_blocks);
+    let claim_qkv: F = weights_qkv
+        .iter()
+        .zip(qkv_targets.iter())
+        .map(|(w, t)| *w * *t)
+        .sum();
+    let (batch_qkv, r_k_qkv) =
+        prove_sumcheck_multi_batched(&fs_qkv, &gs_qkv, &weights_qkv, claim_qkv, transcript);
+
+    // Per-block weight evals at shared (r_k_qkv, r_out)
+    let mut pb_w_q_eval: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut pb_w_k_eval: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut pb_w_v_eval: Vec<F> = Vec::with_capacity(num_blocks);
+    for i in 0..num_blocks {
+        let bpk = &pk.block_pks[i];
+        let wq_mle = mat_to_mle(&convert_tm_to_fm(&bpk.q_pk.w), d, d);
+        let wk_mle = mat_to_mle(&convert_tm_to_fm(&bpk.k_pk.w), d, d);
+        let wv_mle = mat_to_mle(&convert_tm_to_fm(&bpk.v_pk.w), d, d);
+        pb_w_q_eval.push(wq_mle.evaluate(&combine(&r_k_qkv, &r_out)));
+        pb_w_k_eval.push(wk_mle.evaluate(&combine(&r_k_qkv, &r_out)));
+        pb_w_v_eval.push(wv_mle.evaluate(&combine(&r_k_qkv, &r_out)));
+    }
+
+    // =========================================================================
+    // 5. Batch O-proj: absorb per-block coms, build polys
+    // =========================================================================
+    let mut fs_oproj: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut gs_oproj: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut oproj_targets: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut pb_oproj_bias_o_eval: Vec<F> = Vec::with_capacity(num_blocks);
+
+    for i in 0..num_blocks {
+        let bpk = &pk.block_pks[i];
+        let bw = &witness.block_witnesses[i];
+
+        // Absorb O-proj commitments (mirrors prove_projection ordering)
+        absorb_com(transcript, b"w_com", &bpk.o_pk.vk.w_com);
+        transcript.append_field(b"alpha", &bpk.o_pk.vk.alpha);
+        absorb_com(transcript, b"bias_com", &bpk.o_pk.vk.bias_com);
+        // x_com = None (GKR backward)
+
+        let x_inner_mle = mat_to_mle(&bw.o_proj_wit.x, t, d);
+        let bias_o_mle = vec_to_mle(&bpk.o_pk.bias, d);
+
+        let bias_o_eval = bias_o_mle.evaluate(&r_out);
+        let out_attn_eval = mat_to_mle(&bw.o_proj_wit.y, t, d).evaluate(&combine(&r_t, &r_out));
+
+        // f_i(k) = alpha_o * X_inner_i[r_t, k]
+        let alpha_o = bpk.o_pk.vk.alpha;
+        let f_x_raw = eval_rows(&x_inner_mle, t_bits, &r_t);
+        let f_x: Vec<F> = f_x_raw.iter().map(|v| *v * alpha_o).collect();
+
+        // g_i(k) = Wo_i[k, r_out]
+        let g_wo = eval_cols_ternary(&bpk.o_pk.w, &r_out, d, d);
+
+        let target = out_attn_eval - bias_o_eval;
+
+        // Bind claimed_y to transcript before eta (mirrors prove_projection)
+        transcript.append_field(b"claimed_y", &out_attn_eval);
+
+        fs_oproj.push(DenseMLPoly::from_vec_padded(f_x));
+        gs_oproj.push(DenseMLPoly::from_vec_padded(g_wo));
+        oproj_targets.push(target);
+        pb_oproj_bias_o_eval.push(bias_o_eval);
+    }
+
+    // Cross-block O-proj batch sumcheck
+    let eta_oproj: F = transcript.challenge_field(b"batch_eta_oproj");
+    let weights_oproj = powers_of(eta_oproj, num_blocks);
+    let claim_oproj: F = weights_oproj
+        .iter()
+        .zip(oproj_targets.iter())
+        .map(|(w, t)| *w * *t)
+        .sum();
+    let (batch_oproj, r_k_o) =
+        prove_sumcheck_multi_batched(&fs_oproj, &gs_oproj, &weights_oproj, claim_oproj, transcript);
+
+    // Per-block Wo evals at shared (r_k_o, r_out)
+    let mut pb_w_o_eval: Vec<F> = Vec::with_capacity(num_blocks);
+    for i in 0..num_blocks {
+        let bpk = &pk.block_pks[i];
+        let wo_mle = mat_to_mle(&convert_tm_to_fm(&bpk.o_pk.w), d, d);
+        pb_w_o_eval.push(wo_mle.evaluate(&combine(&r_k_o, &r_out)));
+    }
+
+    // =========================================================================
+    // 6. Per-block Attention (uses x_inner_eval from O-proj batch)
+    // =========================================================================
+    let mut attn_proofs: Vec<LinearAttentionProof> = Vec::with_capacity(num_blocks);
+    let mut pb_v_attn_open: Vec<HyraxProof> = Vec::with_capacity(num_blocks);
+    let mut pb_v_attn_eval: Vec<F> = Vec::with_capacity(num_blocks);
+
+    for i in 0..num_blocks {
+        let bpk = &pk.block_pks[i];
+        let bw = &witness.block_witnesses[i];
+        let p1 = &phase1_data[i];
+
+        // x_inner_eval_i = final_evals_f[i] / alpha_o_i
+        let alpha_o = bpk.o_pk.vk.alpha;
+        let x_inner_eval_i = if alpha_o == F::from(0u64) {
+            F::from(0u64)
+        } else {
+            batch_oproj.final_evals_f[i] * alpha_o.inverse().unwrap()
+        };
+
+        let o_x_claim = crate::subprotocols::EvalClaim {
+            point: combine(&r_t, &r_k_o),
+            value: x_inner_eval_i,
+        };
+
+        let attn_io = AttentionIOCommitments {
+            q_com: p1.q_com.clone(),
+            k_com: p1.k_com.clone(),
+            v_com: p1.v_com.clone(),
+            skip_io_absorb: true,
+        };
+        let (attn_proof, _attn_out_claim, attn_v_claim) = prove_linear_attention(
+            &bw.attn_wit,
             inst_attn,
-            inst_ffn,
+            &bpk.attn_pk,
+            &attn_io,
+            Some(o_x_claim),
             transcript,
             lasso_params,
-            &r_td,
-        )?;
+        );
 
+        // Per-block v_attn open (different eval point per block)
+        let v_evals = mat_to_mle(&bw.attn_wit.v, t, d).evaluations;
+        let v_attn_open = hyrax_open(&v_evals, &attn_v_claim.point, nu_td, sigma_td);
+
+        attn_proofs.push(attn_proof);
+        pb_v_attn_open.push(v_attn_open);
+        pb_v_attn_eval.push(attn_v_claim.value);
+    }
+
+    // =========================================================================
+    // 7. Per-block FFN: Lasso + M commit + absorb coms
+    // =========================================================================
+    let mut ffn_lasso_proofs: Vec<LassoProof> = Vec::with_capacity(num_blocks);
+    let mut ffn_m_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
+    let mut ffn_m_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+
+    for i in 0..num_blocks {
+        let bpk = &pk.block_pks[i];
+        let bw = &witness.block_witnesses[i];
+
+        // Absorb FFN weight commitments (mirrors prove_ffn ordering)
+        absorb_com(transcript, b"w1_com", &bpk.ffn_pk.vk.w1_com);
+        absorb_com(transcript, b"w2_com", &bpk.ffn_pk.vk.w2_com);
+        // x_com = None (GKR mode), y_com = None (already in Phase 1)
+
+        // GKR backward: run Lasso FIRST to commit A before rx_y is sampled
+        let ffn_lasso_proof = prove_lasso(
+            &inst_ffn.activation_lasso,
+            &bw.ffn_wit.activation_query_indices,
+            &bpk.ffn_pk.activation_lasso_pk,
+            transcript,
+            lasso_params,
+        );
+
+        // Commit M
+        let m_mle = mat_to_mle(&bw.ffn_wit.m, t, d_ff);
+        let (nu_m, _, params_m) = params_from_vars(t_bits + f_bits);
+        let ffn_m_com = hyrax_commit(&m_mle.evaluations, nu_m, &params_m);
+        absorb_com(transcript, b"m_com", &ffn_m_com);
+
+        ffn_lasso_proofs.push(ffn_lasso_proof);
+        ffn_m_coms.push(ffn_m_com);
+        ffn_m_mles.push(m_mle);
+    }
+
+    // =========================================================================
+    // 8. Batch FFN-Y: Y = A · W2 at shared (r_t, r_out) = r_td
+    // =========================================================================
+    let mut fs_ffn_y: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut gs_ffn_y: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut ffn_y_targets: Vec<F> = Vec::with_capacity(num_blocks);
+
+    for i in 0..num_blocks {
+        let bpk = &pk.block_pks[i];
+        let bw = &witness.block_witnesses[i];
+
+        let a_mle = mat_to_mle(&bw.ffn_wit.a, t, d_ff);
+        let w2_mle = mat_to_mle(&convert_tm_to_fm(&bpk.ffn_pk.w2), d_ff, d);
+        let y_mle = mat_to_mle(&bw.ffn_wit.y, t, d);
+
+        let y_eval = y_mle.evaluate(&combine(&r_t, &r_out));
+
+        // Bind y_eval claim to transcript (mirrors prove_ffn step 4)
+        transcript.append_field(b"claim_y", &y_eval);
+
+        // f_i(k) = A_i[r_t, k]
+        let f_a = eval_rows(&a_mle, t_bits, &r_t);
+        // g_i(k) = W2_i[k, r_out]
+        let g_w2 = eval_cols(&w2_mle, f_bits, &r_out);
+
+        fs_ffn_y.push(DenseMLPoly::from_vec_padded(f_a));
+        gs_ffn_y.push(DenseMLPoly::from_vec_padded(g_w2));
+        ffn_y_targets.push(y_eval);
+    }
+
+    // Cross-block FFN-Y batch sumcheck
+    let eta_ffn_y: F = transcript.challenge_field(b"batch_eta_ffn_y");
+    let weights_ffn_y = powers_of(eta_ffn_y, num_blocks);
+    let claim_ffn_y: F = weights_ffn_y
+        .iter()
+        .zip(ffn_y_targets.iter())
+        .map(|(w, t)| *w * *t)
+        .sum();
+    let (batch_ffn_y, r_k_fy) =
+        prove_sumcheck_multi_batched(&fs_ffn_y, &gs_ffn_y, &weights_ffn_y, claim_ffn_y, transcript);
+
+    // =========================================================================
+    // 9. Batch FFN-M: M = X2 · W1 with shared rx_m, ry_m
+    // =========================================================================
+    let rx_m = challenge_vec(transcript, t_bits, b"ffn_rx_m");
+    let ry_m = challenge_vec(transcript, f_bits, b"ffn_ry_m");
+
+    let mut fs_ffn_m: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut gs_ffn_m: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut ffn_m_targets: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut pb_ffn_m_eval: Vec<F> = Vec::with_capacity(num_blocks);
+
+    for i in 0..num_blocks {
+        let bpk = &pk.block_pks[i];
+        let bw = &witness.block_witnesses[i];
+
+        let x_norm2_mle = mat_to_mle(&bw.ln2_wit.y, t, d);
+        let w1_mle = mat_to_mle(&convert_tm_to_fm(&bpk.ffn_pk.w1), d, d_ff);
+        let m_eval = ffn_m_mles[i].evaluate(&combine(&rx_m, &ry_m));
+
+        // Bind m_eval claim to transcript
+        transcript.append_field(b"claim_m", &m_eval);
+
+        // f_i(k) = X2_i[rx_m, k]
+        let f_x = eval_rows(&x_norm2_mle, t_bits, &rx_m);
+        // g_i(k) = W1_i[k, ry_m]
+        let g_w1 = eval_cols(&w1_mle, d_bits, &ry_m);
+
+        fs_ffn_m.push(DenseMLPoly::from_vec_padded(f_x));
+        gs_ffn_m.push(DenseMLPoly::from_vec_padded(g_w1));
+        ffn_m_targets.push(m_eval);
+        pb_ffn_m_eval.push(m_eval);
+    }
+
+    // Cross-block FFN-M batch sumcheck
+    let eta_ffn_m: F = transcript.challenge_field(b"batch_eta_ffn_m");
+    let weights_ffn_m = powers_of(eta_ffn_m, num_blocks);
+    let claim_ffn_m: F = weights_ffn_m
+        .iter()
+        .zip(ffn_m_targets.iter())
+        .map(|(w, t)| *w * *t)
+        .sum();
+    let (batch_ffn_m, r_k_m) =
+        prove_sumcheck_multi_batched(&fs_ffn_m, &gs_ffn_m, &weights_ffn_m, claim_ffn_m, transcript);
+
+    // =========================================================================
+    // 10. Build per-block proof structs
+    // =========================================================================
+    let mut block_proofs: Vec<TransformerBlockProof> = Vec::with_capacity(num_blocks);
+    for i in 0..num_blocks {
         let p1 = &phase1_data[i];
+        let bw = &witness.block_witnesses[i];
+
         block_proofs.push(TransformerBlockProof {
             ln1_proof: p1.ln1_proof.clone(),
-            qkv_proj_proof: p2.qkv_proj_proof,
-            o_proj_proof: p2.o_proj_proof,
-            attn_proof: p2.attn_proof,
             ln2_proof: p1.ln2_proof.clone(),
-            ffn_proof: p2.ffn_proof,
+            attn_proof: attn_proofs.remove(0),
+            block_range_m: p1.block_range_m.clone(),
+            ffn_lasso_proof: ffn_lasso_proofs.remove(0),
+            ffn_m_com: ffn_m_coms[i].clone(),
             x_norm1_com: p1.x_norm1_com.clone(),
             q_com: p1.q_com.clone(),
             k_com: p1.k_com.clone(),
@@ -552,20 +752,31 @@ pub fn prove(
             out_attn_com: p1.out_attn_com.clone(),
             x_norm2_com: p1.x_norm2_com.clone(),
             out_ffn_com: p1.out_ffn_com.clone(),
-            q_eval: p2.q_eval,
-            k_eval: p2.k_eval,
-            v_eval_rtd: p2.v_eval_rtd,
-            out_attn_eval: p2.out_attn_eval,
-            out_ffn_eval: p2.out_ffn_eval,
-            x_norm1_open: p2.x_norm1_open,
-            x_norm2_open: p2.x_norm2_open,
-            v_attn_open: p2.v_attn_open,
-            v_attn_eval: p2.v_attn_eval,
-            block_range_m: p1.block_range_m.clone(),
+            q_eval: pb_q_eval[i],
+            k_eval: pb_k_eval[i],
+            v_eval_rtd: pb_v_eval[i],
+            out_attn_eval: mat_to_mle(&bw.o_proj_wit.y, t, d)
+                .evaluate(&combine(&r_t, &r_out)),
+            out_ffn_eval: ffn_y_targets[i],
+            qkv_lambda: pb_qkv_lambda[i],
+            qkv_mu: pb_qkv_mu[i],
+            qkv_w_q_eval: pb_w_q_eval[i],
+            qkv_w_k_eval: pb_w_k_eval[i],
+            qkv_w_v_eval: pb_w_v_eval[i],
+            qkv_bias_q_eval: pb_bias_q_eval[i],
+            qkv_bias_k_eval: pb_bias_k_eval[i],
+            qkv_bias_v_eval: pb_bias_v_eval[i],
+            oproj_w_o_eval: pb_w_o_eval[i],
+            oproj_bias_o_eval: pb_oproj_bias_o_eval[i],
+            ffn_m_eval: pb_ffn_m_eval[i],
+            v_attn_open: pb_v_attn_open.remove(0),
+            v_attn_eval: pb_v_attn_eval[i],
         });
     }
 
-    // 5. Final LayerNorm
+    // =========================================================================
+    // 11. Final LayerNorm
+    // =========================================================================
     let final_rw = compute_range_witnesses(&witness.final_ln_wit, &pk.vk.final_ln_vk);
     let (mut final_range_proofs, final_range_m, final_r_vs) = prove_range_batched(
         &[&final_rw.sigma_witness, &final_rw.y_witness],
@@ -588,7 +799,9 @@ pub fn prove(
         transcript,
     )?;
 
-    // 6. LM Head
+    // =========================================================================
+    // 12. LM Head
+    // =========================================================================
     let logits_mle = mat_to_mle(&witness.lm_head_wit.y, t, v);
     let logits_com = commit_mat(&witness.lm_head_wit.y, t, v);
     let lm_io = ProjectionIOCommitments { x_com: Some(final_ln_out_com.clone()) };
@@ -600,22 +813,18 @@ pub fn prove(
     let lm_head_logits_open =
         hyrax_open(&logits_mle.evaluations, &lm_y_claim.point, lm_nu, lm_sigma);
 
-    // 7. Advance transcript to match verifier's 10 accumulator finalizations
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
+    // =========================================================================
+    // 13. Advance transcript for accumulator mu challenges (10 accumulators)
+    // =========================================================================
+    for _ in 0..10 {
+        let _ = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    }
 
-    // 8. Global hyrax_open_batch for 5L intermediate matrices at shared r_td
-    let (nu_td, sigma_td, _) = params_from_vars(td_num_vars);
-    let mut all_evals_vecs: Vec<Vec<F>> = Vec::with_capacity(5 * pk.vk.num_blocks);
-    for i in 0..pk.vk.num_blocks {
+    // =========================================================================
+    // 14. Global hyrax_open_batch for 5L intermediate matrices at r_td
+    // =========================================================================
+    let mut all_evals_vecs: Vec<Vec<F>> = Vec::with_capacity(5 * num_blocks);
+    for i in 0..num_blocks {
         let bw = &witness.block_witnesses[i];
         all_evals_vecs.push(mat_to_mle(&bw.attn_wit.q, t, d).evaluations);
         all_evals_vecs.push(mat_to_mle(&bw.attn_wit.k, t, d).evaluations);
@@ -627,13 +836,114 @@ pub fn prove(
     let inter_batch_open =
         hyrax_open_batch(&evals_refs, &r_td, nu_td, sigma_td, transcript);
 
-    // 9. Global batched Lasso
+    // =========================================================================
+    // 15. Cross-block batch opens
+    // =========================================================================
+
+    // x_norm1_batch: L x_norm1_i at combine(r_t, r_k_qkv) [td_num_vars]
+    let x_norm1_point = combine(&r_t, &r_k_qkv);
+    let x_norm1_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
+        .map(|i| mat_to_mle(&witness.block_witnesses[i].ln1_wit.y, t, d).evaluations)
+        .collect();
+    let x_norm1_refs: Vec<&[F]> = x_norm1_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let x_norm1_batch_open =
+        hyrax_open_batch(&x_norm1_refs, &x_norm1_point, nu_td, sigma_td, transcript);
+
+    // w_q_batch: L Wq_i at combine(r_k_qkv, r_out) [d_bits + d_bits]
+    let wq_point = combine(&r_k_qkv, &r_out);
+    let wq_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
+        .map(|i| mat_to_mle(&convert_tm_to_fm(&pk.block_pks[i].q_pk.w), d, d).evaluations)
+        .collect();
+    let wq_refs: Vec<&[F]> = wq_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let w_q_batch_open = hyrax_open_batch(&wq_refs, &wq_point, nu_w, sigma_w, transcript);
+
+    let wk_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
+        .map(|i| mat_to_mle(&convert_tm_to_fm(&pk.block_pks[i].k_pk.w), d, d).evaluations)
+        .collect();
+    let wk_refs: Vec<&[F]> = wk_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let w_k_batch_open = hyrax_open_batch(&wk_refs, &wq_point, nu_w, sigma_w, transcript);
+
+    let wv_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
+        .map(|i| mat_to_mle(&convert_tm_to_fm(&pk.block_pks[i].v_pk.w), d, d).evaluations)
+        .collect();
+    let wv_refs: Vec<&[F]> = wv_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let w_v_batch_open = hyrax_open_batch(&wv_refs, &wq_point, nu_w, sigma_w, transcript);
+
+    // bias_q/k/v batch at r_out [d_bits]
+    let bq_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
+        .map(|i| vec_to_mle(&pk.block_pks[i].q_pk.bias, d).evaluations)
+        .collect();
+    let bq_refs: Vec<&[F]> = bq_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let bias_q_batch_open = hyrax_open_batch(&bq_refs, &r_out, nu_b, sigma_b, transcript);
+
+    let bk_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
+        .map(|i| vec_to_mle(&pk.block_pks[i].k_pk.bias, d).evaluations)
+        .collect();
+    let bk_refs: Vec<&[F]> = bk_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let bias_k_batch_open = hyrax_open_batch(&bk_refs, &r_out, nu_b, sigma_b, transcript);
+
+    let bv_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
+        .map(|i| vec_to_mle(&pk.block_pks[i].v_pk.bias, d).evaluations)
+        .collect();
+    let bv_refs: Vec<&[F]> = bv_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let bias_v_batch_open = hyrax_open_batch(&bv_refs, &r_out, nu_b, sigma_b, transcript);
+
+    // w_o_batch: L Wo_i at combine(r_k_o, r_out) [d_bits + d_bits]
+    let wo_point = combine(&r_k_o, &r_out);
+    let wo_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
+        .map(|i| mat_to_mle(&convert_tm_to_fm(&pk.block_pks[i].o_pk.w), d, d).evaluations)
+        .collect();
+    let wo_refs: Vec<&[F]> = wo_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let w_o_batch_open = hyrax_open_batch(&wo_refs, &wo_point, nu_w, sigma_w, transcript);
+
+    // bias_o_batch at r_out
+    let bo_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
+        .map(|i| vec_to_mle(&pk.block_pks[i].o_pk.bias, d).evaluations)
+        .collect();
+    let bo_refs: Vec<&[F]> = bo_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let bias_o_batch_open = hyrax_open_batch(&bo_refs, &r_out, nu_b, sigma_b, transcript);
+
+    // w2_batch: L W2_i at combine(r_k_fy, r_out) [f_bits + d_bits]
+    let w2_point = combine(&r_k_fy, &r_out);
+    let w2_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
+        .map(|i| mat_to_mle(&convert_tm_to_fm(&pk.block_pks[i].ffn_pk.w2), d_ff, d).evaluations)
+        .collect();
+    let w2_refs: Vec<&[F]> = w2_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let w2_batch_open = hyrax_open_batch(&w2_refs, &w2_point, nu_wff, sigma_wff, transcript);
+
+    // w1_batch: L W1_i at combine(r_k_m, ry_m) [d_bits + f_bits]
+    let w1_point = combine(&r_k_m, &ry_m);
+    let w1_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
+        .map(|i| mat_to_mle(&convert_tm_to_fm(&pk.block_pks[i].ffn_pk.w1), d, d_ff).evaluations)
+        .collect();
+    let w1_refs: Vec<&[F]> = w1_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let w1_batch_open = hyrax_open_batch(&w1_refs, &w1_point, nu_wff, sigma_wff, transcript);
+
+    // x_norm2_batch: L x_norm2_i at combine(rx_m, r_k_m) [td_num_vars]
+    let x_norm2_point = combine(&rx_m, &r_k_m);
+    let x_norm2_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
+        .map(|i| mat_to_mle(&witness.block_witnesses[i].ln2_wit.y, t, d).evaluations)
+        .collect();
+    let x_norm2_refs: Vec<&[F]> = x_norm2_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let x_norm2_batch_open =
+        hyrax_open_batch(&x_norm2_refs, &x_norm2_point, nu_td, sigma_td, transcript);
+
+    // ffn_m_com_batch: L M_i at combine(rx_m, ry_m) [t_bits + f_bits]
+    let ffn_m_point = combine(&rx_m, &ry_m);
+    let ffn_m_evals_vecs: Vec<Vec<F>> = ffn_m_mles.iter().map(|m| m.evaluations.clone()).collect();
+    let ffn_m_refs: Vec<&[F]> = ffn_m_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let ffn_m_com_batch_open =
+        hyrax_open_batch(&ffn_m_refs, &ffn_m_point, nu_mff, sigma_mff, transcript);
+
+    // =========================================================================
+    // 16. Global batched Lasso (attention)
+    // =========================================================================
     let mut all_lasso_instances = Vec::new();
     let mut all_instance_coms = Vec::new();
     let mut all_output_bindings: Vec<LassoOutputBinding> = Vec::new();
     let mut all_query_indices: Vec<Vec<usize>> = Vec::new();
     let mut global_nu = 0usize;
-    for i in 0..pk.vk.num_blocks {
+    for i in 0..num_blocks {
         let bpk = &pk.block_pks[i];
         let attn_wit = &witness.block_witnesses[i].attn_wit;
         let phi_q_mle = mat_to_mle(&attn_wit.phi_q, t, d);
@@ -680,8 +990,33 @@ pub fn prove(
         lm_head_logits_open,
         all_lasso_proof,
         final_range_m,
+        batch_qkv,
+        batch_oproj,
+        batch_ffn_y,
+        batch_ffn_m,
         inter_batch_open,
+        x_norm1_batch_open,
+        w_q_batch_open,
+        w_k_batch_open,
+        w_v_batch_open,
+        bias_q_batch_open,
+        bias_k_batch_open,
+        bias_v_batch_open,
+        w_o_batch_open,
+        bias_o_batch_open,
+        w2_batch_open,
+        w1_batch_open,
+        x_norm2_batch_open,
+        ffn_m_com_batch_open,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Cryptographic Helper: Homomorphic Addition
+// ---------------------------------------------------------------------------
+
+pub fn add_commitments_prover(a: &HyraxCommitment, b: &HyraxCommitment) -> HyraxCommitment {
+    crate::verifier::add_commitments(a, b)
 }
 
 // ---------------------------------------------------------------------------
@@ -702,7 +1037,7 @@ mod tests {
         preprocess_transformer_model, TransformerBlockWeights, TransformerModelWeights,
     };
     use crate::transcript::Transcript;
-    use crate::verifier::{add_commitments, verify, verify_transformer_block};
+    use crate::verifier::{add_commitments, verify};
     use ark_ff::Field;
 
     const T: usize = 2;
@@ -952,333 +1287,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Block-level tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_prove_verify_transformer_block_e2e() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
-        let lp = lasso_params();
-        let x_in_com = commit_mat_test(&witness.x_in, T, D);
-
-        let mut pt = Transcript::new(b"block_e2e");
-        let (proof, inter_batch_open) = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
-        ).unwrap();
-
-        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
-        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
-
-        let mut vt = Transcript::new(b"block_e2e");
-        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
-        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let result = verify_transformer_block(
-            &proof, &inter_batch_open, &x_in_com, &x_out_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut vt, &lp,
-            &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
-        );
-        assert!(result.is_ok(), "Block verification failed: {:?}", result.err());
-        let t_bits = T.next_power_of_two().trailing_zeros() as usize;
-        let d_bits = D.next_power_of_two().trailing_zeros() as usize;
-        let (_, _, params_td) = crate::pcs::params_from_vars(t_bits + d_bits);
-        inter_acc.finalize(&params_td, &mut vt).expect("inter_acc finalize failed");
-    }
-
-    #[test]
-    fn test_block_rejects_wrong_x_out_com() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
-        let lp = lasso_params();
-        let x_in_com = commit_mat_test(&witness.x_in, T, D);
-
-        let mut pt = Transcript::new(b"block_wrong_out");
-        let (proof, inter_batch_open) = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
-        ).unwrap();
-
-        let wrong_x_out_com = commit_mat_test(
-            &vec![vec![F::from(1u64), F::from(2u64)], vec![F::from(3u64), F::from(4u64)]],
-            T, D,
-        );
-
-        let mut vt = Transcript::new(b"block_wrong_out");
-        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
-        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let result = verify_transformer_block(
-            &proof, &inter_batch_open, &x_in_com, &wrong_x_out_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut vt, &lp,
-            &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
-        );
-        assert!(result.is_err(), "Should reject wrong x_out_com");
-    }
-
-    #[test]
-    fn test_block_rejects_tampered_ln1_opening() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
-        let lp = lasso_params();
-        let x_in_com = commit_mat_test(&witness.x_in, T, D);
-
-        let mut pt = Transcript::new(b"block_tamper_ln1");
-        let (mut proof, inter_batch_open) = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
-        ).unwrap();
-        proof.ln1_proof.openings.sum_x_at_rt += F::ONE;
-
-        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
-        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
-
-        let mut vt = Transcript::new(b"block_tamper_ln1");
-        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
-        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let result = verify_transformer_block(
-            &proof, &inter_batch_open, &x_in_com, &x_out_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut vt, &lp,
-            &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
-        );
-        assert!(result.is_err(), "Should reject tampered LN1 proof");
-    }
-
-    #[test]
-    fn test_block_rejects_tampered_x_norm1_com() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
-        let lp = lasso_params();
-        let x_in_com = commit_mat_test(&witness.x_in, T, D);
-
-        let mut pt = Transcript::new(b"block_tamper_xnorm1");
-        let (mut proof, inter_batch_open) = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
-        ).unwrap();
-        // Swap x_norm1_open with v_attn_open (wrong proof for x_norm1_com)
-        proof.x_norm1_open = proof.v_attn_open.clone();
-
-        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
-        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
-
-        let mut vt = Transcript::new(b"block_tamper_xnorm1");
-        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
-        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let result = verify_transformer_block(
-            &proof, &inter_batch_open, &x_in_com, &x_out_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut vt, &lp,
-            &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
-        );
-        let t_bits = T.next_power_of_two().trailing_zeros() as usize;
-        let d_bits = D.next_power_of_two().trailing_zeros() as usize;
-        let (_, _, params_td) = crate::pcs::params_from_vars(t_bits + d_bits);
-        let final_result = result.and_then(|_| inter_acc.finalize(&params_td, &mut vt));
-        assert!(final_result.is_err(), "Should reject tampered x_norm1_com");
-    }
-
-    #[test]
-    fn test_block_rejects_tampered_x_norm2_com() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
-        let lp = lasso_params();
-        let x_in_com = commit_mat_test(&witness.x_in, T, D);
-
-        let mut pt = Transcript::new(b"block_tamper_xnorm2");
-        let (mut proof, inter_batch_open) = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
-        ).unwrap();
-        proof.x_norm2_open = proof.v_attn_open.clone();
-
-        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
-        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
-
-        let mut vt = Transcript::new(b"block_tamper_xnorm2");
-        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
-        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let result = verify_transformer_block(
-            &proof, &inter_batch_open, &x_in_com, &x_out_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut vt, &lp,
-            &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
-        );
-        let t_bits = T.next_power_of_two().trailing_zeros() as usize;
-        let d_bits = D.next_power_of_two().trailing_zeros() as usize;
-        let (_, _, params_td) = crate::pcs::params_from_vars(t_bits + d_bits);
-        let final_result = result.and_then(|_| inter_acc.finalize(&params_td, &mut vt));
-        assert!(final_result.is_err(), "Should reject tampered x_norm2_open");
-    }
-
-    #[test]
-    fn test_block_rejects_fraudulent_ln1_output() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
-        let lp = lasso_params();
-        let x_in_com = commit_mat_test(&witness.x_in, T, D);
-
-        let mut pt = Transcript::new(b"block_fraud_ln1");
-        let (mut proof, inter_batch_open) = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
-        ).unwrap();
-        proof.x_norm1_com =
-            commit_mat_test(&vec![vec![F::from(1u64), F::from(2u64)]; T], T, D);
-
-        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
-        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
-
-        let mut vt = Transcript::new(b"block_fraud_ln1");
-        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
-        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let result = verify_transformer_block(
-            &proof, &inter_batch_open, &x_in_com, &x_out_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut vt, &lp,
-            &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
-        );
-        assert!(result.is_err(), "Should reject fraudulent LN1 output commitment");
-    }
-
-    #[test]
-    fn test_block_rejects_fraudulent_ln2_output() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
-        let lp = lasso_params();
-        let x_in_com = commit_mat_test(&witness.x_in, T, D);
-
-        let mut pt = Transcript::new(b"block_fraud_ln2");
-        let (mut proof, inter_batch_open) = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
-        ).unwrap();
-        proof.x_norm2_com =
-            commit_mat_test(&vec![vec![F::from(3u64), F::from(4u64)]; T], T, D);
-
-        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
-        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
-
-        let mut vt = Transcript::new(b"block_fraud_ln2");
-        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
-        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let result = verify_transformer_block(
-            &proof, &inter_batch_open, &x_in_com, &x_out_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut vt, &lp,
-            &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
-        );
-        assert!(result.is_err(), "Should reject fraudulent LN2 output commitment");
-    }
-
-    #[test]
-    fn test_block_rejects_tampered_ln1_sigma_y_binding() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
-        let lp = lasso_params();
-        let x_in_com = commit_mat_test(&witness.x_in, T, D);
-
-        let mut pt = Transcript::new(b"block_tamper_sy_ln1");
-        let (mut proof, inter_batch_open) = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
-        ).unwrap();
-        proof.ln1_proof.openings.y_at_rf_sy =
-            proof.ln1_proof.openings.y_at_rf_sy.map(|v| v + F::ONE);
-
-        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
-        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
-
-        let mut vt = Transcript::new(b"block_tamper_sy_ln1");
-        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
-        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let result = verify_transformer_block(
-            &proof, &inter_batch_open, &x_in_com, &x_out_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut vt, &lp,
-            &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
-        );
-        assert!(result.is_err(), "Should reject tampered y_at_rf_sy (sigma_y binding)");
-    }
-
-    #[test]
-    fn test_block_rejects_tampered_qkv_x_eval() {
-        let (witness, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
-        let lp = lasso_params();
-        let x_in_com = commit_mat_test(&witness.x_in, T, D);
-
-        let mut pt = Transcript::new(b"block_tamper_qkv_x");
-        let (mut proof, inter_batch_open) = prove_transformer_block(
-            &witness, &x_in_com, &pk.block_pks[0], &inst_attn, &inst_ffn, &mut pt, &lp,
-        ).unwrap();
-        proof.qkv_proj_proof.openings.x_eval += F::ONE;
-
-        let x_mid_com = add_commitments(&x_in_com, &proof.out_attn_com);
-        let x_out_com = add_commitments(&x_mid_com, &proof.out_ffn_com);
-
-        let mut vt = Transcript::new(b"block_tamper_qkv_x");
-        let mut ln_acc_t = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ln_acc_td = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut proj_acc_b = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_sig = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
-        let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
-        let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let result = verify_transformer_block(
-            &proof, &inter_batch_open, &x_in_com, &x_out_com, &pk.block_pks[0],
-            &inst_attn, &inst_ffn, &mut vt, &lp,
-            &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
-        );
-        assert!(result.is_err(), "Should reject tampered QKV x_eval");
-    }
-
-    // -----------------------------------------------------------------------
-    // Model-level tests
+    // Model-level tests (single block L=1)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1297,19 +1306,52 @@ mod tests {
     }
 
     #[test]
-    fn test_model_rejects_tampered_block_proof() {
+    fn test_model_rejects_tampered_block_ln1_proof() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
         let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
-        let mut pt = Transcript::new(b"model_tamper_block");
+        let mut pt = Transcript::new(b"model_tamper_ln1");
         let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
         proof.block_proofs[0].ln1_proof.openings.sum_x_at_rt += F::ONE;
 
-        let mut vt = Transcript::new(b"model_tamper_block");
+        let mut vt = Transcript::new(b"model_tamper_ln1");
         let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
-        assert!(result.is_err(), "Should reject tampered block LN1 proof");
+        assert!(result.is_err(), "Should reject tampered LN1 proof");
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_x_norm1_com() {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_tamper_xnorm1");
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        // Tamper x_norm1_batch_open — opens x_norm1_com at (r_t, r_k_qkv)
+        proof.x_norm1_batch_open = proof.inter_batch_open.clone();
+
+        let mut vt = Transcript::new(b"model_tamper_xnorm1");
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        assert!(result.is_err(), "Should reject tampered x_norm1_batch_open");
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_x_norm2_com() {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_tamper_xnorm2");
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        proof.x_norm2_batch_open = proof.inter_batch_open.clone();
+
+        let mut vt = Transcript::new(b"model_tamper_xnorm2");
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        assert!(result.is_err(), "Should reject tampered x_norm2_batch_open");
     }
 
     #[test]
@@ -1361,6 +1403,40 @@ mod tests {
         let mut vt = Transcript::new(b"model_tamper_xin");
         let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
         assert!(result.is_err(), "Should reject tampered x_in_com");
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_batch_qkv_eval() {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_tamper_qkv_eval");
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        // Tamper x_norm1_eval in the batch sumcheck
+        proof.batch_qkv.final_evals_f[0] += F::ONE;
+
+        let mut vt = Transcript::new(b"model_tamper_qkv_eval");
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        assert!(result.is_err(), "Should reject tampered batch_qkv final_evals_f");
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_fraudulent_ln1_output() {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_tamper_fraud_ln1");
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        proof.block_proofs[0].x_norm1_com =
+            commit_mat_test(&vec![vec![F::from(1u64), F::from(2u64)]; T], T, D);
+
+        let mut vt = Transcript::new(b"model_tamper_fraud_ln1");
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        assert!(result.is_err(), "Should reject fraudulent LN1 output commitment");
     }
 
     #[test]
