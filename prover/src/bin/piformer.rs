@@ -341,11 +341,11 @@ fn run_inspect(path: &Path) -> io::Result<()> {
             println!("Lasso sigma  : {}", lasso_sigma);
             println!(
                 "Q lasso queries : {}",
-                inst_attn.q_lasso.query_indices.len()
+                inst_attn.q_lasso.outputs.len()
             );
             println!(
                 "FFN lasso queries: {}",
-                inst_ffn.activation_lasso.query_indices.len()
+                inst_ffn.activation_lasso.outputs.len()
             );
         }
         _ => {

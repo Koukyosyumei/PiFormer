@@ -458,8 +458,6 @@ pub fn prove(
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // acc_range_sig
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // acc_range_y
     let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // acc_range_m
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // ffn_acc_w
-    let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu"); // ffn_acc_m
 
     // 5. Global batched Lasso: one proof for all activation lookups across all layers.
     // Instance order per block: [Q_i, K_i].
@@ -468,6 +466,7 @@ pub fn prove(
     let mut all_lasso_instances: Vec<_> = Vec::new();
     let mut all_instance_coms = Vec::new();
     let mut all_output_bindings: Vec<LassoOutputBinding> = Vec::new();
+    let mut all_query_indices: Vec<Vec<usize>> = Vec::new();
     let mut global_nu = 0usize;
     for i in 0..pk.vk.num_blocks {
         let bpk = &pk.block_pks[i];
@@ -477,6 +476,8 @@ pub fn prove(
 
         all_lasso_instances.push(inst_attn.q_lasso.clone());
         all_lasso_instances.push(inst_attn.k_lasso.clone());
+        all_query_indices.push(inst_attn.q_query_indices.clone());
+        all_query_indices.push(inst_attn.k_query_indices.clone());
         all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
         all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
         global_nu = bpk.attn_pk.qk_lasso_pk.nu;
@@ -495,7 +496,7 @@ pub fn prove(
     }
     let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
     let global_lasso_pk = LassoMultiProvingKey { instance_table_coms: all_instance_coms, nu: global_nu };
-    let all_lasso_proof = prove_lasso_multi(&global_multi_inst, &global_lasso_pk, &all_output_bindings, transcript, lasso_params);
+    let all_lasso_proof = prove_lasso_multi(&global_multi_inst, &all_query_indices, &global_lasso_pk, &all_output_bindings, transcript, lasso_params);
 
     Ok(TransformerModelProof {
         x_in_com,
@@ -704,18 +705,17 @@ mod tests {
     }
 
     /// Build a Lasso instance from explicit query indices and outputs.
-    fn build_lasso(indices: Vec<usize>, outputs: Vec<u64>) -> LassoInstance {
+    fn build_lasso(indices: Vec<usize>, outputs: Vec<u64>) -> (LassoInstance, Vec<usize>) {
         let table: Vec<F> = (0u64..1 << M_BITS).map(F::from).collect();
-        LassoInstance {
+        (LassoInstance {
             tables: vec![table],
-            query_indices: indices,
             outputs: outputs.into_iter().map(F::from).collect(),
             bits_per_chunk: M_BITS,
-        }
+        }, indices)
     }
 
     /// Build a Lasso instance whose every query indexes slot 0 (output = 0).
-    fn build_zero_lasso(num_queries: usize) -> LassoInstance {
+    fn build_zero_lasso(num_queries: usize) -> (LassoInstance, Vec<usize>) {
         build_lasso(vec![0usize; num_queries], vec![0u64; num_queries])
     }
 
@@ -806,6 +806,7 @@ mod tests {
             m: m_ffn.clone(),
             a: m_ffn.clone(),
             y: ffn_out.clone(),
+            activation_query_indices: vec![7, 0, 0, 0, 7, 0, 0, 0],
         };
 
         // Residual 2: x_out = x_mid + out_ffn = [[14+7,10],[20+7,16]] = [[21,10],[27,16]]
@@ -829,19 +830,24 @@ mod tests {
         };
 
         // Lasso for phi(q) and phi(k): phi([[7,0],[7,0]]) → indices [7,0,7,0]
+        let (q_lasso, q_query_indices) = build_lasso(vec![7, 0, 7, 0], vec![7, 0, 7, 0]);
+        let (k_lasso, k_query_indices) = build_lasso(vec![7, 0, 7, 0], vec![7, 0, 7, 0]);
         let inst_attn = LinearAttentionInstance {
             seq_len: T,
             d_head: D,
-            q_lasso: build_lasso(vec![7, 0, 7, 0], vec![7, 0, 7, 0]),
-            k_lasso: build_lasso(vec![7, 0, 7, 0], vec![7, 0, 7, 0]),
+            q_lasso,
+            k_lasso,
+            q_query_indices,
+            k_query_indices,
         };
 
         // Lasso for FFN phi(m): phi([[7,0,0,0],[7,0,0,0]]) → indices [7,0,0,0,7,0,0,0]
+        let (ffn_lasso, _ffn_qi) = build_lasso(
+            vec![7, 0, 0, 0, 7, 0, 0, 0],
+            vec![7, 0, 0, 0, 7, 0, 0, 0],
+        );
         let inst_ffn = FFNInstance {
-            activation_lasso: build_lasso(
-                vec![7, 0, 0, 0, 7, 0, 0, 0],
-                vec![7, 0, 0, 0, 7, 0, 0, 0],
-            ),
+            activation_lasso: ffn_lasso,
         };
 
         (witness, inst_attn, inst_ffn)
@@ -909,8 +915,6 @@ mod tests {
         let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
         let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -927,8 +931,6 @@ mod tests {
             &mut acc_range_sig,
             &mut acc_range_y,
             &mut acc_range_m,
-            &mut ffn_acc_w,
-            &mut ffn_acc_m,
             &mut inter_acc,
         );
         assert!(result.is_ok(), "Block verification failed: {:?}", result.err());
@@ -980,8 +982,6 @@ mod tests {
         let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
         let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -998,8 +998,6 @@ mod tests {
             &mut acc_range_sig,
             &mut acc_range_y,
             &mut acc_range_m,
-            &mut ffn_acc_w,
-            &mut ffn_acc_m,
             &mut inter_acc,
         );
         // Error comes from the residual commitment check, before inter_acc is finalized.
@@ -1042,8 +1040,6 @@ mod tests {
         let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
         let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -1060,8 +1056,6 @@ mod tests {
             &mut acc_range_sig,
             &mut acc_range_y,
             &mut acc_range_m,
-            &mut ffn_acc_w,
-            &mut ffn_acc_m,
             &mut inter_acc,
         );
         // Error comes from LN1 sub-verifier (step 1), before any inter_acc entries.
@@ -1105,8 +1099,6 @@ mod tests {
         let mut acc_range_y = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m = crate::pcs::HyraxBatchAccumulator::new();
         let mut inter_acc = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof,
             &x_in_com,
@@ -1123,8 +1115,6 @@ mod tests {
             &mut acc_range_sig,
             &mut acc_range_y,
             &mut acc_range_m,
-            &mut ffn_acc_w,
-            &mut ffn_acc_m,
             &mut inter_acc,
         );
         // The inner-product check in add_verify passes (w' is from the original data),
@@ -1166,12 +1156,10 @@ mod tests {
         let mut acc_range_y   = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m   = crate::pcs::HyraxBatchAccumulator::new();
         let mut inter_acc  = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof, &x_in_com, &x_out_com, &pk.block_pks[0], &inst_attn, &inst_ffn,
             &mut vt, &lp, &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut ffn_acc_w, &mut ffn_acc_m, &mut inter_acc,
+            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
         );
         let t_bits = T.next_power_of_two().trailing_zeros() as usize;
         let d_bits = D.next_power_of_two().trailing_zeros() as usize;
@@ -1213,13 +1201,11 @@ mod tests {
         let mut acc_range_y   = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m   = crate::pcs::HyraxBatchAccumulator::new();
         let mut inter_acc  = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_m = crate::pcs::HyraxBatchAccumulator::new();
         // Transcript diverges at LN1's y_com absorption → sub-verifier fails immediately.
         let result = verify_transformer_block(
             &proof, &x_in_com, &x_out_com, &pk.block_pks[0], &inst_attn, &inst_ffn,
             &mut vt, &lp, &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut ffn_acc_w, &mut ffn_acc_m, &mut inter_acc,
+            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
         );
         assert!(result.is_err(), "Should reject fraudulent LN1 output commitment");
     }
@@ -1255,13 +1241,11 @@ mod tests {
         let mut acc_range_y   = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m   = crate::pcs::HyraxBatchAccumulator::new();
         let mut inter_acc  = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_m = crate::pcs::HyraxBatchAccumulator::new();
         // Transcript diverges at LN2's y_com absorption → sub-verifier fails immediately.
         let result = verify_transformer_block(
             &proof, &x_in_com, &x_out_com, &pk.block_pks[0], &inst_attn, &inst_ffn,
             &mut vt, &lp, &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut ffn_acc_w, &mut ffn_acc_m, &mut inter_acc,
+            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
         );
         assert!(result.is_err(), "Should reject fraudulent LN2 output commitment");
     }
@@ -1297,12 +1281,10 @@ mod tests {
         let mut acc_range_y   = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m   = crate::pcs::HyraxBatchAccumulator::new();
         let mut inter_acc  = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof, &x_in_com, &x_out_com, &pk.block_pks[0], &inst_attn, &inst_ffn,
             &mut vt, &lp, &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut ffn_acc_w, &mut ffn_acc_m, &mut inter_acc,
+            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
         );
         assert!(result.is_err(), "Should reject tampered y_at_rf_sy (sigma_y binding)");
     }
@@ -1336,12 +1318,10 @@ mod tests {
         let mut acc_range_y   = crate::pcs::HyraxBatchAccumulator::new();
         let mut acc_range_m   = crate::pcs::HyraxBatchAccumulator::new();
         let mut inter_acc  = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_w = crate::pcs::HyraxBatchAccumulator::new();
-        let mut ffn_acc_m = crate::pcs::HyraxBatchAccumulator::new();
         let result = verify_transformer_block(
             &proof, &x_in_com, &x_out_com, &pk.block_pks[0], &inst_attn, &inst_ffn,
             &mut vt, &lp, &mut ln_acc_t, &mut ln_acc_td, &mut proj_acc_w, &mut proj_acc_b,
-            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut ffn_acc_w, &mut ffn_acc_m, &mut inter_acc,
+            &mut acc_range_sig, &mut acc_range_y, &mut acc_range_m, &mut inter_acc,
         );
         assert!(result.is_err(), "Should reject tampered QKV x_eval");
     }

@@ -17,8 +17,8 @@ use crate::lookup::lasso::{
     LassoInstance, LassoProof, LassoProvingKey, LassoVerifyingKey,
 };
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_open, params_from_vars, HyraxBatchAccumulator,
-    HyraxCommitment, HyraxParams, HyraxProof,
+    absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment,
+    HyraxParams, HyraxProof,
 };
 use ark_ff::Field;
 use crate::poly::utils::{combine, convert_tm_to_fm, eval_cols, eval_rows, mat_to_mle, TernaryValue};
@@ -64,6 +64,8 @@ pub struct FFNWitness {
     pub m: Vec<Vec<F>>,
     pub a: Vec<Vec<F>>,
     pub y: Vec<Vec<F>>,
+    /// Private Lasso query indices for A = φ(M): activation table lookup keys.
+    pub activation_query_indices: Vec<usize>,
 }
 
 pub struct FFNInstance {
@@ -193,6 +195,7 @@ pub fn prove_ffn(
     //    Eliminates a_com — verifier checks a_eval from public outputs MLE.
     let activation_lasso_proof = prove_lasso(
         &inst.activation_lasso,
+        &witness.activation_query_indices,
         &pk.activation_lasso_pk,
         transcript,
         lasso_params,
@@ -273,16 +276,14 @@ pub fn verify_ffn(
     io_coms: &FFNIOCommitments,
     transcript: &mut Transcript,
     lasso_params: &HyraxParams,
-    acc_w: &mut HyraxBatchAccumulator,
-    acc_m: &mut HyraxBatchAccumulator,
 ) -> Result<(EvalClaim, EvalClaim), String> {
     let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
     let d_bits = vk.d_model.next_power_of_two().trailing_zeros() as usize;
     let f_bits = vk.d_ff.next_power_of_two().trailing_zeros() as usize;
 
-    // params are no longer used inline — openings are deferred to acc_w / acc_m
-    let _ = params_from_vars(d_bits + f_bits);
-    let _ = params_from_vars(t_bits + f_bits);
+    let (_, _, params_w1) = params_from_vars(d_bits + f_bits);
+    let (_, _, params_w2) = params_from_vars(f_bits + d_bits);
+    let (_, _, params_mf) = params_from_vars(t_bits + f_bits);
 
     // 1. Absorb Trusted IO & VK Commitments (no a_com — GKR backward eliminates it)
     absorb_com(transcript, b"w1_com", &vk.w1_com);
@@ -339,15 +340,31 @@ pub fn verify_ffn(
         return Err("M Sumcheck mismatch".into());
     }
 
-    // 7. Static weight openings — deferred to batch accumulator (was inline MSM).
-    acc_w.add_verify(&vk.w2_com, proof.openings.w2_eval, &combine(&r_k, &ry_y), &proof.openings.w2_open)
-        .map_err(|e| format!("FFN w2_open: {e}"))?;
-    acc_w.add_verify(&vk.w1_com, proof.openings.w1_eval, &combine(&r_j, &ry_m), &proof.openings.w1_open)
-        .map_err(|e| format!("FFN w1_open: {e}"))?;
+    // 7. Static weight openings (inline — deferred batch is slower for large 18-bit polys).
+    hyrax_verify(
+        &vk.w2_com,
+        proof.openings.w2_eval,
+        &combine(&r_k, &ry_y),
+        &proof.openings.w2_open,
+        &params_w2,
+    )?;
+    hyrax_verify(
+        &vk.w1_com,
+        proof.openings.w1_eval,
+        &combine(&r_j, &ry_m),
+        &proof.openings.w1_open,
+        &params_w1,
+    )?;
 
-    // 8. Hyrax opening for M — deferred to batch accumulator.
-    acc_m.add_verify(&proof.m_com, proof.openings.m_eval, &combine(&rx_m, &ry_m), &proof.m_open)
-        .map_err(|e| format!("FFN m_open: {e}"))?;
+    // 8. Hyrax opening for M (inline).
+    hyrax_verify(
+        &proof.m_com,
+        proof.openings.m_eval,
+        &combine(&rx_m, &ry_m),
+        &proof.m_open,
+        &params_mf,
+    )
+    .map_err(|e| format!("FFN m_open: {e}"))?;
 
     // 8. Return IO EvalClaims for block-level combine — no direct opens for x and y.
     let y_claim = EvalClaim { point: combine(&rx_y, &ry_y), value: proof.openings.y_eval };
@@ -419,7 +436,6 @@ mod ffn_tests {
         }
         let activation_lasso = LassoInstance {
             tables: vec![table.clone()],
-            query_indices,
             outputs,
             bits_per_chunk: m_bits,
         };
@@ -440,7 +456,7 @@ mod ffn_tests {
             y_com: hyrax_commit(&y_mle.evaluations, nu_x, &params_x),
         };
 
-        let witness = FFNWitness { x, m, a, y };
+        let witness = FFNWitness { x, m, a, y, activation_query_indices: query_indices };
         let inst = FFNInstance { activation_lasso };
 
         (pk, witness, inst, io_coms)
@@ -455,17 +471,8 @@ mod ffn_tests {
         let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let d_bits = pk.vk.d_model.next_power_of_two().trailing_zeros() as usize;
-        let f_bits = pk.vk.d_ff.next_power_of_two().trailing_zeros() as usize;
-        let t_bits = pk.vk.seq_len.next_power_of_two().trailing_zeros() as usize;
-        let params_w = params_from_vars(d_bits + f_bits).2;
-        let params_m = params_from_vars(t_bits + f_bits).2;
-        let mut acc_w = HyraxBatchAccumulator::new();
-        let mut acc_m = HyraxBatchAccumulator::new();
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, &mut acc_w, &mut acc_m);
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
         assert!(result.is_ok(), "verify failed: {:?}", result.err());
-        acc_w.finalize(&params_w, &mut vt).expect("acc_w finalize");
-        acc_m.finalize(&params_m, &mut vt).expect("acc_m finalize");
     }
 
     #[test]
@@ -479,9 +486,7 @@ mod ffn_tests {
         let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let mut acc_w = HyraxBatchAccumulator::new();
-        let mut acc_m = HyraxBatchAccumulator::new();
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, &mut acc_w, &mut acc_m);
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
         assert!(result.is_err(), "Should reject tampered weights");
     }
 
@@ -499,9 +504,7 @@ mod ffn_tests {
         let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let mut acc_w = HyraxBatchAccumulator::new();
-        let mut acc_m = HyraxBatchAccumulator::new();
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, &mut acc_w, &mut acc_m);
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
         assert!(result.is_err(), "Should reject tampered X input");
     }
 
@@ -517,9 +520,7 @@ mod ffn_tests {
         let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let mut acc_w = HyraxBatchAccumulator::new();
-        let mut acc_m = HyraxBatchAccumulator::new();
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, &mut acc_w, &mut acc_m);
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
         assert!(result.is_err(), "Should reject tampered Y output");
     }
 
@@ -535,9 +536,7 @@ mod ffn_tests {
         let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let mut acc_w = HyraxBatchAccumulator::new();
-        let mut acc_m = HyraxBatchAccumulator::new();
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, &mut acc_w, &mut acc_m);
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
         assert!(result.is_err(), "Should reject tampered activation A");
     }
 
@@ -553,9 +552,7 @@ mod ffn_tests {
         let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let mut acc_w = HyraxBatchAccumulator::new();
-        let mut acc_m = HyraxBatchAccumulator::new();
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, &mut acc_w, &mut acc_m);
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
         assert!(result.is_err(), "Should reject tampered W1");
     }
 }

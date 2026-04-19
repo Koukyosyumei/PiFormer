@@ -254,7 +254,10 @@ fn write_lasso_proof<W: Write>(w: &mut W, p: &LassoProof) -> io::Result<()> {
     write_vec_f(w, &p.sub_claims)?;
     write_vec(w, &p.sumcheck_proofs, write_sumcheck_proof)?;
     write_vec_f(w, &p.table_openings)?;
-    write_vec(w, &p.hyrax_proofs, write_hyrax_proof)
+    write_vec(w, &p.hyrax_proofs, write_hyrax_proof)?;
+    write_vec(w, &p.l_k_coms, write_hyrax_commitment)?;
+    write_vec_f(w, &p.l_k_evals)?;
+    write_vec(w, &p.l_k_opens, write_hyrax_proof)
 }
 fn read_lasso_proof<R: Read>(r: &mut R) -> io::Result<LassoProof> {
     Ok(LassoProof {
@@ -262,6 +265,9 @@ fn read_lasso_proof<R: Read>(r: &mut R) -> io::Result<LassoProof> {
         sumcheck_proofs: read_vec(r, read_sumcheck_proof)?,
         table_openings: read_vec_f(r)?,
         hyrax_proofs: read_vec(r, read_hyrax_proof)?,
+        l_k_coms: read_vec(r, read_hyrax_commitment)?,
+        l_k_evals: read_vec_f(r)?,
+        l_k_opens: read_vec(r, read_hyrax_proof)?,
     })
 }
 
@@ -328,7 +334,14 @@ fn write_lasso_multi_proof<W: Write>(w: &mut W, p: &LassoMultiProof) -> io::Resu
     write_sumcheck_proof_multi(w, &p.combined_sumcheck_proof)?;
     write_vec(w, &p.table_openings, |w, v: &Vec<F>| write_vec_f(w, v))?;
     write_hyrax_proof(w, &p.hyrax_proof)?;
-    write_vec(w, &p.output_opening_proofs, write_hyrax_proof)
+    write_vec(w, &p.output_opening_proofs, write_hyrax_proof)?;
+    write_vec(w, &p.l_k_coms_multi, |w, v: &Vec<HyraxCommitment>| {
+        write_vec(w, v, write_hyrax_commitment)
+    })?;
+    write_vec(w, &p.l_k_evals_multi, |w, v: &Vec<F>| write_vec_f(w, v))?;
+    write_vec(w, &p.l_k_opens_multi, |w, v: &Vec<HyraxProof>| {
+        write_vec(w, v, write_hyrax_proof)
+    })
 }
 fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
     Ok(LassoMultiProof {
@@ -337,6 +350,9 @@ fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
         table_openings: read_vec(r, |r| read_vec_f(r))?,
         hyrax_proof: read_hyrax_proof(r)?,
         output_opening_proofs: read_vec(r, read_hyrax_proof)?,
+        l_k_coms_multi: read_vec(r, |r| read_vec(r, read_hyrax_commitment))?,
+        l_k_evals_multi: read_vec(r, |r| read_vec_f(r))?,
+        l_k_opens_multi: read_vec(r, |r| read_vec(r, read_hyrax_proof))?,
     })
 }
 
@@ -923,14 +939,12 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
 
 fn write_lasso_instance<W: Write>(w: &mut W, inst: &LassoInstance) -> io::Result<()> {
     write_vec(w, &inst.tables, |w2, t| write_vec_f(w2, t))?;
-    write_vec_usize(w, &inst.query_indices)?;
     write_vec_f(w, &inst.outputs)?;
     write_usize(w, inst.bits_per_chunk)
 }
 fn read_lasso_instance<R: Read>(r: &mut R) -> io::Result<LassoInstance> {
     Ok(LassoInstance {
         tables: read_vec(r, read_vec_f)?,
-        query_indices: read_vec_usize(r)?,
         outputs: read_vec_f(r)?,
         bits_per_chunk: read_usize(r)?,
     })
@@ -940,7 +954,10 @@ fn write_attn_instance<W: Write>(w: &mut W, inst: &LinearAttentionInstance) -> i
     write_usize(w, inst.seq_len)?;
     write_usize(w, inst.d_head)?;
     write_lasso_instance(w, &inst.q_lasso)?;
-    write_lasso_instance(w, &inst.k_lasso)
+    write_lasso_instance(w, &inst.k_lasso)?;
+    // q/k_query_indices are private witness — not serialized in public instance
+    write_vec_usize(w, &inst.q_query_indices)?;
+    write_vec_usize(w, &inst.k_query_indices)
 }
 fn read_attn_instance<R: Read>(r: &mut R) -> io::Result<LinearAttentionInstance> {
     Ok(LinearAttentionInstance {
@@ -948,6 +965,8 @@ fn read_attn_instance<R: Read>(r: &mut R) -> io::Result<LinearAttentionInstance>
         d_head: read_usize(r)?,
         q_lasso: read_lasso_instance(r)?,
         k_lasso: read_lasso_instance(r)?,
+        q_query_indices: read_vec_usize(r)?,
+        k_query_indices: read_vec_usize(r)?,
     })
 }
 

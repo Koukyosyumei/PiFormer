@@ -291,7 +291,6 @@ pub fn weights_from_json(j: JsonWeights) -> Result<TransformerModelWeights, Stri
 #[derive(Serialize, Deserialize)]
 pub struct JsonLassoInstance {
     pub tables: Vec<Vec<String>>,
-    pub query_indices: Vec<usize>,
     pub outputs: Vec<String>,
     pub bits_per_chunk: usize,
 }
@@ -302,6 +301,10 @@ pub struct JsonAttnInstance {
     pub d_head: usize,
     pub q_lasso: JsonLassoInstance,
     pub k_lasso: JsonLassoInstance,
+    #[serde(default)]
+    pub q_query_indices: Vec<usize>,
+    #[serde(default)]
+    pub k_query_indices: Vec<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -341,6 +344,8 @@ pub struct JsonFFNWitness {
     pub m: Vec<Vec<String>>,
     pub a: Vec<Vec<String>>,
     pub y: Vec<Vec<String>>,
+    #[serde(default)]
+    pub activation_query_indices: Vec<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -377,7 +382,6 @@ pub struct JsonWitness {
 fn lasso_to_json(inst: &LassoInstance) -> JsonLassoInstance {
     JsonLassoInstance {
         tables: inst.tables.iter().map(|t| vec_to_json(t)).collect(),
-        query_indices: inst.query_indices.clone(),
         outputs: vec_to_json(&inst.outputs),
         bits_per_chunk: inst.bits_per_chunk,
     }
@@ -391,7 +395,6 @@ fn lasso_from_json(j: JsonLassoInstance) -> Result<LassoInstance, String> {
             .enumerate()
             .map(|(i, t)| vec_from_json(t).map_err(|e| format!("tables[{i}]: {e}")))
             .collect::<Result<_, _>>()?,
-        query_indices: j.query_indices,
         outputs: vec_from_json(j.outputs)?,
         bits_per_chunk: j.bits_per_chunk,
     })
@@ -475,6 +478,7 @@ fn ffn_wit_to_json(w: &FFNWitness) -> JsonFFNWitness {
         m: mat_to_json(&w.m),
         a: mat_to_json(&w.a),
         y: mat_to_json(&w.y),
+        activation_query_indices: w.activation_query_indices.clone(),
     }
 }
 
@@ -484,6 +488,7 @@ fn ffn_wit_from_json(j: JsonFFNWitness) -> Result<FFNWitness, String> {
         m: mat_from_json(j.m)?,
         a: mat_from_json(j.a)?,
         y: mat_from_json(j.y)?,
+        activation_query_indices: j.activation_query_indices,
     })
 }
 
@@ -518,6 +523,8 @@ pub fn witness_to_json(
             d_head: inst_attn.d_head,
             q_lasso: lasso_to_json(&inst_attn.q_lasso),
             k_lasso: lasso_to_json(&inst_attn.k_lasso),
+            q_query_indices: inst_attn.q_query_indices.clone(),
+            k_query_indices: inst_attn.k_query_indices.clone(),
         },
         inst_ffn: JsonFFNInstance {
             activation_lasso: lasso_to_json(&inst_ffn.activation_lasso),
@@ -547,6 +554,8 @@ pub fn witness_from_json(
         d_head: j.inst_attn.d_head,
         q_lasso: lasso_from_json(j.inst_attn.q_lasso)?,
         k_lasso: lasso_from_json(j.inst_attn.k_lasso)?,
+        q_query_indices: j.inst_attn.q_query_indices,
+        k_query_indices: j.inst_attn.k_query_indices,
     };
     let inst_ffn = FFNInstance {
         activation_lasso: lasso_from_json(j.inst_ffn.activation_lasso)?,

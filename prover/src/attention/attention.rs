@@ -99,6 +99,9 @@ pub struct LinearAttentionInstance {
     pub d_head: usize,
     pub q_lasso: LassoInstance,
     pub k_lasso: LassoInstance,
+    /// Private witness: table lookup indices for Q/K activations (not sent to verifier).
+    pub q_query_indices: Vec<usize>,
+    pub k_query_indices: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -520,19 +523,18 @@ mod linear_attention_tests {
             }
         }
 
-        let build_lasso = |mat: &Vec<Vec<F>>, phi: &Vec<Vec<F>>| -> LassoInstance {
+        let build_lasso = |mat: &Vec<Vec<F>>, phi: &Vec<Vec<F>>| -> (LassoInstance, Vec<usize>) {
             let indices: Vec<usize> = mat
                 .iter()
                 .flatten()
                 .map(|x| x.into_bigint().as_ref()[0] as usize)
                 .collect();
             let outputs: Vec<F> = phi.iter().flatten().copied().collect();
-            LassoInstance {
+            (LassoInstance {
                 tables: vec![table.clone()],
-                query_indices: indices,
                 outputs,
                 bits_per_chunk: m,
-            }
+            }, indices)
         };
 
         // 1. Prover's Private Data
@@ -546,12 +548,17 @@ mod linear_attention_tests {
             out: out.clone(),
         };
 
+        let (q_lasso, q_query_indices) = build_lasso(&q, &witness.phi_q);
+        let (k_lasso, k_query_indices) = build_lasso(&k, &witness.phi_k);
+
         // 2. Public Instance (Dimensions and Lookups)
         let inst = LinearAttentionInstance {
             seq_len,
             d_head,
-            q_lasso: build_lasso(&q, &witness.phi_q),
-            k_lasso: build_lasso(&k, &witness.phi_k),
+            q_lasso,
+            k_lasso,
+            q_query_indices,
+            k_query_indices,
         };
 
         // 3. Trusted IO Commitments (Simulating Global Pipeline Manager)

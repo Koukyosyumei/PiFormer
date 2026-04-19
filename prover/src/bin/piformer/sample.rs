@@ -161,8 +161,9 @@ pub fn build_zero_witness(
         ffn_wit: FFNWitness {
             x: ln_y.clone(),
             m: zero_tff.clone(),
-            a: zero_tff,
+            a: zero_tff.clone(),
             y: zero_td.clone(),
+            activation_query_indices: vec![0usize; seq_len * d_ff],
         },
         x_out: x_in.clone(),
     };
@@ -174,7 +175,6 @@ pub fn build_zero_witness(
 
     let make_lasso = |num_queries: usize| LassoInstance {
         tables: vec![vec![F::ZERO; table_size]],
-        query_indices: vec![0usize; num_queries],
         outputs: vec![F::ZERO; num_queries],
         bits_per_chunk: m_bits,
     };
@@ -184,6 +184,8 @@ pub fn build_zero_witness(
         d_head: d_model,
         q_lasso: make_lasso(num_queries_td),
         k_lasso: make_lasso(num_queries_td),
+        q_query_indices: vec![0usize; num_queries_td],
+        k_query_indices: vec![0usize; num_queries_td],
     };
     let inst_ffn = FFNInstance {
         activation_lasso: make_lasso(num_queries_tff),
