@@ -242,8 +242,8 @@ pub fn prove_linear_attention(
             let phi_k_eval = proof.final_evals_f[1];
             let v_eval = proof.final_evals_g[1];
 
-            let phi_q_point = combine(&rx, &batch_r);
-            let phi_k_point = combine(&batch_r, &r_i);
+            let _phi_q_point = combine(&rx, &batch_r);
+            let _phi_k_point = combine(&batch_r, &r_i);
             let v_point = combine(&batch_r, &ry);
 
             (
@@ -251,8 +251,8 @@ pub fn prove_linear_attention(
                 phi_q_eval,
                 phi_k_eval,
                 v_eval,
-                phi_q_point,
-                phi_k_point,
+                _phi_q_point,
+                _phi_k_point,
                 v_point,
             )
         } else {
@@ -278,8 +278,8 @@ pub fn prove_linear_attention(
             let phi_k_eval = context_sumcheck.final_eval_f;
             let v_eval = context_sumcheck.final_eval_g;
 
-            let phi_q_point = combine(&rx, &batch_r_out);
-            let phi_k_point = combine(&batch_r_ctx, &batch_r_out);
+            let _phi_q_point = combine(&rx, &batch_r_out);
+            let _phi_k_point = combine(&batch_r_ctx, &batch_r_out);
             let v_point = combine(&batch_r_ctx, &ry);
 
             (
@@ -290,8 +290,8 @@ pub fn prove_linear_attention(
                 phi_q_eval,
                 phi_k_eval,
                 v_eval,
-                phi_q_point,
-                phi_k_point,
+                _phi_q_point,
+                _phi_k_point,
                 v_point,
             )
         };

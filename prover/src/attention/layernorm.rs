@@ -65,6 +65,8 @@ pub struct LayerNormWitness {
 
 #[derive(Clone)]
 pub struct LayerNormInternalCommitments {
+    // 統計量(row-level)のコミットメントは RangeProof との紐付けに必要だが、
+    // 積や二乗 (sum_x_sq, sigma_sq, sigma_y, gamma_x) は削除。
     pub sum_x_com: HyraxCommitment,
     pub sigma_com: HyraxCommitment,
     pub sq_sum_x_com: HyraxCommitment,
