@@ -111,7 +111,8 @@ Run a full setup → prove → verify cycle on a tiny synthetic model:
 ```bash
 cd prover
 cargo run --release --bin piformer -- sample --output-dir /tmp/piformer_sample
-# Writes weights.json, model.pk, model.vk, witness.json, proof.bin
+# Writes weights.json, model.pk, model.vk, witness.json, public_input.json,
+# public_output.json, proof.bin
 # ✓  Proof is VALID.
 ```
 
@@ -142,7 +143,9 @@ piformer prove \
 # Verify the proof
 piformer verify \
   --vk model.vk \
-  --proof proof.bin
+  --proof proof.bin \
+  --public-input public_input.json \
+  --public-output public_output.json
 ```
 
 ### 4. Python Training (optional)
@@ -167,7 +170,11 @@ cd prover && cargo test
 | `*.json`  | Human-readable weights or witness (field elements as hex strings) |
 | `*.pk`    | Proving key — Hyrax G1 commitments + raw ternary weight vectors |
 | `*.vk`    | Verifying key — Hyrax G1 commitments only (no raw weights) |
-| `*.bin`   | Proof bundle — proof + public instances (binary, magic-prefixed) |
+| `*.bin`   | Proof bundle — proof + per-proof lookup outputs (binary, magic-prefixed) |
+
+`verify` binds the proof to verifier-supplied public I/O by recomputing the
+Hyrax commitments for `public_input.json` and `public_output.json`. Lookup table
+metadata is taken from the verifying key, not from the proof bundle.
 
 All binary files carry a magic header (`PFMR_PK\0`, `PFMR_VK\0`, `PFMR_PR\0`) and a version byte for forward-compatibility detection.
 
