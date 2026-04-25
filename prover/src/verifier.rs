@@ -12,10 +12,10 @@ use crate::field::F;
 use crate::lookup::lasso::{verify_lasso, verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey};
 use crate::lookup::range::verify_range_batched;
 use crate::pcs::{
-    absorb_com, hyrax_verify, hyrax_verify_batch, params_from_vars, HyraxBatchAccumulator,
+    absorb_com, hyrax_commit, hyrax_verify, hyrax_verify_batch, params_from_vars, HyraxBatchAccumulator,
     HyraxCommitment, HyraxParams,
 };
-use crate::poly::utils::combine;
+use crate::poly::utils::{combine, mat_to_mle};
 use crate::subprotocols::verify_sumcheck_multi_batched;
 use crate::transcript::{challenge_vec, Transcript};
 
@@ -85,6 +85,27 @@ fn powers_of(base: F, n: usize) -> Vec<F> {
     v
 }
 
+fn commit_public_mat(mat: &[Vec<F>], rows: usize, cols: usize) -> Result<HyraxCommitment, String> {
+    if mat.len() != rows || mat.iter().any(|r| r.len() != cols) {
+        return Err(format!(
+            "public matrix dimension mismatch: got {}x{}, expected {}x{}",
+            mat.len(),
+            mat.first().map(|r| r.len()).unwrap_or(0),
+            rows,
+            cols
+        ));
+    }
+    let mle = mat_to_mle(mat, rows, cols);
+    let vars = rows.next_power_of_two().trailing_zeros() as usize
+        + cols.next_power_of_two().trailing_zeros() as usize;
+    let (nu, _, params) = params_from_vars(vars);
+    Ok(hyrax_commit(&mle.evaluations, nu, &params))
+}
+
+fn commitments_equal(a: &HyraxCommitment, b: &HyraxCommitment) -> bool {
+    a.nu == b.nu && a.sigma == b.sigma && a.row_coms == b.row_coms
+}
+
 // ---------------------------------------------------------------------------
 // Model Verifier (E2E)
 // ---------------------------------------------------------------------------
@@ -94,6 +115,8 @@ pub fn verify(
     vk: &TransformerModelVerifyingKey,
     inst_attn: &LinearAttentionInstance,
     inst_ffn: &FFNInstance,
+    public_x_in: &[Vec<F>],
+    public_logits: &[Vec<F>],
     transcript: &mut Transcript,
     lasso_params: &HyraxParams,
 ) -> Result<(), String> {
@@ -134,6 +157,15 @@ pub fn verify(
     let (_, _, params_mff) = params_from_vars(t_bits + f_bits);
 
     let num_blocks = vk.num_blocks;
+
+    let expected_x_in_com = commit_public_mat(public_x_in, t, d)?;
+    if !commitments_equal(&proof.x_in_com, &expected_x_in_com) {
+        return Err("public input does not match x_in commitment".into());
+    }
+    let expected_logits_com = commit_public_mat(public_logits, t, v_vocab)?;
+    if !commitments_equal(&proof.logits_com, &expected_logits_com) {
+        return Err("public output does not match logits commitment".into());
+    }
 
     let mut ln_acc_t = HyraxBatchAccumulator::new();
     let mut ln_acc_td = HyraxBatchAccumulator::new();

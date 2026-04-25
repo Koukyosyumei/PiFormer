@@ -1385,7 +1385,7 @@ mod tests {
         let proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
 
         let mut vt = Transcript::new(b"model_e2e");
-        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &model_wit.x_in, &model_wit.lm_head_wit.y, &mut vt, &lp);
         assert!(result.is_ok(), "Model verification failed: {:?}", result.err());
     }
 
@@ -1401,7 +1401,7 @@ mod tests {
         proof.block_proofs[0].ln1_proof.openings.sum_x_at_rt += F::ONE;
 
         let mut vt = Transcript::new(b"model_tamper_ln1");
-        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &model_wit.x_in, &model_wit.lm_head_wit.y, &mut vt, &lp);
         assert!(result.is_err(), "Should reject tampered LN1 proof");
     }
 
@@ -1418,7 +1418,7 @@ mod tests {
         proof.x_norm1_batch_open = proof.inter_batch_open.clone();
 
         let mut vt = Transcript::new(b"model_tamper_xnorm1");
-        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &model_wit.x_in, &model_wit.lm_head_wit.y, &mut vt, &lp);
         assert!(result.is_err(), "Should reject tampered x_norm1_batch_open");
     }
 
@@ -1434,7 +1434,7 @@ mod tests {
         proof.x_norm2_batch_open = proof.inter_batch_open.clone();
 
         let mut vt = Transcript::new(b"model_tamper_xnorm2");
-        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &model_wit.x_in, &model_wit.lm_head_wit.y, &mut vt, &lp);
         assert!(result.is_err(), "Should reject tampered x_norm2_batch_open");
     }
 
@@ -1450,7 +1450,7 @@ mod tests {
         proof.final_ln_proof.openings.sum_x_at_rt += F::ONE;
 
         let mut vt = Transcript::new(b"model_tamper_final_ln");
-        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &model_wit.x_in, &model_wit.lm_head_wit.y, &mut vt, &lp);
         assert!(result.is_err(), "Should reject tampered final LN proof");
     }
 
@@ -1466,7 +1466,7 @@ mod tests {
         proof.lm_head_proof.openings.y_eval += F::ONE;
 
         let mut vt = Transcript::new(b"model_tamper_lm");
-        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &model_wit.x_in, &model_wit.lm_head_wit.y, &mut vt, &lp);
         assert!(result.is_err(), "Should reject tampered LM head proof");
     }
 
@@ -1485,7 +1485,7 @@ mod tests {
         );
 
         let mut vt = Transcript::new(b"model_tamper_xin");
-        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &model_wit.x_in, &model_wit.lm_head_wit.y, &mut vt, &lp);
         assert!(result.is_err(), "Should reject tampered x_in_com");
     }
 
@@ -1502,7 +1502,7 @@ mod tests {
         proof.batch_qkv.final_evals_f[0] += F::ONE;
 
         let mut vt = Transcript::new(b"model_tamper_qkv_eval");
-        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &model_wit.x_in, &model_wit.lm_head_wit.y, &mut vt, &lp);
         assert!(result.is_err(), "Should reject tampered batch_qkv final_evals_f");
     }
 
@@ -1519,7 +1519,7 @@ mod tests {
             commit_mat_test(&vec![vec![F::from(1u64), F::from(2u64)]; T], T, D);
 
         let mut vt = Transcript::new(b"model_tamper_fraud_ln1");
-        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &mut vt, &lp);
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &model_wit.x_in, &model_wit.lm_head_wit.y, &mut vt, &lp);
         assert!(result.is_err(), "Should reject fraudulent LN1 output commitment");
     }
 

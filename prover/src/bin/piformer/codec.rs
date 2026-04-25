@@ -14,7 +14,7 @@ use piformer_prover::{
     attention::{
         attention::{
             AttentionOpenings, AttentionProvingKey,
-            AttentionSumcheckProof, AttentionVerifyingKey, LinearAttentionInstance,
+            AttentionSumcheckProof, LinearAttentionInstance,
             LinearAttentionProof,
         },
         layernorm::{
@@ -1014,49 +1014,78 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
 }
 
 // ---------------------------------------------------------------------------
-// Public instances (bundled with proof)
+// Per-proof lookup outputs (bundled with proof)
 // ---------------------------------------------------------------------------
 
-fn write_lasso_instance<W: Write>(w: &mut W, inst: &LassoInstance) -> io::Result<()> {
-    write_vec(w, &inst.tables, |w2, t| write_vec_f(w2, t))?;
-    write_vec_f(w, &inst.outputs)?;
-    write_usize(w, inst.bits_per_chunk)
+fn lasso_bits_from_coms(coms: &[HyraxCommitment]) -> io::Result<usize> {
+    let first = coms.first().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "empty lasso verifying key")
+    })?;
+    Ok(first.nu + first.sigma)
 }
-fn read_lasso_instance<R: Read>(r: &mut R) -> io::Result<LassoInstance> {
+
+fn dummy_lasso_from_coms(coms: &[HyraxCommitment], outputs: Vec<F>) -> io::Result<LassoInstance> {
     Ok(LassoInstance {
-        tables: read_vec(r, read_vec_f)?,
-        outputs: read_vec_f(r)?,
-        bits_per_chunk: read_usize(r)?,
+        tables: vec![Vec::new(); coms.len()],
+        outputs,
+        bits_per_chunk: lasso_bits_from_coms(coms)?,
     })
 }
 
-fn write_attn_instance<W: Write>(w: &mut W, inst: &LinearAttentionInstance) -> io::Result<()> {
-    write_usize(w, inst.seq_len)?;
-    write_usize(w, inst.d_head)?;
-    write_lasso_instance(w, &inst.q_lasso)?;
-    write_lasso_instance(w, &inst.k_lasso)?;
-    // q/k_query_indices are private witness — not serialized in public instance
-    write_vec_usize(w, &inst.q_query_indices)?;
-    write_vec_usize(w, &inst.k_query_indices)
-}
-fn read_attn_instance<R: Read>(r: &mut R) -> io::Result<LinearAttentionInstance> {
-    Ok(LinearAttentionInstance {
-        seq_len: read_usize(r)?,
-        d_head: read_usize(r)?,
-        q_lasso: read_lasso_instance(r)?,
-        k_lasso: read_lasso_instance(r)?,
-        q_query_indices: read_vec_usize(r)?,
-        k_query_indices: read_vec_usize(r)?,
-    })
+fn write_lookup_outputs<W: Write>(
+    w: &mut W,
+    inst_attn: &LinearAttentionInstance,
+    inst_ffn: &FFNInstance,
+) -> io::Result<()> {
+    write_vec_f(w, &inst_attn.q_lasso.outputs)?;
+    write_vec_f(w, &inst_attn.k_lasso.outputs)?;
+    write_vec_f(w, &inst_ffn.activation_lasso.outputs)
 }
 
-fn write_ffn_instance<W: Write>(w: &mut W, inst: &FFNInstance) -> io::Result<()> {
-    write_lasso_instance(w, &inst.activation_lasso)
+fn read_lookup_outputs<R: Read>(r: &mut R) -> io::Result<(Vec<F>, Vec<F>, Vec<F>)> {
+    Ok((read_vec_f(r)?, read_vec_f(r)?, read_vec_f(r)?))
 }
-fn read_ffn_instance<R: Read>(r: &mut R) -> io::Result<FFNInstance> {
-    Ok(FFNInstance {
-        activation_lasso: read_lasso_instance(r)?,
-    })
+
+fn instances_from_vk_and_outputs(
+    vk: &TransformerModelVerifyingKey,
+    q_outputs: Vec<F>,
+    k_outputs: Vec<F>,
+    ffn_outputs: Vec<F>,
+) -> io::Result<(LinearAttentionInstance, FFNInstance)> {
+    let first_block = vk.block_vks.first().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "verifying key has no blocks")
+    })?;
+    let q_coms = first_block
+        .attn_pk
+        .qk_lasso_pk
+        .instance_table_coms
+        .get(0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Q lasso table commitments"))?;
+    let k_coms = first_block
+        .attn_pk
+        .qk_lasso_pk
+        .instance_table_coms
+        .get(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing K lasso table commitments"))?;
+    let q_lasso = dummy_lasso_from_coms(q_coms, q_outputs)?;
+    let k_lasso = dummy_lasso_from_coms(k_coms, k_outputs)?;
+    let ffn_lasso = dummy_lasso_from_coms(
+        &first_block.ffn_vk.activation_lasso_vk.table_coms,
+        ffn_outputs,
+    )?;
+    Ok((
+        LinearAttentionInstance {
+            seq_len: vk.seq_len,
+            d_head: vk.d_model,
+            q_lasso,
+            k_lasso,
+            q_query_indices: Vec::new(),
+            k_query_indices: Vec::new(),
+        },
+        FFNInstance {
+            activation_lasso: ffn_lasso,
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,7 +1431,10 @@ pub fn decode_vk(bytes: &[u8]) -> io::Result<TransformerModelVerifyingKey> {
     })
 }
 
-/// Encode a proof bundle (proof + public instances + lasso sigma).
+/// Encode a proof bundle.
+///
+/// The bundle stores per-proof lookup output vectors, but not lookup tables.
+/// Table commitments and metadata are reconstructed from the verifying key.
 pub fn encode_proof_bundle(
     proof: &TransformerModelProof,
     inst_attn: &LinearAttentionInstance,
@@ -1413,15 +1445,15 @@ pub fn encode_proof_bundle(
     buf.extend_from_slice(PROOF_MAGIC);
     buf.push(VERSION);
     write_model_proof(&mut buf, proof)?;
-    write_attn_instance(&mut buf, inst_attn)?;
-    write_ffn_instance(&mut buf, inst_ffn)?;
+    write_lookup_outputs(&mut buf, inst_attn, inst_ffn)?;
     write_usize(&mut buf, lasso_sigma)?;
     Ok(buf)
 }
 
-/// Decode a proof bundle.
+/// Decode a proof bundle using the verifying key as the source of lookup-table metadata.
 pub fn decode_proof_bundle(
     bytes: &[u8],
+    vk: &TransformerModelVerifyingKey,
 ) -> io::Result<(
     TransformerModelProof,
     LinearAttentionInstance,
@@ -1436,10 +1468,28 @@ pub fn decode_proof_bundle(
         v[0]
     };
     let proof = read_model_proof(&mut r)?;
-    let inst_attn = read_attn_instance(&mut r)?;
-    let inst_ffn = read_ffn_instance(&mut r)?;
+    let (q_outputs, k_outputs, ffn_outputs) = read_lookup_outputs(&mut r)?;
     let lasso_sigma = read_usize(&mut r)?;
+    let (inst_attn, inst_ffn) =
+        instances_from_vk_and_outputs(vk, q_outputs, k_outputs, ffn_outputs)?;
     Ok((proof, inst_attn, inst_ffn, lasso_sigma))
+}
+
+/// Decode only the proof and per-proof lookup output vectors for inspection.
+pub fn decode_proof_bundle_public_parts(
+    bytes: &[u8],
+) -> io::Result<(TransformerModelProof, Vec<F>, Vec<F>, Vec<F>, usize)> {
+    let mut r = bytes;
+    check_magic(&mut r, PROOF_MAGIC)?;
+    let _version = {
+        let mut v = [0u8; 1];
+        r.read_exact(&mut v)?;
+        v[0]
+    };
+    let proof = read_model_proof(&mut r)?;
+    let (q_outputs, k_outputs, ffn_outputs) = read_lookup_outputs(&mut r)?;
+    let lasso_sigma = read_usize(&mut r)?;
+    Ok((proof, q_outputs, k_outputs, ffn_outputs, lasso_sigma))
 }
 
 fn check_magic<R: Read>(r: &mut R, expected: &[u8; 8]) -> io::Result<()> {

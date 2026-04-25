@@ -71,6 +71,16 @@ fn mat_from_json(json: Vec<Vec<String>>) -> Result<Vec<Vec<F>>, String> {
         .collect()
 }
 
+pub fn matrix_from_json_str(s: &str) -> Result<Vec<Vec<F>>, String> {
+    let json: Vec<Vec<String>> =
+        serde_json::from_str(s).map_err(|e| format!("matrix JSON: {e}"))?;
+    mat_from_json(json)
+}
+
+pub fn matrix_to_json_string(mat: &[Vec<F>]) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&mat_to_json(mat))
+}
+
 fn ternary_mat_to_json(mat: &[Vec<TernaryValue>]) -> Vec<Vec<i8>> {
     mat.iter()
         .map(|row: &Vec<TernaryValue>| {
