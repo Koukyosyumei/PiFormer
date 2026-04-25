@@ -308,11 +308,13 @@ pub struct TransformerModelProof {
     pub w1_batch_open: HyraxProof,
     pub x_norm2_batch_open: HyraxProof,
     pub ffn_m_com_batch_open: HyraxProof,
+    pub ffn_lasso_bind_open: HyraxProof,
 
     // Cross-block batch opens for attention phi_q, phi_k, v (shared eval points)
     pub phi_q_batch_open: HyraxProof,
     pub phi_k_batch_open: HyraxProof,
     pub v_attn_batch_open: HyraxProof,
+    pub qk_lasso_bind_open: HyraxProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +329,18 @@ fn powers_of(base: F, n: usize) -> Vec<F> {
         cur *= base;
     }
     v
+}
+
+fn absorb_index_vectors(transcript: &mut Transcript, label: &[u8], vectors: &[&[usize]]) {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(vectors.len() as u64).to_le_bytes());
+    for v in vectors {
+        bytes.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        for &idx in *v {
+            bytes.extend_from_slice(&(idx as u64).to_le_bytes());
+        }
+    }
+    transcript.append_bytes(label, &bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +717,18 @@ pub fn prove(
         ffn_m_mles.push(m_mle);
     }
 
+    let ffn_index_refs: Vec<&[usize]> = witness
+        .block_witnesses
+        .iter()
+        .map(|bw| bw.ffn_wit.activation_query_indices.as_slice())
+        .collect();
+    absorb_index_vectors(transcript, b"ffn_lasso_indices", &ffn_index_refs);
+    let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
+    let ffn_bind_refs: Vec<&[F]> = ffn_m_mles.iter().map(|m| m.evaluations.as_slice()).collect();
+    let (nu_mff_bind, sigma_mff_bind, _) = params_from_vars(t_bits + f_bits);
+    let ffn_lasso_bind_open =
+        hyrax_open_batch(&ffn_bind_refs, &ffn_lasso_bind_point, nu_mff_bind, sigma_mff_bind, transcript);
+
     // =========================================================================
     // 8. Batch FFN-Y: Y = A · W2 at shared (r_t, r_out) = r_td
     // =========================================================================
@@ -1050,6 +1076,17 @@ pub fn prove(
     let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
     let global_lasso_pk =
         LassoMultiProvingKey { instance_table_coms: all_instance_coms, nu: global_nu };
+    let qk_index_refs: Vec<&[usize]> = all_query_indices.iter().map(|v| v.as_slice()).collect();
+    absorb_index_vectors(transcript, b"qk_lasso_indices", &qk_index_refs);
+    let qk_lasso_bind_point = challenge_vec(transcript, td_num_vars, b"qk_lasso_bind_r");
+    let mut qk_bind_evals_vecs: Vec<Vec<F>> = Vec::with_capacity(2 * num_blocks);
+    for bw in &witness.block_witnesses {
+        qk_bind_evals_vecs.push(mat_to_mle(&bw.attn_wit.q, t, d).evaluations);
+        qk_bind_evals_vecs.push(mat_to_mle(&bw.attn_wit.k, t, d).evaluations);
+    }
+    let qk_bind_refs: Vec<&[F]> = qk_bind_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let qk_lasso_bind_open =
+        hyrax_open_batch(&qk_bind_refs, &qk_lasso_bind_point, nu_td, sigma_td, transcript);
     let all_lasso_proof = prove_lasso_multi(
         &global_multi_inst,
         &all_query_indices,
@@ -1089,9 +1126,11 @@ pub fn prove(
         w1_batch_open,
         x_norm2_batch_open,
         ffn_m_com_batch_open,
+        ffn_lasso_bind_open,
         phi_q_batch_open,
         phi_k_batch_open,
         v_attn_batch_open,
+        qk_lasso_bind_open,
     })
 }
 

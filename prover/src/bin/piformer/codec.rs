@@ -971,10 +971,12 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_hyrax_proof(w, &p.w1_batch_open)?;
     write_hyrax_proof(w, &p.x_norm2_batch_open)?;
     write_hyrax_proof(w, &p.ffn_m_com_batch_open)?;
+    write_hyrax_proof(w, &p.ffn_lasso_bind_open)?;
     // 3 attention batch opens
     write_hyrax_proof(w, &p.phi_q_batch_open)?;
     write_hyrax_proof(w, &p.phi_k_batch_open)?;
-    write_hyrax_proof(w, &p.v_attn_batch_open)
+    write_hyrax_proof(w, &p.v_attn_batch_open)?;
+    write_hyrax_proof(w, &p.qk_lasso_bind_open)
 }
 fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
     Ok(TransformerModelProof {
@@ -1010,10 +1012,12 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         w1_batch_open: read_hyrax_proof(r)?,
         x_norm2_batch_open: read_hyrax_proof(r)?,
         ffn_m_com_batch_open: read_hyrax_proof(r)?,
+        ffn_lasso_bind_open: read_hyrax_proof(r)?,
         // 3 attention batch opens
         phi_q_batch_open: read_hyrax_proof(r)?,
         phi_k_batch_open: read_hyrax_proof(r)?,
         v_attn_batch_open: read_hyrax_proof(r)?,
+        qk_lasso_bind_open: read_hyrax_proof(r)?,
     })
 }
 

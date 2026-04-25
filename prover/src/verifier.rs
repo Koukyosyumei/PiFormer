@@ -16,6 +16,7 @@ use crate::pcs::{
     HyraxCommitment, HyraxParams,
 };
 use crate::poly::utils::{combine, mat_to_mle};
+use crate::poly::DenseMLPoly;
 use crate::subprotocols::verify_sumcheck_multi_batched;
 use crate::transcript::{challenge_vec, Transcript};
 
@@ -106,11 +107,24 @@ fn commitments_equal(a: &HyraxCommitment, b: &HyraxCommitment) -> bool {
     a.nu == b.nu && a.sigma == b.sigma && a.row_coms == b.row_coms
 }
 
-fn commit_query_indices(
+fn absorb_index_vectors(transcript: &mut Transcript, label: &[u8], vectors: &[&[usize]]) {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(vectors.len() as u64).to_le_bytes());
+    for v in vectors {
+        bytes.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        for &idx in *v {
+            bytes.extend_from_slice(&(idx as u64).to_le_bytes());
+        }
+    }
+    transcript.append_bytes(label, &bytes);
+}
+
+fn eval_query_indices(
     indices: &[usize],
     rows: usize,
     cols: usize,
-) -> Result<HyraxCommitment, String> {
+    point: &[F],
+) -> Result<F, String> {
     if indices.len() != rows * cols {
         return Err(format!(
             "lookup index length mismatch: got {}, expected {}",
@@ -118,27 +132,43 @@ fn commit_query_indices(
             rows * cols
         ));
     }
-    let mut mat = vec![vec![F::from(0u64); cols]; rows];
-    for i in 0..rows {
-        for j in 0..cols {
-            mat[i][j] = F::from(indices[i * cols + j] as u64);
-        }
+    let num_vars = rows.next_power_of_two().trailing_zeros() as usize
+        + cols.next_power_of_two().trailing_zeros() as usize;
+    if point.len() != num_vars {
+        return Err(format!(
+            "lookup index evaluation point length mismatch: got {}, expected {}",
+            point.len(),
+            num_vars
+        ));
     }
-    commit_public_mat(&mat, rows, cols)
+    let evals: Vec<F> = indices.iter().map(|&idx| F::from(idx as u64)).collect();
+    Ok(DenseMLPoly::from_vec_padded(evals).evaluate(point))
 }
 
-fn verify_query_indices_bind_commitment(
+fn verify_query_indices_bound_batch(
     label: &str,
-    indices: &[usize],
-    commitment: &HyraxCommitment,
+    indices: &[&[usize]],
+    commitments: &[HyraxCommitment],
     rows: usize,
     cols: usize,
+    point: &[F],
+    proof: &crate::pcs::HyraxProof,
+    params: &HyraxParams,
+    transcript: &mut Transcript,
 ) -> Result<(), String> {
-    let index_com = commit_query_indices(indices, rows, cols)?;
-    if !commitments_equal(commitment, &index_com) {
-        return Err(format!("{label} lookup indices do not match committed input tensor"));
+    if indices.len() != commitments.len() {
+        return Err(format!(
+            "{label} lookup binding count mismatch: got {} index vectors, {} commitments",
+            indices.len(),
+            commitments.len()
+        ));
     }
-    Ok(())
+    let evals = indices
+        .iter()
+        .map(|idx| eval_query_indices(idx, rows, cols, point))
+        .collect::<Result<Vec<_>, _>>()?;
+    hyrax_verify_batch(commitments, &evals, point, proof, params, transcript)
+        .map_err(|e| format!("{label} lookup index binding opening: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -487,14 +517,28 @@ pub fn verify(
         eprintln!("[block {}] ffn_lasso:{:>8.3}ms", i, _t0.elapsed().as_secs_f64()*1000.0);
 
         absorb_com(transcript, b"m_com", &bp.ffn_m_com);
-        verify_query_indices_bind_commitment(
-            "FFN",
-            &bp.ffn_lasso_proof.query_indices,
-            &bp.ffn_m_com,
-            t,
-            d_ff,
-        )?;
     }
+    let ffn_index_refs: Vec<&[usize]> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.ffn_lasso_proof.query_indices.as_slice())
+        .collect();
+    absorb_index_vectors(transcript, b"ffn_lasso_indices", &ffn_index_refs);
+    let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
+    let ffn_bind_m_coms: Vec<HyraxCommitment> =
+        proof.block_proofs.iter().map(|bp| bp.ffn_m_com.clone()).collect();
+    let (_, _, params_mff_bind) = params_from_vars(t_bits + f_bits);
+    verify_query_indices_bound_batch(
+        "FFN",
+        &ffn_index_refs,
+        &ffn_bind_m_coms,
+        t,
+        d_ff,
+        &ffn_lasso_bind_point,
+        &proof.ffn_lasso_bind_open,
+        &params_mff_bind,
+        transcript,
+    )?;
 
     // =========================================================================
     // 8. Batch FFN-Y (sumcheck only)
@@ -846,21 +890,6 @@ pub fn verify(
     }
     for i in 0..num_blocks {
         let bvk = &vk.block_vks[i];
-        let bp = &proof.block_proofs[i];
-        verify_query_indices_bind_commitment(
-            "attention Q",
-            &proof.all_lasso_proof.all_query_indices[2 * i],
-            &bp.q_com,
-            t,
-            d,
-        )?;
-        verify_query_indices_bind_commitment(
-            "attention K",
-            &proof.all_lasso_proof.all_query_indices[2 * i + 1],
-            &bp.k_com,
-            t,
-            d,
-        )?;
         all_lasso_instances.push(inst_attn.q_lasso.clone());
         all_lasso_instances.push(inst_attn.k_lasso.clone());
         all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
@@ -870,6 +899,30 @@ pub fn verify(
     }
     let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
     let global_lasso_vk = LassoMultiVerifyingKey { instance_table_coms: all_instance_coms };
+    let qk_index_refs: Vec<&[usize]> = proof
+        .all_lasso_proof
+        .all_query_indices
+        .iter()
+        .map(|v| v.as_slice())
+        .collect();
+    absorb_index_vectors(transcript, b"qk_lasso_indices", &qk_index_refs);
+    let qk_lasso_bind_point = challenge_vec(transcript, td_num_vars, b"qk_lasso_bind_r");
+    let mut qk_coms = Vec::with_capacity(2 * num_blocks);
+    for bp in &proof.block_proofs {
+        qk_coms.push(bp.q_com.clone());
+        qk_coms.push(bp.k_com.clone());
+    }
+    verify_query_indices_bound_batch(
+        "attention Q/K",
+        &qk_index_refs,
+        &qk_coms,
+        t,
+        d,
+        &qk_lasso_bind_point,
+        &proof.qk_lasso_bind_open,
+        &params_td,
+        transcript,
+    )?;
     verify_lasso_multi(
         &proof.all_lasso_proof, &global_multi_inst, &global_lasso_vk,
         &all_output_coms, transcript, lasso_params,
