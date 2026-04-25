@@ -1490,6 +1490,30 @@ mod tests {
     }
 
     #[test]
+    fn test_model_rejects_tampered_lasso_query_indices() {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_tamper_lasso_indices");
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        proof.block_proofs[0].ffn_lasso_proof.query_indices[0] += 1;
+
+        let mut vt = Transcript::new(b"model_tamper_lasso_indices");
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &model_wit.x_in, &model_wit.lm_head_wit.y, &mut vt, &lp);
+        assert!(result.is_err(), "Should reject tampered FFN Lasso query indices");
+
+        let mut pt = Transcript::new(b"model_tamper_global_lasso_indices");
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        proof.all_lasso_proof.all_query_indices[0][0] += 1;
+
+        let mut vt = Transcript::new(b"model_tamper_global_lasso_indices");
+        let result = verify(&proof, &pk.vk, &inst_attn, &inst_ffn, &model_wit.x_in, &model_wit.lm_head_wit.y, &mut vt, &lp);
+        assert!(result.is_err(), "Should reject tampered attention Lasso query indices");
+    }
+
+    #[test]
     fn test_model_rejects_tampered_batch_qkv_eval() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);

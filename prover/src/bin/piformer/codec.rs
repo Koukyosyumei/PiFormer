@@ -250,6 +250,7 @@ fn read_sumcheck_proof<R: Read>(r: &mut R) -> io::Result<SumcheckProof> {
 // ---------------------------------------------------------------------------
 
 fn write_lasso_proof<W: Write>(w: &mut W, p: &LassoProof) -> io::Result<()> {
+    write_vec_usize(w, &p.query_indices)?;
     write_vec_f(w, &p.sub_claims)?;
     write_vec(w, &p.sumcheck_proofs, write_sumcheck_proof)?;
     write_vec_f(w, &p.table_openings)?;
@@ -260,6 +261,7 @@ fn write_lasso_proof<W: Write>(w: &mut W, p: &LassoProof) -> io::Result<()> {
 }
 fn read_lasso_proof<R: Read>(r: &mut R) -> io::Result<LassoProof> {
     Ok(LassoProof {
+        query_indices: read_vec_usize(r)?,
         sub_claims: read_vec_f(r)?,
         sumcheck_proofs: read_vec(r, read_sumcheck_proof)?,
         table_openings: read_vec_f(r)?,
@@ -329,6 +331,7 @@ fn read_sumcheck_cubic_proof_multi<R: Read>(r: &mut R) -> io::Result<SumcheckCub
 }
 
 fn write_lasso_multi_proof<W: Write>(w: &mut W, p: &LassoMultiProof) -> io::Result<()> {
+    write_vec(w, &p.all_query_indices, |w, v: &Vec<usize>| write_vec_usize(w, v))?;
     write_f(w, &p.combined_grand_sum)?;
     write_sumcheck_proof_multi(w, &p.combined_sumcheck_proof)?;
     write_vec(w, &p.table_openings, |w, v: &Vec<F>| write_vec_f(w, v))?;
@@ -344,6 +347,7 @@ fn write_lasso_multi_proof<W: Write>(w: &mut W, p: &LassoMultiProof) -> io::Resu
 }
 fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
     Ok(LassoMultiProof {
+        all_query_indices: read_vec(r, |r| read_vec_usize(r))?,
         combined_grand_sum: read_f(r)?,
         combined_sumcheck_proof: read_sumcheck_proof_multi(r)?,
         table_openings: read_vec(r, |r| read_vec_f(r))?,

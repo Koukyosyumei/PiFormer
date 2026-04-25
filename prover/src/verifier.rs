@@ -106,6 +106,41 @@ fn commitments_equal(a: &HyraxCommitment, b: &HyraxCommitment) -> bool {
     a.nu == b.nu && a.sigma == b.sigma && a.row_coms == b.row_coms
 }
 
+fn commit_query_indices(
+    indices: &[usize],
+    rows: usize,
+    cols: usize,
+) -> Result<HyraxCommitment, String> {
+    if indices.len() != rows * cols {
+        return Err(format!(
+            "lookup index length mismatch: got {}, expected {}",
+            indices.len(),
+            rows * cols
+        ));
+    }
+    let mut mat = vec![vec![F::from(0u64); cols]; rows];
+    for i in 0..rows {
+        for j in 0..cols {
+            mat[i][j] = F::from(indices[i * cols + j] as u64);
+        }
+    }
+    commit_public_mat(&mat, rows, cols)
+}
+
+fn verify_query_indices_bind_commitment(
+    label: &str,
+    indices: &[usize],
+    commitment: &HyraxCommitment,
+    rows: usize,
+    cols: usize,
+) -> Result<(), String> {
+    let index_com = commit_query_indices(indices, rows, cols)?;
+    if !commitments_equal(commitment, &index_com) {
+        return Err(format!("{label} lookup indices do not match committed input tensor"));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Model Verifier (E2E)
 // ---------------------------------------------------------------------------
@@ -452,6 +487,13 @@ pub fn verify(
         eprintln!("[block {}] ffn_lasso:{:>8.3}ms", i, _t0.elapsed().as_secs_f64()*1000.0);
 
         absorb_com(transcript, b"m_com", &bp.ffn_m_com);
+        verify_query_indices_bind_commitment(
+            "FFN",
+            &bp.ffn_lasso_proof.query_indices,
+            &bp.ffn_m_com,
+            t,
+            d_ff,
+        )?;
     }
 
     // =========================================================================
@@ -795,8 +837,30 @@ pub fn verify(
     let mut all_lasso_instances = Vec::new();
     let mut all_instance_coms = Vec::new();
     let mut all_output_coms: Vec<(HyraxCommitment, usize)> = Vec::new();
+    if proof.all_lasso_proof.all_query_indices.len() != 2 * num_blocks {
+        return Err(format!(
+            "Global Lasso query index count mismatch: got {}, expected {}",
+            proof.all_lasso_proof.all_query_indices.len(),
+            2 * num_blocks
+        ));
+    }
     for i in 0..num_blocks {
         let bvk = &vk.block_vks[i];
+        let bp = &proof.block_proofs[i];
+        verify_query_indices_bind_commitment(
+            "attention Q",
+            &proof.all_lasso_proof.all_query_indices[2 * i],
+            &bp.q_com,
+            t,
+            d,
+        )?;
+        verify_query_indices_bind_commitment(
+            "attention K",
+            &proof.all_lasso_proof.all_query_indices[2 * i + 1],
+            &bp.k_com,
+            t,
+            d,
+        )?;
         all_lasso_instances.push(inst_attn.q_lasso.clone());
         all_lasso_instances.push(inst_attn.k_lasso.clone());
         all_instance_coms.push(bvk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());

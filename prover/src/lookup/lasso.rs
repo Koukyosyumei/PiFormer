@@ -66,8 +66,8 @@ pub fn precommit_lasso_tables(
 }
 
 /// Public description of a lookup instance.
-/// query_indices are now private witness — they are passed separately to prove_lasso
-/// and are no longer needed by verify_lasso (L_k is committed in the proof instead).
+/// Lookup indices are carried by the proof so the verifier can bind selector
+/// polynomials to the committed lookup input tensor at the model call site.
 #[derive(Clone)]
 pub struct LassoInstance {
     /// c sub-tables T_0, ..., T_{c-1}, each of size 2^bits_per_chunk.
@@ -80,6 +80,9 @@ pub struct LassoInstance {
 
 /// Proof for a Lasso lookup (with Hyrax PCS).
 pub struct LassoProof {
+    /// Lookup indices used to build the selector polynomials.
+    /// Verifiers bind these to the committed lookup input tensor at the call site.
+    pub query_indices: Vec<usize>,
     /// Batched sum per sub-table: Σ_j ρ^j · T_k[chunk_k(idx_j)].
     pub sub_claims: Vec<F>,
     /// Sumcheck proof per sub-table.
@@ -90,7 +93,7 @@ pub struct LassoProof {
     pub hyrax_proofs: Vec<HyraxProof>,
     /// Committed counting polynomial L_k (size 2^m, one per sub-table).
     /// L_k[ch] = Σ_{j: chunk_k(idx_j)==ch} ρ^j.
-    /// Committing L_k lets the verifier check L_k(r) via Hyrax instead of O(n) histogram work.
+    /// Committing L_k lets the verifier bind the opened L_k(r) to this polynomial.
     pub l_k_coms: Vec<HyraxCommitment>,
     /// L_k evaluated at the sumcheck output point r (one per sub-table).
     pub l_k_evals: Vec<F>,
@@ -180,6 +183,7 @@ pub fn prove_lasso(
     }
 
     LassoProof {
+        query_indices: query_indices.to_vec(),
         sub_claims,
         sumcheck_proofs,
         table_openings,
@@ -219,6 +223,13 @@ pub fn verify_lasso(
     }
     let rho = transcript.challenge_field::<F>(b"lasso_rho");
     let rho_pows = powers_of(rho, n);
+    if proof.query_indices.len() != n {
+        return Err(format!(
+            "Lasso query index length mismatch: got {}, expected {}",
+            proof.query_indices.len(),
+            n
+        ));
+    }
 
     // Grand Sum Identity: Σ_j ρ^j · output_j = Σ_k sub_claim_k.
     // This is still O(n) but unavoidable given public outputs.
@@ -229,6 +240,14 @@ pub fn verify_lasso(
     }
 
     for k in 0..c {
+        let size = 1usize << m;
+        let mask = size - 1;
+        let mut expected_l_hist = vec![F::ZERO; size];
+        for j in 0..n {
+            let ch = chunk(proof.query_indices[j], k, m, mask);
+            expected_l_hist[ch] += rho_pows[j];
+        }
+
         // Absorb committed L_k into transcript (matches prover's absorb_com call).
         absorb_com(transcript, b"lasso_l_com", &proof.l_k_coms[k]);
 
@@ -243,9 +262,13 @@ pub fn verify_lasso(
         let t_opening = proof.table_openings[k];
         transcript.append_field(b"lasso_opening", &t_opening);
 
-        // Verify sumcheck final: T_k(r) * L_k(r) == sumcheck_final.
-        // L_k(r) is verified via Hyrax of committed L_k — O(sqrt(2^m)) instead of O(n).
+        // Verify sumcheck final and bind L_k(r) to the proof-carried indices.
+        // The Hyrax opening still binds L_k(r) to the committed L_k polynomial.
         let l_at_r = proof.l_k_evals[k];
+        let expected_l_at_r = DenseMLPoly::new(expected_l_hist).evaluate(&r_vec);
+        if l_at_r != expected_l_at_r {
+            return Err(format!("Table {k} selector is not derived from query indices"));
+        }
         let expected_final = t_opening * l_at_r;
         let actual_final =
             proof.sumcheck_proofs[k].final_eval_f * proof.sumcheck_proofs[k].final_eval_g;
@@ -346,6 +369,9 @@ pub struct LassoMultiInstance {
 
 /// 集約されたLasso証明
 pub struct LassoMultiProof {
+    /// Private lookup indices for every instance. Verifiers bind these to the
+    /// corresponding committed lookup input tensors at the call site.
+    pub all_query_indices: Vec<Vec<usize>>,
     /// 全インスタンスの重み付き合計: Σ_t α^t · (Σ_j ρ^j · output_{t,j})
     pub combined_grand_sum: F,
     /// 全インスタンス・全サブテーブルを統合した単一のSumcheck証明
@@ -545,6 +571,7 @@ pub fn prove_lasso_multi(
     }
 
     LassoMultiProof {
+        all_query_indices: all_query_indices.to_vec(),
         combined_grand_sum,
         combined_sumcheck_proof,
         table_openings,
@@ -584,11 +611,26 @@ pub fn verify_lasso_multi(
     let alpha = transcript.challenge_field::<F>(b"instance_batch_alpha");
     let rho = transcript.challenge_field::<F>(b"lookup_batch_rho");
     let alpha_pows = powers_of(alpha, t_count);
+    if proof.all_query_indices.len() != t_count {
+        return Err(format!(
+            "Multi-Lasso query index instance count mismatch: got {}, expected {}",
+            proof.all_query_indices.len(),
+            t_count
+        ));
+    }
 
     // Grand Sum: Σ_t α^t * Σ_j ρ^j * output_{t,j}
     // Compute rho_pows once (all instances share the same output length n),
     // then evaluate each instance's weighted sum in parallel via rayon.
     let n = multi_instance.instances[0].outputs.len();
+    for (t, qi) in proof.all_query_indices.iter().enumerate() {
+        if qi.len() != n {
+            return Err(format!(
+                "Multi-Lasso query index length mismatch at instance {t}: got {}, expected {n}",
+                qi.len()
+            ));
+        }
+    }
     let rho_pows = powers_of(rho, n);
     let expected_grand_sum: F = multi_instance
         .instances
@@ -618,7 +660,7 @@ pub fn verify_lasso_multi(
         transcript,
     )?;
 
-    // Verify sumcheck final via committed L_k evaluations (no O(n) histogram needed).
+    // Verify sumcheck final via committed L_k evaluations and proof-carried indices.
     // l_k_evals_multi[t][k] = (alpha^t * L_{t,k})(r): the prover builds l_hist with
     // alpha-scaling already included, so the eval is alpha-scaled — no extra multiply needed.
     let mut expected_final_eval = F::ZERO;
@@ -628,6 +670,19 @@ pub fn verify_lasso_multi(
         for k in 0..instance.tables.len() {
             // l_tk_at_r already includes alpha_pows[t] (baked into l_hist during prove).
             let l_tk_at_r = proof.l_k_evals_multi[t][k];
+            let size = 1usize << m;
+            let mask = size - 1;
+            let mut expected_l_hist = vec![F::ZERO; size];
+            for j in 0..n {
+                let ch = chunk(proof.all_query_indices[t][j], k, m, mask);
+                expected_l_hist[ch] += alpha_pows[t] * rho_pows[j];
+            }
+            let expected_l_at_r = DenseMLPoly::new(expected_l_hist).evaluate(&r_vec);
+            if l_tk_at_r != expected_l_at_r {
+                return Err(format!(
+                    "Weighted selector is not derived from query indices at instance {t}, table {k}"
+                ));
+            }
 
             if proof.table_openings[t][k] != proof.combined_sumcheck_proof.final_evals_f[table_idx]
             {
