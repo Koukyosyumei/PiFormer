@@ -17,7 +17,7 @@
 //! relative to each other, derived via hash-and-multiply).
 
 use ark_bn254::{Fr, G1Affine, G1Projective};
-use ark_ec::{Group, VariableBaseMSM};
+use ark_ec::{AffineRepr, CurveGroup, Group, VariableBaseMSM};
 use ark_ff::{Field, PrimeField, Zero};
 use rayon::prelude::*;
 use sha3::{Digest, Sha3_256};
@@ -514,13 +514,21 @@ impl HyraxBatchAccumulator {
     /// Finalize: derive one `b"hyrax_group_mu"` challenge, then run exactly
     /// 1 lhs MSM + 1 rhs MSM for all accumulated slots.
     pub fn finalize(self, params: &HyraxParams, transcript: &mut Transcript) -> Result<(), String> {
+        let mu = transcript.challenge_field::<F>(b"hyrax_group_mu");
+        self.finalize_with_mu(params, mu)
+    }
+
+    /// Like `finalize`, but accepts a pre-derived `mu` challenge instead of
+    /// sampling from the transcript. Use this to parallelize multiple finalize
+    /// calls: derive all mu values sequentially first (preserving transcript
+    /// ordering), then invoke this on each accumulator concurrently.
+    pub fn finalize_with_mu(self, params: &HyraxParams, mu: F) -> Result<(), String> {
         if self.slots.is_empty() {
             return Ok(());
         }
         let count = self.slots.len();
         let num_cols = params.gens.len();
 
-        let mu = transcript.challenge_field::<F>(b"hyrax_group_mu");
         let mu_pows = powers_of(mu, count);
 
         // Combined rhs: w'_combined[j] = Σ_k μ^k * w'_k[j]
@@ -591,14 +599,31 @@ pub fn lagrange_basis(point: &[F]) -> Vec<F> {
     table
 }
 
+/// Below this count, naive scalar-mul accumulation beats Pippenger.
+/// Pippenger pays O(2^window) bucket-setup cost that dominates for small n.
+const SMALL_MSM_THRESHOLD: usize = 16;
+
 /// MSM with G1Affine bases and F scalars.
+///
+/// For n ≤ SMALL_MSM_THRESHOLD uses naive double-and-add accumulation, which
+/// avoids Pippenger's bucket-initialization overhead and is faster in practice
+/// for the tiny MSMs (n = 2–8) that appear in Hyrax verification on small models.
 fn msm(bases: &[G1Affine], scalars: &[F]) -> G1Affine {
     assert_eq!(bases.len(), scalars.len());
-    if bases.is_empty() {
-        return G1Affine::identity();
+    match bases.len() {
+        0 => G1Affine::identity(),
+        n if n <= SMALL_MSM_THRESHOLD => {
+            let mut acc = G1Projective::zero();
+            for (base, scalar) in bases.iter().zip(scalars.iter()) {
+                acc += base.mul_bigint(scalar.into_bigint());
+            }
+            acc.into_affine()
+        }
+        _ => {
+            let bigints: Vec<_> = scalars.iter().map(|s| s.into_bigint()).collect();
+            <G1Projective as VariableBaseMSM>::msm_bigint(bases, &bigints).into()
+        }
     }
-    let bigints: Vec<_> = scalars.iter().map(|s| s.into_bigint()).collect();
-    <G1Projective as VariableBaseMSM>::msm_bigint(bases, &bigints).into()
 }
 
 /// MSM where scalars are already F field elements (same as `msm` but avoids confusion).

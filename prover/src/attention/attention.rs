@@ -18,8 +18,10 @@ use crate::lookup::lasso::{
     precommit_lasso_multi_tables, LassoInstance, LassoMultiInstance, LassoMultiProvingKey,
     LassoMultiVerifyingKey,
 };
-use ark_ff::Field;
-use crate::pcs::{absorb_com, HyraxCommitment, HyraxParams};
+use crate::pcs::{
+    absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, poly_hyrax,
+    HyraxCommitment, HyraxParams, HyraxProof,
+};
 use crate::poly::utils::{combine, eval_cols, eval_rows, mat_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{
@@ -74,10 +76,14 @@ pub fn precommit_attention_tables(
 ///
 /// GKR backward fusion: out_com is eliminated. out_inner is not committed
 /// independently — it is bound by the shared sumcheck claim with O_proj.
+///
+/// `skip_io_absorb`: when true, q/k/v_com are already in the transcript (Phase 1
+/// absorbs all block commitments before r_td derivation). Avoids double absorption.
 pub struct AttentionIOCommitments {
     pub q_com: HyraxCommitment,
     pub k_com: HyraxCommitment,
     pub v_com: HyraxCommitment,
+    pub skip_io_absorb: bool,
 }
 
 /// Private witness data. ONLY the Prover holds this.
@@ -97,6 +103,9 @@ pub struct LinearAttentionInstance {
     pub d_head: usize,
     pub q_lasso: LassoInstance,
     pub k_lasso: LassoInstance,
+    /// Private witness: table lookup indices for Q/K activations (not sent to verifier).
+    pub q_query_indices: Vec<usize>,
+    pub k_query_indices: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +140,12 @@ pub enum AttentionSumcheckProof {
 pub struct LinearAttentionProof {
     pub sumcheck: AttentionSumcheckProof,
     pub openings: AttentionOpenings,
+    /// Hyrax commitments to phi_q and phi_k MLE vectors, absorbed before sumcheck challenges.
+    pub phi_q_com: HyraxCommitment,
+    pub phi_k_com: HyraxCommitment,
+    /// Openings of phi_q_com / phi_k_com at the sumcheck-derived evaluation points.
+    pub phi_q_open: HyraxProof,
+    pub phi_k_open: HyraxProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -167,9 +182,21 @@ pub fn prove_linear_attention(
     let out_mle = mat_to_mle(&witness.out, t, d);
 
     // 1. Absorb IO commitments. out_com eliminated via GKR backward (no out_inner_com).
-    absorb_com(transcript, b"q_com", &io_coms.q_com);
-    absorb_com(transcript, b"k_com", &io_coms.k_com);
-    absorb_com(transcript, b"v_com", &io_coms.v_com);
+    // In GKR multi-block mode, q/k/v_com are already in the transcript (Phase 1).
+    if !io_coms.skip_io_absorb {
+        absorb_com(transcript, b"q_com", &io_coms.q_com);
+        absorb_com(transcript, b"k_com", &io_coms.k_com);
+        absorb_com(transcript, b"v_com", &io_coms.v_com);
+    }
+
+    // Commit phi_q and phi_k and absorb before any sumcheck challenges.
+    // This ensures the sumcheck challenges are drawn after committing to phi_q/phi_k,
+    // making the evaluation points phi_q_point/phi_k_point binding.
+    let (nu_td, sigma_td, params_td) = poly_hyrax(&phi_q_mle);
+    let phi_q_com = hyrax_commit(&phi_q_mle.evaluations, nu_td, &params_td);
+    let phi_k_com = hyrax_commit(&phi_k_mle.evaluations, nu_td, &params_td);
+    absorb_com(transcript, b"phi_q_com", &phi_q_com);
+    absorb_com(transcript, b"phi_k_com", &phi_k_com);
 
     // 2. Determine (rx, ry): sampled from transcript, or externally supplied (GKR backward).
     let (rx, ry, out_eval) = if let Some(ref claim) = external_out_claim {
@@ -186,7 +213,7 @@ pub fn prove_linear_attention(
         (rx, ry, out_eval)
     };
 
-    let (sumcheck, phi_q_eval, phi_k_eval, v_eval, _phi_q_point, _phi_k_point, v_point) =
+    let (sumcheck, phi_q_eval, phi_k_eval, v_eval, phi_q_point, phi_k_point, v_point) =
         if t_bits == d_bits {
             // 3a. Batched Sumcheck — seq_len == d_head, both pairs share the same variable count.
             transcript.append_field(b"claimed_out", &out_eval);
@@ -269,9 +296,16 @@ pub fn prove_linear_attention(
             )
         };
 
+    let phi_q_open = hyrax_open(&phi_q_mle.evaluations, &phi_q_point, nu_td, sigma_td);
+    let phi_k_open = hyrax_open(&phi_k_mle.evaluations, &phi_k_point, nu_td, sigma_td);
+
     let proof = LinearAttentionProof {
         sumcheck,
         openings: AttentionOpenings { out_eval, phi_q_eval, phi_k_eval, v_eval },
+        phi_q_com,
+        phi_k_com,
+        phi_q_open,
+        phi_k_open,
     };
 
     let out_claim = EvalClaim { point: combine(&rx, &ry), value: out_eval };
@@ -307,9 +341,15 @@ pub fn verify_linear_attention(
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
 
     // 1. Absorb IO commitments (out_com removed — GKR backward, no out_inner_com).
-    absorb_com(transcript, b"q_com", &io_coms.q_com);
-    absorb_com(transcript, b"k_com", &io_coms.k_com);
-    absorb_com(transcript, b"v_com", &io_coms.v_com);
+    if !io_coms.skip_io_absorb {
+        absorb_com(transcript, b"q_com", &io_coms.q_com);
+        absorb_com(transcript, b"k_com", &io_coms.k_com);
+        absorb_com(transcript, b"v_com", &io_coms.v_com);
+    }
+
+    // Absorb phi_q_com and phi_k_com (mirrors prover commitment step).
+    absorb_com(transcript, b"phi_q_com", &proof.phi_q_com);
+    absorb_com(transcript, b"phi_k_com", &proof.phi_k_com);
 
     // 2. Reproduce challenge points (or use external if GKR backward).
     let (rx, ry) = if let Some(ref claim) = external_out_claim {
@@ -392,25 +432,25 @@ pub fn verify_linear_attention(
         }
     };
 
-    // 4. Verify phi_q/phi_k directly against public Lasso outputs MLE.
-    let padded_len = 1usize << (t_bits + d_bits);
-    let mut phi_q_evals = vec![F::ZERO; padded_len];
-    for (j, &out) in inst.q_lasso.outputs.iter().enumerate() {
-        phi_q_evals[j] = out;
-    }
-    let phi_q_eval_expected = DenseMLPoly::new(phi_q_evals).evaluate(&phi_q_point);
-    if phi_q_eval_expected != proof.openings.phi_q_eval {
-        return Err("phi_q eval mismatch with Lasso outputs MLE".into());
-    }
-
-    let mut phi_k_evals = vec![F::ZERO; padded_len];
-    for (j, &out) in inst.k_lasso.outputs.iter().enumerate() {
-        phi_k_evals[j] = out;
-    }
-    let phi_k_eval_expected = DenseMLPoly::new(phi_k_evals).evaluate(&phi_k_point);
-    if phi_k_eval_expected != proof.openings.phi_k_eval {
-        return Err("phi_k eval mismatch with Lasso outputs MLE".into());
-    }
+    // 4. Verify phi_q/phi_k via Hyrax openings against committed phi_q_com/phi_k_com.
+    //    (phi_q_com/phi_k_com are bound to Lasso outputs via global output binding.)
+    let (_, _, params_td) = params_from_vars(t_bits + d_bits);
+    hyrax_verify(
+        &proof.phi_q_com,
+        proof.openings.phi_q_eval,
+        &phi_q_point,
+        &proof.phi_q_open,
+        &params_td,
+    )
+    .map_err(|e| format!("phi_q Hyrax opening failed: {e}"))?;
+    hyrax_verify(
+        &proof.phi_k_com,
+        proof.openings.phi_k_eval,
+        &phi_k_point,
+        &proof.phi_k_open,
+        &params_td,
+    )
+    .map_err(|e| format!("phi_k Hyrax opening failed: {e}"))?;
 
     // out_com and v_com deferred to block-level combine proof
     let out_claim = EvalClaim { point: combine(&rx, &ry), value: proof.openings.out_eval };
@@ -492,19 +532,18 @@ mod linear_attention_tests {
             }
         }
 
-        let build_lasso = |mat: &Vec<Vec<F>>, phi: &Vec<Vec<F>>| -> LassoInstance {
+        let build_lasso = |mat: &Vec<Vec<F>>, phi: &Vec<Vec<F>>| -> (LassoInstance, Vec<usize>) {
             let indices: Vec<usize> = mat
                 .iter()
                 .flatten()
                 .map(|x| x.into_bigint().as_ref()[0] as usize)
                 .collect();
             let outputs: Vec<F> = phi.iter().flatten().copied().collect();
-            LassoInstance {
+            (LassoInstance {
                 tables: vec![table.clone()],
-                query_indices: indices,
                 outputs,
                 bits_per_chunk: m,
-            }
+            }, indices)
         };
 
         // 1. Prover's Private Data
@@ -518,12 +557,17 @@ mod linear_attention_tests {
             out: out.clone(),
         };
 
+        let (q_lasso, q_query_indices) = build_lasso(&q, &witness.phi_q);
+        let (k_lasso, k_query_indices) = build_lasso(&k, &witness.phi_k);
+
         // 2. Public Instance (Dimensions and Lookups)
         let inst = LinearAttentionInstance {
             seq_len,
             d_head,
-            q_lasso: build_lasso(&q, &witness.phi_q),
-            k_lasso: build_lasso(&k, &witness.phi_k),
+            q_lasso,
+            k_lasso,
+            q_query_indices,
+            k_query_indices,
         };
 
         // 3. Trusted IO Commitments (Simulating Global Pipeline Manager)
@@ -543,7 +587,7 @@ mod linear_attention_tests {
         let v_com = hyrax_commit(&v_mle.evaluations, nu_td, &params_td);
 
         // GKR backward: out_com removed from AttentionIOCommitments.
-        let io_coms = AttentionIOCommitments { q_com, k_com, v_com };
+        let io_coms = AttentionIOCommitments { q_com, k_com, v_com, skip_io_absorb: false };
 
         let lp = lasso_params();
         let pk = precommit_attention_tables(&inst.q_lasso, &inst.k_lasso, &lp);

@@ -132,11 +132,14 @@ pub struct ProjectionProof {
 ///
 /// `y_claim` = EvalClaim on the output y at (r_t, r_out) — deferred to combine proof.
 /// `x_claim` = EvalClaim on the input x at (r_t, r_k) — propagated backward for combine.
+/// `r_td`: when Some, use as the output eval point (GKR mode).
+/// When None, derive r_t / r_out from transcript (standalone mode).
 pub fn prove_projection(
     pk: &ProjectionProvingKey,
     witness: &ProjectionWitness,
     io_coms: &ProjectionIOCommitments,
     transcript: &mut Transcript,
+    r_td: Option<&[F]>,
 ) -> Result<(ProjectionProof, EvalClaim, EvalClaim), String> {
     let t = pk.vk.seq_len;
     let d_in = pk.vk.d_in;
@@ -163,9 +166,13 @@ pub fn prove_projection(
     transcript.append_field(b"alpha", &pk.vk.alpha);
     absorb_com(transcript, b"bias_com", &pk.vk.bias_com);
 
-    // 2. Challenges
-    let r_t = challenge_vec(transcript, t_bits, b"proj_rt");
-    let r_out = challenge_vec(transcript, out_bits, b"proj_rout");
+    // 2. Challenges (GKR mode: use r_td as eval point; standalone: derive from transcript)
+    let (r_t, r_out) = if let Some(rtd) = r_td {
+        (rtd[..t_bits].to_vec(), rtd[t_bits..].to_vec())
+    } else {
+        (challenge_vec(transcript, t_bits, b"proj_rt"),
+         challenge_vec(transcript, out_bits, b"proj_rout"))
+    };
 
     // 3. Sumcheck: Z = alpha * Σ X * W
     let f_x_evals = eval_rows(&x_mle, t_bits, &r_t);
@@ -218,6 +225,7 @@ pub fn verify_projection(
     transcript: &mut Transcript,
     acc_w: &mut HyraxBatchAccumulator,
     acc_b: &mut HyraxBatchAccumulator,
+    r_td: Option<&[F]>,
 ) -> Result<(EvalClaim, EvalClaim), String> {
     let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
     let in_bits = vk.d_in.next_power_of_two().trailing_zeros() as usize;
@@ -231,8 +239,12 @@ pub fn verify_projection(
     transcript.append_field(b"alpha", &vk.alpha);
     absorb_com(transcript, b"bias_com", &vk.bias_com);
 
-    let r_t = challenge_vec(transcript, t_bits, b"proj_rt");
-    let r_out = challenge_vec(transcript, out_bits, b"proj_rout");
+    let (r_t, r_out) = if let Some(rtd) = r_td {
+        (rtd[..t_bits].to_vec(), rtd[t_bits..].to_vec())
+    } else {
+        (challenge_vec(transcript, t_bits, b"proj_rt"),
+         challenge_vec(transcript, out_bits, b"proj_rout"))
+    };
 
     // 2. Sumcheck — target is y_eval - bias (y_eval trusted; verified by combine proof)
     let target_z = proof.openings.y_eval - proof.openings.bias_at_rj;
@@ -274,8 +286,11 @@ pub struct BatchedQKVProjectionWitness {
     pub v: Vec<Vec<F>>,
 }
 
+/// IO commitments for QKV projection.
+/// x_com is None in GKR mode: x (= LN1.y) is never committed; binding comes
+/// from the block-level GKR check using LN1's internal commitments.
 pub struct BatchedQKVProjectionIOCommitments {
-    pub x_com: HyraxCommitment,
+    pub x_com: Option<HyraxCommitment>,
 }
 
 pub struct BatchedQKVProjectionOpenings {
@@ -306,6 +321,9 @@ pub struct BatchedQKVProjectionProof {
 ///
 /// All three projections share the same input x_norm1 and the same r_t / r_k
 /// after the batched sumcheck, eliminating the 3-claim CombineProof for x_norm1_com.
+/// GKR mode: all three output matrices (Q, K, V) are evaluated at the SAME point r_td,
+/// enabling a single global `hyrax_open_batch` across all L blocks. The shared `r_out`
+/// is derived from r_td instead of three independent transcript challenges.
 pub fn prove_qkv_projections(
     pk_q: &ProjectionProvingKey,
     pk_k: &ProjectionProvingKey,
@@ -313,6 +331,7 @@ pub fn prove_qkv_projections(
     witness: &BatchedQKVProjectionWitness,
     io_coms: &BatchedQKVProjectionIOCommitments,
     transcript: &mut Transcript,
+    r_td: &[F],
 ) -> Result<(BatchedQKVProjectionProof, EvalClaim, EvalClaim, EvalClaim, EvalClaim), String> {
     let t = pk_q.vk.seq_len;
     let d_in = pk_q.vk.d_in;
@@ -340,7 +359,9 @@ pub fn prove_qkv_projections(
     absorb_com(transcript, b"qkv_w_q_com", &pk_q.vk.w_com);
     absorb_com(transcript, b"qkv_w_k_com", &pk_k.vk.w_com);
     absorb_com(transcript, b"qkv_w_v_com", &pk_v.vk.w_com);
-    absorb_com(transcript, b"qkv_x_com", &io_coms.x_com);
+    if let Some(ref xc) = io_coms.x_com {
+        absorb_com(transcript, b"qkv_x_com", xc);
+    }
     transcript.append_field(b"qkv_alpha_q", &pk_q.vk.alpha);
     transcript.append_field(b"qkv_alpha_k", &pk_k.vk.alpha);
     transcript.append_field(b"qkv_alpha_v", &pk_v.vk.alpha);
@@ -348,11 +369,13 @@ pub fn prove_qkv_projections(
     absorb_com(transcript, b"qkv_bias_k_com", &pk_k.vk.bias_com);
     absorb_com(transcript, b"qkv_bias_v_com", &pk_v.vk.bias_com);
 
-    // 2. Challenges: shared r_t, independent r_out per projection, batch scalars λ, μ
-    let r_t = challenge_vec(transcript, t_bits, b"qkv_rt");
-    let r_out_q = challenge_vec(transcript, out_bits, b"qkv_rout_q");
-    let r_out_k = challenge_vec(transcript, out_bits, b"qkv_rout_k");
-    let r_out_v = challenge_vec(transcript, out_bits, b"qkv_rout_v");
+    // 2. Challenges: r_td provides the shared eval point (r_t || r_out) for all three outputs.
+    // Using a common r_out for Q, K, V enables a single global hyrax_open_batch across blocks.
+    let r_t = r_td[..t_bits].to_vec();
+    let r_out = r_td[t_bits..].to_vec();
+    let r_out_q = r_out.clone();
+    let r_out_k = r_out.clone();
+    let r_out_v = r_out.clone();
     let lambda: F = transcript.challenge_field(b"qkv_lambda");
     let mu: F = transcript.challenge_field(b"qkv_mu");
 
@@ -440,6 +463,7 @@ pub fn verify_qkv_projections(
     transcript: &mut Transcript,
     acc_w: &mut HyraxBatchAccumulator,
     acc_b: &mut HyraxBatchAccumulator,
+    r_td: &[F],
 ) -> Result<(EvalClaim, EvalClaim, EvalClaim, EvalClaim), String> {
     let t_bits = vk_q.seq_len.next_power_of_two().trailing_zeros() as usize;
     let in_bits = vk_q.d_in.next_power_of_two().trailing_zeros() as usize;
@@ -449,7 +473,9 @@ pub fn verify_qkv_projections(
     absorb_com(transcript, b"qkv_w_q_com", &vk_q.w_com);
     absorb_com(transcript, b"qkv_w_k_com", &vk_k.w_com);
     absorb_com(transcript, b"qkv_w_v_com", &vk_v.w_com);
-    absorb_com(transcript, b"qkv_x_com", &io_coms.x_com);
+    if let Some(ref xc) = io_coms.x_com {
+        absorb_com(transcript, b"qkv_x_com", xc);
+    }
     transcript.append_field(b"qkv_alpha_q", &vk_q.alpha);
     transcript.append_field(b"qkv_alpha_k", &vk_k.alpha);
     transcript.append_field(b"qkv_alpha_v", &vk_v.alpha);
@@ -457,10 +483,11 @@ pub fn verify_qkv_projections(
     absorb_com(transcript, b"qkv_bias_k_com", &vk_k.bias_com);
     absorb_com(transcript, b"qkv_bias_v_com", &vk_v.bias_com);
 
-    let r_t = challenge_vec(transcript, t_bits, b"qkv_rt");
-    let r_out_q = challenge_vec(transcript, out_bits, b"qkv_rout_q");
-    let r_out_k = challenge_vec(transcript, out_bits, b"qkv_rout_k");
-    let r_out_v = challenge_vec(transcript, out_bits, b"qkv_rout_v");
+    let r_t = r_td[..t_bits].to_vec();
+    let r_out = r_td[t_bits..].to_vec();
+    let r_out_q = r_out.clone();
+    let r_out_k = r_out.clone();
+    let r_out_v = r_out.clone();
     let lambda: F = transcript.challenge_field(b"qkv_lambda");
     let mu: F = transcript.challenge_field(b"qkv_mu");
 
@@ -513,13 +540,167 @@ pub fn verify_qkv_projections(
 }
 
 // ---------------------------------------------------------------------------
+// GKR Backward Mode — single projection
+//
+// In standard mode the prover commits Y and derives (r_t, r_out) from the
+// transcript. In GKR backward mode the downstream sub-protocol already chose
+// (r_t, r_out) and hands the claim Y_mle(r_t, r_out) = v to this prover. The
+// prover absorbs the claim into the transcript (binding it via Fiat-Shamir) and
+// runs sumcheck at that external point. No Y commitment is needed; the x_claim
+// that comes out can be chained further backward.
+// ---------------------------------------------------------------------------
+
+/// GKR-backward projection proof. Y is never committed.
+pub struct ProjectionGKRProof {
+    pub sumcheck: SumcheckProof,
+    /// Prover's claimed evaluation of X at (r_t, r_k).
+    pub x_eval: F,
+    /// Static weight evaluation and opening at (r_k, r_out).
+    pub w_eval: F,
+    pub w_open: HyraxProof,
+    /// Bias evaluation and opening at r_out.
+    pub bias_eval: F,
+    pub bias_open: HyraxProof,
+}
+
+/// Prove a single projection in GKR backward mode.
+///
+/// * `y_claim` — external evaluation claim: Y_mle(y_claim.point) = y_claim.value.
+///   `y_claim.point` must equal `combine(&r_t, &r_out)` for this layer's dimensions.
+/// * Returns `(proof, x_claim)` where `x_claim.point = combine(&r_t, &r_k)`.
+pub fn prove_projection_gkr(
+    pk: &ProjectionProvingKey,
+    witness: &ProjectionWitness,
+    y_claim: &EvalClaim,
+    transcript: &mut Transcript,
+) -> Result<(ProjectionGKRProof, EvalClaim), String> {
+    let t = pk.vk.seq_len;
+    let d_in = pk.vk.d_in;
+    let d_out = pk.vk.d_out;
+
+    let t_bits = t.next_power_of_two().trailing_zeros() as usize;
+    let in_bits = d_in.next_power_of_two().trailing_zeros() as usize;
+    let out_bits = d_out.next_power_of_two().trailing_zeros() as usize;
+
+    if y_claim.point.len() != t_bits + out_bits {
+        return Err(format!(
+            "y_claim.point length mismatch: got {}, expected {}",
+            y_claim.point.len(),
+            t_bits + out_bits
+        ));
+    }
+
+    let r_t = y_claim.point[..t_bits].to_vec();
+    let r_out = y_claim.point[t_bits..].to_vec();
+
+    // Absorb static keys then the external claim — binds (r_t, r_out, v_y) via FS.
+    absorb_com(transcript, b"gkr_w_com", &pk.vk.w_com);
+    transcript.append_field(b"gkr_alpha", &pk.vk.alpha);
+    absorb_com(transcript, b"gkr_bias_com", &pk.vk.bias_com);
+    for ri in &y_claim.point {
+        transcript.append_field(b"gkr_y_pt", ri);
+    }
+    transcript.append_field(b"gkr_y_val", &y_claim.value);
+
+    let x_mle = mat_to_mle(&witness.x, t, d_in);
+    let w_mle = mat_to_mle(&convert_tm_to_fm(&pk.w), d_in, d_out);
+    let bias_mle = vec_to_mle(&pk.bias, d_out);
+
+    let (nu_w, sigma_w, _) = params_from_vars(in_bits + out_bits);
+    let (nu_b, sigma_b, _) = params_from_vars(out_bits);
+
+    // Sumcheck: Σ_k alpha * X(r_t, k) * W(k, r_out) = y_claim.value - bias(r_out)
+    let f_x_evals = eval_rows(&x_mle, t_bits, &r_t);
+    let f_x_scaled =
+        DenseMLPoly::from_vec_padded(f_x_evals.iter().map(|v| *v * pk.vk.alpha).collect());
+    let g_w_evals = eval_cols_ternary(&pk.w, &r_out, d_in, d_out);
+    let g_w = DenseMLPoly::from_vec_padded(g_w_evals);
+
+    let bias_eval = bias_mle.evaluate(&r_out);
+    let target_z = y_claim.value - bias_eval;
+
+    let (sumcheck, r_k) = prove_sumcheck(&f_x_scaled, &g_w, target_z, transcript);
+
+    let x_eval = x_mle.evaluate(&combine(&r_t, &r_k));
+    let w_eval = w_mle.evaluate(&combine(&r_k, &r_out));
+
+    let proof = ProjectionGKRProof {
+        sumcheck,
+        x_eval,
+        w_eval,
+        w_open: hyrax_open(&w_mle.evaluations, &combine(&r_k, &r_out), nu_w, sigma_w),
+        bias_eval,
+        bias_open: hyrax_open(&bias_mle.evaluations, &r_out, nu_b, sigma_b),
+    };
+
+    let x_claim = EvalClaim { point: combine(&r_t, &r_k), value: x_eval };
+    Ok((proof, x_claim))
+}
+
+/// Verify a single GKR-backward projection proof.
+///
+/// * `y_claim` — the external claim absorbed into the transcript.
+/// * Returns `x_claim` for upstream backward chaining.
+/// * Weight and bias openings are deferred to the provided accumulators.
+pub fn verify_projection_gkr(
+    proof: &ProjectionGKRProof,
+    vk: &ProjectionVerifyingKey,
+    y_claim: &EvalClaim,
+    transcript: &mut Transcript,
+    acc_w: &mut HyraxBatchAccumulator,
+    acc_b: &mut HyraxBatchAccumulator,
+) -> Result<EvalClaim, String> {
+    let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
+    let in_bits = vk.d_in.next_power_of_two().trailing_zeros() as usize;
+    let out_bits = vk.d_out.next_power_of_two().trailing_zeros() as usize;
+
+    if y_claim.point.len() != t_bits + out_bits {
+        return Err(format!(
+            "y_claim.point length mismatch: got {}, expected {}",
+            y_claim.point.len(),
+            t_bits + out_bits
+        ));
+    }
+
+    let r_t = y_claim.point[..t_bits].to_vec();
+    let r_out = y_claim.point[t_bits..].to_vec();
+
+    // Mirror transcript absorption (must match prover exactly).
+    absorb_com(transcript, b"gkr_w_com", &vk.w_com);
+    transcript.append_field(b"gkr_alpha", &vk.alpha);
+    absorb_com(transcript, b"gkr_bias_com", &vk.bias_com);
+    for ri in &y_claim.point {
+        transcript.append_field(b"gkr_y_pt", ri);
+    }
+    transcript.append_field(b"gkr_y_val", &y_claim.value);
+
+    // Verify sumcheck: target = y_claim.value - bias_eval
+    let target_z = y_claim.value - proof.bias_eval;
+    let (r_k, final_val) =
+        verify_sumcheck(&proof.sumcheck, target_z, in_bits, transcript)
+            .map_err(|e| format!("GKR Projection Sumcheck: {e}"))?;
+
+    // Algebraic consistency: sumcheck_final == alpha * x_eval * w_eval
+    if final_val != vk.alpha * proof.x_eval * proof.w_eval {
+        return Err("GKR Projection: alpha * X * W != sumcheck_final".into());
+    }
+
+    // Defer weight and bias openings.
+    acc_w.add_verify(&vk.w_com, proof.w_eval, &combine(&r_k, &r_out), &proof.w_open)?;
+    acc_b.add_verify(&vk.bias_com, proof.bias_eval, &r_out, &proof.bias_open)?;
+
+    let x_claim = EvalClaim { point: combine(&r_t, &r_k), value: proof.x_eval };
+    Ok(x_claim)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod projection_full_tests {
     use super::*;
-    use ark_ff::{One, Zero};
+    use ark_ff::One;
 
     fn setup_mock_projection(
         t: usize,
@@ -541,7 +722,7 @@ mod projection_full_tests {
         let y = vec![vec![y_val; d_out]; t];
 
         let x_mle = mat_to_mle(&x, t, d_in);
-        let y_mle = mat_to_mle(&y, t, d_out);
+        let _y_mle = mat_to_mle(&y, t, d_out);
         let b_mle = vec_to_mle(&bias, d_out);
         let w_mle = mat_to_mle(&convert_tm_to_fm(&w), d_in, d_out);
 
@@ -580,7 +761,7 @@ mod projection_full_tests {
         let (pk, witness, io) = setup_mock_projection(2, 4, 2);
         let mut transcript = Transcript::new(b"test");
         let (proof, _y_claim, _x_claim) =
-            prove_projection(&pk, &witness, &io, &mut transcript).unwrap();
+            prove_projection(&pk, &witness, &io, &mut transcript, None).unwrap();
         // Advance transcript to match verifier's 2 finalize calls.
         let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
         let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
@@ -588,7 +769,7 @@ mod projection_full_tests {
         let mut v_transcript = Transcript::new(b"test");
         let mut acc_w = HyraxBatchAccumulator::new();
         let mut acc_b = HyraxBatchAccumulator::new();
-        let result = verify_projection(&proof, &pk.vk, &io, &mut v_transcript, &mut acc_w, &mut acc_b);
+        let result = verify_projection(&proof, &pk.vk, &io, &mut v_transcript, &mut acc_w, &mut acc_b, None);
         if result.is_ok() {
             let in_bits = pk.vk.d_in.next_power_of_two().trailing_zeros() as usize;
             let out_bits = pk.vk.d_out.next_power_of_two().trailing_zeros() as usize;
@@ -605,7 +786,7 @@ mod projection_full_tests {
         let (pk, witness, io) = setup_mock_projection(2, 4, 2);
         let mut transcript = Transcript::new(b"test");
         let (proof, _y_claim, _x_claim) =
-            prove_projection(&pk, &witness, &io, &mut transcript).unwrap();
+            prove_projection(&pk, &witness, &io, &mut transcript, None).unwrap();
         // Advance transcript to match verifier's 2 finalize calls.
         let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
         let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
@@ -615,7 +796,7 @@ mod projection_full_tests {
         let mut v_transcript = Transcript::new(b"test");
         let mut acc_w = HyraxBatchAccumulator::new();
         let mut acc_b = HyraxBatchAccumulator::new();
-        let result = verify_projection(&proof, &vk_bad, &io, &mut v_transcript, &mut acc_w, &mut acc_b);
+        let result = verify_projection(&proof, &vk_bad, &io, &mut v_transcript, &mut acc_w, &mut acc_b, None);
         assert!(result.is_err());
     }
 
@@ -624,7 +805,7 @@ mod projection_full_tests {
         let (pk, witness, io) = setup_mock_projection(2, 4, 2);
         let mut transcript = Transcript::new(b"test");
         let (mut proof, _y_claim, _x_claim) =
-            prove_projection(&pk, &witness, &io, &mut transcript).unwrap();
+            prove_projection(&pk, &witness, &io, &mut transcript, None).unwrap();
         // Advance transcript to match verifier's 2 finalize calls.
         let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
         let _ = transcript.challenge_field::<crate::field::F>(b"hyrax_group_mu");
@@ -634,7 +815,100 @@ mod projection_full_tests {
         let mut v_transcript = Transcript::new(b"test");
         let mut acc_w = HyraxBatchAccumulator::new();
         let mut acc_b = HyraxBatchAccumulator::new();
-        let result = verify_projection(&proof, &pk.vk, &io, &mut v_transcript, &mut acc_w, &mut acc_b);
+        let result = verify_projection(&proof, &pk.vk, &io, &mut v_transcript, &mut acc_w, &mut acc_b, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_projection_gkr_prove_verify() {
+        let t = 2usize;
+        let d_in = 4usize;
+        let d_out = 2usize;
+        let alpha = F::from(3u64);
+        let bias = vec![F::from(5u64); d_out];
+        let x = vec![vec![F::from(2u64); d_in]; t];
+        let w = vec![vec![TernaryValue::ONE; d_out]; d_in];
+        let y_val = alpha * F::from(2 * d_in as u64) + F::from(5u64);
+        let y = vec![vec![y_val; d_out]; t];
+
+        let pk = preprocess_projection(t, d_in, d_out, w, alpha, bias);
+        let witness = ProjectionWitness { x, y };
+
+        // Compute external y_claim by evaluating Y_mle at a random-looking point.
+        let t_bits = t.next_power_of_two().trailing_zeros() as usize;
+        let out_bits = d_out.next_power_of_two().trailing_zeros() as usize;
+        let in_bits = d_in.next_power_of_two().trailing_zeros() as usize;
+
+        let y_mle = mat_to_mle(&witness.y, t, d_out);
+        // Use a deterministic point for the test.
+        let r_t: Vec<F> = (0..t_bits).map(|i| F::from(i as u64 + 2)).collect();
+        let r_out: Vec<F> = (0..out_bits).map(|i| F::from(i as u64 + 7)).collect();
+        let y_point = combine(&r_t, &r_out);
+        let y_value = y_mle.evaluate(&y_point);
+        let y_claim = EvalClaim { point: y_point.clone(), value: y_value };
+
+        // Prove
+        let mut p_transcript = Transcript::new(b"gkr_test");
+        let (proof, x_claim) =
+            prove_projection_gkr(&pk, &witness, &y_claim, &mut p_transcript).unwrap();
+
+        // Verify
+        let mut v_transcript = Transcript::new(b"gkr_test");
+        let mut acc_w = HyraxBatchAccumulator::new();
+        let mut acc_b = HyraxBatchAccumulator::new();
+        let x_claim_v =
+            verify_projection_gkr(&proof, &pk.vk, &y_claim, &mut v_transcript, &mut acc_w, &mut acc_b)
+                .unwrap();
+
+        // x_claim must match.
+        assert_eq!(x_claim.point, x_claim_v.point);
+        assert_eq!(x_claim.value, x_claim_v.value);
+
+        // Finalize PCS batch accumulators.
+        let params_w = params_from_vars(in_bits + out_bits).2;
+        let params_b = params_from_vars(out_bits).2;
+        acc_w.finalize(&params_w, &mut v_transcript).unwrap();
+        acc_b.finalize(&params_b, &mut v_transcript).unwrap();
+
+        // x_claim should be consistent with the actual x_mle.
+        let x_mle = mat_to_mle(&witness.x, t, d_in);
+        assert_eq!(x_mle.evaluate(&x_claim.point), x_claim.value);
+    }
+
+    #[test]
+    fn test_projection_gkr_rejects_tampered_x_eval() {
+        let t = 2usize;
+        let d_in = 4usize;
+        let d_out = 2usize;
+        let alpha = F::from(3u64);
+        let bias = vec![F::from(5u64); d_out];
+        let x = vec![vec![F::from(2u64); d_in]; t];
+        let w = vec![vec![TernaryValue::ONE; d_out]; d_in];
+        let y_val = alpha * F::from(2 * d_in as u64) + F::from(5u64);
+        let y = vec![vec![y_val; d_out]; t];
+
+        let pk = preprocess_projection(t, d_in, d_out, w, alpha, bias);
+        let witness = ProjectionWitness { x, y };
+
+        let t_bits = t.next_power_of_two().trailing_zeros() as usize;
+        let out_bits = d_out.next_power_of_two().trailing_zeros() as usize;
+        let y_mle = mat_to_mle(&witness.y, t, d_out);
+        let r_t: Vec<F> = (0..t_bits).map(|i| F::from(i as u64 + 2)).collect();
+        let r_out: Vec<F> = (0..out_bits).map(|i| F::from(i as u64 + 7)).collect();
+        let y_point = combine(&r_t, &r_out);
+        let y_claim = EvalClaim { point: y_point, value: y_mle.evaluate(&combine(&r_t, &r_out)) };
+
+        let mut p_transcript = Transcript::new(b"gkr_test");
+        let (mut proof, _) =
+            prove_projection_gkr(&pk, &witness, &y_claim, &mut p_transcript).unwrap();
+
+        proof.x_eval += F::from(1u64); // tamper
+
+        let mut v_transcript = Transcript::new(b"gkr_test");
+        let mut acc_w = HyraxBatchAccumulator::new();
+        let mut acc_b = HyraxBatchAccumulator::new();
+        let result =
+            verify_projection_gkr(&proof, &pk.vk, &y_claim, &mut v_transcript, &mut acc_w, &mut acc_b);
         assert!(result.is_err());
     }
 }

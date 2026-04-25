@@ -31,9 +31,13 @@ use crate::transcript::{challenge_vec, Transcript};
 // ---------------------------------------------------------------------------
 
 /// Trusted IO Commitments provided by the Global Pipeline Verifier.
+/// x_com is None in GKR mode: x (= LN2.y) is not committed; binding comes
+/// from the block-level GKR check using LN2's internal commitments.
+/// y_com is None in GKR multi-block mode: out_ffn_com was already absorbed
+/// into the transcript during Phase 1 (before r_td derivation).
 pub struct FFNIOCommitments {
-    pub x_com: HyraxCommitment,
-    pub y_com: HyraxCommitment,
+    pub x_com: Option<HyraxCommitment>,
+    pub y_com: Option<HyraxCommitment>,
 }
 
 /// Preprocessing Key for the Verifier. (Static model weights)
@@ -62,6 +66,8 @@ pub struct FFNWitness {
     pub m: Vec<Vec<F>>,
     pub a: Vec<Vec<F>>,
     pub y: Vec<Vec<F>>,
+    /// Private Lasso query indices for A = φ(M): activation table lookup keys.
+    pub activation_query_indices: Vec<usize>,
 }
 
 pub struct FFNInstance {
@@ -152,6 +158,8 @@ pub struct FFNProof {
 /// transcript. This eliminates a_com and a_open — the verifier checks a_eval directly from
 /// the public Lasso outputs MLE. m_com is kept because M = X·W1 can be negative in the field,
 /// making M_field[j] ≠ F::from(query_indices[j]) for out-of-range values.
+/// `r_td`: when Some, use as Y-sumcheck output eval point (GKR multi-block mode).
+/// When None, derive rx_y / ry_y from transcript (single-block / standalone mode).
 pub fn prove_ffn(
     pk: &FFNProvingKey,
     witness: &FFNWitness,
@@ -159,6 +167,7 @@ pub fn prove_ffn(
     io_coms: &FFNIOCommitments,
     transcript: &mut Transcript,
     lasso_params: &HyraxParams,
+    r_td: Option<&[F]>,
 ) -> Result<(FFNProof, EvalClaim, EvalClaim), String> {
     let t = pk.vk.seq_len;
     let d = pk.vk.d_model;
@@ -182,13 +191,19 @@ pub fn prove_ffn(
     // 1. Absorb Trusted IO & VK Commitments
     absorb_com(transcript, b"w1_com", &pk.vk.w1_com);
     absorb_com(transcript, b"w2_com", &pk.vk.w2_com);
-    absorb_com(transcript, b"x_com", &io_coms.x_com);
-    absorb_com(transcript, b"y_com", &io_coms.y_com);
+    if let Some(ref xc) = io_coms.x_com {
+        absorb_com(transcript, b"x_com", xc);
+    }
+    // y_com is None in GKR multi-block mode (already absorbed in Phase 1).
+    if let Some(ref yc) = io_coms.y_com {
+        absorb_com(transcript, b"y_com", yc);
+    }
 
     // 2. GKR backward: run Lasso FIRST to commit A (outputs) before rx_y is sampled.
     //    Eliminates a_com — verifier checks a_eval from public outputs MLE.
     let activation_lasso_proof = prove_lasso(
         &inst.activation_lasso,
+        &witness.activation_query_indices,
         &pk.activation_lasso_pk,
         transcript,
         lasso_params,
@@ -199,8 +214,13 @@ pub fn prove_ffn(
     absorb_com(transcript, b"m_com", &m_com);
 
     // 4. Sumcheck 1: Y = A · W2
-    let rx_y = challenge_vec(transcript, t_bits, b"ffn_rx_y");
-    let ry_y = challenge_vec(transcript, d_bits, b"ffn_ry_y");
+    // In GKR mode, use the global r_td as the output eval point (enables global batch opening).
+    let (rx_y, ry_y) = if let Some(rtd) = r_td {
+        (rtd[..t_bits].to_vec(), rtd[t_bits..].to_vec())
+    } else {
+        (challenge_vec(transcript, t_bits, b"ffn_rx_y"),
+         challenge_vec(transcript, d_bits, b"ffn_ry_y"))
+    };
     let y_eval = y_mle.evaluate(&combine(&rx_y, &ry_y));
     transcript.append_field(b"claim_y", &y_eval);
 
@@ -269,6 +289,7 @@ pub fn verify_ffn(
     io_coms: &FFNIOCommitments,
     transcript: &mut Transcript,
     lasso_params: &HyraxParams,
+    r_td: Option<&[F]>,
 ) -> Result<(EvalClaim, EvalClaim), String> {
     let t_bits = vk.seq_len.next_power_of_two().trailing_zeros() as usize;
     let d_bits = vk.d_model.next_power_of_two().trailing_zeros() as usize;
@@ -276,14 +297,17 @@ pub fn verify_ffn(
 
     let (_, _, params_w1) = params_from_vars(d_bits + f_bits);
     let (_, _, params_w2) = params_from_vars(f_bits + d_bits);
-
     let (_, _, params_mf) = params_from_vars(t_bits + f_bits);
 
     // 1. Absorb Trusted IO & VK Commitments (no a_com — GKR backward eliminates it)
     absorb_com(transcript, b"w1_com", &vk.w1_com);
     absorb_com(transcript, b"w2_com", &vk.w2_com);
-    absorb_com(transcript, b"x_com", &io_coms.x_com);
-    absorb_com(transcript, b"y_com", &io_coms.y_com);
+    if let Some(ref xc) = io_coms.x_com {
+        absorb_com(transcript, b"x_com", xc);
+    }
+    if let Some(ref yc) = io_coms.y_com {
+        absorb_com(transcript, b"y_com", yc);
+    }
 
     // 2. GKR backward: verify Lasso FIRST to bind A (outputs) before rx_y is sampled.
     verify_lasso(
@@ -298,8 +322,12 @@ pub fn verify_ffn(
     absorb_com(transcript, b"m_com", &proof.m_com);
 
     // 4. Verify Y Sumcheck: Y = A · W2
-    let rx_y = challenge_vec(transcript, t_bits, b"ffn_rx_y");
-    let ry_y = challenge_vec(transcript, d_bits, b"ffn_ry_y");
+    let (rx_y, ry_y) = if let Some(rtd) = r_td {
+        (rtd[..t_bits].to_vec(), rtd[t_bits..].to_vec())
+    } else {
+        (challenge_vec(transcript, t_bits, b"ffn_rx_y"),
+         challenge_vec(transcript, d_bits, b"ffn_ry_y"))
+    };
     transcript.append_field(b"claim_y", &proof.openings.y_eval);
 
     let (r_k, final_y) =
@@ -332,7 +360,7 @@ pub fn verify_ffn(
         return Err("M Sumcheck mismatch".into());
     }
 
-    // 7. Static weight openings (w1 and w2 are public model weights — must keep).
+    // 7. Static weight openings (inline — deferred batch is slower for large 18-bit polys).
     hyrax_verify(
         &vk.w2_com,
         proof.openings.w2_eval,
@@ -348,7 +376,7 @@ pub fn verify_ffn(
         &params_w1,
     )?;
 
-    // 8. Hyrax opening for M (kept).
+    // 8. Hyrax opening for M (inline).
     hyrax_verify(
         &proof.m_com,
         proof.openings.m_eval,
@@ -428,7 +456,6 @@ mod ffn_tests {
         }
         let activation_lasso = LassoInstance {
             tables: vec![table.clone()],
-            query_indices,
             outputs,
             bits_per_chunk: m_bits,
         };
@@ -445,11 +472,11 @@ mod ffn_tests {
                 + d.next_power_of_two().trailing_zeros() as usize,
         );
         let io_coms = FFNIOCommitments {
-            x_com: hyrax_commit(&x_mle.evaluations, nu_x, &params_x),
-            y_com: hyrax_commit(&y_mle.evaluations, nu_x, &params_x),
+            x_com: Some(hyrax_commit(&x_mle.evaluations, nu_x, &params_x)),
+            y_com: Some(hyrax_commit(&y_mle.evaluations, nu_x, &params_x)),
         };
 
-        let witness = FFNWitness { x, m, a, y };
+        let witness = FFNWitness { x, m, a, y, activation_query_indices: query_indices };
         let inst = FFNInstance { activation_lasso };
 
         (pk, witness, inst, io_coms)
@@ -461,10 +488,10 @@ mod ffn_tests {
         let lasso_params = HyraxParams::new(2);
 
         let mut pt = Transcript::new(b"ffn-test");
-        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, None);
         assert!(result.is_ok(), "verify failed: {:?}", result.err());
     }
 
@@ -476,28 +503,28 @@ mod ffn_tests {
         pk.w2[0][0] = TernaryValue::ZERO; // Tamper weight internally (was ONE)
 
         let mut pt = Transcript::new(b"ffn-test");
-        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, None);
         assert!(result.is_err(), "Should reject tampered weights");
     }
 
     /// Tampering with the input X while keeping io_coms fixed should be detected
-    /// via the Hyrax opening check on X.
+    /// via the sumcheck inconsistency (x_com binding is at block level).
     #[test]
     fn test_rejects_tampered_x_input() {
         let (pk, mut witness, inst, io_coms) = setup_test_pipeline();
         let lasso_params = HyraxParams::new(2);
 
-        // Tamper with X (but io_coms.x_com is still bound to the original X)
+        // Tamper with X (but witness.m is still from original X, causing M sumcheck to fail).
         witness.x[0][0] += F::one();
 
         let mut pt = Transcript::new(b"ffn-test");
-        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, None);
         assert!(result.is_err(), "Should reject tampered X input");
     }
 
@@ -510,10 +537,10 @@ mod ffn_tests {
         witness.y[0][0] += F::one();
 
         let mut pt = Transcript::new(b"ffn-test");
-        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, None);
         assert!(result.is_err(), "Should reject tampered Y output");
     }
 
@@ -526,10 +553,10 @@ mod ffn_tests {
         witness.a[0][0] += F::one();
 
         let mut pt = Transcript::new(b"ffn-test");
-        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, None);
         assert!(result.is_err(), "Should reject tampered activation A");
     }
 
@@ -542,10 +569,10 @@ mod ffn_tests {
         pk.w1[0][0] = TernaryValue::ZERO; // Tamper weight internally (was ONE)
 
         let mut pt = Transcript::new(b"ffn-test");
-        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params).unwrap();
+        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params);
+        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, None);
         assert!(result.is_err(), "Should reject tampered W1");
     }
 }

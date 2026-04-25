@@ -129,13 +129,11 @@ pub fn preprocess_transformer_model(
         // --- Attention activation tables precommitment ---
         let q_lasso_dummy = LassoInstance {
             tables: bw.q_activation_tables.clone(),
-            query_indices: vec![],
             outputs: vec![],
             bits_per_chunk: bw.qk_activation_bits_per_chunk,
         };
         let k_lasso_dummy = LassoInstance {
             tables: bw.k_activation_tables.clone(),
-            query_indices: vec![],
             outputs: vec![],
             bits_per_chunk: bw.qk_activation_bits_per_chunk,
         };

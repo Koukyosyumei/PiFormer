@@ -39,9 +39,9 @@ pub fn prove_ternary_weights(
     inst: &TernaryWeightInstance,
     transcript: &mut Transcript,
 ) -> TernaryWeightProof {
-    let (lasso_inst, params) = build_lasso_instance(inst);
+    let (lasso_inst, query_indices, params) = build_lasso_instance(inst);
     let pk = precommit_lasso_tables(&lasso_inst.tables, lasso_inst.bits_per_chunk, &params);
-    let lasso_proof = prove_lasso(&lasso_inst, &pk, transcript, &params);
+    let lasso_proof = prove_lasso(&lasso_inst, &query_indices, &pk, transcript, &params);
     TernaryWeightProof { lasso_proof }
 }
 
@@ -50,7 +50,7 @@ pub fn verify_ternary_weights(
     inst: &TernaryWeightInstance,
     transcript: &mut Transcript,
 ) -> Result<(), String> {
-    let (lasso_inst, params) = build_lasso_instance(inst);
+    let (lasso_inst, _query_indices, params) = build_lasso_instance(inst);
     let pk = precommit_lasso_tables(&lasso_inst.tables, lasso_inst.bits_per_chunk, &params);
     let vk = pk.vk();
     verify_lasso(&proof.lasso_proof, &lasso_inst, &vk, transcript, &params)
@@ -60,7 +60,7 @@ pub fn verify_ternary_weights(
 // Internals
 // ---------------------------------------------------------------------------
 
-fn build_lasso_instance(inst: &TernaryWeightInstance) -> (LassoInstance, HyraxParams) {
+fn build_lasso_instance(inst: &TernaryWeightInstance) -> (LassoInstance, Vec<usize>, HyraxParams) {
     // 2-bit table (size 4); single chunk (c=1).
     let bits_per_chunk = 2usize;
     let neg_one = F::ZERO - F::ONE;
@@ -91,10 +91,10 @@ fn build_lasso_instance(inst: &TernaryWeightInstance) -> (LassoInstance, HyraxPa
     (
         LassoInstance {
             tables: vec![table],
-            query_indices,
             outputs,
             bits_per_chunk,
         },
+        query_indices,
         params,
     )
 }
