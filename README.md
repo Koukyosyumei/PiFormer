@@ -69,16 +69,6 @@ DESIGN.md  Technical specification
 
 Research prototype. The Rust prover is currently single-head (`n_heads = 1`); training and export refuse other configurations. The cross-layer projection and stand-alone ternary-weight check exist as building blocks but are not yet wired into the end-to-end prover.
 
-## References
-
-- Setty, Thaler, Wahby. *Unlocking the Lookup Singularity with Lasso.* EUROCRYPT 2024.
-- Setty. *Spartan: Efficient and general-purpose zkSNARKs without trusted setup.* CRYPTO 2020.
-- Wahby et al. *Doubly-Efficient zkSNARKs Without Trusted Setup.* IEEE S&P 2018.
-- Arun et al. *Jolt: SNARKs for Virtual Machines via Lookups.* EUROCRYPT 2024.
-- Katharopoulos et al. *Transformers are RNNs.* ICML 2020.
-- Wang et al. *BitNet: Scaling 1-bit Transformers for Large Language Models.* 2023.
-- zkGPT, zkLLM — see `paper/`.
-
 ## License
 
-MIT
+Apache 2.0
