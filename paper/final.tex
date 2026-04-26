@@ -534,36 +534,48 @@ the roadmap but does not change the protocol structure.
 
 \paragraph{Smoke-test benchmark.}
 We measure the end-to-end CLI on a randomly initialised model exported
-from PyTorch.  Times are wall-clock on a single CPU core; proof sizes
-are measured on the binary proof bundle.
+from PyTorch.  Setup, prove, and verify times are the inner
+\emph{compute}-only timings reported by the Rust CLI itself (i.e., the
+preprocessing, \texttt{prove}, and \texttt{verify} calls), excluding
+JSON parsing and proving/verifying-key file IO.  All numbers are
+single-thread wall-clock on a single x86\_64 CPU core; proof sizes are
+the on-disk size of the binary proof bundle.
 
 \medskip
-\begin{tabular}{lrrrrrrrr}
+\begin{tabular}{lrrrrrrrrr}
   \toprule
   \textbf{Model} & \textbf{$d$} & \textbf{$L$} & \textbf{$d_{ff}$} & \textbf{$T$}
-                 & \textbf{Setup} & \textbf{Prove} & \textbf{Verify} & \textbf{Proof} \\
+                 & \textbf{Params} & \textbf{Setup} & \textbf{Prove}
+                 & \textbf{Verify} & \textbf{Proof} \\
   \midrule
-  tiny  & 8   & 1 & 16  & 8  & 0.07\,s & 0.27\,s & 0.15\,s & 108\,KB \\
-  small & 64  & 2 & 256 & 16 & 0.14\,s & 1.25\,s & 0.32\,s & 1.0\,MB \\
+  tiny   & 8   & 1 & 16  & 8  & 1.1\,k    & 0.02\,s & 0.22\,s & 0.03\,s & 108\,KB \\
+  small  & 64  & 2 & 256 & 16 & 133\,k    & 0.09\,s & 1.10\,s & 0.15\,s & 1.0\,MB \\
+  medium & 128 & 4 & 512 & 32 & 924\,k    & 0.29\,s & 4.24\,s & 0.28\,s & 5.5\,MB \\
   \bottomrule
 \end{tabular}
 \medskip
 
-For the \texttt{tiny} configuration the prover proceeds through six
-cross-block sumchecks ($\sim$milliseconds each), the global Lasso
-($\sim$6\,ms), the global intermediate batch open ($\sim$3\,ms), and
-the deferred-accumulator finaliser, with verification at 0.05\,s
-($\sim$0.15\,s including JSON parsing). The \texttt{small}
-configuration ($d{=}64$, $L{=}2$, $d_{ff}{=}256$, $T{=}16$,
-$\sim$133\,k parameters) finishes in 1.25\,s of proving time and
-yields a 1.0\,MB proof. Larger configurations (\texttt{medium}:
-$d{=}128$, $L{=}4$; \texttt{large}: $d{=}256$, $L{=}6$) are
-implemented and pass the same setup/prove/verify cycle; the witness
-export becomes the dominant time at the larger end (170\,MB witness
-for the \texttt{large} configuration). A full side-by-side comparison
-with zkLLM~\cite{sun2024zkllm} and zkGPT~\cite{qu2025zkgpt} requires
-fixing matched architectures and matched quantisation, and is left
-to future work.
+The prove time scales roughly linearly in the number of intermediate
+matrix entries ($L\!\cdot\!T\!\cdot\!d$ and $L\!\cdot\!T\!\cdot\!d_{ff}$):
+the per-block sumchecks are $O(Td)$/$O(Td_{ff})$ and the cross-block
+batching collapses transcript work but not arithmetic work. Verifier
+compute is sub-linear in the model size because every cross-block
+sumcheck is a $\log Td$-round transcript and the deferred Hyrax
+accumulators finalise in one MSM pair per group (vs.\ $O(L)$ pairs).
+For the \texttt{medium} configuration ($\sim$924\,k parameters), pure
+verification takes 0.28\,s while the surrounding JSON parsing and
+file IO add another 0.7\,s of wall-clock for a total CLI invocation
+of $\sim$1\,s; this gap is engineering, not protocol.
+
+Larger configurations (\texttt{large}: $d{=}256$, $L{=}6$;
+\texttt{gpt2-small}: $d{=}512$, $L{=}12$) are implemented and pass
+the same setup/prove/verify cycle, but the JSON witness export
+becomes the dominant time at that end (170\,MB witness for the
+\texttt{large} configuration); they are excluded from the table
+because their wall-clock is no longer dominated by the prover. A
+full side-by-side comparison with zkLLM~\cite{sun2024zkllm} and
+zkGPT~\cite{qu2025zkgpt} requires fixing matched architectures and
+matched quantisation, and is left to future work.
 
 \paragraph{Status of training.}
 The Python pipeline (custom \texttt{LinearAttentionLayer},

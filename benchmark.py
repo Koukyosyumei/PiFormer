@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -130,16 +131,53 @@ def _section(title: str) -> None:
     print('─' * 60)
 
 
-def _run_timed(cmd: list[str], label: str) -> float:
-    """Run *cmd*, stream its output, and return wall-clock seconds."""
+_INNER_TIMING_PATTERNS = {
+    # Setup prints "Preprocessing (offline commitment phase) ... done (X.XXs)".
+    # Prove   prints "Generating proof  ... done (X.XXs)".
+    # Both lines end with "done (X.XXs)"; we take the LAST such line so a
+    # later "Writing ..." (which doesn't end in "done") is ignored.
+    "setup": re.compile(r"done \(([\d.]+)s\)"),
+    "prove": re.compile(r"done \(([\d.]+)s\)"),
+    # Verify prints "Verifying  ... VALID (X.XXXs)".
+    "verify": re.compile(r"VALID \(([\d.]+)s\)"),
+}
+
+
+def _run_timed(cmd: list[str], label: str) -> tuple[float, float | None]:
+    """Run *cmd*, stream its output, and return (wall_clock_s, inner_compute_s).
+
+    *wall_clock_s* is the full subprocess time (including JSON load, parse, and
+    file write). *inner_compute_s* is the pure prover/verifier time as reported
+    by the Rust CLI itself (None if no matching marker is found).
+    """
     print(f"\n[{label}] $ {' '.join(cmd)}")
     t0 = time.perf_counter()
-    result = subprocess.run(cmd, text=True)
+    result = subprocess.run(cmd, text=True, capture_output=True)
     elapsed = time.perf_counter() - t0
+    # Re-emit captured streams so the user still sees CLI output.
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
     if result.returncode != 0:
         print(f"[{label}] FAILED (exit {result.returncode})", file=sys.stderr)
         sys.exit(result.returncode)
-    return elapsed
+
+    inner: float | None = None
+    pat = _INNER_TIMING_PATTERNS.get(label)
+    if pat is not None:
+        # Use the LAST match (setup prints two "done" lines for vk/pk writes
+        # which don't carry a timing, but if any did we want the compute one
+        # which appears first; rely on the specific full-line match below).
+        for line in (result.stdout + result.stderr).splitlines():
+            m = pat.search(line)
+            if m:
+                inner = float(m.group(1))
+                # Setup: "Preprocessing ... done (X.XXs)" appears before two
+                # "Writing ... ok (...)" lines that don't match. So the FIRST
+                # match is the right one.
+                break
+    return elapsed, inner
 
 
 def _build_rust() -> None:
@@ -282,7 +320,7 @@ def benchmark_one(name: str, cfg: dict, out_dir: Path) -> dict:
     t_export = _export(cfg, out_dir)
     _write_public_io_from_witness(witness, public_input, public_output)
 
-    t_setup = _run_timed(
+    t_setup_wall, t_setup_inner = _run_timed(
         [str(BINARY), "setup",
          "--weights", str(weights),
          "--seq-len", str(cfg["seq_len"]),
@@ -291,7 +329,7 @@ def benchmark_one(name: str, cfg: dict, out_dir: Path) -> dict:
         "setup",
     )
 
-    t_prove = _run_timed(
+    t_prove_wall, t_prove_inner = _run_timed(
         [str(BINARY), "prove",
          "--pk", str(pk),
          "--witness", str(witness),
@@ -299,7 +337,7 @@ def benchmark_one(name: str, cfg: dict, out_dir: Path) -> dict:
         "prove",
     )
 
-    t_verify = _run_timed(
+    t_verify_wall, t_verify_inner = _run_timed(
         [str(BINARY), "verify",
          "--vk", str(vk),
          "--proof", str(proof),
@@ -324,9 +362,14 @@ def benchmark_one(name: str, cfg: dict, out_dir: Path) -> dict:
         "vocab_size": cfg["vocab_size"],
         "approx_params": _model_params(cfg),
         "t_export_s":  round(t_export,  3),
-        "t_setup_s":   round(t_setup,   3),
-        "t_prove_s":   round(t_prove,   3),
-        "t_verify_s":  round(t_verify,  3),
+        # Wall-clock includes JSON parse + file IO; "inner" is the pure
+        # compute time reported by the Rust CLI (excludes IO).
+        "t_setup_wall_s":   round(t_setup_wall,  3),
+        "t_setup_s":        round(t_setup_inner,  3) if t_setup_inner  is not None else None,
+        "t_prove_wall_s":   round(t_prove_wall,  3),
+        "t_prove_s":        round(t_prove_inner,  3) if t_prove_inner  is not None else None,
+        "t_verify_wall_s":  round(t_verify_wall, 3),
+        "t_verify_s":       round(t_verify_inner, 3) if t_verify_inner is not None else None,
         "pk_bytes":    sizes["pk"],
         "vk_bytes":    sizes["vk"],
         "proof_bytes": sizes["proof"],
@@ -346,13 +389,35 @@ def _fmt_bytes(n: int) -> str:
 
 
 def print_table(results: list[dict]) -> None:
-    _section("Results summary")
+    _section("Results summary (compute time only — IO excluded)")
     header = (
         f"{'Model':<14} {'d_model':>7} {'layers':>6} {'d_ff':>6} "
         f"{'seq':>4} {'params':>10}  "
         f"{'export':>8} {'setup':>8} {'prove':>8} {'verify':>8}  "
         f"{'proof size':>10}"
     )
+    print(header)
+    print("─" * len(header))
+
+    def _fmt(v: Optional[float]) -> str:
+        return f"{v:>7.2f}s" if v is not None else "     n/a"
+
+    for r in results:
+        row = (
+            f"{r['model']:<14} "
+            f"{r['d_model']:>7} "
+            f"{r['n_layers']:>6} "
+            f"{r['d_ff']:>6} "
+            f"{r['seq_len']:>4} "
+            f"{r['approx_params']:>10,}  "
+            f"{r['t_export_s']:>7.2f}s "
+            f"{_fmt(r['t_setup_s'])} "
+            f"{_fmt(r['t_prove_s'])} "
+            f"{_fmt(r['t_verify_s'])}  "
+            f"{_fmt_bytes(r['proof_bytes']):>10}"
+        )
+        print(row)
+    _section("Wall-clock (includes JSON parse + file IO)")
     print(header)
     print("─" * len(header))
     for r in results:
@@ -364,9 +429,9 @@ def print_table(results: list[dict]) -> None:
             f"{r['seq_len']:>4} "
             f"{r['approx_params']:>10,}  "
             f"{r['t_export_s']:>7.2f}s "
-            f"{r['t_setup_s']:>7.2f}s "
-            f"{r['t_prove_s']:>7.2f}s "
-            f"{r['t_verify_s']:>7.2f}s  "
+            f"{r['t_setup_wall_s']:>7.2f}s "
+            f"{r['t_prove_wall_s']:>7.2f}s "
+            f"{r['t_verify_wall_s']:>7.2f}s  "
             f"{_fmt_bytes(r['proof_bytes']):>10}"
         )
         print(row)
