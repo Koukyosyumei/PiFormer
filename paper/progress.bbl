@@ -1,0 +1,53 @@
+\begin{thebibliography}{1}
+
+\bibitem{arun2024jolt}
+Arasu Arun, Srinath Setty, and Justin Thaler.
+\newblock Jolt: Snarks for virtual machines via lookups.
+\newblock In {\em Annual International Conference on the Theory and
+  Applications of Cryptographic Techniques}, pages 3--33. Springer, 2024.
+
+\bibitem{bengio2013estimating}
+Yoshua Bengio, Nicholas L{\'e}onard, and Aaron Courville.
+\newblock Estimating or propagating gradients through stochastic neurons for
+  conditional computation.
+\newblock {\em arXiv preprint arXiv:1308.3432}, 2013.
+
+\bibitem{ma2025bitnet}
+Shuming Ma, Hongyu Wang, Shaohan Huang, Xingxing Zhang, Ying Hu, Ting Song, Yan
+  Xia, and Furu Wei.
+\newblock Bitnet b1. 58 2b4t technical report.
+\newblock {\em arXiv preprint arXiv:2504.12285}, 2025.
+
+\bibitem{qu2025zkgpt}
+Wenjie Qu, Yijun Sun, Xuanming Liu, Tao Lu, Yanpei Guo, Kai Chen, and Jiaheng
+  Zhang.
+\newblock $\{$zkGPT$\}$: An efficient non-interactive zero-knowledge proof
+  framework for $\{$LLM$\}$ inference.
+\newblock In {\em 34th USENIX Security Symposium (USENIX Security 25)}, pages
+  2045--2063, 2025.
+
+\bibitem{setty2024unlocking}
+Srinath Setty, Justin Thaler, and Riad Wahby.
+\newblock Unlocking the lookup singularity with lasso.
+\newblock In {\em Annual International Conference on the Theory and
+  Applications of Cryptographic Techniques}, pages 180--209. Springer, 2024.
+
+\bibitem{sun2024zkllm}
+Haochen Sun, Jason Li, and Hongyang Zhang.
+\newblock zkllm: Zero knowledge proofs for large language models.
+\newblock In {\em Proceedings of the 2024 on ACM SIGSAC Conference on Computer
+  and Communications Security}, pages 4405--4419, 2024.
+
+\bibitem{vaswani2017attention}
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+  Aidan~N Gomez, {\L}ukasz Kaiser, and Illia Polosukhin.
+\newblock Attention is all you need.
+\newblock {\em Advances in neural information processing systems}, 30, 2017.
+
+\bibitem{wahby2018doubly}
+Riad~S Wahby, Ioanna Tzialla, Abhi Shelat, Justin Thaler, and Michael Walfish.
+\newblock Doubly-efficient zksnarks without trusted setup.
+\newblock In {\em 2018 IEEE Symposium on Security and Privacy (SP)}, pages
+  926--943. IEEE, 2018.
+
+\end{thebibliography}
