@@ -170,8 +170,10 @@ pub fn prove_projection(
     let (r_t, r_out) = if let Some(rtd) = r_td {
         (rtd[..t_bits].to_vec(), rtd[t_bits..].to_vec())
     } else {
-        (challenge_vec(transcript, t_bits, b"proj_rt"),
-         challenge_vec(transcript, out_bits, b"proj_rout"))
+        (
+            challenge_vec(transcript, t_bits, b"proj_rt"),
+            challenge_vec(transcript, out_bits, b"proj_rout"),
+        )
     };
 
     // 3. Sumcheck: Z = alpha * Σ X * W
@@ -204,8 +206,14 @@ pub fn prove_projection(
         },
     };
 
-    let y_claim = EvalClaim { point: combine(&r_t, &r_out), value: y_eval };
-    let x_claim = EvalClaim { point: combine(&r_t, &r_k), value: x_eval };
+    let y_claim = EvalClaim {
+        point: combine(&r_t, &r_out),
+        value: y_eval,
+    };
+    let x_claim = EvalClaim {
+        point: combine(&r_t, &r_k),
+        value: x_eval,
+    };
 
     Ok((proof, y_claim, x_claim))
 }
@@ -242,8 +250,10 @@ pub fn verify_projection(
     let (r_t, r_out) = if let Some(rtd) = r_td {
         (rtd[..t_bits].to_vec(), rtd[t_bits..].to_vec())
     } else {
-        (challenge_vec(transcript, t_bits, b"proj_rt"),
-         challenge_vec(transcript, out_bits, b"proj_rout"))
+        (
+            challenge_vec(transcript, t_bits, b"proj_rt"),
+            challenge_vec(transcript, out_bits, b"proj_rout"),
+        )
     };
 
     // 2. Sumcheck — target is y_eval - bias (y_eval trusted; verified by combine proof)
@@ -258,12 +268,28 @@ pub fn verify_projection(
     }
 
     // 4. Open static weight commitments via deferred accumulators
-    acc_w.add_verify(&vk.w_com, proof.openings.w_eval, &combine(&r_k, &r_out), &proof.openings.w_open)?;
-    acc_b.add_verify(&vk.bias_com, proof.openings.bias_at_rj, &r_out, &proof.openings.bias_opening_proof)?;
+    acc_w.add_verify(
+        &vk.w_com,
+        proof.openings.w_eval,
+        &combine(&r_k, &r_out),
+        &proof.openings.w_open,
+    )?;
+    acc_b.add_verify(
+        &vk.bias_com,
+        proof.openings.bias_at_rj,
+        &r_out,
+        &proof.openings.bias_opening_proof,
+    )?;
 
     // Return both claims for block-level combine verification
-    let y_claim = EvalClaim { point: combine(&r_t, &r_out), value: proof.openings.y_eval };
-    let x_claim = EvalClaim { point: combine(&r_t, &r_k), value: proof.openings.x_eval };
+    let y_claim = EvalClaim {
+        point: combine(&r_t, &r_out),
+        value: proof.openings.y_eval,
+    };
+    let x_claim = EvalClaim {
+        point: combine(&r_t, &r_k),
+        value: proof.openings.x_eval,
+    };
     Ok((y_claim, x_claim))
 }
 // ---------------------------------------------------------------------------
@@ -332,7 +358,16 @@ pub fn prove_qkv_projections(
     io_coms: &BatchedQKVProjectionIOCommitments,
     transcript: &mut Transcript,
     r_td: &[F],
-) -> Result<(BatchedQKVProjectionProof, EvalClaim, EvalClaim, EvalClaim, EvalClaim), String> {
+) -> Result<
+    (
+        BatchedQKVProjectionProof,
+        EvalClaim,
+        EvalClaim,
+        EvalClaim,
+        EvalClaim,
+    ),
+    String,
+> {
     let t = pk_q.vk.seq_len;
     let d_in = pk_q.vk.d_in;
     let d_out = pk_q.vk.d_out;
@@ -433,19 +468,46 @@ pub fn prove_qkv_projections(
             bias_q_eval,
             bias_k_eval,
             bias_v_eval,
-            w_q_open: hyrax_open(&w_q_mle.evaluations, &combine(&r_k, &r_out_q), nu_w, sigma_w),
-            w_k_open: hyrax_open(&w_k_mle.evaluations, &combine(&r_k, &r_out_k), nu_w, sigma_w),
-            w_v_open: hyrax_open(&w_v_mle.evaluations, &combine(&r_k, &r_out_v), nu_w, sigma_w),
+            w_q_open: hyrax_open(
+                &w_q_mle.evaluations,
+                &combine(&r_k, &r_out_q),
+                nu_w,
+                sigma_w,
+            ),
+            w_k_open: hyrax_open(
+                &w_k_mle.evaluations,
+                &combine(&r_k, &r_out_k),
+                nu_w,
+                sigma_w,
+            ),
+            w_v_open: hyrax_open(
+                &w_v_mle.evaluations,
+                &combine(&r_k, &r_out_v),
+                nu_w,
+                sigma_w,
+            ),
             bias_q_open: hyrax_open(&bias_q_mle.evaluations, &r_out_q, nu_b, sigma_b),
             bias_k_open: hyrax_open(&bias_k_mle.evaluations, &r_out_k, nu_b, sigma_b),
             bias_v_open: hyrax_open(&bias_v_mle.evaluations, &r_out_v, nu_b, sigma_b),
         },
     };
 
-    let q_claim = EvalClaim { point: combine(&r_t, &r_out_q), value: q_eval };
-    let k_claim = EvalClaim { point: combine(&r_t, &r_out_k), value: k_eval };
-    let v_claim = EvalClaim { point: combine(&r_t, &r_out_v), value: v_eval };
-    let x_norm1_claim = EvalClaim { point: combine(&r_t, &r_k), value: x_eval };
+    let q_claim = EvalClaim {
+        point: combine(&r_t, &r_out_q),
+        value: q_eval,
+    };
+    let k_claim = EvalClaim {
+        point: combine(&r_t, &r_out_k),
+        value: k_eval,
+    };
+    let v_claim = EvalClaim {
+        point: combine(&r_t, &r_out_v),
+        value: v_eval,
+    };
+    let x_norm1_claim = EvalClaim {
+        point: combine(&r_t, &r_k),
+        value: x_eval,
+    };
 
     Ok((proof, q_claim, k_claim, v_claim, x_norm1_claim))
 }
@@ -495,9 +557,8 @@ pub fn verify_qkv_projections(
     let target = lambda * (proof.openings.q_eval - proof.openings.bias_q_eval)
         + mu * (proof.openings.k_eval - proof.openings.bias_k_eval)
         + (proof.openings.v_eval - proof.openings.bias_v_eval);
-    let (r_k, final_val) =
-        verify_sumcheck(&proof.sumcheck, target, in_bits, transcript)
-            .map_err(|e| format!("BatchedQKV Sumcheck: {e}"))?;
+    let (r_k, final_val) = verify_sumcheck(&proof.sumcheck, target, in_bits, transcript)
+        .map_err(|e| format!("BatchedQKV Sumcheck: {e}"))?;
 
     transcript.append_field(b"qkv_q_eval", &proof.openings.q_eval);
     transcript.append_field(b"qkv_k_eval", &proof.openings.k_eval);
@@ -513,28 +574,58 @@ pub fn verify_qkv_projections(
 
     // 4. Defer weight and bias openings to block-level accumulators
     acc_w.add_verify(
-        &vk_q.w_com, proof.openings.w_q_eval, &combine(&r_k, &r_out_q), &proof.openings.w_q_open,
+        &vk_q.w_com,
+        proof.openings.w_q_eval,
+        &combine(&r_k, &r_out_q),
+        &proof.openings.w_q_open,
     )?;
     acc_w.add_verify(
-        &vk_k.w_com, proof.openings.w_k_eval, &combine(&r_k, &r_out_k), &proof.openings.w_k_open,
+        &vk_k.w_com,
+        proof.openings.w_k_eval,
+        &combine(&r_k, &r_out_k),
+        &proof.openings.w_k_open,
     )?;
     acc_w.add_verify(
-        &vk_v.w_com, proof.openings.w_v_eval, &combine(&r_k, &r_out_v), &proof.openings.w_v_open,
+        &vk_v.w_com,
+        proof.openings.w_v_eval,
+        &combine(&r_k, &r_out_v),
+        &proof.openings.w_v_open,
     )?;
     acc_b.add_verify(
-        &vk_q.bias_com, proof.openings.bias_q_eval, &r_out_q, &proof.openings.bias_q_open,
+        &vk_q.bias_com,
+        proof.openings.bias_q_eval,
+        &r_out_q,
+        &proof.openings.bias_q_open,
     )?;
     acc_b.add_verify(
-        &vk_k.bias_com, proof.openings.bias_k_eval, &r_out_k, &proof.openings.bias_k_open,
+        &vk_k.bias_com,
+        proof.openings.bias_k_eval,
+        &r_out_k,
+        &proof.openings.bias_k_open,
     )?;
     acc_b.add_verify(
-        &vk_v.bias_com, proof.openings.bias_v_eval, &r_out_v, &proof.openings.bias_v_open,
+        &vk_v.bias_com,
+        proof.openings.bias_v_eval,
+        &r_out_v,
+        &proof.openings.bias_v_open,
     )?;
 
-    let q_claim = EvalClaim { point: combine(&r_t, &r_out_q), value: proof.openings.q_eval };
-    let k_claim = EvalClaim { point: combine(&r_t, &r_out_k), value: proof.openings.k_eval };
-    let v_claim = EvalClaim { point: combine(&r_t, &r_out_v), value: proof.openings.v_eval };
-    let x_norm1_claim = EvalClaim { point: combine(&r_t, &r_k), value: proof.openings.x_eval };
+    let q_claim = EvalClaim {
+        point: combine(&r_t, &r_out_q),
+        value: proof.openings.q_eval,
+    };
+    let k_claim = EvalClaim {
+        point: combine(&r_t, &r_out_k),
+        value: proof.openings.k_eval,
+    };
+    let v_claim = EvalClaim {
+        point: combine(&r_t, &r_out_v),
+        value: proof.openings.v_eval,
+    };
+    let x_norm1_claim = EvalClaim {
+        point: combine(&r_t, &r_k),
+        value: proof.openings.x_eval,
+    };
 
     Ok((q_claim, k_claim, v_claim, x_norm1_claim))
 }
@@ -633,7 +724,10 @@ pub fn prove_projection_gkr(
         bias_open: hyrax_open(&bias_mle.evaluations, &r_out, nu_b, sigma_b),
     };
 
-    let x_claim = EvalClaim { point: combine(&r_t, &r_k), value: x_eval };
+    let x_claim = EvalClaim {
+        point: combine(&r_t, &r_k),
+        value: x_eval,
+    };
     Ok((proof, x_claim))
 }
 
@@ -676,9 +770,8 @@ pub fn verify_projection_gkr(
 
     // Verify sumcheck: target = y_claim.value - bias_eval
     let target_z = y_claim.value - proof.bias_eval;
-    let (r_k, final_val) =
-        verify_sumcheck(&proof.sumcheck, target_z, in_bits, transcript)
-            .map_err(|e| format!("GKR Projection Sumcheck: {e}"))?;
+    let (r_k, final_val) = verify_sumcheck(&proof.sumcheck, target_z, in_bits, transcript)
+        .map_err(|e| format!("GKR Projection Sumcheck: {e}"))?;
 
     // Algebraic consistency: sumcheck_final == alpha * x_eval * w_eval
     if final_val != vk.alpha * proof.x_eval * proof.w_eval {
@@ -686,10 +779,18 @@ pub fn verify_projection_gkr(
     }
 
     // Defer weight and bias openings.
-    acc_w.add_verify(&vk.w_com, proof.w_eval, &combine(&r_k, &r_out), &proof.w_open)?;
+    acc_w.add_verify(
+        &vk.w_com,
+        proof.w_eval,
+        &combine(&r_k, &r_out),
+        &proof.w_open,
+    )?;
     acc_b.add_verify(&vk.bias_com, proof.bias_eval, &r_out, &proof.bias_open)?;
 
-    let x_claim = EvalClaim { point: combine(&r_t, &r_k), value: proof.x_eval };
+    let x_claim = EvalClaim {
+        point: combine(&r_t, &r_k),
+        value: proof.x_eval,
+    };
     Ok(x_claim)
 }
 
@@ -769,7 +870,15 @@ mod projection_full_tests {
         let mut v_transcript = Transcript::new(b"test");
         let mut acc_w = HyraxBatchAccumulator::new();
         let mut acc_b = HyraxBatchAccumulator::new();
-        let result = verify_projection(&proof, &pk.vk, &io, &mut v_transcript, &mut acc_w, &mut acc_b, None);
+        let result = verify_projection(
+            &proof,
+            &pk.vk,
+            &io,
+            &mut v_transcript,
+            &mut acc_w,
+            &mut acc_b,
+            None,
+        );
         if result.is_ok() {
             let in_bits = pk.vk.d_in.next_power_of_two().trailing_zeros() as usize;
             let out_bits = pk.vk.d_out.next_power_of_two().trailing_zeros() as usize;
@@ -796,7 +905,15 @@ mod projection_full_tests {
         let mut v_transcript = Transcript::new(b"test");
         let mut acc_w = HyraxBatchAccumulator::new();
         let mut acc_b = HyraxBatchAccumulator::new();
-        let result = verify_projection(&proof, &vk_bad, &io, &mut v_transcript, &mut acc_w, &mut acc_b, None);
+        let result = verify_projection(
+            &proof,
+            &vk_bad,
+            &io,
+            &mut v_transcript,
+            &mut acc_w,
+            &mut acc_b,
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -815,7 +932,15 @@ mod projection_full_tests {
         let mut v_transcript = Transcript::new(b"test");
         let mut acc_w = HyraxBatchAccumulator::new();
         let mut acc_b = HyraxBatchAccumulator::new();
-        let result = verify_projection(&proof, &pk.vk, &io, &mut v_transcript, &mut acc_w, &mut acc_b, None);
+        let result = verify_projection(
+            &proof,
+            &pk.vk,
+            &io,
+            &mut v_transcript,
+            &mut acc_w,
+            &mut acc_b,
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -845,7 +970,10 @@ mod projection_full_tests {
         let r_out: Vec<F> = (0..out_bits).map(|i| F::from(i as u64 + 7)).collect();
         let y_point = combine(&r_t, &r_out);
         let y_value = y_mle.evaluate(&y_point);
-        let y_claim = EvalClaim { point: y_point.clone(), value: y_value };
+        let y_claim = EvalClaim {
+            point: y_point.clone(),
+            value: y_value,
+        };
 
         // Prove
         let mut p_transcript = Transcript::new(b"gkr_test");
@@ -856,9 +984,15 @@ mod projection_full_tests {
         let mut v_transcript = Transcript::new(b"gkr_test");
         let mut acc_w = HyraxBatchAccumulator::new();
         let mut acc_b = HyraxBatchAccumulator::new();
-        let x_claim_v =
-            verify_projection_gkr(&proof, &pk.vk, &y_claim, &mut v_transcript, &mut acc_w, &mut acc_b)
-                .unwrap();
+        let x_claim_v = verify_projection_gkr(
+            &proof,
+            &pk.vk,
+            &y_claim,
+            &mut v_transcript,
+            &mut acc_w,
+            &mut acc_b,
+        )
+        .unwrap();
 
         // x_claim must match.
         assert_eq!(x_claim.point, x_claim_v.point);
@@ -896,7 +1030,10 @@ mod projection_full_tests {
         let r_t: Vec<F> = (0..t_bits).map(|i| F::from(i as u64 + 2)).collect();
         let r_out: Vec<F> = (0..out_bits).map(|i| F::from(i as u64 + 7)).collect();
         let y_point = combine(&r_t, &r_out);
-        let y_claim = EvalClaim { point: y_point, value: y_mle.evaluate(&combine(&r_t, &r_out)) };
+        let y_claim = EvalClaim {
+            point: y_point,
+            value: y_mle.evaluate(&combine(&r_t, &r_out)),
+        };
 
         let mut p_transcript = Transcript::new(b"gkr_test");
         let (mut proof, _) =
@@ -907,8 +1044,14 @@ mod projection_full_tests {
         let mut v_transcript = Transcript::new(b"gkr_test");
         let mut acc_w = HyraxBatchAccumulator::new();
         let mut acc_b = HyraxBatchAccumulator::new();
-        let result =
-            verify_projection_gkr(&proof, &pk.vk, &y_claim, &mut v_transcript, &mut acc_w, &mut acc_b);
+        let result = verify_projection_gkr(
+            &proof,
+            &pk.vk,
+            &y_claim,
+            &mut v_transcript,
+            &mut acc_w,
+            &mut acc_b,
+        );
         assert!(result.is_err());
     }
 }

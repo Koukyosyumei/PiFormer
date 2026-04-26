@@ -71,6 +71,16 @@ fn mat_from_json(json: Vec<Vec<String>>) -> Result<Vec<Vec<F>>, String> {
         .collect()
 }
 
+pub fn matrix_from_json_str(s: &str) -> Result<Vec<Vec<F>>, String> {
+    let json: Vec<Vec<String>> =
+        serde_json::from_str(s).map_err(|e| format!("matrix JSON: {e}"))?;
+    mat_from_json(json)
+}
+
+pub fn matrix_to_json_string(mat: &[Vec<F>]) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&mat_to_json(mat))
+}
+
 fn ternary_mat_to_json(mat: &[Vec<TernaryValue>]) -> Vec<Vec<i8>> {
     mat.iter()
         .map(|row: &Vec<TernaryValue>| {
@@ -334,6 +344,10 @@ pub struct JsonAttnWitness {
     pub v: Vec<Vec<String>>,
     pub phi_q: Vec<Vec<String>>,
     pub phi_k: Vec<Vec<String>>,
+    #[serde(default)]
+    pub q_query_indices: Vec<usize>,
+    #[serde(default)]
+    pub k_query_indices: Vec<usize>,
     pub context: Vec<Vec<String>>,
     pub out: Vec<Vec<String>>,
 }
@@ -455,6 +469,8 @@ fn attn_wit_to_json(w: &LinearAttentionWitness) -> JsonAttnWitness {
         v: mat_to_json(&w.v),
         phi_q: mat_to_json(&w.phi_q),
         phi_k: mat_to_json(&w.phi_k),
+        q_query_indices: w.q_query_indices.clone(),
+        k_query_indices: w.k_query_indices.clone(),
         context: mat_to_json(&w.context),
         out: mat_to_json(&w.out),
     }
@@ -467,6 +483,8 @@ fn attn_wit_from_json(j: JsonAttnWitness) -> Result<LinearAttentionWitness, Stri
         v: mat_from_json(j.v)?,
         phi_q: mat_from_json(j.phi_q)?,
         phi_k: mat_from_json(j.phi_k)?,
+        q_query_indices: j.q_query_indices,
+        k_query_indices: j.k_query_indices,
         context: mat_from_json(j.context)?,
         out: mat_from_json(j.out)?,
     })

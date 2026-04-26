@@ -13,9 +13,8 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate
 use piformer_prover::{
     attention::{
         attention::{
-            AttentionOpenings, AttentionProvingKey,
-            AttentionSumcheckProof, AttentionVerifyingKey, LinearAttentionInstance,
-            LinearAttentionProof,
+            AttentionOpenings, AttentionProvingKey, AttentionSumcheckProof,
+            LinearAttentionInstance, LinearAttentionProof,
         },
         layernorm::{
             LayerNormInternalCommitments, LayerNormOpenings, LayerNormProof, LayerNormVerifyingKey,
@@ -25,9 +24,7 @@ use piformer_prover::{
             ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey,
         },
     },
-    ffn::ffn::{
-        FFNInstance, FFNOpenings, FFNProof, FFNProvingKey, FFNVerifyingKey,
-    },
+    ffn::ffn::{FFNInstance, FFNOpenings, FFNProof, FFNProvingKey, FFNVerifyingKey},
     lookup::{
         lasso::{
             LassoInstance, LassoMultiProof, LassoMultiProvingKey, LassoMultiVerifyingKey,
@@ -41,11 +38,9 @@ use piformer_prover::{
         TransformerBlockProof, TransformerModelProof, TransformerModelProvingKey,
         TransformerModelVerifyingKey,
     },
-    subprotocols::{
-        sumcheck::{
-            CubicRoundPoly, RoundPoly, SumcheckCubicProof, SumcheckCubicProofMulti, SumcheckProof,
-            SumcheckProofMulti,
-        },
+    subprotocols::sumcheck::{
+        CubicRoundPoly, RoundPoly, SumcheckCubicProof, SumcheckCubicProofMulti, SumcheckProof,
+        SumcheckProofMulti,
     },
     verifier::TransformerBlockVerifyingKey,
     F,
@@ -58,6 +53,7 @@ const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
 const VERSION: u8 = 1;
+const PROOF_VERSION: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -178,6 +174,22 @@ fn read_bool<R: Read>(r: &mut R) -> io::Result<bool> {
     Ok(buf[0] != 0)
 }
 
+fn read_version<R: Read>(r: &mut R) -> io::Result<u8> {
+    let mut v = [0u8; 1];
+    r.read_exact(&mut v)?;
+    Ok(v[0])
+}
+
+fn check_version(version: u8, expected: u8, label: &str) -> io::Result<()> {
+    if version != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported {label} version: expected {expected}, got {version}"),
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Hyrax primitives
 // ---------------------------------------------------------------------------
@@ -250,6 +262,8 @@ fn read_sumcheck_proof<R: Read>(r: &mut R) -> io::Result<SumcheckProof> {
 // ---------------------------------------------------------------------------
 
 fn write_lasso_proof<W: Write>(w: &mut W, p: &LassoProof) -> io::Result<()> {
+    write_vec_f(w, &p.outputs)?;
+    write_vec_usize(w, &p.query_indices)?;
     write_vec_f(w, &p.sub_claims)?;
     write_vec(w, &p.sumcheck_proofs, write_sumcheck_proof)?;
     write_vec_f(w, &p.table_openings)?;
@@ -260,6 +274,8 @@ fn write_lasso_proof<W: Write>(w: &mut W, p: &LassoProof) -> io::Result<()> {
 }
 fn read_lasso_proof<R: Read>(r: &mut R) -> io::Result<LassoProof> {
     Ok(LassoProof {
+        outputs: read_vec_f(r)?,
+        query_indices: read_vec_usize(r)?,
         sub_claims: read_vec_f(r)?,
         sumcheck_proofs: read_vec(r, read_sumcheck_proof)?,
         table_openings: read_vec_f(r)?,
@@ -329,6 +345,10 @@ fn read_sumcheck_cubic_proof_multi<R: Read>(r: &mut R) -> io::Result<SumcheckCub
 }
 
 fn write_lasso_multi_proof<W: Write>(w: &mut W, p: &LassoMultiProof) -> io::Result<()> {
+    write_vec(w, &p.all_outputs, |w, v: &Vec<F>| write_vec_f(w, v))?;
+    write_vec(w, &p.all_query_indices, |w, v: &Vec<usize>| {
+        write_vec_usize(w, v)
+    })?;
     write_f(w, &p.combined_grand_sum)?;
     write_sumcheck_proof_multi(w, &p.combined_sumcheck_proof)?;
     write_vec(w, &p.table_openings, |w, v: &Vec<F>| write_vec_f(w, v))?;
@@ -344,6 +364,8 @@ fn write_lasso_multi_proof<W: Write>(w: &mut W, p: &LassoMultiProof) -> io::Resu
 }
 fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
     Ok(LassoMultiProof {
+        all_outputs: read_vec(r, |r| read_vec_f(r))?,
+        all_query_indices: read_vec(r, |r| read_vec_usize(r))?,
         combined_grand_sum: read_f(r)?,
         combined_sumcheck_proof: read_sumcheck_proof_multi(r)?,
         table_openings: read_vec(r, |r| read_vec_f(r))?,
@@ -449,7 +471,9 @@ fn write_ln_internal_coms<W: Write>(w: &mut W, c: &LayerNormInternalCommitments)
     write_hyrax_commitment(w, &c.sq_sum_x_com)?;
     let has_sy = c.sigma_y_com.is_some();
     w.write_all(&[has_sy as u8])?;
-    if let Some(ref sy) = c.sigma_y_com { write_hyrax_commitment(w, sy)?; }
+    if let Some(ref sy) = c.sigma_y_com {
+        write_hyrax_commitment(w, sy)?;
+    }
     Ok(())
 }
 fn read_ln_internal_coms<R: Read>(r: &mut R) -> io::Result<LayerNormInternalCommitments> {
@@ -458,8 +482,17 @@ fn read_ln_internal_coms<R: Read>(r: &mut R) -> io::Result<LayerNormInternalComm
     let sq_sum_x_com = read_hyrax_commitment(r)?;
     let mut flag = [0u8; 1];
     r.read_exact(&mut flag)?;
-    let sigma_y_com = if flag[0] != 0 { Some(read_hyrax_commitment(r)?) } else { None };
-    Ok(LayerNormInternalCommitments { sum_x_com, sigma_com, sq_sum_x_com, sigma_y_com })
+    let sigma_y_com = if flag[0] != 0 {
+        Some(read_hyrax_commitment(r)?)
+    } else {
+        None
+    };
+    Ok(LayerNormInternalCommitments {
+        sum_x_com,
+        sigma_com,
+        sq_sum_x_com,
+        sigma_y_com,
+    })
 }
 
 fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<()> {
@@ -482,7 +515,9 @@ fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<(
     // y_at_ry: None in GKR mode, Some in conventional mode
     let has_y_at_ry = o.y_at_ry.is_some();
     w.write_all(&[has_y_at_ry as u8])?;
-    if let Some(ref v) = o.y_at_ry { write_f(w, v)?; }
+    if let Some(ref v) = o.y_at_ry {
+        write_f(w, v)?;
+    }
     write_f(w, &o.gamma_x_at_ry)?;
     write_f(w, &o.sigma_y_at_ry)?;
     write_hyrax_proof(w, &o.ry_td_batch_proof)?;
@@ -497,10 +532,22 @@ fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<(
     let has_y_at_rf_sy = o.y_at_rf_sy.is_some();
     w.write_all(&[has_y_at_rf_sy as u8])?;
     if has_y_at_rf_sy {
-        write_ep!(w, o.y_at_rf_sy.as_ref().unwrap(), o.y_at_rf_sy_proof.as_ref().unwrap());
+        write_ep!(
+            w,
+            o.y_at_rf_sy.as_ref().unwrap(),
+            o.y_at_rf_sy_proof.as_ref().unwrap()
+        );
     } else {
-        write_ep!(w, o.sigma_y_at_rf.as_ref().unwrap(), o.sigma_y_at_rf_proof.as_ref().unwrap());
-        write_ep!(w, o.sum_x_at_rf_sy_t.as_ref().unwrap(), o.sum_x_at_rf_sy_t_proof.as_ref().unwrap());
+        write_ep!(
+            w,
+            o.sigma_y_at_rf.as_ref().unwrap(),
+            o.sigma_y_at_rf_proof.as_ref().unwrap()
+        );
+        write_ep!(
+            w,
+            o.sum_x_at_rf_sy_t.as_ref().unwrap(),
+            o.sum_x_at_rf_sy_t_proof.as_ref().unwrap()
+        );
     }
     write_ep!(w, &o.sigma_at_rf_sy_t, &o.sigma_at_rf_sy_t_proof);
     write_ep!(w, &o.sum_x_at_rf_sig, &o.sum_x_at_rf_sig_proof);
@@ -539,8 +586,14 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
     let (x_at_rf_gx, x_at_rf_gx_proof) = read_ep!(r);
     // Group 6: at r_f_sy
     r.read_exact(&mut flag)?;
-    let (y_at_rf_sy, y_at_rf_sy_proof, sigma_y_at_rf, sigma_y_at_rf_proof,
-         sum_x_at_rf_sy_t, sum_x_at_rf_sy_t_proof) = if flag[0] != 0 {
+    let (
+        y_at_rf_sy,
+        y_at_rf_sy_proof,
+        sigma_y_at_rf,
+        sigma_y_at_rf_proof,
+        sum_x_at_rf_sy_t,
+        sum_x_at_rf_sy_t_proof,
+    ) = if flag[0] != 0 {
         let (v, p) = read_ep!(r);
         (Some(v), Some(p), None, None, None, None)
     } else {
@@ -697,10 +750,7 @@ fn read_batched_qkv_openings<R: Read>(r: &mut R) -> io::Result<BatchedQKVProject
         bias_v_open,
     })
 }
-fn write_batched_qkv_proof<W: Write>(
-    w: &mut W,
-    p: &BatchedQKVProjectionProof,
-) -> io::Result<()> {
+fn write_batched_qkv_proof<W: Write>(w: &mut W, p: &BatchedQKVProjectionProof) -> io::Result<()> {
     write_sumcheck_proof(w, &p.sumcheck)?;
     write_batched_qkv_openings(w, &p.openings)
 }
@@ -865,8 +915,6 @@ fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Resu
     write_f(w, &p.out_attn_eval)?;
     write_f(w, &p.out_ffn_eval)?;
     // Per-block QKV batch scalars
-    write_f(w, &p.qkv_lambda)?;
-    write_f(w, &p.qkv_mu)?;
     write_f(w, &p.qkv_w_q_eval)?;
     write_f(w, &p.qkv_w_k_eval)?;
     write_f(w, &p.qkv_w_v_eval)?;
@@ -881,11 +929,7 @@ fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Resu
     // Attention phi_q/phi_k commitments + scalars
     write_hyrax_commitment(w, &p.attn_phi_q_com)?;
     write_hyrax_commitment(w, &p.attn_phi_k_com)?;
-    write_f(w, &p.attn_out_eval)?;
-    write_f(w, &p.attn_phi_q_eval)?;
-    write_f(w, &p.attn_phi_k_eval)?;
-    write_f(w, &p.attn_ctx_eval)?;
-    write_f(w, &p.attn_v_eval)
+    write_f(w, &p.attn_out_eval)
 }
 fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
     Ok(TransformerBlockProof {
@@ -910,8 +954,6 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
         out_attn_eval: read_f(r)?,
         out_ffn_eval: read_f(r)?,
         // Per-block QKV batch scalars
-        qkv_lambda: read_f(r)?,
-        qkv_mu: read_f(r)?,
         qkv_w_q_eval: read_f(r)?,
         qkv_w_k_eval: read_f(r)?,
         qkv_w_v_eval: read_f(r)?,
@@ -927,10 +969,6 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
         attn_phi_q_com: read_hyrax_commitment(r)?,
         attn_phi_k_com: read_hyrax_commitment(r)?,
         attn_out_eval: read_f(r)?,
-        attn_phi_q_eval: read_f(r)?,
-        attn_phi_k_eval: read_f(r)?,
-        attn_ctx_eval: read_f(r)?,
-        attn_v_eval: read_f(r)?,
     })
 }
 
@@ -967,10 +1005,12 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_hyrax_proof(w, &p.w1_batch_open)?;
     write_hyrax_proof(w, &p.x_norm2_batch_open)?;
     write_hyrax_proof(w, &p.ffn_m_com_batch_open)?;
+    write_hyrax_proof(w, &p.ffn_lasso_bind_open)?;
     // 3 attention batch opens
     write_hyrax_proof(w, &p.phi_q_batch_open)?;
     write_hyrax_proof(w, &p.phi_k_batch_open)?;
-    write_hyrax_proof(w, &p.v_attn_batch_open)
+    write_hyrax_proof(w, &p.v_attn_batch_open)?;
+    write_hyrax_proof(w, &p.qk_lasso_bind_open)
 }
 fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
     Ok(TransformerModelProof {
@@ -1006,57 +1046,99 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         w1_batch_open: read_hyrax_proof(r)?,
         x_norm2_batch_open: read_hyrax_proof(r)?,
         ffn_m_com_batch_open: read_hyrax_proof(r)?,
+        ffn_lasso_bind_open: read_hyrax_proof(r)?,
         // 3 attention batch opens
         phi_q_batch_open: read_hyrax_proof(r)?,
         phi_k_batch_open: read_hyrax_proof(r)?,
         v_attn_batch_open: read_hyrax_proof(r)?,
+        qk_lasso_bind_open: read_hyrax_proof(r)?,
     })
 }
 
 // ---------------------------------------------------------------------------
-// Public instances (bundled with proof)
+// Per-proof lookup outputs (bundled with proof)
 // ---------------------------------------------------------------------------
 
-fn write_lasso_instance<W: Write>(w: &mut W, inst: &LassoInstance) -> io::Result<()> {
-    write_vec(w, &inst.tables, |w2, t| write_vec_f(w2, t))?;
-    write_vec_f(w, &inst.outputs)?;
-    write_usize(w, inst.bits_per_chunk)
+fn lasso_bits_from_coms(coms: &[HyraxCommitment]) -> io::Result<usize> {
+    let first = coms
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty lasso verifying key"))?;
+    Ok(first.nu + first.sigma)
 }
-fn read_lasso_instance<R: Read>(r: &mut R) -> io::Result<LassoInstance> {
+
+fn dummy_lasso_from_coms(coms: &[HyraxCommitment], outputs: Vec<F>) -> io::Result<LassoInstance> {
     Ok(LassoInstance {
-        tables: read_vec(r, read_vec_f)?,
-        outputs: read_vec_f(r)?,
-        bits_per_chunk: read_usize(r)?,
+        tables: vec![Vec::new(); coms.len()],
+        outputs,
+        bits_per_chunk: lasso_bits_from_coms(coms)?,
     })
 }
 
-fn write_attn_instance<W: Write>(w: &mut W, inst: &LinearAttentionInstance) -> io::Result<()> {
-    write_usize(w, inst.seq_len)?;
-    write_usize(w, inst.d_head)?;
-    write_lasso_instance(w, &inst.q_lasso)?;
-    write_lasso_instance(w, &inst.k_lasso)?;
-    // q/k_query_indices are private witness — not serialized in public instance
-    write_vec_usize(w, &inst.q_query_indices)?;
-    write_vec_usize(w, &inst.k_query_indices)
-}
-fn read_attn_instance<R: Read>(r: &mut R) -> io::Result<LinearAttentionInstance> {
-    Ok(LinearAttentionInstance {
-        seq_len: read_usize(r)?,
-        d_head: read_usize(r)?,
-        q_lasso: read_lasso_instance(r)?,
-        k_lasso: read_lasso_instance(r)?,
-        q_query_indices: read_vec_usize(r)?,
-        k_query_indices: read_vec_usize(r)?,
-    })
+fn write_lookup_outputs<W: Write>(
+    w: &mut W,
+    inst_attn: &LinearAttentionInstance,
+    inst_ffn: &FFNInstance,
+) -> io::Result<()> {
+    write_vec_f(w, &inst_attn.q_lasso.outputs)?;
+    write_vec_f(w, &inst_attn.k_lasso.outputs)?;
+    write_vec_f(w, &inst_ffn.activation_lasso.outputs)
 }
 
-fn write_ffn_instance<W: Write>(w: &mut W, inst: &FFNInstance) -> io::Result<()> {
-    write_lasso_instance(w, &inst.activation_lasso)
+fn read_lookup_outputs<R: Read>(r: &mut R) -> io::Result<(Vec<F>, Vec<F>, Vec<F>)> {
+    Ok((read_vec_f(r)?, read_vec_f(r)?, read_vec_f(r)?))
 }
-fn read_ffn_instance<R: Read>(r: &mut R) -> io::Result<FFNInstance> {
-    Ok(FFNInstance {
-        activation_lasso: read_lasso_instance(r)?,
-    })
+
+fn instances_from_vk_and_outputs(
+    vk: &TransformerModelVerifyingKey,
+    q_outputs: Vec<F>,
+    k_outputs: Vec<F>,
+    ffn_outputs: Vec<F>,
+) -> io::Result<(LinearAttentionInstance, FFNInstance)> {
+    let first_block = vk
+        .block_vks
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "verifying key has no blocks"))?;
+    let q_coms = first_block
+        .attn_pk
+        .qk_lasso_pk
+        .instance_table_coms
+        .get(0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing Q lasso table commitments",
+            )
+        })?;
+    let k_coms = first_block
+        .attn_pk
+        .qk_lasso_pk
+        .instance_table_coms
+        .get(1)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing K lasso table commitments",
+            )
+        })?;
+    let q_lasso = dummy_lasso_from_coms(q_coms, q_outputs)?;
+    let k_lasso = dummy_lasso_from_coms(k_coms, k_outputs)?;
+    let ffn_lasso = dummy_lasso_from_coms(
+        &first_block.ffn_vk.activation_lasso_vk.table_coms,
+        ffn_outputs,
+    )?;
+    Ok((
+        LinearAttentionInstance {
+            seq_len: vk.seq_len,
+            d_head: vk.d_model,
+            q_lasso,
+            k_lasso,
+            q_query_indices: Vec::new(),
+            k_query_indices: Vec::new(),
+        },
+        FFNInstance {
+            activation_lasso: ffn_lasso,
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,11 +1403,7 @@ pub fn encode_pk(pk: &TransformerModelProvingKey) -> io::Result<Vec<u8>> {
 pub fn decode_pk(bytes: &[u8]) -> io::Result<TransformerModelProvingKey> {
     let mut r = bytes;
     check_magic(&mut r, PK_MAGIC)?;
-    let _version = {
-        let mut v = [0u8; 1];
-        r.read_exact(&mut v)?;
-        v[0]
-    };
+    check_version(read_version(&mut r)?, VERSION, "proving key")?;
     let num_blocks = read_usize(&mut r)?;
     let seq_len = read_usize(&mut r)?;
     let d_model = read_usize(&mut r)?;
@@ -1376,11 +1454,7 @@ pub fn encode_vk(vk: &TransformerModelVerifyingKey) -> io::Result<Vec<u8>> {
 pub fn decode_vk(bytes: &[u8]) -> io::Result<TransformerModelVerifyingKey> {
     let mut r = bytes;
     check_magic(&mut r, VK_MAGIC)?;
-    let _version = {
-        let mut v = [0u8; 1];
-        r.read_exact(&mut v)?;
-        v[0]
-    };
+    check_version(read_version(&mut r)?, VERSION, "verifying key")?;
     let num_blocks = read_usize(&mut r)?;
     let seq_len = read_usize(&mut r)?;
     let d_model = read_usize(&mut r)?;
@@ -1402,7 +1476,10 @@ pub fn decode_vk(bytes: &[u8]) -> io::Result<TransformerModelVerifyingKey> {
     })
 }
 
-/// Encode a proof bundle (proof + public instances + lasso sigma).
+/// Encode a proof bundle.
+///
+/// The bundle stores per-proof lookup output vectors, but not lookup tables.
+/// Table commitments and metadata are reconstructed from the verifying key.
 pub fn encode_proof_bundle(
     proof: &TransformerModelProof,
     inst_attn: &LinearAttentionInstance,
@@ -1411,17 +1488,17 @@ pub fn encode_proof_bundle(
 ) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     buf.extend_from_slice(PROOF_MAGIC);
-    buf.push(VERSION);
+    buf.push(PROOF_VERSION);
     write_model_proof(&mut buf, proof)?;
-    write_attn_instance(&mut buf, inst_attn)?;
-    write_ffn_instance(&mut buf, inst_ffn)?;
+    write_lookup_outputs(&mut buf, inst_attn, inst_ffn)?;
     write_usize(&mut buf, lasso_sigma)?;
     Ok(buf)
 }
 
-/// Decode a proof bundle.
+/// Decode a proof bundle using the verifying key as the source of lookup-table metadata.
 pub fn decode_proof_bundle(
     bytes: &[u8],
+    vk: &TransformerModelVerifyingKey,
 ) -> io::Result<(
     TransformerModelProof,
     LinearAttentionInstance,
@@ -1430,16 +1507,26 @@ pub fn decode_proof_bundle(
 )> {
     let mut r = bytes;
     check_magic(&mut r, PROOF_MAGIC)?;
-    let _version = {
-        let mut v = [0u8; 1];
-        r.read_exact(&mut v)?;
-        v[0]
-    };
+    check_version(read_version(&mut r)?, PROOF_VERSION, "proof")?;
     let proof = read_model_proof(&mut r)?;
-    let inst_attn = read_attn_instance(&mut r)?;
-    let inst_ffn = read_ffn_instance(&mut r)?;
+    let (q_outputs, k_outputs, ffn_outputs) = read_lookup_outputs(&mut r)?;
     let lasso_sigma = read_usize(&mut r)?;
+    let (inst_attn, inst_ffn) =
+        instances_from_vk_and_outputs(vk, q_outputs, k_outputs, ffn_outputs)?;
     Ok((proof, inst_attn, inst_ffn, lasso_sigma))
+}
+
+/// Decode only the proof and per-proof lookup output vectors for inspection.
+pub fn decode_proof_bundle_public_parts(
+    bytes: &[u8],
+) -> io::Result<(TransformerModelProof, Vec<F>, Vec<F>, Vec<F>, usize)> {
+    let mut r = bytes;
+    check_magic(&mut r, PROOF_MAGIC)?;
+    check_version(read_version(&mut r)?, PROOF_VERSION, "proof")?;
+    let proof = read_model_proof(&mut r)?;
+    let (q_outputs, k_outputs, ffn_outputs) = read_lookup_outputs(&mut r)?;
+    let lasso_sigma = read_usize(&mut r)?;
+    Ok((proof, q_outputs, k_outputs, ffn_outputs, lasso_sigma))
 }
 
 fn check_magic<R: Read>(r: &mut R, expected: &[u8; 8]) -> io::Result<()> {

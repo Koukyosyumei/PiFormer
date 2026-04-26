@@ -341,6 +341,8 @@ def _gen_block_witness(
             "v": mat_to_json(v_raw),
             "phi_q": mat_to_json(phi_q),
             "phi_k": mat_to_json(phi_k),
+            "q_query_indices": q_indices,
+            "k_query_indices": k_indices,
             "context": mat_to_json(context),
             "out": mat_to_json(attn_out),
         },
@@ -358,6 +360,7 @@ def _gen_block_witness(
             "m": mat_to_json(ffn_m),
             "a": mat_to_json(ffn_a),
             "y": mat_to_json(ffn_y),
+            "activation_query_indices": ffn_q_indices,
         },
         "x_out": mat_to_json(x_out),
     }
@@ -506,6 +509,8 @@ class WitnessGenerator:
                 "d_head": d_model,
                 "q_lasso": q_lasso_last,
                 "k_lasso": k_lasso_last,
+                "q_query_indices": q_lasso_last["query_indices"],
+                "k_query_indices": k_lasso_last["query_indices"],
             },
             "inst_ffn": {
                 "activation_lasso": ffn_lasso_last,

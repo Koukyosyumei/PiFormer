@@ -10,7 +10,8 @@
 //! piformer prove --pk model.pk --witness witness.json --proof proof.bin
 //!
 //! # 3. Verify the proof
-//! piformer verify --vk model.vk --proof proof.bin
+//! piformer verify --vk model.vk --proof proof.bin \
+//!   --public-input public_input.json --public-output public_output.json
 //!
 //! # 4. Inspect a key or proof file
 //! piformer inspect model.vk
@@ -43,10 +44,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use piformer_prover::{
-    pcs::HyraxParams,
-    prover::prove,
-    setup::preprocess_transformer_model,
-    transcript::Transcript,
+    pcs::HyraxParams, prover::prove, setup::preprocess_transformer_model, transcript::Transcript,
     verifier::verify,
 };
 
@@ -119,6 +117,14 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         proof: PathBuf,
 
+        /// Public input matrix JSON ([[hex field, ...], ...]) expected for x_in.
+        #[arg(long, value_name = "FILE")]
+        public_input: PathBuf,
+
+        /// Public output/logits matrix JSON ([[hex field, ...], ...]) expected for logits.
+        #[arg(long, value_name = "FILE")]
+        public_output: PathBuf,
+
         /// Fiat-Shamir transcript domain separator (must match prove).
         #[arg(long, value_name = "LABEL", default_value = "piformer")]
         transcript_label: String,
@@ -146,13 +152,31 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Setup { weights, seq_len, pk, vk } => run_setup(&weights, seq_len, &pk, &vk),
-        Command::Prove { pk, witness, proof, transcript_label } => {
-            run_prove(&pk, &witness, &proof, &transcript_label)
-        }
-        Command::Verify { vk, proof, transcript_label } => {
-            run_verify(&vk, &proof, &transcript_label)
-        }
+        Command::Setup {
+            weights,
+            seq_len,
+            pk,
+            vk,
+        } => run_setup(&weights, seq_len, &pk, &vk),
+        Command::Prove {
+            pk,
+            witness,
+            proof,
+            transcript_label,
+        } => run_prove(&pk, &witness, &proof, &transcript_label),
+        Command::Verify {
+            vk,
+            proof,
+            public_input,
+            public_output,
+            transcript_label,
+        } => run_verify(
+            &vk,
+            &proof,
+            &public_input,
+            &public_output,
+            &transcript_label,
+        ),
         Command::Inspect { file } => run_inspect(&file),
         Command::Sample { output_dir } => run_sample(&output_dir),
     };
@@ -166,7 +190,12 @@ fn main() {
 // Command handlers
 // ---------------------------------------------------------------------------
 
-fn run_setup(weights_path: &Path, seq_len: usize, pk_path: &Path, vk_path: &Path) -> io::Result<()> {
+fn run_setup(
+    weights_path: &Path,
+    seq_len: usize,
+    pk_path: &Path,
+    vk_path: &Path,
+) -> io::Result<()> {
     println!("=== PiFormer Setup ===");
 
     // Load weights
@@ -236,8 +265,15 @@ fn run_prove(
     eprint!("  Generating proof  ... ");
     let t0 = Instant::now();
     let mut transcript = Transcript::new(label.as_bytes());
-    let proof = prove(&pk, &witness, &inst_attn, &inst_ffn, &mut transcript, &lasso_params)
-        .map_err(io_err)?;
+    let proof = prove(
+        &pk,
+        &witness,
+        &inst_attn,
+        &inst_ffn,
+        &mut transcript,
+        &lasso_params,
+    )
+    .map_err(io_err)?;
     eprintln!("done ({:.2}s)", t0.elapsed().as_secs_f64());
 
     // Write proof bundle
@@ -252,7 +288,13 @@ fn run_prove(
     Ok(())
 }
 
-fn run_verify(vk_path: &Path, proof_path: &Path, label: &str) -> io::Result<()> {
+fn run_verify(
+    vk_path: &Path,
+    proof_path: &Path,
+    public_input_path: &Path,
+    public_output_path: &Path,
+    label: &str,
+) -> io::Result<()> {
     println!("=== PiFormer Verify ===");
 
     // Load verifying key
@@ -268,15 +310,31 @@ fn run_verify(vk_path: &Path, proof_path: &Path, label: &str) -> io::Result<()> 
     eprint!("  Loading proof from {}  ... ", proof_path.display());
     let proof_bytes = fs::read(proof_path)?;
     let (proof, inst_attn, inst_ffn, lasso_sigma) =
-        codec::decode_proof_bundle(&proof_bytes).map_err(io_err)?;
+        codec::decode_proof_bundle(&proof_bytes, &vk).map_err(io_err)?;
     let lasso_params = HyraxParams::new(lasso_sigma);
+    eprintln!("ok");
+
+    eprint!("  Loading public input/output  ... ");
+    let public_x_in =
+        json_io::matrix_from_json_str(&fs::read_to_string(public_input_path)?).map_err(io_err)?;
+    let public_logits =
+        json_io::matrix_from_json_str(&fs::read_to_string(public_output_path)?).map_err(io_err)?;
     eprintln!("ok");
 
     // Verify
     eprint!("  Verifying  ... ");
     let t0 = Instant::now();
     let mut transcript = Transcript::new(label.as_bytes());
-    match verify(&proof, &vk, &inst_attn, &inst_ffn, &mut transcript, &lasso_params) {
+    match verify(
+        &proof,
+        &vk,
+        &inst_attn,
+        &inst_ffn,
+        &public_x_in,
+        &public_logits,
+        &mut transcript,
+        &lasso_params,
+    ) {
         Ok(()) => {
             let elapsed = t0.elapsed().as_secs_f64();
             eprintln!("VALID ({elapsed:.3}s)");
@@ -306,7 +364,10 @@ fn run_inspect(path: &Path) -> io::Result<()> {
             println!("d_model      : {}", vk.d_model);
             println!("Vocab size   : {}", vk.vocab_size);
             for (i, bvk) in vk.block_vks.iter().enumerate() {
-                println!("  Block[{}]: seq_len={}, d_model={}", i, bvk.seq_len, bvk.d_model);
+                println!(
+                    "  Block[{}]: seq_len={}, d_model={}",
+                    i, bvk.seq_len, bvk.d_model
+                );
             }
         }
         "pk" => {
@@ -330,23 +391,16 @@ fn run_inspect(path: &Path) -> io::Result<()> {
             }
         }
         "bin" => {
-            let (proof, inst_attn, inst_ffn, lasso_sigma) =
-                codec::decode_proof_bundle(&bytes).map_err(io_err)?;
+            let (proof, q_outputs, k_outputs, ffn_outputs, lasso_sigma) =
+                codec::decode_proof_bundle_public_parts(&bytes).map_err(io_err)?;
             println!("File type    : Proof Bundle");
             println!("Path         : {}", path.display());
             println!("Size         : {} bytes", bytes.len());
             println!("Blocks       : {}", proof.block_proofs.len());
-            println!("Attn seq_len : {}", inst_attn.seq_len);
-            println!("Attn d_head  : {}", inst_attn.d_head);
             println!("Lasso sigma  : {}", lasso_sigma);
-            println!(
-                "Q lasso queries : {}",
-                inst_attn.q_lasso.outputs.len()
-            );
-            println!(
-                "FFN lasso queries: {}",
-                inst_ffn.activation_lasso.outputs.len()
-            );
+            println!("Q lasso queries : {}", q_outputs.len());
+            println!("K lasso queries : {}", k_outputs.len());
+            println!("FFN lasso queries: {}", ffn_outputs.len());
         }
         _ => {
             return Err(io_err(format!(
@@ -358,11 +412,11 @@ fn run_inspect(path: &Path) -> io::Result<()> {
 }
 
 fn run_sample(out_dir: &Path) -> io::Result<()> {
-    const T: usize = 2;       // seq_len
-    const D: usize = 2;       // d_model
-    const D_FF: usize = 4;    // d_ff
-    const V: usize = 2;       // vocab_size
-    const M_BITS: usize = 4;  // activation bit-width for lasso
+    const T: usize = 2; // seq_len
+    const D: usize = 2; // d_model
+    const D_FF: usize = 4; // d_ff
+    const V: usize = 2; // vocab_size
+    const M_BITS: usize = 4; // activation bit-width for lasso
 
     println!("=== PiFormer Sample (T={T}, D={D}, D_FF={D_FF}, V={V}) ===");
     fs::create_dir_all(out_dir)?;
@@ -380,20 +434,38 @@ fn run_sample(out_dir: &Path) -> io::Result<()> {
     run_setup(&weights_path, T, &pk_path, &vk_path)?;
 
     // --- Witness ---
-    let (witness, inst_attn, inst_ffn) =
-        sample::build_zero_witness(T, D, D_FF, V, M_BITS);
+    let (witness, inst_attn, inst_ffn) = sample::build_zero_witness(T, D, D_FF, V, M_BITS);
     let lasso_sigma = M_BITS / 2;
     let jw = json_io::witness_to_json(&witness, &inst_attn, &inst_ffn, lasso_sigma);
     let witness_path = out_dir.join("witness.json");
     fs::write(&witness_path, serde_json::to_string_pretty(&jw).unwrap())?;
     println!("  Wrote {}", witness_path.display());
 
+    let public_input_path = out_dir.join("public_input.json");
+    fs::write(
+        &public_input_path,
+        json_io::matrix_to_json_string(&witness.x_in).unwrap(),
+    )?;
+    let public_output_path = out_dir.join("public_output.json");
+    fs::write(
+        &public_output_path,
+        json_io::matrix_to_json_string(&witness.lm_head_wit.y).unwrap(),
+    )?;
+    println!("  Wrote {}", public_input_path.display());
+    println!("  Wrote {}", public_output_path.display());
+
     // --- Prove ---
     let proof_path = out_dir.join("proof.bin");
     run_prove(&pk_path, &witness_path, &proof_path, "piformer-sample")?;
 
     // --- Verify ---
-    run_verify(&vk_path, &proof_path, "piformer-sample")?;
+    run_verify(
+        &vk_path,
+        &proof_path,
+        &public_input_path,
+        &public_output_path,
+        "piformer-sample",
+    )?;
 
     println!();
     println!("All sample files written to '{}'.", out_dir.display());

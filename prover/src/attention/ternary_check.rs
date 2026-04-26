@@ -17,8 +17,7 @@
 
 use crate::field::F;
 use crate::lookup::lasso::{
-    precommit_lasso_tables, prove_lasso, verify_lasso,
-    LassoInstance, LassoProof,
+    precommit_lasso_tables, prove_lasso, verify_lasso, LassoInstance, LassoProof,
 };
 use crate::pcs::HyraxParams;
 use crate::transcript::Transcript;

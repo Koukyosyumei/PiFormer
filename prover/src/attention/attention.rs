@@ -25,8 +25,8 @@ use crate::pcs::{
 use crate::poly::utils::{combine, eval_cols, eval_rows, mat_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{
-    prove_sumcheck, prove_sumcheck_multi_batched, verify_sumcheck,
-    verify_sumcheck_multi_batched, EvalClaim, SumcheckProof, SumcheckProofMulti,
+    prove_sumcheck, prove_sumcheck_multi_batched, verify_sumcheck, verify_sumcheck_multi_batched,
+    EvalClaim, SumcheckProof, SumcheckProofMulti,
 };
 use crate::transcript::{challenge_vec, Transcript};
 
@@ -93,6 +93,8 @@ pub struct LinearAttentionWitness {
     pub v: Vec<Vec<F>>,
     pub phi_q: Vec<Vec<F>>,
     pub phi_k: Vec<Vec<F>>,
+    pub q_query_indices: Vec<usize>,
+    pub k_query_indices: Vec<usize>,
     pub context: Vec<Vec<F>>,
     pub out: Vec<Vec<F>>,
 }
@@ -261,16 +263,14 @@ pub fn prove_linear_attention(
             // Out(rx, ry) = Σ_i Phi_Q(rx, i) · Context(i, ry)   [d_bits vars]
             let f_out = DenseMLPoly::from_vec_padded(eval_rows(&phi_q_mle, t_bits, &rx));
             let g_out = DenseMLPoly::from_vec_padded(eval_cols(&ctx_mle, d_bits, &ry));
-            let (out_sumcheck, batch_r_out) =
-                prove_sumcheck(&f_out, &g_out, out_eval, transcript);
+            let (out_sumcheck, batch_r_out) = prove_sumcheck(&f_out, &g_out, out_eval, transcript);
 
             let phi_q_eval = out_sumcheck.final_eval_f;
             // ctx(batch_r_out, ry) — derived from out-sumcheck, not committed separately.
             let ctx_at_batch = out_sumcheck.final_eval_g;
 
             // Context(batch_r_out, ry) = Σ_t Phi_K(t, batch_r_out) · V(t, ry)   [t_bits vars]
-            let f_ctx =
-                DenseMLPoly::from_vec_padded(eval_cols(&phi_k_mle, t_bits, &batch_r_out));
+            let f_ctx = DenseMLPoly::from_vec_padded(eval_cols(&phi_k_mle, t_bits, &batch_r_out));
             let g_v = DenseMLPoly::from_vec_padded(eval_cols(&v_mle, t_bits, &ry));
             let (context_sumcheck, batch_r_ctx) =
                 prove_sumcheck(&f_ctx, &g_v, ctx_at_batch, transcript);
@@ -301,15 +301,26 @@ pub fn prove_linear_attention(
 
     let proof = LinearAttentionProof {
         sumcheck,
-        openings: AttentionOpenings { out_eval, phi_q_eval, phi_k_eval, v_eval },
+        openings: AttentionOpenings {
+            out_eval,
+            phi_q_eval,
+            phi_k_eval,
+            v_eval,
+        },
         phi_q_com,
         phi_k_com,
         phi_q_open,
         phi_k_open,
     };
 
-    let out_claim = EvalClaim { point: combine(&rx, &ry), value: out_eval };
-    let v_claim = EvalClaim { point: v_point, value: v_eval };
+    let out_claim = EvalClaim {
+        point: combine(&rx, &ry),
+        value: out_eval,
+    };
+    let v_claim = EvalClaim {
+        point: v_point,
+        value: v_eval,
+    };
 
     (proof, out_claim, v_claim)
 }
@@ -364,7 +375,10 @@ pub fn verify_linear_attention(
 
     // 3. Verify sumcheck (variant selected by the prover at proof time)
     let (phi_q_point, phi_k_point, v_point) = match &proof.sumcheck {
-        AttentionSumcheckProof::Batched { proof: sc, ctx_eval } => {
+        AttentionSumcheckProof::Batched {
+            proof: sc,
+            ctx_eval,
+        } => {
             // Reproduce r_i and alpha from transcript (mirrors prover exactly).
             transcript.append_field(b"claimed_out", &proof.openings.out_eval);
             let r_i = challenge_vec(transcript, d_bits, b"r_i_attn");
@@ -401,12 +415,8 @@ pub fn verify_linear_attention(
             context_sumcheck,
         } => {
             // Out(rx, ry) = Σ_i Phi_Q(rx, i) · Context(i, ry)   [d_bits vars]
-            let (batch_r_out, _) = verify_sumcheck(
-                out_sumcheck,
-                proof.openings.out_eval,
-                d_bits,
-                transcript,
-            )?;
+            let (batch_r_out, _) =
+                verify_sumcheck(out_sumcheck, proof.openings.out_eval, d_bits, transcript)?;
 
             if proof.openings.phi_q_eval != out_sumcheck.final_eval_f {
                 return Err("phi_q eval inconsistent with out sumcheck leaf".into());
@@ -453,8 +463,14 @@ pub fn verify_linear_attention(
     .map_err(|e| format!("phi_k Hyrax opening failed: {e}"))?;
 
     // out_com and v_com deferred to block-level combine proof
-    let out_claim = EvalClaim { point: combine(&rx, &ry), value: proof.openings.out_eval };
-    let v_claim = EvalClaim { point: v_point, value: proof.openings.v_eval };
+    let out_claim = EvalClaim {
+        point: combine(&rx, &ry),
+        value: proof.openings.out_eval,
+    };
+    let v_claim = EvalClaim {
+        point: v_point,
+        value: proof.openings.v_eval,
+    };
 
     Ok((out_claim, v_claim))
 }
@@ -539,20 +555,35 @@ mod linear_attention_tests {
                 .map(|x| x.into_bigint().as_ref()[0] as usize)
                 .collect();
             let outputs: Vec<F> = phi.iter().flatten().copied().collect();
-            (LassoInstance {
-                tables: vec![table.clone()],
-                outputs,
-                bits_per_chunk: m,
-            }, indices)
+            (
+                LassoInstance {
+                    tables: vec![table.clone()],
+                    outputs,
+                    bits_per_chunk: m,
+                },
+                indices,
+            )
         };
 
         // 1. Prover's Private Data
+        let q_query_indices_wit: Vec<usize> = q
+            .iter()
+            .flatten()
+            .map(|x| x.into_bigint().as_ref()[0] as usize)
+            .collect();
+        let k_query_indices_wit: Vec<usize> = k
+            .iter()
+            .flatten()
+            .map(|x| x.into_bigint().as_ref()[0] as usize)
+            .collect();
         let witness = LinearAttentionWitness {
             q: q.clone(),
             k: k.clone(),
             v: v.clone(),
             phi_q,
             phi_k,
+            q_query_indices: q_query_indices_wit,
+            k_query_indices: k_query_indices_wit,
             context,
             out: out.clone(),
         };
@@ -587,7 +618,12 @@ mod linear_attention_tests {
         let v_com = hyrax_commit(&v_mle.evaluations, nu_td, &params_td);
 
         // GKR backward: out_com removed from AttentionIOCommitments.
-        let io_coms = AttentionIOCommitments { q_com, k_com, v_com, skip_io_absorb: false };
+        let io_coms = AttentionIOCommitments {
+            q_com,
+            k_com,
+            v_com,
+            skip_io_absorb: false,
+        };
 
         let lp = lasso_params();
         let pk = precommit_attention_tables(&inst.q_lasso, &inst.k_lasso, &lp);
@@ -627,8 +663,15 @@ mod linear_attention_tests {
         let ext_claim = make_external_out_claim(&witness.out, 2, 2, b"ext_out");
 
         let mut pt = Transcript::new(b"linear_attn_test");
-        let (proof, _out_claim, _v_claim) =
-            prove_linear_attention(&witness, &inst, &pk, &io_coms, Some(ext_claim.clone()), &mut pt, &lp);
+        let (proof, _out_claim, _v_claim) = prove_linear_attention(
+            &witness,
+            &inst,
+            &pk,
+            &io_coms,
+            Some(ext_claim.clone()),
+            &mut pt,
+            &lp,
+        );
 
         let mut vt = Transcript::new(b"linear_attn_test");
         let result = verify_linear_attention(&proof, &inst, &io_coms, Some(ext_claim), &mut vt);
@@ -651,8 +694,15 @@ mod linear_attention_tests {
         witness.context[0][0] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_tamper_ctx");
-        let (proof, _, _) =
-            prove_linear_attention(&witness, &inst, &pk, &io_coms, Some(ext_claim.clone()), &mut pt, &lp);
+        let (proof, _, _) = prove_linear_attention(
+            &witness,
+            &inst,
+            &pk,
+            &io_coms,
+            Some(ext_claim.clone()),
+            &mut pt,
+            &lp,
+        );
 
         let mut vt = Transcript::new(b"linear_attn_tamper_ctx");
         let result = verify_linear_attention(&proof, &inst, &io_coms, Some(ext_claim), &mut vt);
@@ -670,12 +720,22 @@ mod linear_attention_tests {
         let ext_claim = make_external_out_claim(&witness.out, 2, 2, b"ext_out_tamper");
 
         let mut pt = Transcript::new(b"linear_attn_test");
-        let (proof, _, _) =
-            prove_linear_attention(&witness, &inst, &pk, &io_coms, Some(ext_claim.clone()), &mut pt, &lp);
+        let (proof, _, _) = prove_linear_attention(
+            &witness,
+            &inst,
+            &pk,
+            &io_coms,
+            Some(ext_claim.clone()),
+            &mut pt,
+            &lp,
+        );
 
         let mut vt = Transcript::new(b"linear_attn_test");
         let result = verify_linear_attention(&proof, &inst, &io_coms, Some(ext_claim), &mut vt);
-        assert!(result.is_err(), "should reject tampered out (sumcheck mismatch)");
+        assert!(
+            result.is_err(),
+            "should reject tampered out (sumcheck mismatch)"
+        );
     }
 
     #[test]
@@ -687,8 +747,15 @@ mod linear_attention_tests {
         witness.phi_q[1][0] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_test");
-        let (proof, _, _) =
-            prove_linear_attention(&witness, &inst, &pk, &io_coms, Some(ext_claim.clone()), &mut pt, &lp);
+        let (proof, _, _) = prove_linear_attention(
+            &witness,
+            &inst,
+            &pk,
+            &io_coms,
+            Some(ext_claim.clone()),
+            &mut pt,
+            &lp,
+        );
 
         let mut vt = Transcript::new(b"linear_attn_test");
         let result = verify_linear_attention(&proof, &inst, &io_coms, Some(ext_claim), &mut vt);
@@ -705,11 +772,21 @@ mod linear_attention_tests {
         witness.v[0][1] += F::one();
 
         let mut pt = Transcript::new(b"linear_attn_test");
-        let (proof, _, _) =
-            prove_linear_attention(&witness, &inst, &pk, &io_coms, Some(ext_claim.clone()), &mut pt, &lp);
+        let (proof, _, _) = prove_linear_attention(
+            &witness,
+            &inst,
+            &pk,
+            &io_coms,
+            Some(ext_claim.clone()),
+            &mut pt,
+            &lp,
+        );
 
         let mut vt = Transcript::new(b"linear_attn_test");
         let result = verify_linear_attention(&proof, &inst, &io_coms, Some(ext_claim), &mut vt);
-        assert!(result.is_err(), "should reject tampered v (context sumcheck mismatch)");
+        assert!(
+            result.is_err(),
+            "should reject tampered v (context sumcheck mismatch)"
+        );
     }
 }

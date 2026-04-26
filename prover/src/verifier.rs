@@ -9,20 +9,20 @@
 //!   cross-block batch opens, then global Lasso.
 
 use crate::field::F;
-use crate::lookup::lasso::{verify_lasso, verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey};
+use crate::lookup::lasso::{
+    verify_lasso, verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey,
+};
 use crate::lookup::range::verify_range_batched;
 use crate::pcs::{
-    absorb_com, hyrax_verify, hyrax_verify_batch, params_from_vars, HyraxBatchAccumulator,
-    HyraxCommitment, HyraxParams,
+    absorb_com, hyrax_commit, hyrax_verify, hyrax_verify_batch, params_from_vars,
+    HyraxBatchAccumulator, HyraxCommitment, HyraxParams,
 };
-use crate::poly::utils::combine;
+use crate::poly::utils::{combine, mat_to_mle};
+use crate::poly::DenseMLPoly;
 use crate::subprotocols::verify_sumcheck_multi_batched;
 use crate::transcript::{challenge_vec, Transcript};
 
-use crate::attention::attention::{
-    AttentionProvingKey,
-    LinearAttentionInstance,
-};
+use crate::attention::attention::{AttentionProvingKey, LinearAttentionInstance};
 use crate::attention::layernorm::{
     verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey,
 };
@@ -65,14 +65,22 @@ pub struct TransformerBlockVerifyingKey {
 // ---------------------------------------------------------------------------
 
 pub fn add_commitments(a: &HyraxCommitment, b: &HyraxCommitment) -> HyraxCommitment {
-    assert_eq!(a.row_coms.len(), b.row_coms.len(), "Commitment dimensions must match");
+    assert_eq!(
+        a.row_coms.len(),
+        b.row_coms.len(),
+        "Commitment dimensions must match"
+    );
     let mut result_coms = Vec::with_capacity(a.row_coms.len());
     for (pt_a, pt_b) in a.row_coms.iter().zip(b.row_coms.iter()) {
         let mut sum_proj = pt_a.into_group();
         sum_proj.add_assign(&pt_b.into_group());
         result_coms.push(sum_proj.into_affine());
     }
-    HyraxCommitment { row_coms: result_coms, nu: a.nu, sigma: a.sigma }
+    HyraxCommitment {
+        row_coms: result_coms,
+        nu: a.nu,
+        sigma: a.sigma,
+    }
 }
 
 fn powers_of(base: F, n: usize) -> Vec<F> {
@@ -85,6 +93,91 @@ fn powers_of(base: F, n: usize) -> Vec<F> {
     v
 }
 
+fn commit_public_mat(mat: &[Vec<F>], rows: usize, cols: usize) -> Result<HyraxCommitment, String> {
+    if mat.len() != rows || mat.iter().any(|r| r.len() != cols) {
+        return Err(format!(
+            "public matrix dimension mismatch: got {}x{}, expected {}x{}",
+            mat.len(),
+            mat.first().map(|r| r.len()).unwrap_or(0),
+            rows,
+            cols
+        ));
+    }
+    let mle = mat_to_mle(mat, rows, cols);
+    let vars = rows.next_power_of_two().trailing_zeros() as usize
+        + cols.next_power_of_two().trailing_zeros() as usize;
+    let (nu, _, params) = params_from_vars(vars);
+    Ok(hyrax_commit(&mle.evaluations, nu, &params))
+}
+
+fn commitments_equal(a: &HyraxCommitment, b: &HyraxCommitment) -> bool {
+    a.nu == b.nu && a.sigma == b.sigma && a.row_coms == b.row_coms
+}
+
+fn absorb_index_vectors(transcript: &mut Transcript, label: &[u8], vectors: &[&[usize]]) {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(vectors.len() as u64).to_le_bytes());
+    for v in vectors {
+        bytes.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        for &idx in *v {
+            bytes.extend_from_slice(&(idx as u64).to_le_bytes());
+        }
+    }
+    transcript.append_bytes(label, &bytes);
+}
+
+fn eval_query_indices(
+    indices: &[usize],
+    rows: usize,
+    cols: usize,
+    point: &[F],
+) -> Result<F, String> {
+    if indices.len() != rows * cols {
+        return Err(format!(
+            "lookup index length mismatch: got {}, expected {}",
+            indices.len(),
+            rows * cols
+        ));
+    }
+    let num_vars = rows.next_power_of_two().trailing_zeros() as usize
+        + cols.next_power_of_two().trailing_zeros() as usize;
+    if point.len() != num_vars {
+        return Err(format!(
+            "lookup index evaluation point length mismatch: got {}, expected {}",
+            point.len(),
+            num_vars
+        ));
+    }
+    let evals: Vec<F> = indices.iter().map(|&idx| F::from(idx as u64)).collect();
+    Ok(DenseMLPoly::from_vec_padded(evals).evaluate(point))
+}
+
+fn verify_query_indices_bound_batch(
+    label: &str,
+    indices: &[&[usize]],
+    commitments: &[HyraxCommitment],
+    rows: usize,
+    cols: usize,
+    point: &[F],
+    proof: &crate::pcs::HyraxProof,
+    params: &HyraxParams,
+    transcript: &mut Transcript,
+) -> Result<(), String> {
+    if indices.len() != commitments.len() {
+        return Err(format!(
+            "{label} lookup binding count mismatch: got {} index vectors, {} commitments",
+            indices.len(),
+            commitments.len()
+        ));
+    }
+    let evals = indices
+        .iter()
+        .map(|idx| eval_query_indices(idx, rows, cols, point))
+        .collect::<Result<Vec<_>, _>>()?;
+    hyrax_verify_batch(commitments, &evals, point, proof, params, transcript)
+        .map_err(|e| format!("{label} lookup index binding opening: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Model Verifier (E2E)
 // ---------------------------------------------------------------------------
@@ -94,6 +187,8 @@ pub fn verify(
     vk: &TransformerModelVerifyingKey,
     inst_attn: &LinearAttentionInstance,
     inst_ffn: &FFNInstance,
+    public_x_in: &[Vec<F>],
+    public_logits: &[Vec<F>],
     transcript: &mut Transcript,
     lasso_params: &HyraxParams,
 ) -> Result<(), String> {
@@ -135,6 +230,15 @@ pub fn verify(
 
     let num_blocks = vk.num_blocks;
 
+    let expected_x_in_com = commit_public_mat(public_x_in, t, d)?;
+    if !commitments_equal(&proof.x_in_com, &expected_x_in_com) {
+        return Err("public input does not match x_in commitment".into());
+    }
+    let expected_logits_com = commit_public_mat(public_logits, t, v_vocab)?;
+    if !commitments_equal(&proof.logits_com, &expected_logits_com) {
+        return Err("public output does not match logits commitment".into());
+    }
+
     let mut ln_acc_t = HyraxBatchAccumulator::new();
     let mut ln_acc_td = HyraxBatchAccumulator::new();
     let mut proj_acc_w = HyraxBatchAccumulator::new();
@@ -174,7 +278,11 @@ pub fn verify(
             &mut acc_range_y,
             &mut acc_range_m,
         )?;
-        eprintln!("[block {}] range_batch:{:>8.3}ms", i, _t0.elapsed().as_secs_f64()*1000.0);
+        eprintln!(
+            "[block {}] range_batch:{:>8.3}ms",
+            i,
+            _t0.elapsed().as_secs_f64() * 1000.0
+        );
 
         let ln1_sig_rv = &block_r_vs[0];
         let ln1_y_rv = &block_r_vs[1];
@@ -188,10 +296,20 @@ pub fn verify(
         };
         let _t0 = Instant::now();
         verify_layernorm(
-            &bp.ln1_proof, &ln1_io, &bvk.ln1_vk,
-            ln1_sig_rv, ln1_y_rv, transcript, &mut ln_acc_t, &mut ln_acc_td,
+            &bp.ln1_proof,
+            &ln1_io,
+            &bvk.ln1_vk,
+            ln1_sig_rv,
+            ln1_y_rv,
+            transcript,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
         )?;
-        eprintln!("[block {}] ln1:{:>8.3}ms", i, _t0.elapsed().as_secs_f64()*1000.0);
+        eprintln!(
+            "[block {}] ln1:{:>8.3}ms",
+            i,
+            _t0.elapsed().as_secs_f64() * 1000.0
+        );
 
         absorb_com(transcript, b"q_com", &bp.q_com);
         absorb_com(transcript, b"k_com", &bp.k_com);
@@ -207,10 +325,20 @@ pub fn verify(
         };
         let _t0 = Instant::now();
         verify_layernorm(
-            &bp.ln2_proof, &ln2_io, &bvk.ln2_vk,
-            ln2_sig_rv, ln2_y_rv, transcript, &mut ln_acc_t, &mut ln_acc_td,
+            &bp.ln2_proof,
+            &ln2_io,
+            &bvk.ln2_vk,
+            ln2_sig_rv,
+            ln2_y_rv,
+            transcript,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
         )?;
-        eprintln!("[block {}] ln2:{:>8.3}ms", i, _t0.elapsed().as_secs_f64()*1000.0);
+        eprintln!(
+            "[block {}] ln2:{:>8.3}ms",
+            i,
+            _t0.elapsed().as_secs_f64() * 1000.0
+        );
 
         absorb_com(transcript, b"y_com", &bp.out_ffn_com);
 
@@ -271,7 +399,11 @@ pub fn verify(
         .sum();
 
     let (r_k_qkv, _) = verify_sumcheck_multi_batched(
-        &proof.batch_qkv, &weights_qkv, claim_qkv, d_bits, transcript,
+        &proof.batch_qkv,
+        &weights_qkv,
+        claim_qkv,
+        d_bits,
+        transcript,
     )?;
 
     // Algebraic check: g_eval == lambda*alpha_q*wq + mu*alpha_k*wk + alpha_v*wv
@@ -286,7 +418,10 @@ pub fn verify(
         }
     }
 
-    eprintln!("[model] batch_qkv:{:>8.3}ms", _tqkv.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[model] batch_qkv:{:>8.3}ms",
+        _tqkv.elapsed().as_secs_f64() * 1000.0
+    );
 
     // =========================================================================
     // 5. Batch O-proj (sumcheck only; batch opens deferred to step 13)
@@ -314,7 +449,11 @@ pub fn verify(
         .sum();
 
     let (r_k_o, _) = verify_sumcheck_multi_batched(
-        &proof.batch_oproj, &weights_oproj, claim_oproj, d_bits, transcript,
+        &proof.batch_oproj,
+        &weights_oproj,
+        claim_oproj,
+        d_bits,
+        transcript,
     )?;
 
     // Algebraic check: final_evals_g[i] == bp.oproj_w_o_eval
@@ -325,7 +464,10 @@ pub fn verify(
         }
     }
 
-    eprintln!("[model] batch_oproj:{:>8.3}ms", _to.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[model] batch_oproj:{:>8.3}ms",
+        _to.elapsed().as_secs_f64() * 1000.0
+    );
 
     // =========================================================================
     // 6. Cross-block batch attention sumchecks
@@ -349,13 +491,16 @@ pub fn verify(
         .map(|i| weights_attn_out[i] * proof.block_proofs[i].attn_out_eval)
         .sum();
     let (batch_r_attn_out, _) = verify_sumcheck_multi_batched(
-        &proof.batch_attn_out, &weights_attn_out, claim_attn_out, d_bits, transcript,
+        &proof.batch_attn_out,
+        &weights_attn_out,
+        claim_attn_out,
+        d_bits,
+        transcript,
     )?;
 
-    // Algebraic checks: leaves of batch_attn_out match claimed scalars
+    // Algebraic check: the attention claim is derived from the O-proj leaf.
     for i in 0..num_blocks {
         let bp = &proof.block_proofs[i];
-        // Derive expected attn_out_eval from batch_oproj leaf / alpha_o
         let alpha_o = vk.block_vks[i].o_vk.alpha;
         let expected_out = if alpha_o == F::from(0u64) {
             F::from(0u64)
@@ -363,41 +508,33 @@ pub fn verify(
             proof.batch_oproj.final_evals_f[i] * alpha_o.inverse().unwrap()
         };
         if bp.attn_out_eval != expected_out {
-            return Err(format!("Block {i}: attn_out_eval mismatch with o_proj leaf"));
-        }
-        if proof.batch_attn_out.final_evals_f[i] != bp.attn_phi_q_eval {
-            return Err(format!("Block {i}: batch_attn_out final_f != phi_q_eval"));
-        }
-        if proof.batch_attn_out.final_evals_g[i] != bp.attn_ctx_eval {
-            return Err(format!("Block {i}: batch_attn_out final_g != ctx_eval"));
+            return Err(format!(
+                "Block {i}: attn_out_eval mismatch with o_proj leaf"
+            ));
         }
     }
 
     // 6c. Verify batch ctx sumcheck
     for i in 0..num_blocks {
-        transcript.append_field(b"attn_ctx_eval", &proof.block_proofs[i].attn_ctx_eval);
+        transcript.append_field(b"attn_ctx_eval", &proof.batch_attn_out.final_evals_g[i]);
     }
     let eta_attn_ctx: F = transcript.challenge_field(b"batch_eta_attn_ctx");
     let weights_attn_ctx = powers_of(eta_attn_ctx, num_blocks);
     let claim_attn_ctx: F = (0..num_blocks)
-        .map(|i| weights_attn_ctx[i] * proof.block_proofs[i].attn_ctx_eval)
+        .map(|i| weights_attn_ctx[i] * proof.batch_attn_out.final_evals_g[i])
         .sum();
     let (batch_r_attn_ctx, _) = verify_sumcheck_multi_batched(
-        &proof.batch_attn_ctx, &weights_attn_ctx, claim_attn_ctx, t_bits, transcript,
+        &proof.batch_attn_ctx,
+        &weights_attn_ctx,
+        claim_attn_ctx,
+        t_bits,
+        transcript,
     )?;
 
-    // Algebraic checks: leaves of batch_attn_ctx match claimed scalars
-    for i in 0..num_blocks {
-        let bp = &proof.block_proofs[i];
-        if proof.batch_attn_ctx.final_evals_f[i] != bp.attn_phi_k_eval {
-            return Err(format!("Block {i}: batch_attn_ctx final_f != phi_k_eval"));
-        }
-        if proof.batch_attn_ctx.final_evals_g[i] != bp.attn_v_eval {
-            return Err(format!("Block {i}: batch_attn_ctx final_g != v_eval"));
-        }
-    }
-
-    eprintln!("[model] batch_attn:{:>8.3}ms", _tattn.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[model] batch_attn:{:>8.3}ms",
+        _tattn.elapsed().as_secs_f64() * 1000.0
+    );
 
     // =========================================================================
     // 7. Per-block FFN: Lasso + M absorb
@@ -417,10 +554,38 @@ pub fn verify(
             transcript,
             lasso_params,
         )?;
-        eprintln!("[block {}] ffn_lasso:{:>8.3}ms", i, _t0.elapsed().as_secs_f64()*1000.0);
+        eprintln!(
+            "[block {}] ffn_lasso:{:>8.3}ms",
+            i,
+            _t0.elapsed().as_secs_f64() * 1000.0
+        );
 
         absorb_com(transcript, b"m_com", &bp.ffn_m_com);
     }
+    let ffn_index_refs: Vec<&[usize]> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.ffn_lasso_proof.query_indices.as_slice())
+        .collect();
+    absorb_index_vectors(transcript, b"ffn_lasso_indices", &ffn_index_refs);
+    let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
+    let ffn_bind_m_coms: Vec<HyraxCommitment> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.ffn_m_com.clone())
+        .collect();
+    let (_, _, params_mff_bind) = params_from_vars(t_bits + f_bits);
+    verify_query_indices_bound_batch(
+        "FFN",
+        &ffn_index_refs,
+        &ffn_bind_m_coms,
+        t,
+        d_ff,
+        &ffn_lasso_bind_point,
+        &proof.ffn_lasso_bind_open,
+        &params_mff_bind,
+        transcript,
+    )?;
 
     // =========================================================================
     // 8. Batch FFN-Y (sumcheck only)
@@ -439,10 +604,17 @@ pub fn verify(
         .sum();
 
     let (r_k_fy, _) = verify_sumcheck_multi_batched(
-        &proof.batch_ffn_y, &weights_ffn_y, claim_ffn_y, f_bits, transcript,
+        &proof.batch_ffn_y,
+        &weights_ffn_y,
+        claim_ffn_y,
+        f_bits,
+        transcript,
     )?;
 
-    eprintln!("[model] batch_ffn_y:{:>8.3}ms", _tffy.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[model] batch_ffn_y:{:>8.3}ms",
+        _tffy.elapsed().as_secs_f64() * 1000.0
+    );
 
     // =========================================================================
     // 9. Batch FFN-M (sumcheck only)
@@ -464,10 +636,17 @@ pub fn verify(
         .sum();
 
     let (r_k_m, _) = verify_sumcheck_multi_batched(
-        &proof.batch_ffn_m, &weights_ffn_m, claim_ffn_m, d_bits, transcript,
+        &proof.batch_ffn_m,
+        &weights_ffn_m,
+        claim_ffn_m,
+        d_bits,
+        transcript,
     )?;
 
-    eprintln!("[model] batch_ffn_m:{:>8.3}ms", _tffm.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[model] batch_ffn_m:{:>8.3}ms",
+        _tffm.elapsed().as_secs_f64() * 1000.0
+    );
 
     // =========================================================================
     // 10. Final LayerNorm
@@ -476,7 +655,10 @@ pub fn verify(
     let final_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
     let _t0 = Instant::now();
     let (final_r_vs, _) = verify_range_batched(
-        &[&proof.final_ln_proof.sigma_range_proof, &proof.final_ln_proof.y_range_proof],
+        &[
+            &proof.final_ln_proof.sigma_range_proof,
+            &proof.final_ln_proof.y_range_proof,
+        ],
         &proof.final_range_m,
         &[final_sigma_n, final_y_n],
         32,
@@ -486,7 +668,10 @@ pub fn verify(
         &mut acc_range_m,
     )
     .map_err(|e| format!("Final LN range: {e}"))?;
-    eprintln!("[model] final_range:{:>8.3}ms", _t0.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[model] final_range:{:>8.3}ms",
+        _t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     let _t0 = Instant::now();
     let ln_io = LayerNormIOCommitments {
@@ -494,29 +679,51 @@ pub fn verify(
         y_com: Some(proof.final_ln_out_com.clone()),
     };
     verify_layernorm(
-        &proof.final_ln_proof, &ln_io, &vk.final_ln_vk,
-        &final_r_vs[0], &final_r_vs[1], transcript, &mut ln_acc_t, &mut ln_acc_td,
+        &proof.final_ln_proof,
+        &ln_io,
+        &vk.final_ln_vk,
+        &final_r_vs[0],
+        &final_r_vs[1],
+        transcript,
+        &mut ln_acc_t,
+        &mut ln_acc_td,
     )
     .map_err(|e| format!("Final LN: {e}"))?;
-    eprintln!("[model] final_ln:{:>8.3}ms", _t0.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[model] final_ln:{:>8.3}ms",
+        _t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     // =========================================================================
     // 11. LM Head
     // =========================================================================
     let _t0 = Instant::now();
-    let lm_io = ProjectionIOCommitments { x_com: Some(proof.final_ln_out_com.clone()) };
+    let lm_io = ProjectionIOCommitments {
+        x_com: Some(proof.final_ln_out_com.clone()),
+    };
     let (lm_y_claim, _) = verify_projection(
-        &proof.lm_head_proof, &vk.lm_head_vk, &lm_io, transcript,
-        &mut lmh_acc_w, &mut lmh_acc_b, None,
+        &proof.lm_head_proof,
+        &vk.lm_head_vk,
+        &lm_io,
+        transcript,
+        &mut lmh_acc_w,
+        &mut lmh_acc_b,
+        None,
     )
     .map_err(|e| format!("LM Head: {e}"))?;
-    eprintln!("[model] lm_head:{:>8.3}ms", _t0.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[model] lm_head:{:>8.3}ms",
+        _t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     let v_bits = v_vocab.next_power_of_two().trailing_zeros() as usize;
     let (_, _, params_logits) = params_from_vars(t_bits + v_bits);
     hyrax_verify(
-        &proof.logits_com, lm_y_claim.value, &lm_y_claim.point,
-        &proof.lm_head_logits_open, &params_logits,
+        &proof.logits_com,
+        lm_y_claim.value,
+        &lm_y_claim.point,
+        &proof.lm_head_logits_open,
+        &params_logits,
     )
     .map_err(|e| format!("Logits commit: {e}"))?;
 
@@ -524,43 +731,103 @@ pub fn verify(
     // 12. Finalize 10 accumulators (same order as prover's mu challenge loop)
     // =========================================================================
     let _tacc = Instant::now();
-    let mu_inter  = transcript.challenge_field::<F>(b"hyrax_group_mu");
-    let mu_ln_t   = transcript.challenge_field::<F>(b"hyrax_group_mu");
-    let mu_ln_td  = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_inter = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_ln_t = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_ln_td = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_proj_w = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_proj_b = transcript.challenge_field::<F>(b"hyrax_group_mu");
-    let mu_lmh_w  = transcript.challenge_field::<F>(b"hyrax_group_mu");
-    let mu_lmh_b  = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_lmh_w = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_lmh_b = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_rng_sig = transcript.challenge_field::<F>(b"hyrax_group_mu");
-    let mu_rng_y  = transcript.challenge_field::<F>(b"hyrax_group_mu");
-    let mu_rng_m  = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_rng_y = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_rng_m = transcript.challenge_field::<F>(b"hyrax_group_mu");
 
     let ((r0, r1), (r2, r3)) = rayon::join(
-        || rayon::join(
-            || inter_acc.finalize_with_mu(&params_td, mu_inter).map_err(|e| format!("inter_acc: {e}")),
-            || ln_acc_t.finalize_with_mu(&params_t, mu_ln_t).map_err(|e| format!("ln_acc_t: {e}")),
-        ),
-        || rayon::join(
-            || ln_acc_td.finalize_with_mu(&params_td, mu_ln_td).map_err(|e| format!("ln_acc_td: {e}")),
-            || proj_acc_w.finalize_with_mu(&params_qkvo_w, mu_proj_w).map_err(|e| format!("proj_acc_w: {e}")),
-        ),
+        || {
+            rayon::join(
+                || {
+                    inter_acc
+                        .finalize_with_mu(&params_td, mu_inter)
+                        .map_err(|e| format!("inter_acc: {e}"))
+                },
+                || {
+                    ln_acc_t
+                        .finalize_with_mu(&params_t, mu_ln_t)
+                        .map_err(|e| format!("ln_acc_t: {e}"))
+                },
+            )
+        },
+        || {
+            rayon::join(
+                || {
+                    ln_acc_td
+                        .finalize_with_mu(&params_td, mu_ln_td)
+                        .map_err(|e| format!("ln_acc_td: {e}"))
+                },
+                || {
+                    proj_acc_w
+                        .finalize_with_mu(&params_qkvo_w, mu_proj_w)
+                        .map_err(|e| format!("proj_acc_w: {e}"))
+                },
+            )
+        },
     );
     let ((r4, r5), (r6, r7)) = rayon::join(
-        || rayon::join(
-            || proj_acc_b.finalize_with_mu(&params_qkvo_b, mu_proj_b).map_err(|e| format!("proj_acc_b: {e}")),
-            || lmh_acc_w.finalize_with_mu(&params_lmh_w, mu_lmh_w).map_err(|e| format!("lmh_acc_w: {e}")),
-        ),
-        || rayon::join(
-            || lmh_acc_b.finalize_with_mu(&params_lmh_b, mu_lmh_b).map_err(|e| format!("lmh_acc_b: {e}")),
-            || acc_range_sig.finalize_with_mu(&params_range_sig, mu_rng_sig).map_err(|e| format!("acc_range_sig: {e}")),
-        ),
+        || {
+            rayon::join(
+                || {
+                    proj_acc_b
+                        .finalize_with_mu(&params_qkvo_b, mu_proj_b)
+                        .map_err(|e| format!("proj_acc_b: {e}"))
+                },
+                || {
+                    lmh_acc_w
+                        .finalize_with_mu(&params_lmh_w, mu_lmh_w)
+                        .map_err(|e| format!("lmh_acc_w: {e}"))
+                },
+            )
+        },
+        || {
+            rayon::join(
+                || {
+                    lmh_acc_b
+                        .finalize_with_mu(&params_lmh_b, mu_lmh_b)
+                        .map_err(|e| format!("lmh_acc_b: {e}"))
+                },
+                || {
+                    acc_range_sig
+                        .finalize_with_mu(&params_range_sig, mu_rng_sig)
+                        .map_err(|e| format!("acc_range_sig: {e}"))
+                },
+            )
+        },
     );
     let (r8, r9) = rayon::join(
-        || acc_range_y.finalize_with_mu(&params_range_y, mu_rng_y).map_err(|e| format!("acc_range_y: {e}")),
-        || acc_range_m.finalize_with_mu(&params_range_m, mu_rng_m).map_err(|e| format!("acc_range_m: {e}")),
+        || {
+            acc_range_y
+                .finalize_with_mu(&params_range_y, mu_rng_y)
+                .map_err(|e| format!("acc_range_y: {e}"))
+        },
+        || {
+            acc_range_m
+                .finalize_with_mu(&params_range_m, mu_rng_m)
+                .map_err(|e| format!("acc_range_m: {e}"))
+        },
     );
-    eprintln!("[model] acc_finalize:{:>8.3}ms", _tacc.elapsed().as_secs_f64()*1000.0);
-    r0?; r1?; r2?; r3?; r4?; r5?; r6?; r7?; r8?; r9?;
+    eprintln!(
+        "[model] acc_finalize:{:>8.3}ms",
+        _tacc.elapsed().as_secs_f64() * 1000.0
+    );
+    r0?;
+    r1?;
+    r2?;
+    r3?;
+    r4?;
+    r5?;
+    r6?;
+    r7?;
+    r8?;
+    r9?;
 
     // =========================================================================
     // 13. Global batch open for 5L intermediate matrices at r_td (inter_batch_open)
@@ -581,10 +848,18 @@ pub fn verify(
         all_evals.push(bp.out_ffn_eval);
     }
     hyrax_verify_batch(
-        &all_coms, &all_evals, &r_td, &proof.inter_batch_open, &params_td, transcript,
+        &all_coms,
+        &all_evals,
+        &r_td,
+        &proof.inter_batch_open,
+        &params_td,
+        transcript,
     )
     .map_err(|e| format!("Global inter_batch: {e}"))?;
-    eprintln!("[model] inter_batch:{:>8.3}ms", _t0.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[model] inter_batch:{:>8.3}ms",
+        _t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     // =========================================================================
     // 14. 13 cross-block weight/activation batch opens
@@ -594,167 +869,318 @@ pub fn verify(
 
     // x_norm1 at combine(r_t, r_k_qkv)
     let x_norm1_point = combine(&r_t, &r_k_qkv);
-    let x_norm1_coms: Vec<HyraxCommitment> =
-        proof.block_proofs.iter().map(|bp| bp.x_norm1_com.clone()).collect();
+    let x_norm1_coms: Vec<HyraxCommitment> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.x_norm1_com.clone())
+        .collect();
     let x_norm1_evals: Vec<F> = proof.batch_qkv.final_evals_f.clone();
     hyrax_verify_batch(
-        &x_norm1_coms, &x_norm1_evals, &x_norm1_point,
-        &proof.x_norm1_batch_open, &params_td, transcript,
-    ).map_err(|e| format!("x_norm1_batch: {e}"))?;
+        &x_norm1_coms,
+        &x_norm1_evals,
+        &x_norm1_point,
+        &proof.x_norm1_batch_open,
+        &params_td,
+        transcript,
+    )
+    .map_err(|e| format!("x_norm1_batch: {e}"))?;
 
     // wq/wk/wv at combine(r_k_qkv, r_out)
     let wq_point = combine(&r_k_qkv, &r_out);
-    let wq_coms: Vec<HyraxCommitment> =
-        vk.block_vks.iter().map(|bvk| bvk.q_vk.w_com.clone()).collect();
-    let wq_evals: Vec<F> =
-        proof.block_proofs.iter().map(|bp| bp.qkv_w_q_eval).collect();
+    let wq_coms: Vec<HyraxCommitment> = vk
+        .block_vks
+        .iter()
+        .map(|bvk| bvk.q_vk.w_com.clone())
+        .collect();
+    let wq_evals: Vec<F> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.qkv_w_q_eval)
+        .collect();
     hyrax_verify_batch(
-        &wq_coms, &wq_evals, &wq_point,
-        &proof.w_q_batch_open, &params_qkvo_w, transcript,
-    ).map_err(|e| format!("w_q_batch: {e}"))?;
+        &wq_coms,
+        &wq_evals,
+        &wq_point,
+        &proof.w_q_batch_open,
+        &params_qkvo_w,
+        transcript,
+    )
+    .map_err(|e| format!("w_q_batch: {e}"))?;
 
-    let wk_coms: Vec<HyraxCommitment> =
-        vk.block_vks.iter().map(|bvk| bvk.k_vk.w_com.clone()).collect();
-    let wk_evals: Vec<F> =
-        proof.block_proofs.iter().map(|bp| bp.qkv_w_k_eval).collect();
+    let wk_coms: Vec<HyraxCommitment> = vk
+        .block_vks
+        .iter()
+        .map(|bvk| bvk.k_vk.w_com.clone())
+        .collect();
+    let wk_evals: Vec<F> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.qkv_w_k_eval)
+        .collect();
     hyrax_verify_batch(
-        &wk_coms, &wk_evals, &wq_point,
-        &proof.w_k_batch_open, &params_qkvo_w, transcript,
-    ).map_err(|e| format!("w_k_batch: {e}"))?;
+        &wk_coms,
+        &wk_evals,
+        &wq_point,
+        &proof.w_k_batch_open,
+        &params_qkvo_w,
+        transcript,
+    )
+    .map_err(|e| format!("w_k_batch: {e}"))?;
 
-    let wv_coms: Vec<HyraxCommitment> =
-        vk.block_vks.iter().map(|bvk| bvk.v_vk.w_com.clone()).collect();
-    let wv_evals: Vec<F> =
-        proof.block_proofs.iter().map(|bp| bp.qkv_w_v_eval).collect();
+    let wv_coms: Vec<HyraxCommitment> = vk
+        .block_vks
+        .iter()
+        .map(|bvk| bvk.v_vk.w_com.clone())
+        .collect();
+    let wv_evals: Vec<F> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.qkv_w_v_eval)
+        .collect();
     hyrax_verify_batch(
-        &wv_coms, &wv_evals, &wq_point,
-        &proof.w_v_batch_open, &params_qkvo_w, transcript,
-    ).map_err(|e| format!("w_v_batch: {e}"))?;
+        &wv_coms,
+        &wv_evals,
+        &wq_point,
+        &proof.w_v_batch_open,
+        &params_qkvo_w,
+        transcript,
+    )
+    .map_err(|e| format!("w_v_batch: {e}"))?;
 
     // bias_q/k/v at r_out
-    let bq_coms: Vec<HyraxCommitment> =
-        vk.block_vks.iter().map(|bvk| bvk.q_vk.bias_com.clone()).collect();
-    let bq_evals: Vec<F> =
-        proof.block_proofs.iter().map(|bp| bp.qkv_bias_q_eval).collect();
+    let bq_coms: Vec<HyraxCommitment> = vk
+        .block_vks
+        .iter()
+        .map(|bvk| bvk.q_vk.bias_com.clone())
+        .collect();
+    let bq_evals: Vec<F> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.qkv_bias_q_eval)
+        .collect();
     hyrax_verify_batch(
-        &bq_coms, &bq_evals, &r_out,
-        &proof.bias_q_batch_open, &params_qkvo_b, transcript,
-    ).map_err(|e| format!("bias_q_batch: {e}"))?;
+        &bq_coms,
+        &bq_evals,
+        &r_out,
+        &proof.bias_q_batch_open,
+        &params_qkvo_b,
+        transcript,
+    )
+    .map_err(|e| format!("bias_q_batch: {e}"))?;
 
-    let bk_coms: Vec<HyraxCommitment> =
-        vk.block_vks.iter().map(|bvk| bvk.k_vk.bias_com.clone()).collect();
-    let bk_evals: Vec<F> =
-        proof.block_proofs.iter().map(|bp| bp.qkv_bias_k_eval).collect();
+    let bk_coms: Vec<HyraxCommitment> = vk
+        .block_vks
+        .iter()
+        .map(|bvk| bvk.k_vk.bias_com.clone())
+        .collect();
+    let bk_evals: Vec<F> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.qkv_bias_k_eval)
+        .collect();
     hyrax_verify_batch(
-        &bk_coms, &bk_evals, &r_out,
-        &proof.bias_k_batch_open, &params_qkvo_b, transcript,
-    ).map_err(|e| format!("bias_k_batch: {e}"))?;
+        &bk_coms,
+        &bk_evals,
+        &r_out,
+        &proof.bias_k_batch_open,
+        &params_qkvo_b,
+        transcript,
+    )
+    .map_err(|e| format!("bias_k_batch: {e}"))?;
 
-    let bv_coms: Vec<HyraxCommitment> =
-        vk.block_vks.iter().map(|bvk| bvk.v_vk.bias_com.clone()).collect();
-    let bv_evals: Vec<F> =
-        proof.block_proofs.iter().map(|bp| bp.qkv_bias_v_eval).collect();
+    let bv_coms: Vec<HyraxCommitment> = vk
+        .block_vks
+        .iter()
+        .map(|bvk| bvk.v_vk.bias_com.clone())
+        .collect();
+    let bv_evals: Vec<F> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.qkv_bias_v_eval)
+        .collect();
     hyrax_verify_batch(
-        &bv_coms, &bv_evals, &r_out,
-        &proof.bias_v_batch_open, &params_qkvo_b, transcript,
-    ).map_err(|e| format!("bias_v_batch: {e}"))?;
+        &bv_coms,
+        &bv_evals,
+        &r_out,
+        &proof.bias_v_batch_open,
+        &params_qkvo_b,
+        transcript,
+    )
+    .map_err(|e| format!("bias_v_batch: {e}"))?;
 
     // wo at combine(r_k_o, r_out)
     let wo_point = combine(&r_k_o, &r_out);
-    let wo_coms: Vec<HyraxCommitment> =
-        vk.block_vks.iter().map(|bvk| bvk.o_vk.w_com.clone()).collect();
-    let wo_evals: Vec<F> =
-        proof.block_proofs.iter().map(|bp| bp.oproj_w_o_eval).collect();
+    let wo_coms: Vec<HyraxCommitment> = vk
+        .block_vks
+        .iter()
+        .map(|bvk| bvk.o_vk.w_com.clone())
+        .collect();
+    let wo_evals: Vec<F> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.oproj_w_o_eval)
+        .collect();
     hyrax_verify_batch(
-        &wo_coms, &wo_evals, &wo_point,
-        &proof.w_o_batch_open, &params_qkvo_w, transcript,
-    ).map_err(|e| format!("w_o_batch: {e}"))?;
+        &wo_coms,
+        &wo_evals,
+        &wo_point,
+        &proof.w_o_batch_open,
+        &params_qkvo_w,
+        transcript,
+    )
+    .map_err(|e| format!("w_o_batch: {e}"))?;
 
     // bias_o at r_out
-    let bo_coms: Vec<HyraxCommitment> =
-        vk.block_vks.iter().map(|bvk| bvk.o_vk.bias_com.clone()).collect();
-    let bo_evals: Vec<F> =
-        proof.block_proofs.iter().map(|bp| bp.oproj_bias_o_eval).collect();
+    let bo_coms: Vec<HyraxCommitment> = vk
+        .block_vks
+        .iter()
+        .map(|bvk| bvk.o_vk.bias_com.clone())
+        .collect();
+    let bo_evals: Vec<F> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.oproj_bias_o_eval)
+        .collect();
     hyrax_verify_batch(
-        &bo_coms, &bo_evals, &r_out,
-        &proof.bias_o_batch_open, &params_qkvo_b, transcript,
-    ).map_err(|e| format!("bias_o_batch: {e}"))?;
+        &bo_coms,
+        &bo_evals,
+        &r_out,
+        &proof.bias_o_batch_open,
+        &params_qkvo_b,
+        transcript,
+    )
+    .map_err(|e| format!("bias_o_batch: {e}"))?;
 
     // w2 at combine(r_k_fy, r_out)
     let w2_point = combine(&r_k_fy, &r_out);
-    let w2_coms: Vec<HyraxCommitment> =
-        vk.block_vks.iter().map(|bvk| bvk.ffn_vk.w2_com.clone()).collect();
+    let w2_coms: Vec<HyraxCommitment> = vk
+        .block_vks
+        .iter()
+        .map(|bvk| bvk.ffn_vk.w2_com.clone())
+        .collect();
     let w2_evals: Vec<F> = proof.batch_ffn_y.final_evals_g.clone();
     hyrax_verify_batch(
-        &w2_coms, &w2_evals, &w2_point,
-        &proof.w2_batch_open, &params_wff, transcript,
-    ).map_err(|e| format!("w2_batch: {e}"))?;
+        &w2_coms,
+        &w2_evals,
+        &w2_point,
+        &proof.w2_batch_open,
+        &params_wff,
+        transcript,
+    )
+    .map_err(|e| format!("w2_batch: {e}"))?;
 
     // w1 at combine(r_k_m, ry_m) — uses same params as prover (params_qkvo_w)
     let w1_point = combine(&r_k_m, &ry_m);
-    let w1_coms: Vec<HyraxCommitment> =
-        vk.block_vks.iter().map(|bvk| bvk.ffn_vk.w1_com.clone()).collect();
+    let w1_coms: Vec<HyraxCommitment> = vk
+        .block_vks
+        .iter()
+        .map(|bvk| bvk.ffn_vk.w1_com.clone())
+        .collect();
     let w1_evals: Vec<F> = proof.batch_ffn_m.final_evals_g.clone();
     hyrax_verify_batch(
-        &w1_coms, &w1_evals, &w1_point,
-        &proof.w1_batch_open, &params_wff, transcript,
-    ).map_err(|e| format!("w1_batch: {e}"))?;
+        &w1_coms,
+        &w1_evals,
+        &w1_point,
+        &proof.w1_batch_open,
+        &params_wff,
+        transcript,
+    )
+    .map_err(|e| format!("w1_batch: {e}"))?;
 
     // x_norm2 at combine(rx_m, r_k_m)
     let x_norm2_point = combine(&rx_m, &r_k_m);
-    let x_norm2_coms: Vec<HyraxCommitment> =
-        proof.block_proofs.iter().map(|bp| bp.x_norm2_com.clone()).collect();
+    let x_norm2_coms: Vec<HyraxCommitment> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.x_norm2_com.clone())
+        .collect();
     let x_norm2_evals: Vec<F> = proof.batch_ffn_m.final_evals_f.clone();
     hyrax_verify_batch(
-        &x_norm2_coms, &x_norm2_evals, &x_norm2_point,
-        &proof.x_norm2_batch_open, &params_td, transcript,
-    ).map_err(|e| format!("x_norm2_batch: {e}"))?;
+        &x_norm2_coms,
+        &x_norm2_evals,
+        &x_norm2_point,
+        &proof.x_norm2_batch_open,
+        &params_td,
+        transcript,
+    )
+    .map_err(|e| format!("x_norm2_batch: {e}"))?;
 
     // ffn_m_com at combine(rx_m, ry_m)
     let ffn_m_point = combine(&rx_m, &ry_m);
-    let ffn_m_coms: Vec<HyraxCommitment> =
-        proof.block_proofs.iter().map(|bp| bp.ffn_m_com.clone()).collect();
-    let ffn_m_evals: Vec<F> =
-        proof.block_proofs.iter().map(|bp| bp.ffn_m_eval).collect();
+    let ffn_m_coms: Vec<HyraxCommitment> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.ffn_m_com.clone())
+        .collect();
+    let ffn_m_evals: Vec<F> = proof.block_proofs.iter().map(|bp| bp.ffn_m_eval).collect();
     hyrax_verify_batch(
-        &ffn_m_coms, &ffn_m_evals, &ffn_m_point,
-        &proof.ffn_m_com_batch_open, &params_mff, transcript,
-    ).map_err(|e| format!("ffn_m_com_batch: {e}"))?;
+        &ffn_m_coms,
+        &ffn_m_evals,
+        &ffn_m_point,
+        &proof.ffn_m_com_batch_open,
+        &params_mff,
+        transcript,
+    )
+    .map_err(|e| format!("ffn_m_com_batch: {e}"))?;
 
     // phi_q at combine(r_t, batch_r_attn_out)
     let phi_q_attn_point = combine(&r_t, &batch_r_attn_out);
-    let phi_q_coms: Vec<HyraxCommitment> =
-        proof.block_proofs.iter().map(|bp| bp.attn_phi_q_com.clone()).collect();
-    let phi_q_evals: Vec<F> =
-        proof.block_proofs.iter().map(|bp| bp.attn_phi_q_eval).collect();
+    let phi_q_coms: Vec<HyraxCommitment> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.attn_phi_q_com.clone())
+        .collect();
+    let phi_q_evals: Vec<F> = proof.batch_attn_out.final_evals_f.clone();
     hyrax_verify_batch(
-        &phi_q_coms, &phi_q_evals, &phi_q_attn_point,
-        &proof.phi_q_batch_open, &params_td, transcript,
-    ).map_err(|e| format!("phi_q_batch: {e}"))?;
+        &phi_q_coms,
+        &phi_q_evals,
+        &phi_q_attn_point,
+        &proof.phi_q_batch_open,
+        &params_td,
+        transcript,
+    )
+    .map_err(|e| format!("phi_q_batch: {e}"))?;
 
     // phi_k at combine(batch_r_attn_ctx, batch_r_attn_out)
     let phi_k_attn_point = combine(&batch_r_attn_ctx, &batch_r_attn_out);
-    let phi_k_coms: Vec<HyraxCommitment> =
-        proof.block_proofs.iter().map(|bp| bp.attn_phi_k_com.clone()).collect();
-    let phi_k_evals: Vec<F> =
-        proof.block_proofs.iter().map(|bp| bp.attn_phi_k_eval).collect();
+    let phi_k_coms: Vec<HyraxCommitment> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.attn_phi_k_com.clone())
+        .collect();
+    let phi_k_evals: Vec<F> = proof.batch_attn_ctx.final_evals_f.clone();
     hyrax_verify_batch(
-        &phi_k_coms, &phi_k_evals, &phi_k_attn_point,
-        &proof.phi_k_batch_open, &params_td, transcript,
-    ).map_err(|e| format!("phi_k_batch: {e}"))?;
+        &phi_k_coms,
+        &phi_k_evals,
+        &phi_k_attn_point,
+        &proof.phi_k_batch_open,
+        &params_td,
+        transcript,
+    )
+    .map_err(|e| format!("phi_k_batch: {e}"))?;
 
     // v_attn at combine(batch_r_attn_ctx, r_k_o)
     let v_attn_batch_point = combine(&batch_r_attn_ctx, &r_k_o);
-    let v_attn_coms: Vec<HyraxCommitment> =
-        proof.block_proofs.iter().map(|bp| bp.v_com.clone()).collect();
-    let v_attn_evals: Vec<F> =
-        proof.block_proofs.iter().map(|bp| bp.attn_v_eval).collect();
+    let v_attn_coms: Vec<HyraxCommitment> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.v_com.clone())
+        .collect();
+    let v_attn_evals: Vec<F> = proof.batch_attn_ctx.final_evals_g.clone();
     hyrax_verify_batch(
-        &v_attn_coms, &v_attn_evals, &v_attn_batch_point,
-        &proof.v_attn_batch_open, &params_td, transcript,
-    ).map_err(|e| format!("v_attn_batch: {e}"))?;
+        &v_attn_coms,
+        &v_attn_evals,
+        &v_attn_batch_point,
+        &proof.v_attn_batch_open,
+        &params_td,
+        transcript,
+    )
+    .map_err(|e| format!("v_attn_batch: {e}"))?;
 
-    eprintln!("[model] cross_batch_opens:{:>8.3}ms", _tbatch.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[model] cross_batch_opens:{:>8.3}ms",
+        _tbatch.elapsed().as_secs_f64() * 1000.0
+    );
 
     // =========================================================================
     // 15. Global batched Lasso (attention Q/K)
@@ -763,6 +1189,13 @@ pub fn verify(
     let mut all_lasso_instances = Vec::new();
     let mut all_instance_coms = Vec::new();
     let mut all_output_coms: Vec<(HyraxCommitment, usize)> = Vec::new();
+    if proof.all_lasso_proof.all_query_indices.len() != 2 * num_blocks {
+        return Err(format!(
+            "Global Lasso query index count mismatch: got {}, expected {}",
+            proof.all_lasso_proof.all_query_indices.len(),
+            2 * num_blocks
+        ));
+    }
     for i in 0..num_blocks {
         let bvk = &vk.block_vks[i];
         all_lasso_instances.push(inst_attn.q_lasso.clone());
@@ -772,14 +1205,49 @@ pub fn verify(
         all_output_coms.push((proof.block_proofs[i].attn_phi_q_com.clone(), td_num_vars));
         all_output_coms.push((proof.block_proofs[i].attn_phi_k_com.clone(), td_num_vars));
     }
-    let global_multi_inst = LassoMultiInstance { instances: all_lasso_instances };
-    let global_lasso_vk = LassoMultiVerifyingKey { instance_table_coms: all_instance_coms };
+    let global_multi_inst = LassoMultiInstance {
+        instances: all_lasso_instances,
+    };
+    let global_lasso_vk = LassoMultiVerifyingKey {
+        instance_table_coms: all_instance_coms,
+    };
+    let qk_index_refs: Vec<&[usize]> = proof
+        .all_lasso_proof
+        .all_query_indices
+        .iter()
+        .map(|v| v.as_slice())
+        .collect();
+    absorb_index_vectors(transcript, b"qk_lasso_indices", &qk_index_refs);
+    let qk_lasso_bind_point = challenge_vec(transcript, td_num_vars, b"qk_lasso_bind_r");
+    let mut qk_coms = Vec::with_capacity(2 * num_blocks);
+    for bp in &proof.block_proofs {
+        qk_coms.push(bp.q_com.clone());
+        qk_coms.push(bp.k_com.clone());
+    }
+    verify_query_indices_bound_batch(
+        "attention Q/K",
+        &qk_index_refs,
+        &qk_coms,
+        t,
+        d,
+        &qk_lasso_bind_point,
+        &proof.qk_lasso_bind_open,
+        &params_td,
+        transcript,
+    )?;
     verify_lasso_multi(
-        &proof.all_lasso_proof, &global_multi_inst, &global_lasso_vk,
-        &all_output_coms, transcript, lasso_params,
+        &proof.all_lasso_proof,
+        &global_multi_inst,
+        &global_lasso_vk,
+        &all_output_coms,
+        transcript,
+        lasso_params,
     )
     .map_err(|e| format!("Global Lasso: {e}"))?;
-    eprintln!("[model] lasso:{:>8.3}ms", _t0.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[model] lasso:{:>8.3}ms",
+        _t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     Ok(())
 }

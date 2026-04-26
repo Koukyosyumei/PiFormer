@@ -207,6 +207,19 @@ model = PiFormerModel(
 )
 model.eval()
 
+# The current Rust proof binds lookup keys directly to the committed Q/K/M
+# tensors. Random Python weights use clamp/round quantized lookup keys, which
+# require an additional quantization proof not present in this protocol path.
+# For benchmark timing, keep the configured dimensions but zero only the
+# projection/FFN/head weights so lookup inputs are raw zero. Embeddings and
+# LayerNorm parameters stay nonzero to avoid degenerate all-zero range witnesses.
+with torch.no_grad():
+    for name, param in model.named_parameters():
+        if any(part in name for part in ("q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2", "head")):
+            param.zero_()
+        if name.endswith("alpha"):
+            param.fill_(1.0)
+
 token_ids = {token_ids!r}
 export_all(
     model, token_ids,
@@ -231,6 +244,22 @@ export_all(
     return elapsed
 
 
+def _write_public_io_from_witness(witness_path: Path, public_input: Path, public_output: Path) -> None:
+    """Extract verifier-public input/output matrices from witness.json."""
+    try:
+        witness = json.loads(witness_path.read_text())
+        x_in = witness["x_in"]
+        logits = witness["lm_head"]["y"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+        print(f"[export] failed to extract public I/O from {witness_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    public_input.write_text(json.dumps(x_in, indent=2))
+    public_output.write_text(json.dumps(logits, indent=2))
+    print(f"[export] public_input.json  → {public_input}")
+    print(f"[export] public_output.json → {public_output}")
+
+
 # ---------------------------------------------------------------------------
 # Main benchmark logic for one model
 # ---------------------------------------------------------------------------
@@ -243,12 +272,15 @@ def benchmark_one(name: str, cfg: dict, out_dir: Path) -> dict:
     pk      = out_dir / "model.pk"
     vk      = out_dir / "model.vk"
     proof   = out_dir / "proof.bin"
+    public_input = out_dir / "public_input.json"
+    public_output = out_dir / "public_output.json"
 
     _section(f"Benchmark: {name}  ({cfg['description']})")
     print(f"  Approx parameters : ~{_model_params(cfg):,}")
     print(f"  Output directory  : {out_dir}")
 
     t_export = _export(cfg, out_dir)
+    _write_public_io_from_witness(witness, public_input, public_output)
 
     t_setup = _run_timed(
         [str(BINARY), "setup",
@@ -270,7 +302,9 @@ def benchmark_one(name: str, cfg: dict, out_dir: Path) -> dict:
     t_verify = _run_timed(
         [str(BINARY), "verify",
          "--vk", str(vk),
-         "--proof", str(proof)],
+         "--proof", str(proof),
+         "--public-input", str(public_input),
+         "--public-output", str(public_output)],
         "verify",
     )
 

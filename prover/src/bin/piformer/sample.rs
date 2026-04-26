@@ -78,7 +78,9 @@ pub fn build_zero_weights(
         d_model,
         d_ff,
         vocab_size,
-        blocks: (0..num_blocks).map(|_| make_block(d_model, d_ff, 4)).collect(),
+        blocks: (0..num_blocks)
+            .map(|_| make_block(d_model, d_ff, 4))
+            .collect(),
         final_ln_gamma: vec![F::from(2u64); d_model],
         final_ln_beta: vec![F::from(5u64); d_model],
         lm_head_w: zero_ternary_mat(d_model, vocab_size),
@@ -149,6 +151,8 @@ pub fn build_zero_witness(
             v: zero_td.clone(),
             phi_q: zero_td.clone(),
             phi_k: zero_td.clone(),
+            q_query_indices: vec![0; seq_len * d_model],
+            k_query_indices: vec![0; seq_len * d_model],
             context: zero_dd,
             out: zero_td.clone(),
         },
