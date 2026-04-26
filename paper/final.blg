@@ -3,23 +3,22 @@ Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
 The top-level auxiliary file: final.aux
 The style file: plain.bst
 Database file #1: ref.bib
-Warning--can't use both volume and number fields in thaler2022proofs
 You've used 17 entries,
             2118 wiz_defined-function locations,
-            587 strings with 7204 characters,
-and the built_in function-call counts, 7432 in all, are:
+            586 strings with 7200 characters,
+and the built_in function-call counts, 7427 in all, are:
 = -- 740
 > -- 379
 < -- 11
 + -- 149
 - -- 132
-* -- 488
+* -- 485
 := -- 1157
 add.period$ -- 57
 call.type$ -- 17
 change.case$ -- 116
 chr.to.int$ -- 0
-cite$ -- 18
+cite$ -- 17
 duplicate$ -- 308
 empty$ -- 545
 format.name$ -- 132
@@ -29,20 +28,19 @@ int.to.str$ -- 17
 missing$ -- 18
 newline$ -- 88
 num.names$ -- 34
-pop$ -- 147
+pop$ -- 148
 preamble$ -- 1
 purify$ -- 100
 quote$ -- 0
 skip$ -- 247
 stack$ -- 0
 substring$ -- 432
-swap$ -- 125
+swap$ -- 124
 text.length$ -- 11
 text.prefix$ -- 0
 top$ -- 0
 type$ -- 66
-warning$ -- 1
+warning$ -- 0
 while$ -- 64
 width$ -- 19
 write$ -- 190
-(There was 1 warning)

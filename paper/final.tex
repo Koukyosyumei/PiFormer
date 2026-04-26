@@ -120,7 +120,7 @@
 
 %% Title
 \title{%
-  \sys{}: Succinct ZK Proofs of Transformer Inference\\
+  \sys{}: Succinct Proofs of Transformer Inference\\
   via Structured Lookup Attention%
 }
 
@@ -137,10 +137,10 @@ Columbia University \\
 %% ============================================================
 \begin{abstract}
 %% ============================================================
-We present \sys{}, a succinct zero-knowledge SNARK system for
-verifiable transformer inference, in which the model architecture and
-the proof system are co-designed so that every operation in a forward
-pass maps to a low-degree sumcheck claim or a structured table lookup.
+We present \sys{}, a succinct SNARK system for verifiable transformer
+inference, in which the model architecture and the proof system are
+co-designed so that every operation in a forward pass maps to a
+low-degree sumcheck claim or a structured table lookup.
 The architecture replaces the three classical SNARK bottlenecks of a
 transformer block: softmax becomes \emph{Learnable Lookup
 Attention}~(LLA), a linear attention whose feature map is parametrised
@@ -169,23 +169,27 @@ We implement \sys{} in $\sim$14\,k lines of Rust with a PyTorch
 training pipeline whose integer forward pass matches the Rust
 circuit's arithmetic exactly. On a single x86\_64 CPU core, end-to-end
 proving for a 4-layer model with $d{=}128$, $d_{ff}{=}512$, $T{=}32$
-($\sim$924\,k parameters) takes 4.2\,s; the verifier runs in 280\,ms
-and the proof is 5.5\,MB. We give formal cross-block batching
-soundness theorems and bound the end-to-end soundness error by
-$L\cdot n_{\max}\cdot\delta_{\max}/|\FF|+\varepsilon_{\mathrm{DL}}$.
+($\sim$924\,k parameters) takes 4.2\,s; the verifier's measured
+end-to-end compute is 280\,ms and the proof is 5.5\,MB. We give
+formal cross-block batching soundness theorems and bound the
+end-to-end soundness error by
+$((m_{\mathrm{sc}}n_{\max}\delta_{\max}
+ +m_{\mathrm{batch}}(L-1)+m_{\mathrm{open}})/|\FF|)
+ +\varepsilon_{\mathrm{DL}}$.
 \end{abstract}
 
 \section{Introduction}
 \label{sec:intro}
 
-Large language models are increasingly deployed in settings, legal
-review, medical decision support, financial auditing, where the user
-needs cryptographic assurance that a claimed output was produced by a
-specific committed model on a specific input. Zero-knowledge SNARKs
-provide the right primitive: the model owner produces a succinct,
-non-interactively verifiable proof, and the verifier can check the
-proof without reading the weights or executing the
-model~\cite{liu2021zkcnn,sun2024zkllm,abbaszadeh2024zero}.
+Large language models are increasingly deployed in settings such as
+legal review, medical decision support, and financial auditing, where
+the user needs cryptographic assurance that a claimed output was
+produced by a specific committed model on a specific input. Succinct
+non-interactive arguments provide the right primitive: the model owner
+produces a compact proof, and the verifier checks it without executing
+the model or reading committed proprietary weights. Zero-knowledge
+masking is orthogonal to this integrity goal and is not enabled in the
+current prototype~\cite{liu2021zkcnn,sun2024zkllm,abbaszadeh2024zero}.
 
 The bottleneck is concrete cost. Transformers are built from exactly
 the operations that finite-field arithmetic circuits find
@@ -235,9 +239,9 @@ pair). None of these is a soundness-affecting trick; each is a
 standard random-linear-combination argument whose error is dominated
 by the inner sumcheck error.
 
-\paragraph{Threat model.}
-We target the standard \emph{honest-verifier non-interactive}
-SNARK setting in the random-oracle model. The verifier is given a
+\paragraph{Threat model and scope.}
+We target the standard \emph{non-interactive argument of knowledge}
+setting in the random-oracle model. The verifier is given a
 verifying key $\popvk$ binding the model weights and lookup tables, a
 public input $\bx_{\mathrm{in}}$, and a claimed output $\by$.
 \sys{}'s prover is computationally bounded; its goal is to prove
@@ -245,9 +249,10 @@ $\calM_\theta(\bx_{\mathrm{in}})=\by$. Soundness is computational
 under the discrete-log assumption on BN254 G1 (the underlying
 assumption for the Hyrax polynomial commitment
 scheme~\cite{wahby2018doubly}). The current implementation is
-\emph{not} zero-knowledge: weight commitments and intermediate
-sumcheck evaluations are revealed; we describe the standard masking
-extension in \S\ref{sec:disc}.
+\emph{not} zero-knowledge: weight commitments are public VK entries
+and intermediate sumcheck evaluations are revealed. We therefore use
+``verifiable inference'' to refer to integrity, not witness privacy,
+and describe the standard masking extension in \S\ref{sec:disc}.
 
 \paragraph{Contributions.}
 \begin{enumerate}
@@ -366,6 +371,7 @@ train--prove gap.
 
 \begin{figure*}[t]
 \centering
+\resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
     font=\small,
     box/.style={rectangle, draw, rounded corners=2pt, minimum width=1.7cm,
@@ -420,19 +426,20 @@ train--prove gap.
         inner sep=8pt, label={[label]above:Single \sys{} block (one of $L$)}] {};
 
   % Bottom: cross-block batching annotation
-  \node[font=\scriptsize, color=gray!70!black, below=2.0cm of xmid, align=left] (note) {%
-    \textbf{Cross-block batching:} every box of one type across all $L$ blocks
-    folds into a single model-level proof:\\[1pt]
-    \textbf{ternary} $\rightarrow$ 2 multi-batched sumchecks (\texttt{batch\_qkv},
-    \texttt{batch\_oproj}, \texttt{batch\_ffn\_y}, \texttt{batch\_ffn\_m});\,
-    \textbf{LLA inner} $\rightarrow$ \texttt{batch\_attn\_out},
-    \texttt{batch\_attn\_ctx};\,
-    \textbf{Lasso $\bphi$} $\rightarrow$ one global \texttt{LassoMultiProof};\,
-    \textbf{LN range} $\rightarrow$ one shared multiplicity commitment;\,
-    \textbf{$+$} $\rightarrow$ homomorphic Hyrax addition (no proof).
+  \node[font=\scriptsize, color=gray!70!black, below=2.0cm of xmid,
+        align=left, text width=0.95\textwidth] (note) {%
+    \textbf{Cross-block batching:} boxes of one type across all $L$
+    blocks fold into one model-level proof:
+    \textbf{ternary} $\rightarrow$ \texttt{qkv}/\texttt{oproj}/\texttt{ffn}
+    sumchecks;
+    \textbf{LLA inner} $\rightarrow$ attention out/context sumchecks;
+    \textbf{Lasso $\bphi$} $\rightarrow$ one global multi-proof;
+    \textbf{LN range} $\rightarrow$ one shared multiplicity commitment;
+    \textbf{$+$} $\rightarrow$ homomorphic Hyrax addition.
   };
 
 \end{tikzpicture}
+}
 \caption{A single \sys{} block. Boxes are matrices; rounded green
 nodes are operations the SNARK proves. ``Ternary'' projections
 contain no field multiplications inside the contraction; ``Lasso''
@@ -718,21 +725,20 @@ Algorithm~\ref{alg:prove}.
 \EndFor
 \State $\eta\gets\mathsf{FS}.\mathsf{challenge}(\texttt{"batch\_eta"})$
 \State $H^\star\gets\sum_{\ell=1}^L\eta^{\ell-1}H_\ell$
-\State $F(x)\gets\sum_{\ell=1}^L\eta^{\ell-1}f_\ell(x)$;\quad
-       $G(x)\gets\sum_{\ell=1}^L\eta^{\ell-1}g_\ell(x)$
+\State $P(x)\gets\sum_{\ell=1}^L\eta^{\ell-1}f_\ell(x)g_\ell(x)$
 \For{$i=1,\dots,n$}
-  \State send univariate $g_i(X)\!=\!\sum_{x\in\{0,1\}^{n-i}}\!\!F_i(X,x)\,G_i(X,x)$ at $X\in\{0,1,2\}$
+  \State send univariate $s_i(X)=\sum_{x\in\{0,1\}^{n-i}}P_i(X,x)$ at $X\in\{0,1,2\}$
   \State $r_i\gets\mathsf{FS}.\mathsf{challenge}(\texttt{"sumcheck\_r"}\Vert i)$
 \EndFor
-\State \Return $\piproof_{\mathrm{batch}}=\{\eta,(g_i)_{i=1}^n\}$, $r=(r_1,\dots,r_n)$
+\State \Return $\piproof_{\mathrm{batch}}=\{\eta,(s_i)_{i=1}^n\}$, $r=(r_1,\dots,r_n)$
 \end{algorithmic}
 \end{algorithm}
 
 The verifier recovers $H^\star$ from the per-block claims and $\eta$,
 then runs the standard sumcheck verifier on $\piproof_{\mathrm{batch}}$
-to a final point $r$. From $r$ the verifier locally computes the
-combined claim $F(r)\,G(r)$ and checks it against per-block evaluations
-opened later via the cross-block batch opens. By
+to a final point $r$. From $r$ the verifier checks the terminal claim
+$P(r)=\sum_{\ell=1}^L\eta^{\ell-1}f_\ell(r)g_\ell(r)$ against the
+per-block evaluations opened later via the cross-block batch opens. By
 Theorem~\ref{thm:cross-block} below, this protocol replaces $L$
 independent sumcheck transcripts with one of length $n$ at a soundness
 cost of an additive $(L-1)/|\FF|$.
@@ -895,12 +901,18 @@ $\bA+\bB$ then follows from binding of $\bA$ and $\bB$.
 For any PPT adversary $\calA$, the probability that $\Verify(\popvk,\piproof,\mathsf{inst},\bx_{\mathrm{in}},\by)=\mathsf{ACCEPT}$
 but $\calM_\theta(\bx_{\mathrm{in}})\ne\by$ is at most
 \[
-  \varepsilon_{\mathrm{sound}}\;\le\;L\cdot n_{\max}\cdot\delta_{\max}/|\FF|+\varepsilon_{\mathrm{DL}},
+  \varepsilon_{\mathrm{sound}}\;\le\;
+  \frac{m_{\mathrm{sc}}\, n_{\max}\delta_{\max}
+        +m_{\mathrm{batch}}(L-1)+m_{\mathrm{open}}}{|\FF|}
+  +\varepsilon_{\mathrm{DL}},
 \]
-where $n_{\max}$ is the maximum number of sumcheck variables across
-all sub-protocols, $\delta_{\max}\le 3$ the maximum round-polynomial
-degree, $L$ the number of transformer blocks, and
-$\varepsilon_{\mathrm{DL}}$ the DL advantage of $\calA$ on $\GG$.
+where $m_{\mathrm{sc}}$ is the number of sumcheck invocations after
+batching, $m_{\mathrm{batch}}=6$ is the number of cross-block
+batches, $m_{\mathrm{open}}$ covers the random-linear-combination
+checks used in batched openings/lookups, $n_{\max}$ is the maximum
+number of sumcheck variables, $\delta_{\max}\le 3$ is the maximum
+round-polynomial degree, and $\varepsilon_{\mathrm{DL}}$ is the DL
+advantage of $\calA$ on $\GG$.
 \end{theorem}
 \begin{proof}[Proof sketch]
 We proceed by hybrid argument over the $L$ blocks.
@@ -923,10 +935,11 @@ Lemma~\ref{lem:sumcheck}.
 (v) The global Lasso $\pi_{\mathrm{lasso}}$ is sound by
 Lemma~\ref{lem:hyrax} per sub-table with batch error bounded by the
 number of sub-tables times the per-table error.
-A union bound over all $L$ blocks, sub-protocols, and sumcheck rounds
-gives the stated bound.
-For $L=12$, $n_{\max}=64$, $\delta_{\max}=3$ over BN254, the
-statistical error is $\le 2^{-242}$, dominated by the DL term.
+A union bound over the batched sumchecks, batched openings, lookup
+arguments, and LayerNorm sub-proofs gives the stated bound. For
+typical parameters ($L\le12$, $n_{\max}\le64$, $\delta_{\max}\le3$)
+over BN254, the statistical term remains below $2^{-240}$ for the
+implemented protocol counts and is dominated by the DL term.
 \end{proof}
 
 \subsection{Zero knowledge}
@@ -1031,7 +1044,9 @@ pair per group.
 \begin{table}[t]
 \centering
 \caption{Verifier compute breakdown by phase (ms). All values are
-single-thread wall-clock from the Rust CLI's internal phase timers.}
+single-thread wall-clock from the Rust CLI's internal phase timers;
+the subtotal omits parser, transcript setup, and top-level dispatch
+overheads included in Table~\ref{tab:e2e}.}
 \label{tab:verify-breakdown}
 \setlength{\tabcolsep}{6pt}
 \small
@@ -1052,20 +1067,20 @@ single-thread wall-clock from the Rust CLI's internal phase timers.}
   \texttt{lasso} (global Lasso)                       & 1.57  & 25.58 & 40.93 \\
   \texttt{acc\_finalize} (10 deferred MSMs)           & 13.20 & 23.75 & 54.15 \\
   \midrule
-  \textbf{Total verify}                                & 22    & 99    & 148   \\
+  \textbf{Instrumented subtotal}                        & 22    & 99    & 148   \\
   \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:verify-breakdown} breaks down verifier compute by
-phase. Three observations: (i) cross-block sumcheck transcript checks
+Table~\ref{tab:verify-breakdown} breaks down the instrumented verifier
+phases. Three observations: (i) cross-block sumcheck transcript checks
 are negligible ($<\!1$\,ms total) regardless of model size, validating
 that the batching collapses verifier transcript work; (ii) the
 \texttt{cross\_batch\_opens} and \texttt{acc\_finalize} phases (Hyrax
-opening verification and accumulator finalisation) dominate, scaling
-with the size of the committed matrices; and (iii) the global Lasso
-verification is sub-linear in the model size as expected (one
-combined sumcheck plus one Hyrax opening).
+opening verification and accumulator finalisation) dominate the
+instrumented compute, scaling with the size of the committed matrices;
+and (iii) the global Lasso verification is sub-linear in the model
+size as expected (one combined sumcheck plus one Hyrax opening).
 
 \subsection{Comparison with prior work}
 
@@ -1112,6 +1127,18 @@ changes the protocol architecture: causal masking is a sumcheck-time
 indicator polynomial, multi-head splits the attention sumchecks
 into parallel batches, and ZK is an additional blinding layer over
 committed witnesses.
+
+\paragraph{Model-quality evaluation.}
+The evaluation in \S\ref{sec:eval} measures proof-system performance
+and end-to-end arithmetic consistency; it is not yet an ML benchmark
+claim. Because \sys{} changes the attention kernel and constrains
+weights to ternary values, a deployment-quality comparison must train
+matched baselines under the same parameter budget, context length,
+dataset, and quantisation regime, then report both task quality and
+proof cost. The present results should therefore be read as evidence
+that the co-designed architecture is efficiently provable, not as
+evidence that it preserves the accuracy of a softmax transformer at
+scale.
 
 \paragraph{From prototype to deployment.}
 Our timings are CPU and single-threaded. GPU MSM and parallel
