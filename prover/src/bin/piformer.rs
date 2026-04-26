@@ -44,10 +44,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use piformer_prover::{
-    pcs::HyraxParams,
-    prover::prove,
-    setup::preprocess_transformer_model,
-    transcript::Transcript,
+    pcs::HyraxParams, prover::prove, setup::preprocess_transformer_model, transcript::Transcript,
     verifier::verify,
 };
 
@@ -155,13 +152,31 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Setup { weights, seq_len, pk, vk } => run_setup(&weights, seq_len, &pk, &vk),
-        Command::Prove { pk, witness, proof, transcript_label } => {
-            run_prove(&pk, &witness, &proof, &transcript_label)
-        }
-        Command::Verify { vk, proof, public_input, public_output, transcript_label } => {
-            run_verify(&vk, &proof, &public_input, &public_output, &transcript_label)
-        }
+        Command::Setup {
+            weights,
+            seq_len,
+            pk,
+            vk,
+        } => run_setup(&weights, seq_len, &pk, &vk),
+        Command::Prove {
+            pk,
+            witness,
+            proof,
+            transcript_label,
+        } => run_prove(&pk, &witness, &proof, &transcript_label),
+        Command::Verify {
+            vk,
+            proof,
+            public_input,
+            public_output,
+            transcript_label,
+        } => run_verify(
+            &vk,
+            &proof,
+            &public_input,
+            &public_output,
+            &transcript_label,
+        ),
         Command::Inspect { file } => run_inspect(&file),
         Command::Sample { output_dir } => run_sample(&output_dir),
     };
@@ -175,7 +190,12 @@ fn main() {
 // Command handlers
 // ---------------------------------------------------------------------------
 
-fn run_setup(weights_path: &Path, seq_len: usize, pk_path: &Path, vk_path: &Path) -> io::Result<()> {
+fn run_setup(
+    weights_path: &Path,
+    seq_len: usize,
+    pk_path: &Path,
+    vk_path: &Path,
+) -> io::Result<()> {
     println!("=== PiFormer Setup ===");
 
     // Load weights
@@ -245,8 +265,15 @@ fn run_prove(
     eprint!("  Generating proof  ... ");
     let t0 = Instant::now();
     let mut transcript = Transcript::new(label.as_bytes());
-    let proof = prove(&pk, &witness, &inst_attn, &inst_ffn, &mut transcript, &lasso_params)
-        .map_err(io_err)?;
+    let proof = prove(
+        &pk,
+        &witness,
+        &inst_attn,
+        &inst_ffn,
+        &mut transcript,
+        &lasso_params,
+    )
+    .map_err(io_err)?;
     eprintln!("done ({:.2}s)", t0.elapsed().as_secs_f64());
 
     // Write proof bundle
@@ -288,10 +315,10 @@ fn run_verify(
     eprintln!("ok");
 
     eprint!("  Loading public input/output  ... ");
-    let public_x_in = json_io::matrix_from_json_str(&fs::read_to_string(public_input_path)?)
-        .map_err(io_err)?;
-    let public_logits = json_io::matrix_from_json_str(&fs::read_to_string(public_output_path)?)
-        .map_err(io_err)?;
+    let public_x_in =
+        json_io::matrix_from_json_str(&fs::read_to_string(public_input_path)?).map_err(io_err)?;
+    let public_logits =
+        json_io::matrix_from_json_str(&fs::read_to_string(public_output_path)?).map_err(io_err)?;
     eprintln!("ok");
 
     // Verify
@@ -337,7 +364,10 @@ fn run_inspect(path: &Path) -> io::Result<()> {
             println!("d_model      : {}", vk.d_model);
             println!("Vocab size   : {}", vk.vocab_size);
             for (i, bvk) in vk.block_vks.iter().enumerate() {
-                println!("  Block[{}]: seq_len={}, d_model={}", i, bvk.seq_len, bvk.d_model);
+                println!(
+                    "  Block[{}]: seq_len={}, d_model={}",
+                    i, bvk.seq_len, bvk.d_model
+                );
             }
         }
         "pk" => {
@@ -382,11 +412,11 @@ fn run_inspect(path: &Path) -> io::Result<()> {
 }
 
 fn run_sample(out_dir: &Path) -> io::Result<()> {
-    const T: usize = 2;       // seq_len
-    const D: usize = 2;       // d_model
-    const D_FF: usize = 4;    // d_ff
-    const V: usize = 2;       // vocab_size
-    const M_BITS: usize = 4;  // activation bit-width for lasso
+    const T: usize = 2; // seq_len
+    const D: usize = 2; // d_model
+    const D_FF: usize = 4; // d_ff
+    const V: usize = 2; // vocab_size
+    const M_BITS: usize = 4; // activation bit-width for lasso
 
     println!("=== PiFormer Sample (T={T}, D={D}, D_FF={D_FF}, V={V}) ===");
     fs::create_dir_all(out_dir)?;
@@ -404,8 +434,7 @@ fn run_sample(out_dir: &Path) -> io::Result<()> {
     run_setup(&weights_path, T, &pk_path, &vk_path)?;
 
     // --- Witness ---
-    let (witness, inst_attn, inst_ffn) =
-        sample::build_zero_witness(T, D, D_FF, V, M_BITS);
+    let (witness, inst_attn, inst_ffn) = sample::build_zero_witness(T, D, D_FF, V, M_BITS);
     let lasso_sigma = M_BITS / 2;
     let jw = json_io::witness_to_json(&witness, &inst_attn, &inst_ffn, lasso_sigma);
     let witness_path = out_dir.join("witness.json");

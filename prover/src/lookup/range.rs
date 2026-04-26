@@ -103,7 +103,9 @@ pub fn prove_range(
     let (sumcheck, r_v) = prove_sumcheck(&v_mle, &ones, claim_v, transcript);
 
     // 5. Batch opening for all chunks at r_v (hyrax_open_batch → 1 proof instead of num_chunks)
-    let chunk_evals: Vec<F> = (0..num_chunks).map(|c| chunk_mles[c].evaluate(&r_v)).collect();
+    let chunk_evals: Vec<F> = (0..num_chunks)
+        .map(|c| chunk_mles[c].evaluate(&r_v))
+        .collect();
     let chunk_slices: Vec<&[F]> = (0..num_chunks)
         .map(|c| chunk_mles[c].evaluations.as_slice())
         .collect();
@@ -145,7 +147,10 @@ pub fn verify_range(
     let _t0 = Instant::now();
     let (_, _, params_m) = params_from_vars(CHUNK_BITS);
     let (_, _, params_c) = params_from_vars(num_vars);
-    eprintln!("[range({num_vars})]  params:      {:>8.3}ms", _t0.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[range({num_vars})]  params:      {:>8.3}ms",
+        _t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     // 1. Absorb commitments
     let _ta = Instant::now();
@@ -153,7 +158,10 @@ pub fn verify_range(
         absorb_com(transcript, b"chunk_com", com);
     }
     absorb_com(transcript, b"logup_m_com", &proof.m_com);
-    eprintln!("[range({num_vars})]  absorb:      {:>8.3}ms", _ta.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[range({num_vars})]  absorb:      {:>8.3}ms",
+        _ta.elapsed().as_secs_f64() * 1000.0
+    );
 
     // 2. Sumcheck Verification
     let _tsc = Instant::now();
@@ -161,7 +169,10 @@ pub fn verify_range(
     let (r_v, final_val) = verify_sumcheck(&proof.sumcheck, proof.claim_v, num_vars, transcript)
         .map_err(|e| format!("Range Sumcheck: {e}"))?;
     let v_eval = final_val;
-    eprintln!("[range({num_vars})]  sumcheck:    {:>8.3}ms", _tsc.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[range({num_vars})]  sumcheck:    {:>8.3}ms",
+        _tsc.elapsed().as_secs_f64() * 1000.0
+    );
 
     // 3. Chunk Algebraic Fusion: V(r) = V_lo(r) + 2^16 * V_hi(r)
     // Batch all chunk openings into a single hyrax_verify_batch call (saves K-1 MSMs).
@@ -175,7 +186,10 @@ pub fn verify_range(
         transcript,
     )
     .map_err(|e| format!("Chunk batch opening failed: {e}"))?;
-    eprintln!("[range({num_vars})]  chunk_hyrax: {:>8.3}ms", _tch.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[range({num_vars})]  chunk_hyrax: {:>8.3}ms",
+        _tch.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Verify the algebraic fusion: V(r) = Σ_c chunk_eval[c] * 2^(16c)
     let mut expected_v_eval = F::ZERO;
@@ -194,7 +208,10 @@ pub fn verify_range(
     let r_m = challenge_vec(transcript, CHUNK_BITS, b"logup_rm");
     hyrax_verify(&proof.m_com, proof.m_eval, &r_m, &proof.m_open, &params_m)
         .map_err(|e| format!("Range Multiplicity Opening: {e}"))?;
-    eprintln!("[range({num_vars})]  m_hyrax:     {:>8.3}ms", _tm.elapsed().as_secs_f64()*1000.0);
+    eprintln!(
+        "[range({num_vars})]  m_hyrax:     {:>8.3}ms",
+        _tm.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Return the coordinate and the evaluated value to the parent layer (e.g. LayerNorm)
     Ok((r_v, v_eval))
@@ -445,7 +462,13 @@ pub fn prove_range_batched(
     absorb_com(transcript, b"logup_m_com", &m_com);
 
     // ---- Phase 2: per-witness sumcheck + chunk opening at r_v ----
-    let mut witness_proofs_partial: Vec<(Vec<HyraxCommitment>, Vec<F>, HyraxProof, SumcheckProof, F)> = Vec::new();
+    let mut witness_proofs_partial: Vec<(
+        Vec<HyraxCommitment>,
+        Vec<F>,
+        HyraxProof,
+        SumcheckProof,
+        F,
+    )> = Vec::new();
     let mut r_vs: Vec<Vec<F>> = Vec::with_capacity(witnesses.len());
 
     for i in 0..witnesses.len() {
@@ -457,10 +480,20 @@ pub fn prove_range_batched(
         let (sumcheck, r_v) = prove_sumcheck(v_mle, &ones, claim_v, transcript);
 
         let chunk_evals: Vec<F> = all_chunk_mles[i].iter().map(|m| m.evaluate(&r_v)).collect();
-        let chunk_slices: Vec<&[F]> = all_chunk_mles[i].iter().map(|m| m.evaluations.as_slice()).collect();
-        let chunk_batch_proof = hyrax_open_batch(&chunk_slices, &r_v, all_nu_c[i], all_sigma_c[i], transcript);
+        let chunk_slices: Vec<&[F]> = all_chunk_mles[i]
+            .iter()
+            .map(|m| m.evaluations.as_slice())
+            .collect();
+        let chunk_batch_proof =
+            hyrax_open_batch(&chunk_slices, &r_v, all_nu_c[i], all_sigma_c[i], transcript);
 
-        witness_proofs_partial.push((all_chunk_coms[i].clone(), chunk_evals, chunk_batch_proof, sumcheck, claim_v));
+        witness_proofs_partial.push((
+            all_chunk_coms[i].clone(),
+            chunk_evals,
+            chunk_batch_proof,
+            sumcheck,
+            claim_v,
+        ));
         r_vs.push(r_v);
     }
 
@@ -477,7 +510,11 @@ pub fn prove_range_batched(
     let mut g_evals: Vec<F> = (0..CHUNK_SIZE).map(|j| alpha - F::from(j as u64)).collect();
     batch_inversion(&mut g_evals); // zeros out any entry where α = j (negligible probability)
     let g_mle = DenseMLPoly::new(g_evals);
-    let logup_rhs_claim: F = m_global.iter().zip(g_mle.evaluations.iter()).map(|(m, g)| *m * *g).sum();
+    let logup_rhs_claim: F = m_global
+        .iter()
+        .zip(g_mle.evaluations.iter())
+        .map(|(m, g)| *m * *g)
+        .sum();
 
     // Commit all h_k = [1/(α - C_k[i])] BEFORE drawing β so β binds the h commitments.
     let mut all_h_mles: Vec<Vec<DenseMLPoly>> = Vec::with_capacity(witnesses.len());
@@ -526,7 +563,8 @@ pub fn prove_range_batched(
         for c in 0..num_chunks {
             let h_mle = &all_h_mles[i][c];
             // q_k[i] = 1 + β*(α - C_k[i])
-            let q_vals: Vec<F> = all_chunk_vals[i][c].iter()
+            let q_vals: Vec<F> = all_chunk_vals[i][c]
+                .iter()
                 .map(|&cv| F::ONE + beta * (alpha - cv))
                 .collect();
             let q_mle = vec_to_mle(&q_vals, n);
@@ -553,8 +591,13 @@ pub fn prove_range_batched(
         }
 
         all_logup_witness.push(LogUpWitnessProof {
-            h_coms: h_coms_w, combined_sumchecks, combined_claims,
-            h_at_rk, chunk_at_rk, h_open_proofs, chunk_open_proofs,
+            h_coms: h_coms_w,
+            combined_sumchecks,
+            combined_claims,
+            h_at_rk,
+            chunk_at_rk,
+            h_open_proofs,
+            chunk_open_proofs,
         });
     }
 
@@ -569,14 +612,28 @@ pub fn prove_range_batched(
     let witness_proofs: Vec<RangeWitnessProof> = witness_proofs_partial
         .into_iter()
         .zip(all_logup_witness.into_iter())
-        .map(|((chunk_coms, chunk_evals, chunk_batch_proof, sumcheck, claim_v), logup)| {
-            RangeWitnessProof { chunk_coms, chunk_evals, chunk_batch_proof, sumcheck, claim_v, logup }
-        })
+        .map(
+            |((chunk_coms, chunk_evals, chunk_batch_proof, sumcheck, claim_v), logup)| {
+                RangeWitnessProof {
+                    chunk_coms,
+                    chunk_evals,
+                    chunk_batch_proof,
+                    sumcheck,
+                    claim_v,
+                    logup,
+                }
+            },
+        )
         .collect();
 
     let global_m = GlobalRangeM {
-        m_com, m_eval, m_open,
-        logup_rhs_sumcheck, logup_rhs_claim, logup_m_at_rm2, logup_m_open_rm2,
+        m_com,
+        m_eval,
+        m_open,
+        logup_rhs_sumcheck,
+        logup_rhs_claim,
+        logup_m_at_rm2,
+        logup_m_open_rm2,
     };
 
     Ok((witness_proofs, global_m, r_vs))
@@ -620,9 +677,19 @@ pub fn verify_range_batched(
             verify_sumcheck(&proof.sumcheck, proof.claim_v, num_vars, transcript)
                 .map_err(|e| format!("GlobalRange witness {i} sumcheck: {e}"))?;
 
-        let acc_chunk = if num_vars == min_nv { &mut *acc_small } else { &mut *acc_large };
+        let acc_chunk = if num_vars == min_nv {
+            &mut *acc_small
+        } else {
+            &mut *acc_large
+        };
         acc_chunk
-            .add_verify_batch(&proof.chunk_coms, &proof.chunk_evals, &r_v, &proof.chunk_batch_proof, transcript)
+            .add_verify_batch(
+                &proof.chunk_coms,
+                &proof.chunk_evals,
+                &r_v,
+                &proof.chunk_batch_proof,
+                transcript,
+            )
             .map_err(|e| format!("GlobalRange witness {i} chunk opening (deferred): {e}"))?;
 
         let mut expected = F::ZERO;
@@ -663,8 +730,11 @@ pub fn verify_range_batched(
         let num_vars = num_vars_list[i];
         let n_padded = 1usize << num_vars;
         // Route LogUp opens to the same accumulator as Phase-2 chunk opens.
-        let acc_logup: &mut HyraxBatchAccumulator =
-            if num_vars == min_nv { &mut *acc_small } else { &mut *acc_large };
+        let acc_logup: &mut HyraxBatchAccumulator = if num_vars == min_nv {
+            &mut *acc_small
+        } else {
+            &mut *acc_large
+        };
 
         for c in 0..num_chunks {
             let combined = proof.logup.combined_claims[c];
@@ -674,8 +744,12 @@ pub fn verify_range_batched(
 
             // Verify sumcheck: Σ_i h_k[i]*(1 + β*(α - C_k[i])) = combined
             let (r_k, final_val) = verify_sumcheck(
-                &proof.logup.combined_sumchecks[c], combined, num_vars, transcript,
-            ).map_err(|e| format!("LogUp witness {i} chunk {c} sumcheck: {e}"))?;
+                &proof.logup.combined_sumchecks[c],
+                combined,
+                num_vars,
+                transcript,
+            )
+            .map_err(|e| format!("LogUp witness {i} chunk {c} sumcheck: {e}"))?;
 
             let h_val = proof.logup.h_at_rk[c];
             let chunk_val = proof.logup.chunk_at_rk[c];
@@ -690,18 +764,32 @@ pub fn verify_range_batched(
 
             // Defer Hyrax opening MSMs to batch accumulator (inner-product checked above).
             acc_logup
-                .add_verify(&proof.logup.h_coms[c], h_val, &r_k, &proof.logup.h_open_proofs[c])
+                .add_verify(
+                    &proof.logup.h_coms[c],
+                    h_val,
+                    &r_k,
+                    &proof.logup.h_open_proofs[c],
+                )
                 .map_err(|e| format!("LogUp witness {i} chunk {c} h opening: {e}"))?;
             acc_logup
-                .add_verify(&proof.chunk_coms[c], chunk_val, &r_k, &proof.logup.chunk_open_proofs[c])
+                .add_verify(
+                    &proof.chunk_coms[c],
+                    chunk_val,
+                    &r_k,
+                    &proof.logup.chunk_open_proofs[c],
+                )
                 .map_err(|e| format!("LogUp witness {i} chunk {c} chunk opening: {e}"))?;
         }
     }
 
     // RHS sumcheck: Σ_j M[j] * g[j] = logup_rhs_claim, g[j] = 1/(α - j)
     let (r_m2, final_mg) = verify_sumcheck(
-        &global_m.logup_rhs_sumcheck, global_m.logup_rhs_claim, CHUNK_BITS, transcript,
-    ).map_err(|e| format!("LogUp RHS sumcheck: {e}"))?;
+        &global_m.logup_rhs_sumcheck,
+        global_m.logup_rhs_claim,
+        CHUNK_BITS,
+        transcript,
+    )
+    .map_err(|e| format!("LogUp RHS sumcheck: {e}"))?;
 
     let g_mle_at_rm2 = g_mle_eval(alpha, &r_m2);
     let m_at_rm2 = global_m.logup_m_at_rm2;
@@ -868,7 +956,11 @@ mod range_tests {
 
         let mut vt = Transcript::new(b"range16");
         let result = verify_range(&proof, num_vars, 16, &mut vt);
-        assert!(result.is_ok(), "16-bit range proof failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "16-bit range proof failed: {:?}",
+            result.err()
+        );
     }
 
     /// Power-of-two number of values.
@@ -883,7 +975,11 @@ mod range_tests {
 
         let mut vt = Transcript::new(b"range_pow2");
         let result = verify_range(&proof, num_vars, 32, &mut vt);
-        assert!(result.is_ok(), "power-of-two count range proof failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "power-of-two count range proof failed: {:?}",
+            result.err()
+        );
     }
 
     /// All values equal zero: an edge case for multiplicity counters.
@@ -898,7 +994,11 @@ mod range_tests {
 
         let mut vt = Transcript::new(b"range_zeros");
         let result = verify_range(&proof, num_vars, 16, &mut vt);
-        assert!(result.is_ok(), "all-zeros range proof failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "all-zeros range proof failed: {:?}",
+            result.err()
+        );
     }
 
     /// Tampered chunk batch proof (proof.chunk_batch_proof) should be caught.
@@ -915,6 +1015,9 @@ mod range_tests {
 
         let mut vt = Transcript::new(b"range_test");
         let result = verify_range(&proof, num_vars, 32, &mut vt);
-        assert!(result.is_err(), "Should reject corrupted chunk opening proof");
+        assert!(
+            result.is_err(),
+            "Should reject corrupted chunk opening proof"
+        );
     }
 }

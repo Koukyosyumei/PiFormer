@@ -90,15 +90,17 @@ This structure exactly matches the **Lasso** lookup argument (§3.5), which expl
 
 **Initialization:** Sub-tables are initialized to approximate $\text{GeLU}(x)/c$ so that their sum closely approximates GeLU at the start of training, enabling stable convergence.
 
-### 2.4 Power-of-Two Weight Quantization
+### 2.4 Ternary Weight Quantization
 
-Projection matrices $W_Q, W_K, W_V, W_O$ and FFN weight matrices are constrained to entries in
+Projection matrices $W_Q, W_K, W_V, W_O$, FFN weight matrices, and the language-model head are constrained to entries in
 
-$$\mathcal{W} = \{0\} \cup \{\pm 2^k \mid k = 0, 1, \ldots, k_{\max}\}$$
+$$\mathcal{T} = \{-1,\, 0,\, +1\}$$
 
-A matrix-vector product $y = Wx$ with $W \in \mathcal{W}^{m \times n}$ in the circuit requires only additions and multiplications by field constants (left-shifts). There are no general field multiplications, so this is **free** in the sumcheck constraint system.
+with a single learnable scalar $\alpha \in \mathbb{F}_r$ per layer absorbing the magnitude. Each forward pass applies $Y = \alpha \cdot (X \cdot W) + b$ where $W \in \mathcal{T}^{m \times n}$. In the circuit, a matrix-vector product with $W \in \mathcal{T}^{m \times n}$ requires only additions and subtractions — no field multiplications — so the contraction is **free** in the sumcheck constraint system. The Rust prover represents weights as `Vec<Vec<TernaryValue>>` where `TernaryValue ∈ {ONE, ZERO, MINUSONE}`, and uses the specialized `eval_cols_ternary` helper to fold the equality polynomial against ternary entries with `+= / -= / skip` rather than field multiplications.
 
-**Training:** A straight-through estimator (STE) is used. The forward pass applies nearest-neighbor quantization to $\mathcal{W}$; the backward pass uses the identity function in place of the quantizer's zero gradient.
+**Training:** A straight-through estimator (STE) is used. The forward pass applies a magnitude-thresholded mapping $w \mapsto \mathrm{sign}(w) \cdot [\,|w| > 0.7 \cdot \overline{|w|}\,]$; the backward pass uses the identity function in place of the quantizer's zero gradient. The learnable $\alpha$ is multiplied in *after* the matrix product, so the in-circuit weight stays ternary.
+
+**Stand-alone enforcement.** A self-contained Lasso check (`attention/ternary_check.rs`) proves that every committed weight value is in $\{-1, 0, +1\}$ using a 4-element table $T = [0, 1, p-1, 0]$ keyed by an integer index $\mathsf{enc}(w) \in \{0,1,2\}$. This module is currently a stand-alone protocol with its own tests; a future revision will fold it into setup-time preprocessing so the verifying key contains a binding proof that $W \in \mathcal{T}^{m \times n}$.
 
 ---
 
@@ -235,20 +237,28 @@ $$\gamma_j \cdot (d \cdot x[i][j] - \mathsf{sum\_x}[i]) + \beta_j \cdot d \cdot 
 
 ### 3.8 Projection Circuit
 
-Proves $Y = X \cdot W$ where $W$ is a committed weight matrix with entries in $\mathcal{W}$.
+Proves $Y = \alpha \cdot (X \cdot W) + b$ where $W$ is a committed ternary weight matrix ($W \in \mathcal{T}^{m \times n}$) and $\alpha \in \mathbb{F}_r$ is a per-layer scale absorbed into the sumcheck claim.
 
 A single random entry $(r_t, r_d)$ is selected via Fiat-Shamir; a degree-2 sumcheck over the contraction index $k$ proves:
-$$Y(r_t, r_d) = \sum_{k \in \{0,1\}^{k_{\mathsf{bits}}}} X(r_t, k) \cdot W(k, r_d)$$
+$$Y(r_t, r_d) - b(r_d) = \alpha \cdot \sum_{k \in \{0,1\}^{k_{\mathsf{bits}}}} X(r_t, k) \cdot W(k, r_d)$$
 
-Hyrax openings bind $X$, $Y$, and $W$ to their claimed MLE evaluations.
+Hyrax openings bind $X$, $Y$, $W$, and $b$ to their claimed MLE evaluations. Because $W$ is ternary, the prover materialises only the cheap $\alpha \cdot W(\cdot, r_d)$ vector via `eval_cols_ternary`, never a full $\mathbb{F}_r$ weight matrix.
 
 **Batched QKV variant:** A single sumcheck proves three projections simultaneously using Fiat-Shamir scalars $\lambda, \mu$:
-$$\lambda \cdot \alpha_Q Y_Q(r_t, r_d) + \mu \cdot \alpha_K Y_K(r_t, r_d) + \alpha_V Y_V(r_t, r_d) = \sum_k X(r_t, k) \cdot (\lambda \alpha_Q W_Q(k,r_d) + \mu \alpha_K W_K(k,r_d) + \alpha_V W_V(k,r_d))$$
+$$\lambda \cdot (Y_Q(r_t, r_d) - b_Q(r_d)) + \mu \cdot (Y_K(r_t, r_d) - b_K(r_d)) + (Y_V(r_t, r_d) - b_V(r_d)) = \sum_k X(r_t, k) \cdot \big(\lambda \alpha_Q W_Q(k,r_d) + \mu \alpha_K W_K(k,r_d) + \alpha_V W_V(k,r_d)\big)$$
 All three projections share the same sumcheck challenge $r_k$, reducing the sumcheck cost from $3\times$ to $1\times$.
+
+**Cross-layer variant (`cross_layer/projection.rs`):** A stand-alone cubic sumcheck proves $Y_l = \alpha_l \cdot X_l \cdot W_l + b_l$ for **all** $L$ layers simultaneously by introducing a layer index variable $b \in \{0,1\}^{\log L}$. The verifier samples a single $(r_l, r_t, r_{\mathsf{out}})$ and the sumcheck runs over $(\log L + \log d_{\mathsf{in}})$ rounds with three multiplicands $f \cdot g \cdot h$ representing the layer-selector $\widetilde{\mathsf{eq}}(r_l, b)$, the activation $X(b, r_t, c)$, and the weight $W(b, c, r_{\mathsf{out}})$. This module is exercised by its own unit tests but is **not yet wired into the end-to-end prover**.
 
 ### 3.9 Linear Attention Circuit
 
-Proves the following claims for a single attention head:
+The Rust prover proves the **un-normalized** linear-attention output
+
+$$\mathsf{Out}_{\mathsf{attn}} = \phi(Q)\,\big(\phi(K)^\top V\big) \cdot W_O$$
+
+for a single head ($n_{\mathsf{heads}} = 1$). The Python `LinearAttentionLayer` additionally divides by a normalizer $Z = \phi(Q) \cdot \sum_s \phi(K_s)$ for training stability; that division is **not** currently part of the SNARK circuit. To match the Rust prover at inference time, either disable $Z$ in the export step or extend the circuit with a row-normalization sumcheck (planned).
+
+The four core claims for a single head are:
 
 | Step | Statement | Protocol |
 |------|-----------|----------|
@@ -259,7 +269,7 @@ Proves the following claims for a single attention head:
 
 Steps 3–4 use a random-entry reduction. The verifier draws $(r_{out}, r_i)$ via Fiat-Shamir and audits a single entry per matrix product.
 
-**GKR backward fusion with O-projection:** The output projection $\mathsf{Out\_inner} = \mathsf{Out} \cdot W_O$ is proved *before* the attention sub-prover. The O-projection prover opens $\mathsf{Out\_inner}$ at a random point $(r_x, r_y)$ and returns this claim. The attention prover receives this as an *external claim* on $\mathsf{Out}$, eliminating the $\mathsf{out\_inner\_com}$ commitment entirely. Two independent sumchecks over different sub-problems share the same binding point, and a cheating prover who fakes either one would fail the other.
+**Cross-block batching of attention.** The end-to-end model prover (§4.2) batches steps 3 and 4 across all $L$ blocks. Two `SumcheckProofMulti` instances — `batch_attn_out` and `batch_attn_ctx` — share one set of sumcheck challenges across all blocks, with per-block claims combined by Fiat-Shamir powers of $\eta$. Per-block opening claims for $\Phi_Q$, $\Phi_K$, $V$ at the shared evaluation points are folded into the global cross-block batch opens (§4.2).
 
 ### 3.10 FFN Circuit
 
@@ -314,7 +324,9 @@ Algorithm Setup(model_weights θ, params):
   return (PK, VK)
 ```
 
-### 4.2 End-to-End Prover
+### 4.2 End-to-End Prover (Cross-Block Batch Architecture)
+
+The model prover does **not** prove blocks independently. Instead, after a per-block "Phase 1" that commits intermediate matrices and runs LayerNorm + range proofs, the prover runs a small number of *cross-block* batched sumchecks that cover one protocol type (e.g. QKV projection) across all $L$ blocks at once, with per-block claims combined by Fiat-Shamir powers of $\eta$.
 
 ```
 Algorithm Prove(PK, witness W, instances inst):
@@ -326,164 +338,188 @@ Algorithm Prove(PK, witness W, instances inst):
   Output:
     π           : TransformerModelProof
 
-  // 1. Initialize Fiat-Shamir transcript
+  // ── 1. Bind initial input ───────────────────────────────────────────────
   FS.init("piformer")
   x_in_com ← Com(W.x_in)
   FS.absorb("x_in_com", x_in_com)
 
+  // ── 2. Phase 1 (per block): commit 7 intermediates, prove LN1+LN2 ──────
   x_cur_com ← x_in_com
-  block_proofs ← []
-
-  // 2. Prove each transformer block
+  phase1[0..L-1] ← []
   For ℓ = 0 to L-1:
-    (block_π_ℓ, x_out_com_ℓ) ← ProveBlock(
-        PK.blocks[ℓ], W.block_witnesses[ℓ],
-        inst.attn_inst[ℓ], inst.ffn_inst[ℓ],
-        x_cur_com, FS)
-    block_proofs.append(block_π_ℓ)
-    x_cur_com ← x_out_com_ℓ
+    p1 ← CommitBlockPhase1(W.block_witnesses[ℓ], x_cur_com, PK.block_pks[ℓ], FS)
+    // p1 contains: x_norm1_com, q_com, k_com, v_com, out_attn_com,
+    //              x_norm2_com, out_ffn_com, x_mid_com, ln1_proof, ln2_proof,
+    //              block_range_m
+    x_cur_com ← HyraxAdd(p1.x_mid_com, p1.out_ffn_com)
+    phase1.append(p1)
 
-  // 3. Final LayerNorm range batch (σ and y for final_ln)
+  // ── 3. Derive global r_td after ALL Phase 1 commitments ────────────────
+  r_td ← FS.challenge("gkr_r_td", t_bits + d_bits)
+  (r_t, r_out) ← split(r_td, t_bits, d_bits)
+
+  // ── 4. Cross-block QKV sumcheck ─────────────────────────────────────────
+  For ℓ = 0 to L-1:
+    Absorb (Wq, Wk, Wv, αq, αk, αv, bq, bk, bv) commitments for block ℓ
+    (λ_ℓ, μ_ℓ) ← FS.challenges("qkv_lambda", "qkv_mu")
+    Build f_ℓ(k) = X_norm1_ℓ(r_t, k)
+    Build g_ℓ(k) = λ_ℓ αq Wq_ℓ(k, r_out) + μ_ℓ αk Wk_ℓ(k, r_out) + αv Wv_ℓ(k, r_out)
+    target_ℓ = λ_ℓ (Q_ℓ - bq_ℓ) + μ_ℓ (K_ℓ - bk_ℓ) + (V_ℓ - bv_ℓ)
+    FS.append claims (Q_ℓ, K_ℓ, V_ℓ at r_td)
+  η_qkv ← FS.challenge("batch_eta_qkv")
+  (batch_qkv, r_k_qkv) ← ProveSumcheckMulti({f_ℓ}, {g_ℓ}, powers(η_qkv), Σ η^ℓ target_ℓ, FS)
+
+  // ── 5. Cross-block O-projection sumcheck ────────────────────────────────
+  Per block: build f_ℓ(k) = α_O · X_inner_ℓ(r_t, k), g_ℓ(k) = Wo_ℓ(k, r_out)
+  η_oproj ← FS.challenge("batch_eta_oproj")
+  (batch_oproj, r_k_o) ← ProveSumcheckMulti(...)
+
+  // ── 6. Cross-block Attention (out, then ctx) ────────────────────────────
+  For ℓ = 0 to L-1:
+    Commit phi_q_ℓ, phi_k_ℓ; absorb both
+  // 6a. out_ℓ(r_t, r_k_o) = Σ_k phi_q_ℓ(r_t, k) · ctx_ℓ(k, r_k_o)
+  (batch_attn_out, batch_r_attn_out) ← ProveSumcheckMulti({phi_q_ℓ@(r_t, ·)},
+                                                           {ctx_ℓ@(·, r_k_o)}, ...)
+  // 6b. ctx_ℓ(batch_r_attn_out, r_k_o) = Σ_t phi_k_ℓ(t, batch_r_attn_out) · v_ℓ(t, r_k_o)
+  (batch_attn_ctx, batch_r_attn_ctx) ← ProveSumcheckMulti({phi_k_ℓ@(·, batch_r_attn_out)},
+                                                           {v_ℓ@(·, r_k_o)}, ...)
+
+  // ── 7. Per-block FFN: Lasso (commits A) → commit M ──────────────────────
+  For ℓ = 0 to L-1:
+    Absorb (W1, W2) commitments
+    ffn_lasso_proof_ℓ ← ProveLasso(inst.ffn.activation_lasso, ...)  // commits A
+    M_ℓ ← W.ffn.m;  m_com_ℓ ← Com(M_ℓ);  FS.absorb(m_com_ℓ)
+
+  // Bind FFN lasso indices to a shared (rx, ry) point and open all M_ℓ at once
+  Absorb concatenated lasso indices
+  ffn_lasso_bind_point ← FS.challenge_vec(t_bits + f_bits)
+  ffn_lasso_bind_open ← HyraxOpenBatch({M_ℓ}, ffn_lasso_bind_point, ...)
+
+  // ── 8. Cross-block FFN-Y sumcheck: Y = A · W2 ───────────────────────────
+  Per block: f_ℓ(k) = A_ℓ(r_t, k), g_ℓ(k) = W2_ℓ(k, r_out)
+  (batch_ffn_y, r_k_fy) ← ProveSumcheckMulti(...)
+
+  // ── 9. Cross-block FFN-M sumcheck: M = X_norm2 · W1 ─────────────────────
+  rx_m ← FS.challenge_vec(t_bits, "ffn_rx_m")
+  ry_m ← FS.challenge_vec(f_bits, "ffn_ry_m")
+  Per block: f_ℓ(k) = X_norm2_ℓ(rx_m, k), g_ℓ(k) = W1_ℓ(k, ry_m)
+  (batch_ffn_m, r_k_m) ← ProveSumcheckMulti(...)
+
+  // ── 10. Final LayerNorm + LM head ───────────────────────────────────────
   final_rw ← ComputeRangeWitnesses(W.final_ln_wit, PK.final_ln_vk)
   (final_rps, final_range_m, final_rvs) ← ProveRangeBatched(
       [final_rw.σ_witness, final_rw.y_witness], bits=32, FS)
+  final_ln_out_com ← Com(W.final_ln_wit.y)
+  final_ln_π ← ProveLayerNorm(W.final_ln_wit, {x_cur_com, final_ln_out_com},
+                              PK.final_ln_vk, final_rps[0..1], FS)
+  logits_com ← Com(W.lm_head_wit.y)
+  (lm_head_π, lm_y_claim, _) ← ProveProjection(PK.lm_head_pk, W.lm_head_wit,
+                                                {x_com: final_ln_out_com}, FS, None)
+  lm_head_logits_open ← HyraxOpen(W.lm_head_wit.y, lm_y_claim.point, ...)
 
-  // 4. Prove final LayerNorm
-  final_ln_io_coms ← { x_com: x_cur_com,
-                        y_com: Com(W.final_ln_wit.y) }
-  final_ln_π ← ProveLayerNorm(
-      W.final_ln_wit, final_ln_io_coms, PK.final_ln_vk,
-      σ_range=(final_rps[0], final_rvs[0]),
-      y_range=(final_rps[1], final_rvs[1]),
-      FS)
+  // ── 11. Advance transcript for accumulator μ-challenges ─────────────────
+  For 10 deferred accumulators: FS.challenge("hyrax_group_mu")
 
-  // 5. Prove LM head projection
-  lm_head_io_coms ← { x_com: final_ln_io_coms.y_com,
-                       y_com: Com(W.lm_head_wit.y) }
-  lm_head_π ← ProveProjection(
-      PK.lm_head_pk, W.lm_head_wit, lm_head_io_coms, FS)
+  // ── 12. Global intermediate batch open ──────────────────────────────────
+  // 5L matrices (Q, K, V, Out_attn, Out_ffn) opened at shared r_td
+  inter_batch_open ← HyraxOpenBatch({Q_ℓ, K_ℓ, V_ℓ, Out_attn_ℓ, Out_ffn_ℓ}_{ℓ=0..L-1},
+                                     r_td, ν_td, σ_td, FS)
 
-  // 6. Finalise six deferred Hyrax batch accumulators
-  //    Each outputs one batched MSM challenge + proof
-  ln_acc_t.finalize(FS)       // LayerNorm row openings
-  ln_acc_td.finalize(FS)      // LayerNorm (row,col) openings
-  proj_acc_w.finalize(FS)     // Projection weight openings
-  proj_acc_b.finalize(FS)     // Projection bias openings
-  lmh_acc_w.finalize(FS)      // LM head weight openings
-  lmh_acc_b.finalize(FS)      // LM head bias openings
+  // ── 13. Cross-block batch opens for weights, biases, activations ────────
+  // One HyraxOpenBatch per (matrix-type, evaluation-point) pair:
+  //   x_norm1 @ (r_t, r_k_qkv);   Wq, Wk, Wv @ (r_k_qkv, r_out);   bq, bk, bv @ r_out
+  //   Wo @ (r_k_o, r_out);        bo @ r_out
+  //   W2 @ (r_k_fy, r_out);       W1 @ (r_k_m, ry_m);   x_norm2 @ (rx_m, r_k_m)
+  //   M  @ (rx_m, ry_m)
+  //   phi_q @ (r_t, batch_r_attn_out);   phi_k @ (batch_r_attn_ctx, batch_r_attn_out)
+  //   v @ (batch_r_attn_ctx, r_k_o)      (per-block opening; v_attn_batch_open)
+  // (See prover.rs §15 for the full list of 17 batch opens.)
 
-  // 7. Global Lasso batch (all φ(Q) and φ(K) across all blocks)
+  // ── 14. Global Lasso batch (all φ(Q) and φ(K) across all blocks) ────────
   all_lasso_π ← ProveLassoMulti(
-      [inst.attn_inst[ℓ].q_lasso, inst.attn_inst[ℓ].k_lasso
-       for ℓ in 0..L-1],
-      PK.lasso_pk, FS)
+      [inst.attn[ℓ].q_lasso, inst.attn[ℓ].k_lasso for ℓ in 0..L-1], PK.lasso_pk, FS)
 
   return TransformerModelProof {
-    x_in_com, block_proofs,
-    final_range_m, final_ln_π, lm_head_π,
-    acc_proofs: [ln_t, ln_td, proj_w, proj_b, lmh_w, lmh_b],
+    x_in_com, block_proofs[0..L-1],
+    final_range_m, final_ln_proof, lm_head_proof,
+    final_ln_out_com, logits_com, lm_head_logits_open,
+    batch_qkv, batch_oproj, batch_ffn_y, batch_ffn_m,
+    batch_attn_out, batch_attn_ctx,
+    inter_batch_open,
+    {x_norm1, w_q, w_k, w_v, bias_q, bias_k, bias_v,
+     w_o, bias_o, w2, w1, x_norm2,
+     ffn_m_com, ffn_lasso_bind, phi_q, phi_k, v_attn, qk_lasso_bind}_batch_open,
     all_lasso_π
   }
 ```
 
-### 4.3 Block Prover
+Each `TransformerBlockProof` carries the 7 intermediate commitments, the LN1/LN2 sub-proofs, the per-block range-multiplicity commitment, the FFN Lasso proof + `M` commitment, and the per-block scalar evaluations consumed by the cross-block batch sumchecks (`q_eval`, `k_eval`, `v_eval`, `attn_phi_q_eval`, `attn_phi_k_eval`, `attn_ctx_eval`, `attn_v_eval`, etc.).
+
+### 4.3 Block Phase 1 (Per-Block Commit + LayerNorm)
+
+The only truly per-block step is **Phase 1**: it commits the seven intermediate matrices, runs the global range batch for both LayerNorms, and proves LN1 / LN2. The remaining sub-protocols (QKV, O-projection, attention, FFN) are *not* run independently per block — they are batched cross-block in §4.2 steps 4–9.
 
 ```
-Algorithm ProveBlock(pk, wit, attn_inst, ffn_inst, x_in_com, FS):
+Algorithm CommitBlockPhase1(wit, x_in_com, pk, FS):
   Input:
-    pk      : TransformerBlockProvingKey
-    wit     : { ln1_wit, qkv_wit, o_proj_wit, attn_wit, ln2_wit, ffn_wit }
+    pk      : TransformerBlockVerifyingKey (carries projection / attention PKs too)
+    wit     : { ln1_wit, q_proj_wit, k_proj_wit, v_proj_wit,
+                o_proj_wit, attn_wit, ln2_wit, ffn_wit }
     x_in_com: Hyrax commitment to X_in ∈ F^{T×d}
   Output:
-    (π, x_out_com)
+    BlockPhase1Data
+      { ln1_proof, ln2_proof, block_range_m,
+        x_norm1_com, q_com, k_com, v_com,
+        out_attn_com, x_norm2_com, out_ffn_com, x_mid_com }
 
-  // ── PHASE 0: Global range batch for this block ──────────────────────────
-  // Commit all chunk arrays and one shared m_com BEFORE any sumchecks
+  // ── 0. Commit 7 intermediate matrices ───────────────────────────────────
+  x_norm1_com  ← Com(wit.ln1_wit.y)
+  q_com        ← Com(wit.attn_wit.q)
+  k_com        ← Com(wit.attn_wit.k)
+  v_com        ← Com(wit.attn_wit.v)
+  out_attn_com ← Com(wit.o_proj_wit.y)
+  x_norm2_com  ← Com(wit.ln2_wit.y)
+  out_ffn_com  ← Com(wit.ffn_wit.y)
+
+  // ── 1. Global range batch for both LayerNorms in this block ────────────
+  // 4 witnesses (ln1.σ, ln1.y, ln2.σ, ln2.y) share one m_com
   rw1 ← ComputeRangeWitnesses(wit.ln1_wit, pk.ln1_vk)
   rw2 ← ComputeRangeWitnesses(wit.ln2_wit, pk.ln2_vk)
   (block_rps, block_range_m, block_rvs) ← ProveRangeBatched(
       [rw1.σ_witness, rw1.y_witness, rw2.σ_witness, rw2.y_witness],
       bits=32, FS)
-  // Transcript now contains: cc^(0)..cc^(3), m_com (5 commitments)
-  // block_rps[i] = RangeWitnessProof per witness (no m_com)
-  // block_rvs[i] = random evaluation point r_v^(i) ∈ F^{t_bits + d_bits + 1}
 
-  // ── PHASE 1: LayerNorm 1 ────────────────────────────────────────────────
-  x_norm1_com ← Com(wit.ln1_wit.y)
-  ln1_io_coms ← { x_com: x_in_com, y_com: x_norm1_com }
-  ln1_π ← ProveLayerNorm(wit.ln1_wit, ln1_io_coms, pk.ln1_vk,
-               σ_range=(block_rps[0], block_rvs[0]),
-               y_range=(block_rps[1], block_rvs[1]), FS)
+  // ── 2. LayerNorm 1 (uses x_norm1_com as y_com) ─────────────────────────
+  ln1_io ← { x_com: x_in_com, y_com: x_norm1_com }
+  ln1_proof ← ProveLayerNorm(wit.ln1_wit, ln1_io, pk.ln1_vk,
+                              σ_range=(block_rps[0], block_rvs[0]),
+                              y_range=(block_rps[1], block_rvs[1]), FS)
 
-  // ── PHASE 2: Batched QKV Projections ────────────────────────────────────
-  q_com ← Com(wit.qkv_wit.q)
-  k_com ← Com(wit.qkv_wit.k)
-  v_com ← Com(wit.qkv_wit.v)
-  qkv_io_coms ← { x_com: x_norm1_com, q_com, k_com, v_com }
-  (qkv_π, q_claim, k_claim, v_proj_claim, x_norm1_claim) ←
-      ProveQKVProjections(pk.qkv_pk, wit.qkv_wit, qkv_io_coms, FS)
-  // Single sumcheck for three projections; shared r_k across Q, K, V
+  // ── 3. Absorb q/k/v_com and out_attn_com explicitly ────────────────────
+  // (the cross-block QKV / O-proj sumchecks rely on this transcript order)
+  FS.absorb("q_com", q_com)
+  FS.absorb("k_com", k_com)
+  FS.absorb("v_com", v_com)
+  FS.absorb("out_attn_com", out_attn_com)
 
-  // ── PHASE 3: Output Projection (GKR forward, before attention) ──────────
-  out_attn_com ← Com(wit.o_proj_wit.y)
-  o_proj_io_coms ← { x_com: None,         // x deferred (GKR backward)
-                      y_com: out_attn_com }
-  (o_proj_π, o_y_claim, o_x_claim) ←
-      ProveProjection(pk.o_proj_pk, wit.o_proj_wit, o_proj_io_coms, FS)
-  // o_x_claim = Out_inner evaluated at (r_x, r_y): used as external claim
-
-  // ── PHASE 4: Linear Attention ────────────────────────────────────────────
-  attn_io_coms ← { q_com, k_com, v_com }
-  (attn_π, attn_out_claim, attn_v_claim) ←
-      ProveLinearAttention(wit.attn_wit, attn_inst,
-          attn_io_coms, external_out_claim=o_x_claim, FS)
-  // o_x_claim binds attention's Out to the same point as O-proj
-  // No out_inner_com emitted (GKR fusion)
-
-  // ── PHASE 5: Residual 1 (homomorphic, zero proof cost) ──────────────────
+  // ── 4. Residual 1 (homomorphic) ────────────────────────────────────────
   x_mid_com ← HyraxAdd(x_in_com, out_attn_com)
-  // x_mid_com = Com(X_in + Out_attn) by Hyrax linearity; no proof needed
 
-  // ── PHASE 6: LayerNorm 2 ────────────────────────────────────────────────
-  x_norm2_com ← Com(wit.ln2_wit.y)
-  ln2_io_coms ← { x_com: x_mid_com, y_com: x_norm2_com }
-  ln2_π ← ProveLayerNorm(wit.ln2_wit, ln2_io_coms, pk.ln2_vk,
-               σ_range=(block_rps[2], block_rvs[2]),
-               y_range=(block_rps[3], block_rvs[3]), FS)
+  // ── 5. LayerNorm 2 (uses x_norm2_com as y_com) ─────────────────────────
+  ln2_io ← { x_com: x_mid_com, y_com: x_norm2_com }
+  ln2_proof ← ProveLayerNorm(wit.ln2_wit, ln2_io, pk.ln2_vk,
+                              σ_range=(block_rps[2], block_rvs[2]),
+                              y_range=(block_rps[3], block_rvs[3]), FS)
 
-  // ── PHASE 7: FFN (GKR backward: Lasso → Y-proj → M-proj) ───────────────
-  out_ffn_com ← Com(wit.ffn_wit.y)
-  ffn_io_coms ← { x_com: x_norm2_com, y_com: out_ffn_com }
-  (ffn_π, ffn_y_claim, ffn_x_claim) ←
-      ProveFFN(pk.ffn_pk, wit.ffn_wit, ffn_inst, ffn_io_coms, FS)
-  // a_com eliminated: Lasso runs first, A(r_k) verified from Lasso MLE
+  // ── 6. Absorb out_ffn_com (so transcript matches Phase 2 expectations) ─
+  FS.absorb("y_com", out_ffn_com)
 
-  // ── PHASE 8: Multi-claim Combine for V ──────────────────────────────────
-  (v_combine_π, v_r, v_eval) ←
-      ProveCombine(wit.qkv_wit.v, v_com,
-                   [v_proj_claim, attn_v_claim], FS)
-
-  // ── PHASE 9: Batch 7 Hyrax openings ─────────────────────────────────────
-  // Openings deferred to block-level MSM batch (multi-point verifier)
-  HyraxBatchOpen([
-    (q_com,        q_claim.eval,       q_claim.point),
-    (k_com,        k_claim.eval,       k_claim.point),
-    (x_norm1_com,  x_norm1_claim.eval, x_norm1_claim.point),
-    (out_attn_com, o_y_claim.eval,     o_y_claim.point),
-    (x_norm2_com,  ln2_x_claim.eval,   ln2_x_claim.point),
-    (out_ffn_com,  ffn_y_claim.eval,   ffn_y_claim.point),
-    (v_com,        v_eval,             v_r)
-  ], FS)
-
-  // ── PHASE 10: Residual 2 (homomorphic) ───────────────────────────────────
-  x_out_com ← HyraxAdd(x_mid_com, out_ffn_com)
-
-  return (TransformerBlockProof {
-    block_range_m,
-    ln1_π, qkv_π, o_proj_π, attn_π, ln2_π, ffn_π, v_combine_π,
-    x_norm1_com, q_com, k_com, v_com, out_attn_com, x_norm2_com, out_ffn_com
-  }, x_out_com)
+  return { ln1_proof, ln2_proof, block_range_m,
+           x_norm1_com, q_com, k_com, v_com,
+           out_attn_com, x_norm2_com, out_ffn_com, x_mid_com }
 ```
+
+Residual 2 (`x_out_com = HyraxAdd(x_mid_com, out_ffn_com)`) is computed by the model-level prover after Phase 1 returns. The cross-block sumchecks in §4.2 (steps 4–9) consume the per-block intermediate commitments and the witness arrays directly; no further per-block sub-proofs are produced.
 
 ### 4.4 Range Proof Prover (Batched)
 
@@ -622,141 +658,136 @@ Algorithm ProveLayerNorm(wit, io_coms, vk, σ_range, y_range, FS):
 ### 4.6 End-to-End Verifier
 
 ```
-Algorithm Verify(VK, x_in_com, logits_com, π):
+Algorithm Verify(VK, π, inst_attn, inst_ffn, public_x_in, public_logits):
   Input:
-    VK           : verifying key (weight commitments + generators)
-    x_in_com     : Hyrax commitment to input X_in
-    logits_com   : expected commitment to output logits
-    π            : TransformerModelProof
+    VK              : verifying key (weight commitments + generators)
+    π               : TransformerModelProof
+    public_x_in     : verifier-provided input matrix
+    public_logits   : verifier-provided expected output matrix
   Output:
     ACCEPT or REJECT
 
-  // 1. Initialize transcript (must match prover exactly)
+  // ── 1. Bind public I/O via re-commitment ────────────────────────────────
+  Assert Com(public_x_in)   == π.x_in_com
+  Assert Com(public_logits) == π.logits_com
   FS.init("piformer")
-  FS.absorb("x_in_com", x_in_com)
+  FS.absorb("x_in_com", π.x_in_com)
 
-  x_cur_com ← x_in_com
-
-  // 2. Verify each transformer block
+  // ── 2. Phase 1 verify (per block): range + LN1 + LN2 ───────────────────
+  Initialize accumulators: ln_acc_t, ln_acc_td, proj_acc_w, proj_acc_b,
+                           lmh_acc_w, lmh_acc_b,
+                           acc_range_sig, acc_range_y, acc_range_m, inter_acc
+  x_cur_com ← π.x_in_com
   For ℓ = 0 to L-1:
-    x_cur_com ← VerifyBlock(
-        VK.blocks[ℓ], π.block_proofs[ℓ],
-        x_cur_com, FS)
+    bp ← π.block_proofs[ℓ]
+    block_r_vs ← VerifyRangeBatched(
+        [bp.ln1_proof.σ_range_proof, bp.ln1_proof.y_range_proof,
+         bp.ln2_proof.σ_range_proof, bp.ln2_proof.y_range_proof],
+        bp.block_range_m, [ln_σ_n, ln_y_n, ln_σ_n, ln_y_n], 32, FS,
+        acc_range_sig, acc_range_y, acc_range_m)
+    VerifyLayerNorm(bp.ln1_proof, {x_cur_com, bp.x_norm1_com}, vk.ln1_vk,
+                    block_r_vs[0..1], FS, ln_acc_t, ln_acc_td)
+    FS.absorb(q_com, k_com, v_com, out_attn_com from bp)
+    x_mid_com ← HyraxAdd(x_cur_com, bp.out_attn_com)
+    VerifyLayerNorm(bp.ln2_proof, {x_mid_com, bp.x_norm2_com}, vk.ln2_vk,
+                    block_r_vs[2..4], FS, ln_acc_t, ln_acc_td)
+    FS.absorb(bp.out_ffn_com)
+    x_cur_com ← HyraxAdd(x_mid_com, bp.out_ffn_com)
 
-  // 3. Final LayerNorm range batch
+  // ── 3. Derive global r_td after ALL Phase 1 ────────────────────────────
+  r_td ← FS.challenge("gkr_r_td", t_bits + d_bits)
+
+  // ── 4–9. Six cross-block batch sumchecks (mirror prover §4.2) ──────────
+  Verify batch_qkv      → recover r_k_qkv
+  Verify batch_oproj    → recover r_k_o
+  Verify batch_attn_out → recover batch_r_attn_out
+  Verify batch_attn_ctx → recover batch_r_attn_ctx
+  Verify per-block FFN Lasso proofs and ffn_lasso_bind opening
+  Verify batch_ffn_y    → recover r_k_fy
+  Verify batch_ffn_m    → recover r_k_m
+  // Each sumcheck reduces L per-block claims to one batched final claim,
+  // which is checked algebraically against per-block (W, b, X, ...) evals
+  // produced by the corresponding cross-block batch open below.
+
+  // ── 10. Final LayerNorm + LM head ──────────────────────────────────────
   (final_r_vs, _) ← VerifyRangeBatched(
-      [π.final_ln_π.σ_range_proof, π.final_ln_π.y_range_proof],
-      π.final_range_m,
-      [ln_σ_n, ln_y_n], bits=32, FS)
+      [π.final_ln_proof.σ_range_proof, π.final_ln_proof.y_range_proof],
+      π.final_range_m, [ln_σ_n, ln_y_n], 32, FS, …)
+  VerifyLayerNorm(π.final_ln_proof, {x_cur_com, π.final_ln_out_com},
+                  VK.final_ln_vk, final_r_vs[0..1], FS, ln_acc_t, ln_acc_td)
+  VerifyProjection(π.lm_head_proof, VK.lm_head_vk,
+                   {x_com: π.final_ln_out_com}, FS, lmh_acc_w, lmh_acc_b)
+  Assert HyraxVerify(π.logits_com, lm_y_claim, π.lm_head_logits_open, FS)
 
-  // 4. Verify final LayerNorm
-  final_ln_io_coms ← { x_com: x_cur_com, y_com: π.final_ln_π.y_com }
-  VerifyLayerNorm(π.final_ln_π, final_ln_io_coms, VK.final_ln_vk,
-                  σ_rv=final_r_vs[0], y_rv=final_r_vs[1],
-                  FS, acc_t, acc_td)
+  // ── 11–13. Global intermediate batch open + 17 cross-block batch opens ─
+  Assert HyraxVerifyBatch({Q_ℓ, K_ℓ, V_ℓ, Out_attn_ℓ, Out_ffn_ℓ}_ℓ at r_td,
+                           π.inter_batch_open, …) == ACCEPT
+  For each (matrices, point, batch_open) listed in §4.2 step 13:
+      Assert HyraxVerifyBatch(matrices, point, batch_open, …) == ACCEPT
 
-  // 5. Verify LM head projection
-  lm_head_io_coms ← { x_com: final_ln_io_coms.y_com, y_com: logits_com }
-  VerifyProjection(π.lm_head_π, VK.lm_head_vk, lm_head_io_coms,
-                   FS, acc_w, acc_b)
+  // ── 14. Finalise deferred Hyrax accumulators (2 MSMs each) ─────────────
+  Assert ln_acc_t.finalize(FS) == ACCEPT
+  Assert ln_acc_td.finalize(FS) == ACCEPT
+  Assert proj_acc_w.finalize(FS) == ACCEPT
+  Assert proj_acc_b.finalize(FS) == ACCEPT
+  Assert lmh_acc_w.finalize(FS) == ACCEPT
+  Assert lmh_acc_b.finalize(FS) == ACCEPT
+  Assert acc_range_sig.finalize(FS) == ACCEPT
+  Assert acc_range_y.finalize(FS) == ACCEPT
+  Assert acc_range_m.finalize(FS) == ACCEPT
+  Assert inter_acc.finalize(FS) == ACCEPT
 
-  // 6. Finalise batch accumulators (2 MSMs each)
-  Assert acc_t.finalize(FS, π.acc_proofs.ln_t)     == ACCEPT
-  Assert acc_td.finalize(FS, π.acc_proofs.ln_td)   == ACCEPT
-  Assert acc_w.finalize(FS, π.acc_proofs.proj_w)   == ACCEPT
-  Assert acc_b.finalize(FS, π.acc_proofs.proj_b)   == ACCEPT
-  Assert acc_lmh_w.finalize(FS, π.acc_proofs.lmh_w) == ACCEPT
-  Assert acc_lmh_b.finalize(FS, π.acc_proofs.lmh_b) == ACCEPT
-
-  // 7. Global Lasso verification (all φ(Q), φ(K))
+  // ── 15. Global Lasso verification (all φ(Q), φ(K) across all blocks) ───
   Assert VerifyLassoMulti(
-      [inst.attn_inst[ℓ].q_lasso, inst.attn_inst[ℓ].k_lasso for ℓ in 0..L-1],
-      π.all_lasso_π, VK.lasso_vk, FS) == ACCEPT
+      [inst_attn[ℓ].q_lasso, inst_attn[ℓ].k_lasso for ℓ in 0..L-1],
+      π.all_lasso_proof, VK.lasso_vk, FS) == ACCEPT
 
   return ACCEPT
 ```
 
-### 4.7 Block Verifier
+### 4.7 Block Phase 1 Verifier
+
+The verifier walks each block in lockstep with the prover's Phase 1 (§4.3) — it never runs a stand-alone "block verifier" for the projection / attention / FFN sub-protocols, which are folded into the model-level cross-block sumchecks (§4.6 step 4–9).
 
 ```
-Algorithm VerifyBlock(vk, π, x_in_com, FS):
+Algorithm VerifyBlockPhase1(vk, bp, x_in_com, FS, accs):
   Input:
     vk           : TransformerBlockVerifyingKey
-    π            : TransformerBlockProof
-    x_in_com     : commitment to X_in
+    bp           : TransformerBlockProof (only the Phase 1 fields are read here)
+    x_in_com     : commitment to X_in for this block
   Output:
-    x_out_com    : commitment to X_out, or REJECT
+    x_out_com    : commitment to X_out, or REJECT (advances accumulators)
 
-  // ── PHASE 0: Global range batch ──────────────────────────────────────────
-  // Transcript must absorb chunk_coms and m_com in same order as prover
-  (block_r_vs, _) ← VerifyRangeBatched(
-      [π.ln1_π.σ_range_proof, π.ln1_π.y_range_proof,
-       π.ln2_π.σ_range_proof, π.ln2_π.y_range_proof],
-      π.block_range_m,
-      [ln_σ_n, ln_y_n, ln_σ_n, ln_y_n], bits=32, FS)
-  ln1_σ_rv ← block_r_vs[0];  ln1_y_rv ← block_r_vs[1]
-  ln2_σ_rv ← block_r_vs[2];  ln2_y_rv ← block_r_vs[3]
+  // ── 0. Range batch (4 witnesses share one m_com) ───────────────────────
+  block_r_vs ← VerifyRangeBatched(
+      [bp.ln1_proof.σ_range_proof, bp.ln1_proof.y_range_proof,
+       bp.ln2_proof.σ_range_proof, bp.ln2_proof.y_range_proof],
+      bp.block_range_m, [ln_σ_n, ln_y_n, ln_σ_n, ln_y_n], 32, FS,
+      accs.range_sig, accs.range_y, accs.range_m)
 
-  // ── PHASE 1: LayerNorm 1 ─────────────────────────────────────────────────
-  ln1_io_coms ← { x_com: x_in_com, y_com: π.x_norm1_com }
-  VerifyLayerNorm(π.ln1_π, ln1_io_coms, vk.ln1_vk,
-                  σ_rv=ln1_σ_rv, y_rv=ln1_y_rv,
-                  FS, acc_t, acc_td)
+  // ── 1. LN1 ──────────────────────────────────────────────────────────────
+  VerifyLayerNorm(bp.ln1_proof, {x_in_com, bp.x_norm1_com}, vk.ln1_vk,
+                  block_r_vs[0..1], FS, accs.ln_t, accs.ln_td)
 
-  // ── PHASE 2: Batched QKV Projections ─────────────────────────────────────
-  qkv_io_coms ← { x_com: π.x_norm1_com,
-                   q_com: π.q_com, k_com: π.k_com, v_com: π.v_com }
-  (q_claim, k_claim, v_proj_claim, x_norm1_claim) ←
-      VerifyQKVProjections(π.qkv_π, vk.qkv_vk, qkv_io_coms, FS, acc_w, acc_b)
+  // ── 2. Absorb Q/K/V/Out_attn coms (matches prover transcript) ──────────
+  FS.absorb("q_com", bp.q_com)
+  FS.absorb("k_com", bp.k_com)
+  FS.absorb("v_com", bp.v_com)
+  FS.absorb("out_attn_com", bp.out_attn_com)
 
-  // ── PHASE 3: Output Projection ───────────────────────────────────────────
-  o_proj_io_coms ← { x_com: None, y_com: π.out_attn_com }
-  (o_y_claim, o_x_claim) ←
-      VerifyProjection(π.o_proj_π, vk.o_proj_vk, o_proj_io_coms,
-                       FS, acc_w, acc_b)
+  // ── 3. Residual 1 ──────────────────────────────────────────────────────
+  x_mid_com ← HyraxAdd(x_in_com, bp.out_attn_com)
 
-  // ── PHASE 4: Linear Attention ─────────────────────────────────────────────
-  attn_io_coms ← { q_com: π.q_com, k_com: π.k_com, v_com: π.v_com }
-  (attn_out_claim, attn_v_claim) ←
-      VerifyLinearAttention(π.attn_π, attn_inst,
-          attn_io_coms, external_out_claim=o_x_claim, FS)
-  // GKR fusion: o_x_claim binds attention's Out evaluation
+  // ── 4. LN2 ──────────────────────────────────────────────────────────────
+  VerifyLayerNorm(bp.ln2_proof, {x_mid_com, bp.x_norm2_com}, vk.ln2_vk,
+                  block_r_vs[2..4], FS, accs.ln_t, accs.ln_td)
+  FS.absorb("y_com", bp.out_ffn_com)
 
-  // ── PHASE 5: Residual 1 ──────────────────────────────────────────────────
-  x_mid_com ← HyraxAdd(x_in_com, π.out_attn_com)
-
-  // ── PHASE 6: LayerNorm 2 ─────────────────────────────────────────────────
-  ln2_io_coms ← { x_com: x_mid_com, y_com: π.x_norm2_com }
-  VerifyLayerNorm(π.ln2_π, ln2_io_coms, vk.ln2_vk,
-                  σ_rv=ln2_σ_rv, y_rv=ln2_y_rv,
-                  FS, acc_t, acc_td)
-
-  // ── PHASE 7: FFN ─────────────────────────────────────────────────────────
-  ffn_io_coms ← { x_com: π.x_norm2_com, y_com: π.out_ffn_com }
-  (ffn_y_claim, ffn_x_claim) ←
-      VerifyFFN(π.ffn_π, ffn_inst, vk.ffn_vk, ffn_io_coms, FS)
-
-  // ── PHASE 8: Combine for V ───────────────────────────────────────────────
-  (v_r, v_eval) ← VerifyCombineDeferred(
-      π.v_combine_π, π.v_com,
-      [v_proj_claim, attn_v_claim], FS)
-
-  // ── PHASE 9: Block-level 7-point Hyrax batch ─────────────────────────────
-  Assert HyraxVerifyMultiPoint([
-    (π.q_com,        q_claim.eval,       q_claim.point),
-    (π.k_com,        k_claim.eval,       k_claim.point),
-    (π.x_norm1_com,  x_norm1_claim.eval, x_norm1_claim.point),
-    (π.out_attn_com, o_y_claim.eval,     o_y_claim.point),
-    (π.x_norm2_com,  ffn_x_claim.eval,   ffn_x_claim.point),
-    (π.out_ffn_com,  ffn_y_claim.eval,   ffn_y_claim.point),
-    (π.v_com,        v_eval,             v_r)
-  ], VK.params, FS) == ACCEPT
-
-  // ── PHASE 10: Residual 2 ─────────────────────────────────────────────────
-  x_out_com ← HyraxAdd(x_mid_com, π.out_ffn_com)
-
-  return x_out_com
+  // ── 5. Residual 2 ──────────────────────────────────────────────────────
+  return HyraxAdd(x_mid_com, bp.out_ffn_com)
 ```
+
+After all $L$ blocks complete Phase 1, the verifier draws `r_td` from the transcript and proceeds to verify the six cross-block batch sumchecks (§4.6 step 4–9), using the per-block scalar evaluations stored in each `TransformerBlockProof` (`q_eval`, `k_eval`, `v_eval_rtd`, `out_attn_eval`, `out_ffn_eval`, `attn_phi_q_eval`, `attn_phi_k_eval`, `attn_ctx_eval`, `attn_v_eval`, `qkv_w_q_eval`, …) as the per-block claims being batched.
 
 ### 4.8 Range Proof Verifier (Batched)
 
@@ -925,19 +956,17 @@ Algorithm VerifyLayerNorm(proof, io_coms, vk, σ_rv, y_rv, FS, acc_t, acc_td):
 
 ### 5.3 Soundness of Structural Optimizations
 
-**Theorem 2 (GKR Backward Fusion Soundness).** *Eliminating $\mathsf{out\_inner\_com}$ via the shared evaluation point between O-projection and attention does not reduce soundness.*
+**Theorem 2 (Cross-Block Batch Sumcheck Soundness).** *Replacing $L$ independent per-block projection sumchecks (one per block, per protocol type) with a single `SumcheckProofMulti` whose round polynomials are random linear combinations $\sum_\ell \eta^{\ell-1} \cdot p_\ell(X)$ does not reduce soundness.*
 
-*Proof.* The O-projection prover outputs an evaluation claim $(r_x, r_y, v)$ asserting $\mathsf{Out\_inner}(r_x, r_y) = v$. The attention prover is given this claim as its output constraint and runs an independent sumcheck to prove:
-$$\mathsf{Out}(r_x, r_y) = \sum_{i \in \{0,1\}^{d_h}} \Phi_Q(r_x, i) \cdot C(i, r_y)$$
-The two sumchecks are over different sub-problems (contraction index $k$ in O-proj; head dimension $i$ in attention). A cheating prover who wishes to pass both checks must simultaneously satisfy two independent polynomial identity checks at the same random point $(r_x, r_y)$. Since the Fiat-Shamir challenges $(r_x, r_y)$ are derived from the transcript *after* all commitments, and the two checks are algebraically independent, the cheating probability is at most $2 \cdot (n \delta / |\mathbb{F}_r|)$ — the same as proving two separate sumchecks. $\square$
+*Proof.* The Fiat-Shamir challenge $\eta$ is drawn from the transcript *after* all per-block commitments and per-block claims have been absorbed. Therefore the prover is committed to the per-block polynomials $\{f_\ell, g_\ell\}_{\ell=0}^{L-1}$ and the per-block targets $\{H_\ell\}$ before learning $\eta$. If any single $\hat H_\ell \neq H_\ell$, the combined claim $\sum_\ell \eta^{\ell-1} \hat H_\ell$ differs from the honest combined claim $\sum_\ell \eta^{\ell-1} H_\ell$ by a non-zero polynomial in $\eta$ of degree $\leq L-1$, which the verifier's random $\eta$ catches except with probability $(L-1)/|\mathbb{F}_r|$. Conditional on the combined target being honest, the inner sumcheck has soundness $n\delta / |\mathbb{F}_r|$ by Lemma 1. The total error is therefore $\leq (L-1)/|\mathbb{F}_r| + n\delta / |\mathbb{F}_r|$, dominated by the latter for transformer-scale $L$. The same argument applies to all six cross-block sumchecks (`batch_qkv`, `batch_oproj`, `batch_attn_out`, `batch_attn_ctx`, `batch_ffn_y`, `batch_ffn_m`). $\square$
 
 **Theorem 3 (Homomorphic Residual Soundness).** *The residual connections $X_{\mathsf{mid}} = X_{\mathsf{in}} + X_{\mathsf{out\_attn}}$ and $X_{\mathsf{out}} = X_{\mathsf{mid}} + X_{\mathsf{out\_ffn}}$, computed as $C_{\mathsf{mid}} = C_{\mathsf{in}} + C_{\mathsf{out\_attn}}$ by the verifier, are sound without any additional proof.*
 
 *Proof.* Since $\mathsf{Com}(A) + \mathsf{Com}(B) = \mathsf{Com}(A + B)$ holds by the linearity of MSM (Pedersen-style commitment), the verifier's local computation of $C_{\mathsf{mid}}$ is deterministically correct given the binding of $C_{\mathsf{in}}$ and $C_{\mathsf{out\_attn}}$. Binding of these two commitments is guaranteed by Lemma 2. $\square$
 
-**Theorem 4 (FFN GKR Ordering Soundness).** *Proving the activation Lasso before the Y-sumcheck (and eliminating $A_{\mathsf{com}}$) does not reduce soundness.*
+**Theorem 4 (FFN Lasso-First Ordering Soundness).** *Running the activation Lasso before any cross-block FFN sumcheck challenges (so that $A$ is bound to the transcript prior to $r_{k,fy}$ and $r_{k,m}$) does not reduce soundness.*
 
-*Proof.* The activation Lasso is committed to the transcript before the Y-sumcheck challenge $r_k$ is derived. Therefore the prover is committed to specific Lasso outputs before learning $r_k$. The verifier evaluates $A(r_k)$ from the Lasso outputs MLE, which is a public, deterministic function of the committed query outputs. A cheating prover who forges $A(r_k)$ must either forge the Lasso outputs (caught by Lemma 4) or forge the sumcheck (caught by Lemma 1). $\square$
+*Proof.* The per-block FFN Lasso is absorbed into the transcript in Phase 7 of `Prove` (§4.2), strictly before the cross-block FFN-Y and FFN-M sumcheck challenges are derived. Therefore the prover is committed to specific Lasso outputs before learning the binding points. The verifier opens $A$ at the shared `ffn_lasso_bind_point` via a single batched Hyrax open (`ffn_lasso_bind_open`) and consumes those evaluations as public inputs to the cross-block FFN-Y batch sumcheck. A cheating prover who forges any $A_\ell(\cdot)$ value must either forge the Lasso outputs (caught by Lemma 4), forge the Hyrax opening (caught by Lemma 2), or forge the batched sumcheck (caught by Theorem 2). $\square$
 
 **Theorem 5 (Batched QKV Soundness).** *The single shared-$r_k$ sumcheck for Q, K, V projections is as sound as three independent sumchecks.*
 
@@ -1026,14 +1055,17 @@ Let $L$ = layers, $T$ = sequence length, $d$ = embedding dimension, $d_{ff}$ = F
 
 **Savings from structural optimizations:**
 
-| Optimization | MSMs saved per block | Proof bytes saved |
+| Optimization | Savings | Where |
 |---|---|---|
-| Batched QKV (1 sumcheck vs 3) | 2 × O($T d$) field ops | 2 sumcheck transcripts |
-| GKR fusion (no out_inner_com) | $\sqrt{Td}$ G1 points | $\sqrt{Td}$ G1 points |
-| Homomorphic residuals (no proof) | 2 × Hyrax opens | 2 Hyrax proofs |
-| FFN GKR (no a_com) | $\sqrt{Td_{ff}}$ G1 points | $\sqrt{Td_{ff}}$ G1 points |
-| Global range batch (1 m_com vs $B_{rng}$) | $(B_{rng}-1) \times \sqrt{2^{16}}$ G1 | $(B_{rng}-1) \times \sqrt{2^{16}}$ G1 |
-| Deferred batch accumulators | $(K-1) \times 2$ MSMs per group | 0 (proof size unchanged) |
+| Cross-block batch sumchecks (1 sumcheck per type vs $L$) | $(L-1)$ sumcheck transcripts × 6 protocol types | §4.2 steps 4–9 |
+| Batched QKV inside each cross-block sumcheck (1 vs 3) | 2 sumcheck transcripts per block | `batch_qkv` |
+| Global intermediate batch open ($5L$ matrices at one point) | $5L - 1$ Hyrax opening proofs | `inter_batch_open` |
+| Cross-block batch opens (one per matrix type, not per block) | $(L-1)$ Hyrax opens per type, $\times \sim 17$ types | §4.2 step 13 |
+| FFN Lasso-first (no separate $A_{\mathsf{com}}$) | $\sqrt{Td_{ff}}$ G1 points | per block |
+| Homomorphic residuals (no proof) | 2 Hyrax opens per block | per block |
+| Global range batch (1 $m_{\mathsf{com}}$ vs $B_{rng}$) | $(B_{rng}-1) \times \sqrt{2^{16}}$ G1 | per block + final |
+| Deferred batch accumulators (10 cross-cutting groups) | $(K-1) \times 2$ MSMs per group | model-level |
+| Ternary weight encoding (no field mults in projection sumcheck) | $T \cdot d$ field mults → $T \cdot d$ adds per layer | every projection |
 
 ---
 
@@ -1092,9 +1124,19 @@ challenge ← F::from_le_bytes_mod_order(SHA3-256(state ‖ label))
 
 The `--transcript-label` flag in the CLI must match between `prove` and `verify` (default: `"piformer"`).
 
-### Transcript Ordering Invariant
+### Transcript Ordering Invariants
 
-The global range batch for each block *must* be processed at the start of that block's sub-protocol sequence. All chunk commitments and the shared $m_{\mathsf{com}}$ are absorbed into the transcript before any per-witness sumcheck challenges are derived. Violating this ordering breaks soundness (§5.3, Theorem 6). In the implementation, `ProveRangeBatched` / `VerifyRangeBatched` is called at the very beginning of `prove_transformer_block` / `verify_transformer_block`, and `prove_layernorm` / `verify_layernorm` do *not* call range proof functions internally.
+The implementation enforces several strict transcript-ordering rules that the soundness proofs rely on:
+
+1. **Per-block range batch** is the very first action inside `commit_block_phase1`: all chunk commitments and the shared $m_{\mathsf{com}}$ are absorbed *before* any per-witness sumcheck challenges. `prove_layernorm` / `verify_layernorm` deliberately do *not* call range-proof functions themselves; the Phase 1 wrapper is responsible. Violating this ordering breaks Theorem 6.
+
+2. **Phase 1 completes for ALL blocks** before the global `r_td = (r_t \| r_{\mathsf{out}})` challenge is sampled. This guarantees that every per-block intermediate commitment ($Q_\ell, K_\ell, V_\ell, \mathsf{Out\_attn}_\ell, \mathsf{Out\_ffn}_\ell, X_{\mathsf{norm}1,\ell}, X_{\mathsf{norm}2,\ell}$) is bound to the transcript before the cross-block batch sumcheck challenges are drawn.
+
+3. **Per-block QKV/O-proj/FFN absorbs precede the corresponding batch $\eta$**. Inside the cross-block QKV loop, each block's $(W_Q, W_K, W_V, \alpha, b_Q, b_K, b_V)$ commitments and the per-block $(\lambda_\ell, \mu_\ell)$ challenges are absorbed before the model-level $\eta_{\mathsf{qkv}}$ is sampled. The same pattern holds for `batch_oproj`, `batch_ffn_y`, `batch_ffn_m`, `batch_attn_out`, and `batch_attn_ctx`.
+
+4. **FFN Lasso commits $A$ before the FFN-Y/M batch challenges**. `prove_lasso` is invoked once per block before the corresponding $\eta_{\mathsf{ffn\_y}}$ challenge is drawn, ensuring the Theorem 4 ordering.
+
+5. **Ten deferred μ-challenges** are advanced after the LM-head proof and before the global intermediate batch open. The verifier mirrors this `for _ in 0..10 { transcript.challenge_field(b"hyrax_group_mu") }` loop so that the Hyrax accumulators consume the same μ values the prover used.
 
 ### Bit-Ordering Convention
 
@@ -1203,4 +1245,11 @@ inst_ffn:    [FFNInstance]
 proof:       [TransformerModelProof]
 ```
 
-`TransformerModelProof` contains one `TransformerBlockProof` per block, each holding all sub-proofs, intermediate Hyrax commitments, the block-level `GlobalRangeM`, and the 7-element batch opening proof. The final `GlobalRangeM` for the final LayerNorm is stored at the model level.
+`TransformerModelProof` carries:
+
+- One `TransformerBlockProof` per block with the LN1/LN2 sub-proofs, the block-level `GlobalRangeM`, the seven intermediate Hyrax commitments, the per-block FFN Lasso proof and `M` commitment, the per-block `phi_q`/`phi_k` commitments, and the per-block scalar evaluations consumed by the cross-block batch sumchecks.
+- Six model-level cross-block batched sumcheck proofs: `batch_qkv`, `batch_oproj`, `batch_attn_out`, `batch_attn_ctx`, `batch_ffn_y`, `batch_ffn_m`.
+- One `inter_batch_open` covering the 5L intermediate matrices (Q, K, V, Out_attn, Out_ffn for each block) opened jointly at `r_td`.
+- Roughly 17 cross-block batch opens for the per-type weight, bias, activation, and intermediate matrices at their respective shared evaluation points (`x_norm1`, `w_q`, `w_k`, `w_v`, `bias_q`, `bias_k`, `bias_v`, `w_o`, `bias_o`, `w2`, `w1`, `x_norm2`, `ffn_m_com`, `ffn_lasso_bind`, `phi_q`, `phi_k`, `v_attn`, `qk_lasso_bind`).
+- One model-level `LassoMultiProof` (`all_lasso_proof`) covering all $\phi(Q)$ / $\phi(K)$ Lasso instances across every block.
+- The final-LayerNorm sub-proof + `GlobalRangeM`, the LM-head projection sub-proof, the LM-head logits opening, and Hyrax commitments for the final-LN output and logits.

@@ -119,8 +119,11 @@ pub fn preprocess_transformer_model(
 
         // --- FFNの事前計算 ---
         let ffn_pk = preprocess_ffn(
-            t, d, f_dim,
-            bw.ffn_w1.clone(), bw.ffn_w2.clone(),
+            t,
+            d,
+            f_dim,
+            bw.ffn_w1.clone(),
+            bw.ffn_w2.clone(),
             bw.ffn_activation_tables.clone(),
             bw.ffn_activation_bits_per_chunk,
             lasso_params,

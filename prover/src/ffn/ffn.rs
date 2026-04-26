@@ -13,18 +13,20 @@
 
 use crate::field::F;
 use crate::lookup::lasso::{
-    precommit_lasso_tables, prove_lasso, verify_lasso,
-    LassoInstance, LassoProof, LassoProvingKey, LassoVerifyingKey,
+    precommit_lasso_tables, prove_lasso, verify_lasso, LassoInstance, LassoProof, LassoProvingKey,
+    LassoVerifyingKey,
 };
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment,
     HyraxParams, HyraxProof,
 };
-use ark_ff::Field;
-use crate::poly::utils::{combine, convert_tm_to_fm, eval_cols, eval_rows, mat_to_mle, TernaryValue};
+use crate::poly::utils::{
+    combine, convert_tm_to_fm, eval_cols, eval_rows, mat_to_mle, TernaryValue,
+};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, EvalClaim, SumcheckProof};
 use crate::transcript::{challenge_vec, Transcript};
+use ark_ff::Field;
 
 // ---------------------------------------------------------------------------
 // Pipeline Interfaces & Keys
@@ -100,7 +102,8 @@ pub fn preprocess_ffn(
     let w1_com = hyrax_commit(&w1_mle.evaluations, nu_w1, &params_w1);
     let w2_com = hyrax_commit(&w2_mle.evaluations, nu_w2, &params_w2);
 
-    let activation_lasso_pk = precommit_lasso_tables(&activation_tables, activation_bits_per_chunk, lasso_params);
+    let activation_lasso_pk =
+        precommit_lasso_tables(&activation_tables, activation_bits_per_chunk, lasso_params);
     let activation_lasso_vk = activation_lasso_pk.vk();
 
     let vk = FFNVerifyingKey {
@@ -111,7 +114,12 @@ pub fn preprocess_ffn(
         w2_com,
         activation_lasso_vk,
     };
-    FFNProvingKey { vk, w1, w2, activation_lasso_pk }
+    FFNProvingKey {
+        vk,
+        w1,
+        w2,
+        activation_lasso_pk,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,8 +226,10 @@ pub fn prove_ffn(
     let (rx_y, ry_y) = if let Some(rtd) = r_td {
         (rtd[..t_bits].to_vec(), rtd[t_bits..].to_vec())
     } else {
-        (challenge_vec(transcript, t_bits, b"ffn_rx_y"),
-         challenge_vec(transcript, d_bits, b"ffn_ry_y"))
+        (
+            challenge_vec(transcript, t_bits, b"ffn_rx_y"),
+            challenge_vec(transcript, d_bits, b"ffn_ry_y"),
+        )
     };
     let y_eval = y_mle.evaluate(&combine(&rx_y, &ry_y));
     transcript.append_field(b"claim_y", &y_eval);
@@ -252,8 +262,14 @@ pub fn prove_ffn(
     let m_open = hyrax_open(&m_mle.evaluations, &combine(&rx_m, &ry_m), nu_m, sigma_m);
 
     // 8. IO EvalClaims returned to block level — no direct opens for x and y.
-    let y_claim = EvalClaim { point: combine(&rx_y, &ry_y), value: y_eval };
-    let x_claim = EvalClaim { point: combine(&rx_m, &r_j), value: x_eval };
+    let y_claim = EvalClaim {
+        point: combine(&rx_y, &ry_y),
+        value: y_eval,
+    };
+    let x_claim = EvalClaim {
+        point: combine(&rx_m, &r_j),
+        value: x_eval,
+    };
 
     Ok((
         FFNProof {
@@ -325,8 +341,10 @@ pub fn verify_ffn(
     let (rx_y, ry_y) = if let Some(rtd) = r_td {
         (rtd[..t_bits].to_vec(), rtd[t_bits..].to_vec())
     } else {
-        (challenge_vec(transcript, t_bits, b"ffn_rx_y"),
-         challenge_vec(transcript, d_bits, b"ffn_ry_y"))
+        (
+            challenge_vec(transcript, t_bits, b"ffn_rx_y"),
+            challenge_vec(transcript, d_bits, b"ffn_ry_y"),
+        )
     };
     transcript.append_field(b"claim_y", &proof.openings.y_eval);
 
@@ -387,8 +405,14 @@ pub fn verify_ffn(
     .map_err(|e| format!("FFN m_open: {e}"))?;
 
     // 8. Return IO EvalClaims for block-level combine — no direct opens for x and y.
-    let y_claim = EvalClaim { point: combine(&rx_y, &ry_y), value: proof.openings.y_eval };
-    let x_claim = EvalClaim { point: combine(&rx_m, &r_j), value: proof.openings.x_eval };
+    let y_claim = EvalClaim {
+        point: combine(&rx_y, &ry_y),
+        value: proof.openings.y_eval,
+    };
+    let x_claim = EvalClaim {
+        point: combine(&rx_m, &r_j),
+        value: proof.openings.x_eval,
+    };
     Ok((y_claim, x_claim))
 }
 
@@ -398,20 +422,29 @@ pub fn verify_ffn(
 #[cfg(test)]
 mod ffn_tests {
     use super::*;
+    use crate::poly::utils::TernaryValue;
     use ark_ff::One;
     use ark_ff::PrimeField;
-    use crate::poly::utils::TernaryValue;
 
     fn setup_test_pipeline() -> (FFNProvingKey, FFNWitness, FFNInstance, FFNIOCommitments) {
-
         let t = 2usize;
         let d = 2usize;
         let f_dim = 4usize;
         // All-positive W1: ensures M = X·W1 entries are non-negative and fit in
         // the 4-bit Lasso table [0, 15], so M_field[j] == F::from(query_indices[j]).
         let w1 = vec![
-            vec![TernaryValue::ONE, TernaryValue::ZERO, TernaryValue::ONE, TernaryValue::ONE],
-            vec![TernaryValue::ZERO, TernaryValue::ONE, TernaryValue::ONE, TernaryValue::ZERO],
+            vec![
+                TernaryValue::ONE,
+                TernaryValue::ZERO,
+                TernaryValue::ONE,
+                TernaryValue::ONE,
+            ],
+            vec![
+                TernaryValue::ZERO,
+                TernaryValue::ONE,
+                TernaryValue::ONE,
+                TernaryValue::ZERO,
+            ],
         ];
         let w2 = vec![
             vec![TernaryValue::ONE, TernaryValue::ZERO],
@@ -462,7 +495,16 @@ mod ffn_tests {
         let y = matmul(&a, &w2_f, t, f_dim, d);
 
         // 1. Offline Preprocessing
-        let pk = preprocess_ffn(t, d, f_dim, w1, w2, vec![table.clone()], m_bits, &HyraxParams::new(m_bits / 2));
+        let pk = preprocess_ffn(
+            t,
+            d,
+            f_dim,
+            w1,
+            w2,
+            vec![table.clone()],
+            m_bits,
+            &HyraxParams::new(m_bits / 2),
+        );
 
         // 2. IO Commitments from Pipeline
         let x_mle = mat_to_mle(&x, t, d);
@@ -476,7 +518,13 @@ mod ffn_tests {
             y_com: Some(hyrax_commit(&y_mle.evaluations, nu_x, &params_x)),
         };
 
-        let witness = FFNWitness { x, m, a, y, activation_query_indices: query_indices };
+        let witness = FFNWitness {
+            x,
+            m,
+            a,
+            y,
+            activation_query_indices: query_indices,
+        };
         let inst = FFNInstance { activation_lasso };
 
         (pk, witness, inst, io_coms)
@@ -488,10 +536,19 @@ mod ffn_tests {
         let lasso_params = HyraxParams::new(2);
 
         let mut pt = Transcript::new(b"ffn-test");
-        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
+        let (proof, _, _) =
+            prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, None);
+        let result = verify_ffn(
+            &proof,
+            &inst,
+            &pk.vk,
+            &io_coms,
+            &mut vt,
+            &lasso_params,
+            None,
+        );
         assert!(result.is_ok(), "verify failed: {:?}", result.err());
     }
 
@@ -503,10 +560,19 @@ mod ffn_tests {
         pk.w2[0][0] = TernaryValue::ZERO; // Tamper weight internally (was ONE)
 
         let mut pt = Transcript::new(b"ffn-test");
-        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
+        let (proof, _, _) =
+            prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, None);
+        let result = verify_ffn(
+            &proof,
+            &inst,
+            &pk.vk,
+            &io_coms,
+            &mut vt,
+            &lasso_params,
+            None,
+        );
         assert!(result.is_err(), "Should reject tampered weights");
     }
 
@@ -521,10 +587,19 @@ mod ffn_tests {
         witness.x[0][0] += F::one();
 
         let mut pt = Transcript::new(b"ffn-test");
-        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
+        let (proof, _, _) =
+            prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, None);
+        let result = verify_ffn(
+            &proof,
+            &inst,
+            &pk.vk,
+            &io_coms,
+            &mut vt,
+            &lasso_params,
+            None,
+        );
         assert!(result.is_err(), "Should reject tampered X input");
     }
 
@@ -537,10 +612,19 @@ mod ffn_tests {
         witness.y[0][0] += F::one();
 
         let mut pt = Transcript::new(b"ffn-test");
-        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
+        let (proof, _, _) =
+            prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, None);
+        let result = verify_ffn(
+            &proof,
+            &inst,
+            &pk.vk,
+            &io_coms,
+            &mut vt,
+            &lasso_params,
+            None,
+        );
         assert!(result.is_err(), "Should reject tampered Y output");
     }
 
@@ -553,10 +637,19 @@ mod ffn_tests {
         witness.a[0][0] += F::one();
 
         let mut pt = Transcript::new(b"ffn-test");
-        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
+        let (proof, _, _) =
+            prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, None);
+        let result = verify_ffn(
+            &proof,
+            &inst,
+            &pk.vk,
+            &io_coms,
+            &mut vt,
+            &lasso_params,
+            None,
+        );
         assert!(result.is_err(), "Should reject tampered activation A");
     }
 
@@ -569,10 +662,19 @@ mod ffn_tests {
         pk.w1[0][0] = TernaryValue::ZERO; // Tamper weight internally (was ONE)
 
         let mut pt = Transcript::new(b"ffn-test");
-        let (proof, _, _) = prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
+        let (proof, _, _) =
+            prove_ffn(&pk, &witness, &inst, &io_coms, &mut pt, &lasso_params, None).unwrap();
 
         let mut vt = Transcript::new(b"ffn-test");
-        let result = verify_ffn(&proof, &inst, &pk.vk, &io_coms, &mut vt, &lasso_params, None);
+        let result = verify_ffn(
+            &proof,
+            &inst,
+            &pk.vk,
+            &io_coms,
+            &mut vt,
+            &lasso_params,
+            None,
+        );
         assert!(result.is_err(), "Should reject tampered W1");
     }
 }

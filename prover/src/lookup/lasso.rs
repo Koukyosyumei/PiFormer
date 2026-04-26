@@ -270,7 +270,9 @@ pub fn verify_lasso(
         let l_at_r = proof.l_k_evals[k];
         let expected_l_at_r = DenseMLPoly::new(expected_l_hist).evaluate(&r_vec);
         if l_at_r != expected_l_at_r {
-            return Err(format!("Table {k} selector is not derived from query indices"));
+            return Err(format!(
+                "Table {k} selector is not derived from query indices"
+            ));
         }
         let expected_final = t_opening * l_at_r;
         let actual_final =
@@ -410,7 +412,11 @@ pub fn prove_lasso_multi(
     let t_count = multi_instance.instances.len();
     let m = multi_instance.instances[0].bits_per_chunk;
     let mask = (1usize << m) - 1;
-    assert_eq!(all_query_indices.len(), t_count, "all_query_indices length must match instance count");
+    assert_eq!(
+        all_query_indices.len(),
+        t_count,
+        "all_query_indices length must match instance count"
+    );
 
     // インスタンスリストが空でないことを確認
     assert!(
@@ -523,13 +529,7 @@ pub fn prove_lasso_multi(
     }
 
     let flatten_tables_slices: Vec<&[F]> = flatten_tables.iter().map(|v| v.as_slice()).collect();
-    let hyrax_proof = hyrax_open_batch(
-        &flatten_tables_slices,
-        &r_vec,
-        nu,
-        sigma,
-        transcript,
-    );
+    let hyrax_proof = hyrax_open_batch(&flatten_tables_slices, &r_vec, nu, sigma, transcript);
 
     // Commit L_{t,k} for each instance and sub-table so the verifier can use Hyrax
     // instead of O(n) histogram recomputation.
@@ -676,7 +676,11 @@ pub fn verify_lasso_multi(
     }
 
     // --- STEP 2: Sumcheck verification ---
-    let total_tables: usize = multi_instance.instances.iter().map(|i| i.tables.len()).sum();
+    let total_tables: usize = multi_instance
+        .instances
+        .iter()
+        .map(|i| i.tables.len())
+        .sum();
     let (r_vec, sumcheck_final_val) = verify_sumcheck_multi_batched(
         &proof.combined_sumcheck_proof,
         &vec![F::ONE; total_tables],
@@ -844,11 +848,14 @@ mod lasso_tests {
         let query_indices = vec![0x12, 0x34];
         let outputs = vec![F::from(12), F::from(34)];
 
-        (LassoInstance {
-            tables: vec![t0, t1],
-            outputs,
-            bits_per_chunk: m,
-        }, query_indices)
+        (
+            LassoInstance {
+                tables: vec![t0, t1],
+                outputs,
+                bits_per_chunk: m,
+            },
+            query_indices,
+        )
     }
 
     #[test]
@@ -865,7 +872,13 @@ mod lasso_tests {
 
         // --- Prover Side ---
         let mut prover_transcript = Transcript::new(b"lasso-protocol");
-        let proof = prove_lasso(&instance, &query_indices, &pk, &mut prover_transcript, &params);
+        let proof = prove_lasso(
+            &instance,
+            &query_indices,
+            &pk,
+            &mut prover_transcript,
+            &params,
+        );
 
         // --- Verifier Side ---
         let mut verifier_transcript = Transcript::new(b"lasso-protocol");
@@ -891,7 +904,13 @@ mod lasso_tests {
         instance.outputs[0] = F::from(999);
 
         let mut prover_transcript = Transcript::new(b"lasso-protocol");
-        let proof = prove_lasso(&instance, &query_indices, &pk, &mut prover_transcript, &params);
+        let proof = prove_lasso(
+            &instance,
+            &query_indices,
+            &pk,
+            &mut prover_transcript,
+            &params,
+        );
 
         let mut verifier_transcript = Transcript::new(b"lasso-protocol");
         let result = verify_lasso(&proof, &instance, &vk, &mut verifier_transcript, &params);
@@ -911,7 +930,13 @@ mod lasso_tests {
         let vk = pk.vk();
 
         let mut prover_transcript = Transcript::new(b"lasso-protocol");
-        let mut proof = prove_lasso(&instance, &query_indices, &pk, &mut prover_transcript, &params);
+        let mut proof = prove_lasso(
+            &instance,
+            &query_indices,
+            &pk,
+            &mut prover_transcript,
+            &params,
+        );
 
         // Tamper with a sumcheck round polynomial
         proof.sumcheck_proofs[0].round_polys[0].evals[0] += F::one();
@@ -932,7 +957,13 @@ mod lasso_tests {
         let vk = pk.vk();
 
         let mut prover_transcript = Transcript::new(b"lasso-protocol");
-        let mut proof = prove_lasso(&instance, &query_indices, &pk, &mut prover_transcript, &params);
+        let mut proof = prove_lasso(
+            &instance,
+            &query_indices,
+            &pk,
+            &mut prover_transcript,
+            &params,
+        );
 
         // --- CLEVER TAMPERING ---
         // Add 1 to sub_claim[0] and subtract 1 from sub_claim[1].
@@ -1065,11 +1096,14 @@ mod lasso_multi_tests {
 
         // Index 0x12 -> T0[2] + T1[1] = 2 + 10 = 12
         // Index 0x34 -> T0[4] + T1[3] = 4 + 30 = 34
-        (LassoInstance {
-            tables: vec![t0, t1],
-            outputs: vec![F::from(12), F::from(34)],
-            bits_per_chunk: m,
-        }, vec![0x12, 0x34])
+        (
+            LassoInstance {
+                tables: vec![t0, t1],
+                outputs: vec![F::from(12), F::from(34)],
+                bits_per_chunk: m,
+            },
+            vec![0x12, 0x34],
+        )
     }
 
     /// インスタンス B: 2つのサブテーブルを持つルックアップ。Returns (instance, query_indices).
@@ -1084,20 +1118,26 @@ mod lasso_multi_tests {
 
         // Index 5 (=0x05): chunk0=5, chunk1=0. T0[5]+T1[0] = 25+0 = 25.
         // Index 1 (=0x01): chunk0=1, chunk1=0. T0[1]+T1[0] = 1+0 = 1.
-        (LassoInstance {
-            tables: vec![t0, t1],
-            outputs: vec![F::from(25), F::from(1)],
-            bits_per_chunk: m,
-        }, vec![5, 1])
+        (
+            LassoInstance {
+                tables: vec![t0, t1],
+                outputs: vec![F::from(25), F::from(1)],
+                bits_per_chunk: m,
+            },
+            vec![5, 1],
+        )
     }
 
     /// 複数のインスタンスを統合した MultiInstance を作成。Returns (multi_instance, all_query_indices).
     fn setup_multi_instance() -> (LassoMultiInstance, Vec<Vec<usize>>) {
         let (inst_a, qi_a) = setup_instance_a();
         let (inst_b, qi_b) = setup_instance_b();
-        (LassoMultiInstance {
-            instances: vec![inst_a, inst_b],
-        }, vec![qi_a, qi_b])
+        (
+            LassoMultiInstance {
+                instances: vec![inst_a, inst_b],
+            },
+            vec![qi_a, qi_b],
+        )
     }
 
     // --- テストケース ---
@@ -1114,7 +1154,14 @@ mod lasso_multi_tests {
 
         // Prover
         let mut prover_transcript = Transcript::new(b"multi-lasso-test");
-        let proof = prove_lasso_multi(&multi_instance, &all_qi, &pk, &[], &mut prover_transcript, &params);
+        let proof = prove_lasso_multi(
+            &multi_instance,
+            &all_qi,
+            &pk,
+            &[],
+            &mut prover_transcript,
+            &params,
+        );
 
         // Verifier
         let mut verifier_transcript = Transcript::new(b"multi-lasso-test");

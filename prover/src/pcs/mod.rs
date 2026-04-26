@@ -498,9 +498,7 @@ impl HyraxBatchAccumulator {
             .map(|(&r, &w)| r * w)
             .sum();
         if inner != eval {
-            return Err(
-                "HyraxBatchAccumulator add_verify: inner product check failed".to_string(),
-            );
+            return Err("HyraxBatchAccumulator add_verify: inner product check failed".to_string());
         }
 
         self.slots.push(HyraxAccSlot {

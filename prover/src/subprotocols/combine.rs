@@ -181,8 +181,7 @@ pub fn verify_combine_deferred(
         .map(|(c, &w)| w * c.value)
         .sum();
 
-    let (r_final, leaf) =
-        verify_sumcheck(&proof.sumcheck, combined_claim, num_vars, transcript)?;
+    let (r_final, leaf) = verify_sumcheck(&proof.sumcheck, combined_claim, num_vars, transcript)?;
 
     let g_final: F = claims
         .iter()

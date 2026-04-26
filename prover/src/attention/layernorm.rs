@@ -13,8 +13,8 @@
 use crate::field::F;
 use crate::lookup::range::{RangeProofWitness, RangeWitnessProof};
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch,
-    poly_hyrax, HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
+    absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, poly_hyrax, HyraxBatchAccumulator,
+    HyraxCommitment, HyraxProof,
 };
 use crate::poly::utils::{combine, eval_rows, mat_to_mle, vec_to_mle};
 use crate::poly::DenseMLPoly;
@@ -317,8 +317,13 @@ pub fn prove_layernorm(
 
     // Binding: sigma_sq(r_sig_t) = Σ_i eq(r_sig_t,i)*(d*sigma[i])^2  [binds to sigma_com]
     let claim_sigma_sq = sigma_sq_mle.evaluate(&r_sig_t);
-    let (sigma_sq_sumcheck, r_f_sigma_sq) =
-        prove_sumcheck_cubic(&eq_sig, &d_sigma_mle, &d_sigma_mle, claim_sigma_sq, transcript);
+    let (sigma_sq_sumcheck, r_f_sigma_sq) = prove_sumcheck_cubic(
+        &eq_sig,
+        &d_sigma_mle,
+        &d_sigma_mle,
+        claim_sigma_sq,
+        transcript,
+    );
 
     let r_y_t = r_y[0..t_bits].to_vec();
     let r_y_d = r_y[t_bits..t_bits + d_bits].to_vec();
@@ -424,7 +429,11 @@ pub fn prove_layernorm(
 
     // x_at_ry and y_at_ry (no transcript): computed here for use in struct literal.
     let x_at_ry = x_mle.evaluate(&ry_td);
-    let y_at_ry_val: Option<F> = if gkr_mode { None } else { Some(y_mle.evaluate(&ry_td)) };
+    let y_at_ry_val: Option<F> = if gkr_mode {
+        None
+    } else {
+        Some(y_mle.evaluate(&ry_td))
+    };
 
     Ok(LayerNormProof {
         internal_coms: LayerNormInternalCommitments {
@@ -548,7 +557,11 @@ pub fn verify_layernorm(
     }
     absorb_com(transcript, b"sum_x_com", &proof.internal_coms.sum_x_com);
     absorb_com(transcript, b"sigma_com", &proof.internal_coms.sigma_com);
-    absorb_com(transcript, b"sq_sum_x_com", &proof.internal_coms.sq_sum_x_com);
+    absorb_com(
+        transcript,
+        b"sq_sum_x_com",
+        &proof.internal_coms.sq_sum_x_com,
+    );
 
     // 2. Row Audit Challenge
     let r_t = challenge_vec(transcript, t_bits, b"layernorm_rt");
@@ -647,8 +660,7 @@ pub fn verify_layernorm(
 
     // gamma * X  and  sigma * Y  Binding (batched)
     let lambda = transcript.challenge_field::<F>(b"gamma_sigma_batch_lambda");
-    let claim_gamma_sigma =
-        proof.openings.gamma_x_at_ry + lambda * proof.openings.sigma_y_at_ry;
+    let claim_gamma_sigma = proof.openings.gamma_x_at_ry + lambda * proof.openings.sigma_y_at_ry;
     let (r_f, _) = verify_sumcheck_cubic_multi_batched(
         &proof.gamma_sigma_sumcheck,
         &[F::one(), lambda],
@@ -763,7 +775,10 @@ pub fn verify_layernorm(
             proof.internal_coms.sigma_com.clone(),
             proof.internal_coms.sq_sum_x_com.clone(),
         ],
-        &[proof.openings.sigma_at_rsig, proof.openings.sq_sum_x_at_rsig],
+        &[
+            proof.openings.sigma_at_rsig,
+            proof.openings.sq_sum_x_at_rsig,
+        ],
         &r_sig_t,
         &proof.openings.rsig_batch_proof,
         transcript,
@@ -872,9 +887,9 @@ pub fn verify_layernorm(
 #[cfg(test)]
 mod layernorm_tests {
     use super::*;
-    use ark_ff::{One, Zero};
     use crate::lookup::range::{prove_range_batched, verify_range_batched, GlobalRangeM};
     use crate::pcs::{params_from_n, params_from_vars};
+    use ark_ff::{One, Zero};
 
     fn setup_test_pipeline() -> (
         LayerNormWitness,
@@ -961,12 +976,8 @@ mod layernorm_tests {
         let y_n_vars = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
 
         let mut pt = Transcript::new(b"layernorm_test");
-        let (mut range_proofs, global_m, r_vs) = prove_range_batched(
-            &[&rw.sigma_witness, &rw.y_witness],
-            32,
-            &mut pt,
-        )
-        .unwrap();
+        let (mut range_proofs, global_m, r_vs) =
+            prove_range_batched(&[&rw.sigma_witness, &rw.y_witness], 32, &mut pt).unwrap();
         let y_rp = range_proofs.remove(1);
         let sigma_rp = range_proofs.remove(0);
         let proof = prove_layernorm(
@@ -989,8 +1000,8 @@ mod layernorm_tests {
         let sigma_rp_ref = &proof.sigma_range_proof;
         let y_rp_ref = &proof.y_range_proof;
         let mut acc_range_sig = HyraxBatchAccumulator::new();
-        let mut acc_range_y   = HyraxBatchAccumulator::new();
-        let mut acc_range_m   = HyraxBatchAccumulator::new();
+        let mut acc_range_y = HyraxBatchAccumulator::new();
+        let mut acc_range_m = HyraxBatchAccumulator::new();
         let (rv_v, _r_m_v) = verify_range_batched(
             &[sigma_rp_ref, y_rp_ref],
             &global_m,
@@ -1021,8 +1032,8 @@ mod layernorm_tests {
             let (_, _, params_t) = params_from_n(n_t);
             let (_, _, params_td) = params_from_n(n_td);
             let (_, _, params_rsig) = params_from_vars(sigma_n_vars);
-            let (_, _, params_ry)   = params_from_vars(y_n_vars);
-            let (_, _, params_rm)   = params_from_vars(crate::lookup::range::CHUNK_BITS);
+            let (_, _, params_ry) = params_from_vars(y_n_vars);
+            let (_, _, params_rm) = params_from_vars(crate::lookup::range::CHUNK_BITS);
             ln_acc_t.finalize(&params_t, &mut vt).unwrap();
             ln_acc_td.finalize(&params_td, &mut vt).unwrap();
             acc_range_sig.finalize(&params_rsig, &mut vt).unwrap();
@@ -1043,7 +1054,7 @@ mod layernorm_tests {
     fn test_rejects_tampered_io_x() {
         let (mut witness, io_coms, vk) = setup_test_pipeline();
         witness.x[0][0] += F::one(); // Tamper locally
-        // prove_layernorm with corrupted witness produces a proof; verifier must reject
+                                     // prove_layernorm with corrupted witness produces a proof; verifier must reject
         let rw = compute_range_witnesses(&witness, &vk);
         let t = vk.seq_len;
         let d = vk.d_head;
@@ -1069,8 +1080,8 @@ mod layernorm_tests {
             let _ = pt.challenge_field::<F>(b"hyrax_group_mu"); // acc_range_m
             let mut vt = Transcript::new(b"layernorm_test");
             let mut acc_range_sig = HyraxBatchAccumulator::new();
-            let mut acc_range_y   = HyraxBatchAccumulator::new();
-            let mut acc_range_m   = HyraxBatchAccumulator::new();
+            let mut acc_range_y = HyraxBatchAccumulator::new();
+            let mut acc_range_m = HyraxBatchAccumulator::new();
             let (rv_v, _) = verify_range_batched(
                 &[&proof.sigma_range_proof, &proof.y_range_proof],
                 &global_m,
@@ -1100,8 +1111,8 @@ mod layernorm_tests {
                 let (_, _, params_t) = params_from_n(n_t);
                 let (_, _, params_td) = params_from_n(n_td);
                 let (_, _, params_rsig) = params_from_vars(sigma_n_vars);
-                let (_, _, params_ry)   = params_from_vars(y_n_vars);
-                let (_, _, params_rm)   = params_from_vars(crate::lookup::range::CHUNK_BITS);
+                let (_, _, params_ry) = params_from_vars(y_n_vars);
+                let (_, _, params_rm) = params_from_vars(crate::lookup::range::CHUNK_BITS);
                 let _ = ln_acc_t.finalize(&params_t, &mut vt);
                 let _ = ln_acc_td.finalize(&params_td, &mut vt);
                 let _ = acc_range_sig.finalize(&params_rsig, &mut vt);

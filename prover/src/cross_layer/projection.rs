@@ -16,15 +16,17 @@
 
 use crate::field::F;
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_open, params_from_vars, HyraxBatchAccumulator,
-    HyraxCommitment, HyraxProof,
+    absorb_com, hyrax_commit, hyrax_open, params_from_vars, HyraxBatchAccumulator, HyraxCommitment,
+    HyraxProof,
 };
 use crate::poly::dense::DenseMLPoly;
+use crate::poly::utils::TernaryValue;
 use crate::poly::utils::{eval_rows, mat_to_mle};
-use crate::subprotocols::sumcheck::{prove_sumcheck_cubic, verify_sumcheck_cubic, SumcheckCubicProof};
+use crate::subprotocols::sumcheck::{
+    prove_sumcheck_cubic, verify_sumcheck_cubic, SumcheckCubicProof,
+};
 use crate::subprotocols::EvalClaim;
 use crate::transcript::{challenge_vec, Transcript};
-use crate::poly::utils::TernaryValue;
 use ark_ff::Field;
 
 // ---------------------------------------------------------------------------
@@ -128,7 +130,7 @@ pub struct CrossLayerProjectionProof {
     /// Cubic sumcheck over (l_bits + k_bits) variables.
     pub sumcheck: SumcheckCubicProof,
     /// Prover's claimed PCS evaluations.
-    pub x_all_eval: F,    // X_all(r_b, r_t, r_c)
+    pub x_all_eval: F, // X_all(r_b, r_t, r_c)
     pub w_all_eval: F,    // W_all(r_b, r_c, r_out)
     pub y_all_eval: F,    // Y_all(r_l, r_t, r_out) — for the sumcheck claim
     pub bias_all_eval: F, // bias_all(r_l, r_out)
@@ -147,8 +149,8 @@ pub struct CrossLayerProjectionProof {
 ///
 /// Returns the proof and an `EvalClaim` for Y_all at (r_l ‖ r_t ‖ r_out).
 pub fn prove_cross_layer_projection(
-    xs: &[Vec<Vec<F>>],  // xs[l]: T × D_in activation matrix
-    ys: &[Vec<Vec<F>>],  // ys[l]: T × D_out output matrix
+    xs: &[Vec<Vec<F>>], // xs[l]: T × D_in activation matrix
+    ys: &[Vec<Vec<F>>], // ys[l]: T × D_out output matrix
     pk: &CrossLayerProjectionPK,
     transcript: &mut Transcript,
 ) -> Result<(CrossLayerProjectionProof, EvalClaim), String> {
@@ -209,9 +211,7 @@ pub fn prove_cross_layer_projection(
     // --- Build f(b,c) = eq(r_l, b) replicated over c ---
     // f has l_bits+k_bits variables; index = b*k_p2 + c
     let eq_l_evals = DenseMLPoly::eq_poly(&r_l).evaluations;
-    let f_evals: Vec<F> = (0..l_p2 * k_p2)
-        .map(|i| eq_l_evals[i / k_p2])
-        .collect();
+    let f_evals: Vec<F> = (0..l_p2 * k_p2).map(|i| eq_l_evals[i / k_p2]).collect();
     let f_poly = DenseMLPoly::new(f_evals);
 
     // --- Build g(b,c) = X_all(b, r_t, c) ---
@@ -241,15 +241,19 @@ pub fn prove_cross_layer_projection(
     // --- Compute claim = Y_all(r_l, r_t, r_out) - bias_all(r_l, r_out) ---
     let y_all_mle = DenseMLPoly::new(y_all_evals.clone());
     let bias_all_mle = DenseMLPoly::new(pk.bias_all_evals.clone());
-    let rl_rt_rout: Vec<F> = r_l.iter().chain(r_t.iter()).chain(r_out.iter()).cloned().collect();
+    let rl_rt_rout: Vec<F> = r_l
+        .iter()
+        .chain(r_t.iter())
+        .chain(r_out.iter())
+        .cloned()
+        .collect();
     let rl_rout: Vec<F> = r_l.iter().chain(r_out.iter()).cloned().collect();
     let y_all_eval = y_all_mle.evaluate(&rl_rt_rout);
     let bias_all_eval = bias_all_mle.evaluate(&rl_rout);
     let claim = y_all_eval - bias_all_eval;
 
     // --- Cubic sumcheck over l_bits + k_bits variables ---
-    let (sumcheck, r_sc) =
-        prove_sumcheck_cubic(&f_poly, &g_poly, &h_poly, claim, transcript);
+    let (sumcheck, r_sc) = prove_sumcheck_cubic(&f_poly, &g_poly, &h_poly, claim, transcript);
 
     // Split sumcheck challenges: first l_bits → layer, last k_bits → inner dim
     let r_b: Vec<F> = r_sc[..l_bits].to_vec();
@@ -257,8 +261,18 @@ pub fn prove_cross_layer_projection(
 
     // --- Compute opening evaluations ---
     let x_all_mle = DenseMLPoly::new(x_all_evals.clone());
-    let rb_rt_rc: Vec<F> = r_b.iter().chain(r_t.iter()).chain(r_c.iter()).cloned().collect();
-    let rb_rc_rout: Vec<F> = r_b.iter().chain(r_c.iter()).chain(r_out.iter()).cloned().collect();
+    let rb_rt_rc: Vec<F> = r_b
+        .iter()
+        .chain(r_t.iter())
+        .chain(r_c.iter())
+        .cloned()
+        .collect();
+    let rb_rc_rout: Vec<F> = r_b
+        .iter()
+        .chain(r_c.iter())
+        .chain(r_out.iter())
+        .cloned()
+        .collect();
 
     let x_all_eval = x_all_mle.evaluate(&rb_rt_rc);
     let w_all_eval = DenseMLPoly::new(pk.w_all_evals.clone()).evaluate(&rb_rc_rout);
@@ -273,7 +287,10 @@ pub fn prove_cross_layer_projection(
     let (b_nu, b_sigma, _) = params_from_vars(bias_num_vars);
     let bias_all_open = hyrax_open(&pk.bias_all_evals, &rl_rout, b_nu, b_sigma);
 
-    let y_claim = EvalClaim { point: rl_rt_rout, value: y_all_eval };
+    let y_claim = EvalClaim {
+        point: rl_rt_rout,
+        value: y_all_eval,
+    };
 
     Ok((
         CrossLayerProjectionProof {
@@ -361,21 +378,63 @@ pub fn verify_cross_layer_projection(
     }
 
     // Deferred PCS openings
-    let rb_rt_rc: Vec<F> = r_b.iter().chain(r_t.iter()).chain(r_c.iter()).cloned().collect();
-    let rb_rc_rout: Vec<F> = r_b.iter().chain(r_c.iter()).chain(r_out.iter()).cloned().collect();
-    let rl_rt_rout: Vec<F> = r_l.iter().chain(r_t.iter()).chain(r_out.iter()).cloned().collect();
+    let rb_rt_rc: Vec<F> = r_b
+        .iter()
+        .chain(r_t.iter())
+        .chain(r_c.iter())
+        .cloned()
+        .collect();
+    let rb_rc_rout: Vec<F> = r_b
+        .iter()
+        .chain(r_c.iter())
+        .chain(r_out.iter())
+        .cloned()
+        .collect();
+    let rl_rt_rout: Vec<F> = r_l
+        .iter()
+        .chain(r_t.iter())
+        .chain(r_out.iter())
+        .cloned()
+        .collect();
     let rl_rout: Vec<F> = r_l.iter().chain(r_out.iter()).cloned().collect();
 
-    acc_x.add_verify(&proof.x_all_com, proof.x_all_eval, &rb_rt_rc, &proof.x_all_open)
+    acc_x
+        .add_verify(
+            &proof.x_all_com,
+            proof.x_all_eval,
+            &rb_rt_rc,
+            &proof.x_all_open,
+        )
         .map_err(|e| format!("x_all_open: {e}"))?;
-    acc_w.add_verify(&vk.w_all_com, proof.w_all_eval, &rb_rc_rout, &proof.w_all_open)
+    acc_w
+        .add_verify(
+            &vk.w_all_com,
+            proof.w_all_eval,
+            &rb_rc_rout,
+            &proof.w_all_open,
+        )
         .map_err(|e| format!("w_all_open: {e}"))?;
-    acc_y.add_verify(&proof.y_all_com, proof.y_all_eval, &rl_rt_rout, &proof.y_all_open)
+    acc_y
+        .add_verify(
+            &proof.y_all_com,
+            proof.y_all_eval,
+            &rl_rt_rout,
+            &proof.y_all_open,
+        )
         .map_err(|e| format!("y_all_open: {e}"))?;
-    acc_b.add_verify(&vk.bias_all_com, proof.bias_all_eval, &rl_rout, &proof.bias_all_open)
+    acc_b
+        .add_verify(
+            &vk.bias_all_com,
+            proof.bias_all_eval,
+            &rl_rout,
+            &proof.bias_all_open,
+        )
         .map_err(|e| format!("bias_all_open: {e}"))?;
 
-    Ok(EvalClaim { point: rl_rt_rout, value: proof.y_all_eval })
+    Ok(EvalClaim {
+        point: rl_rt_rout,
+        value: proof.y_all_eval,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -410,16 +469,12 @@ mod tests {
     fn build_test_witness() -> (Vec<Vec<Vec<F>>>, Vec<Vec<Vec<F>>>) {
         // x[l][t] = [3, 5, 0, 0] for all l, t
         let x_row = vec![F::from(3u64), F::from(5u64), F::ZERO, F::ZERO];
-        let xs: Vec<Vec<Vec<F>>> = (0..L)
-            .map(|_| vec![x_row.clone(); T])
-            .collect();
+        let xs: Vec<Vec<Vec<F>>> = (0..L).map(|_| vec![x_row.clone(); T]).collect();
 
         // Y = alpha * X @ W + bias
         // Y[l][t][0] = 2 * 3 * 1 + 1 = 7, Y[l][t][1] = 2 * 3 * 0 + 1 = 1
         let y_row = vec![F::from(7u64), F::from(1u64)];
-        let ys: Vec<Vec<Vec<F>>> = (0..L)
-            .map(|_| vec![y_row.clone(); T])
-            .collect();
+        let ys: Vec<Vec<Vec<F>>> = (0..L).map(|_| vec![y_row.clone(); T]).collect();
 
         (xs, ys)
     }
@@ -430,8 +485,7 @@ mod tests {
         let (xs, ys) = build_test_witness();
 
         let mut pt = Transcript::new(b"cl_proj_test");
-        let (proof, _y_claim) =
-            prove_cross_layer_projection(&xs, &ys, &pk, &mut pt).unwrap();
+        let (proof, _y_claim) = prove_cross_layer_projection(&xs, &ys, &pk, &mut pt).unwrap();
 
         // Advance transcript to match the 4 finalizations below
         let _ = pt.challenge_field::<crate::field::F>(b"hyrax_group_mu");
@@ -455,24 +509,33 @@ mod tests {
             + T.next_power_of_two().trailing_zeros() as usize
             + D_IN.next_power_of_two().trailing_zeros() as usize;
         let (_, _, x_params) = params_from_vars(x_num_vars);
-        acc_x.finalize(&x_params, &mut vt).expect("acc_x finalize failed");
+        acc_x
+            .finalize(&x_params, &mut vt)
+            .expect("acc_x finalize failed");
 
         let w_num_vars = L.next_power_of_two().trailing_zeros() as usize
             + D_IN.next_power_of_two().trailing_zeros() as usize
             + D_OUT.next_power_of_two().trailing_zeros() as usize;
         let (_, _, w_params) = params_from_vars(w_num_vars);
-        acc_w.finalize(&w_params, &mut vt).expect("acc_w finalize failed");
+        acc_w
+            .finalize(&w_params, &mut vt)
+            .expect("acc_w finalize failed");
 
         let y_num_vars = L.next_power_of_two().trailing_zeros() as usize
             + T.next_power_of_two().trailing_zeros() as usize
             + D_OUT.next_power_of_two().trailing_zeros() as usize;
         let (_, _, y_params) = params_from_vars(y_num_vars);
-        acc_y.finalize(&y_params, &mut vt).expect("acc_y finalize failed");
+        acc_y
+            .finalize(&y_params, &mut vt)
+            .expect("acc_y finalize failed");
 
         let b_num_vars = (L.next_power_of_two().trailing_zeros() as usize
-            + D_OUT.next_power_of_two().trailing_zeros() as usize).max(1);
+            + D_OUT.next_power_of_two().trailing_zeros() as usize)
+            .max(1);
         let (_, _, b_params) = params_from_vars(b_num_vars);
-        acc_b.finalize(&b_params, &mut vt).expect("acc_b finalize failed");
+        acc_b
+            .finalize(&b_params, &mut vt)
+            .expect("acc_b finalize failed");
     }
 
     /// Tampering the output evaluation must trigger a sumcheck failure.
@@ -482,8 +545,7 @@ mod tests {
         let (xs, ys) = build_test_witness();
 
         let mut pt = Transcript::new(b"cl_tamper_y");
-        let (mut proof, _) =
-            prove_cross_layer_projection(&xs, &ys, &pk, &mut pt).unwrap();
+        let (mut proof, _) = prove_cross_layer_projection(&xs, &ys, &pk, &mut pt).unwrap();
 
         proof.y_all_eval += F::ONE; // shift claim
 
@@ -506,8 +568,7 @@ mod tests {
         let (xs, ys) = build_test_witness();
 
         let mut pt = Transcript::new(b"cl_tamper_x");
-        let (mut proof, _) =
-            prove_cross_layer_projection(&xs, &ys, &pk, &mut pt).unwrap();
+        let (mut proof, _) = prove_cross_layer_projection(&xs, &ys, &pk, &mut pt).unwrap();
 
         proof.x_all_eval += F::ONE;
 
