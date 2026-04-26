@@ -7,7 +7,7 @@
 //! Global: 5L intermediate matrices opened at shared r_td (inter_batch_open),
 //!   plus 13 cross-block weight/activation batch opens.
 
-use ark_ff::Field;
+use ark_ff::{Field, PrimeField};
 use crate::field::F;
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, params_from_vars,
@@ -341,6 +341,16 @@ fn absorb_index_vectors(transcript: &mut Transcript, label: &[u8], vectors: &[&[
         }
     }
     transcript.append_bytes(label, &bytes);
+}
+
+fn flatten_mat_values(mat: &[Vec<F>]) -> Vec<F> {
+    mat.iter().flat_map(|row| row.iter().copied()).collect()
+}
+
+fn flatten_mat_indices(mat: &[Vec<F>]) -> Vec<usize> {
+    mat.iter()
+        .flat_map(|row| row.iter().map(|x| x.into_bigint().as_ref()[0] as usize))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -698,9 +708,19 @@ pub fn prove(
         // x_com = None (GKR mode), y_com = None (already in Phase 1)
 
         // GKR backward: run Lasso FIRST to commit A before rx_y is sampled
+        let ffn_query_indices = if bw.ffn_wit.activation_query_indices.is_empty() {
+            flatten_mat_indices(&bw.ffn_wit.m)
+        } else {
+            bw.ffn_wit.activation_query_indices.clone()
+        };
+        let ffn_lasso_instance = crate::lookup::lasso::LassoInstance {
+            tables: inst_ffn.activation_lasso.tables.clone(),
+            outputs: flatten_mat_values(&bw.ffn_wit.a),
+            bits_per_chunk: inst_ffn.activation_lasso.bits_per_chunk,
+        };
         let ffn_lasso_proof = prove_lasso(
-            &inst_ffn.activation_lasso,
-            &bw.ffn_wit.activation_query_indices,
+            &ffn_lasso_instance,
+            &ffn_query_indices,
             &bpk.ffn_pk.activation_lasso_pk,
             transcript,
             lasso_params,
@@ -720,7 +740,8 @@ pub fn prove(
     let ffn_index_refs: Vec<&[usize]> = witness
         .block_witnesses
         .iter()
-        .map(|bw| bw.ffn_wit.activation_query_indices.as_slice())
+        .zip(ffn_lasso_proofs.iter())
+        .map(|(_bw, proof)| proof.query_indices.as_slice())
         .collect();
     absorb_index_vectors(transcript, b"ffn_lasso_indices", &ffn_index_refs);
     let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
@@ -1054,10 +1075,27 @@ pub fn prove(
     let mut global_nu = 0usize;
     for i in 0..num_blocks {
         let bpk = &pk.block_pks[i];
-        all_lasso_instances.push(inst_attn.q_lasso.clone());
-        all_lasso_instances.push(inst_attn.k_lasso.clone());
-        all_query_indices.push(inst_attn.q_query_indices.clone());
-        all_query_indices.push(inst_attn.k_query_indices.clone());
+        let bw = &witness.block_witnesses[i];
+        all_lasso_instances.push(crate::lookup::lasso::LassoInstance {
+            tables: inst_attn.q_lasso.tables.clone(),
+            outputs: flatten_mat_values(&bw.attn_wit.phi_q),
+            bits_per_chunk: inst_attn.q_lasso.bits_per_chunk,
+        });
+        all_lasso_instances.push(crate::lookup::lasso::LassoInstance {
+            tables: inst_attn.k_lasso.tables.clone(),
+            outputs: flatten_mat_values(&bw.attn_wit.phi_k),
+            bits_per_chunk: inst_attn.k_lasso.bits_per_chunk,
+        });
+        all_query_indices.push(if bw.attn_wit.q_query_indices.is_empty() {
+            flatten_mat_indices(&bw.attn_wit.q)
+        } else {
+            bw.attn_wit.q_query_indices.clone()
+        });
+        all_query_indices.push(if bw.attn_wit.k_query_indices.is_empty() {
+            flatten_mat_indices(&bw.attn_wit.k)
+        } else {
+            bw.attn_wit.k_query_indices.clone()
+        });
         all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[0].clone());
         all_instance_coms.push(bpk.attn_pk.qk_lasso_pk.instance_table_coms[1].clone());
         global_nu = bpk.attn_pk.qk_lasso_pk.nu;
@@ -1341,6 +1379,8 @@ mod tests {
             v: zero_out.clone(),
             phi_q: qk_proj_out.clone(),
             phi_k: qk_proj_out.clone(),
+            q_query_indices: vec![7, 0, 7, 0],
+            k_query_indices: vec![7, 0, 7, 0],
             context: zero_out.clone(),
             out: zero_out.clone(),
         };

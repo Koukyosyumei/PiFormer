@@ -93,6 +93,8 @@ pub struct LinearAttentionWitness {
     pub v: Vec<Vec<F>>,
     pub phi_q: Vec<Vec<F>>,
     pub phi_k: Vec<Vec<F>>,
+    pub q_query_indices: Vec<usize>,
+    pub k_query_indices: Vec<usize>,
     pub context: Vec<Vec<F>>,
     pub out: Vec<Vec<F>>,
 }
@@ -547,12 +549,24 @@ mod linear_attention_tests {
         };
 
         // 1. Prover's Private Data
+        let q_query_indices_wit: Vec<usize> = q
+            .iter()
+            .flatten()
+            .map(|x| x.into_bigint().as_ref()[0] as usize)
+            .collect();
+        let k_query_indices_wit: Vec<usize> = k
+            .iter()
+            .flatten()
+            .map(|x| x.into_bigint().as_ref()[0] as usize)
+            .collect();
         let witness = LinearAttentionWitness {
             q: q.clone(),
             k: k.clone(),
             v: v.clone(),
             phi_q,
             phi_k,
+            q_query_indices: q_query_indices_wit,
+            k_query_indices: k_query_indices_wit,
             context,
             out: out.clone(),
         };

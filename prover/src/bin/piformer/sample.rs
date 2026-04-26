@@ -149,6 +149,8 @@ pub fn build_zero_witness(
             v: zero_td.clone(),
             phi_q: zero_td.clone(),
             phi_k: zero_td.clone(),
+            q_query_indices: vec![0; seq_len * d_model],
+            k_query_indices: vec![0; seq_len * d_model],
             context: zero_dd,
             out: zero_td.clone(),
         },

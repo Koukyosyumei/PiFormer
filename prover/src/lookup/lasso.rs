@@ -80,6 +80,8 @@ pub struct LassoInstance {
 
 /// Proof for a Lasso lookup (with Hyrax PCS).
 pub struct LassoProof {
+    /// Lookup outputs used in the grand-sum check.
+    pub outputs: Vec<F>,
     /// Lookup indices used to build the selector polynomials.
     /// Verifiers bind these to the committed lookup input tensor at the call site.
     pub query_indices: Vec<usize>,
@@ -183,6 +185,7 @@ pub fn prove_lasso(
     }
 
     LassoProof {
+        outputs: instance.outputs.clone(),
         query_indices: query_indices.to_vec(),
         sub_claims,
         sumcheck_proofs,
@@ -203,7 +206,7 @@ pub fn verify_lasso(
 ) -> Result<(), String> {
     let c = instance.tables.len();
     let m = instance.bits_per_chunk;
-    let n = instance.outputs.len();
+    let n = proof.outputs.len();
 
     let nu = m / 2;
     let sigma = m - nu;
@@ -233,7 +236,7 @@ pub fn verify_lasso(
 
     // Grand Sum Identity: Σ_j ρ^j · output_j = Σ_k sub_claim_k.
     // This is still O(n) but unavoidable given public outputs.
-    let output_batched_sum: F = (0..n).map(|j| rho_pows[j] * instance.outputs[j]).sum();
+    let output_batched_sum: F = (0..n).map(|j| rho_pows[j] * proof.outputs[j]).sum();
     let sub_claims_combined_sum: F = proof.sub_claims.iter().sum();
     if output_batched_sum != sub_claims_combined_sum {
         return Err("Lasso Grand Sum Identity failed".to_string());
@@ -369,6 +372,8 @@ pub struct LassoMultiInstance {
 
 /// 集約されたLasso証明
 pub struct LassoMultiProof {
+    /// Lookup outputs for every instance.
+    pub all_outputs: Vec<Vec<F>>,
     /// Private lookup indices for every instance. Verifiers bind these to the
     /// corresponding committed lookup input tensors at the call site.
     pub all_query_indices: Vec<Vec<usize>>,
@@ -571,6 +576,11 @@ pub fn prove_lasso_multi(
     }
 
     LassoMultiProof {
+        all_outputs: multi_instance
+            .instances
+            .iter()
+            .map(|inst| inst.outputs.clone())
+            .collect(),
         all_query_indices: all_query_indices.to_vec(),
         combined_grand_sum,
         combined_sumcheck_proof,
@@ -619,10 +629,18 @@ pub fn verify_lasso_multi(
         ));
     }
 
+    if proof.all_outputs.len() != t_count {
+        return Err(format!(
+            "Multi-Lasso output instance count mismatch: got {}, expected {}",
+            proof.all_outputs.len(),
+            t_count
+        ));
+    }
+
     // Grand Sum: Σ_t α^t * Σ_j ρ^j * output_{t,j}
     // Compute rho_pows once (all instances share the same output length n),
     // then evaluate each instance's weighted sum in parallel via rayon.
-    let n = multi_instance.instances[0].outputs.len();
+    let n = proof.all_outputs[0].len();
     for (t, qi) in proof.all_query_indices.iter().enumerate() {
         if qi.len() != n {
             return Err(format!(
@@ -631,14 +649,21 @@ pub fn verify_lasso_multi(
             ));
         }
     }
+    for (t, outputs) in proof.all_outputs.iter().enumerate() {
+        if outputs.len() != n {
+            return Err(format!(
+                "Multi-Lasso output length mismatch at instance {t}: got {}, expected {n}",
+                outputs.len()
+            ));
+        }
+    }
     let rho_pows = powers_of(rho, n);
-    let expected_grand_sum: F = multi_instance
-        .instances
+    let expected_grand_sum: F = proof
+        .all_outputs
         .par_iter()
         .enumerate()
-        .map(|(t, instance)| {
-            let inst_sum: F = instance
-                .outputs
+        .map(|(t, outputs)| {
+            let inst_sum: F = outputs
                 .iter()
                 .zip(rho_pows.iter())
                 .map(|(&out, &rp)| rp * out)
@@ -752,11 +777,10 @@ pub fn verify_lasso_multi(
             .into_par_iter()
             .map(|i| {
                 let (_, num_vars) = output_coms[i];
-                let instance = &multi_instance.instances[i];
                 let r_out = &r_outs[i];
                 let padded_len = 1usize << num_vars;
                 let mut padded = vec![F::ZERO; padded_len];
-                for (j, &out) in instance.outputs.iter().enumerate() {
+                for (j, &out) in proof.all_outputs[i].iter().enumerate() {
                     padded[j] = out;
                 }
                 DenseMLPoly::new(padded).evaluate(r_out)
