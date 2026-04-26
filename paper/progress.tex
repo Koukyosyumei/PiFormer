@@ -1,0 +1,381 @@
+\documentclass{article}
+
+\usepackage{PRIMEarxiv}
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc
+\usepackage{multicol}
+\usepackage{microtype}      % microtypography
+\usepackage{fancyhdr}       % header
+\usepackage{graphicx}       % graphics
+\usepackage{listings}
+\usepackage{bbm}
+\graphicspath{{media/}}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{centernot}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx,wrapfig}
+\usepackage{color}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{remark}[theorem]{Remark}
+
+\tcbuselibrary{theorems}
+\newtcbtheorem[number within=section]{tcdefinition}{Definition}{%
+  colback=green!5,
+  colframe=green!35!black,
+  fonttitle=\bfseries,
+}{def}
+
+%Header
+\pagestyle{fancy}
+\thispagestyle{empty}
+\rhead{\textit{\sys --- Preprint}}
+
+\newcommand{\argmin}{\mathop{\rm arg\,min}\limits}
+\newcommand{\argmax}{\mathop{\rm arg\,max}\limits}
+
+% Paper-specific macros
+\newcommand{\FF}{\mathbb{F}}          % finite field
+\newcommand{\RR}{\mathbb{R}}          % reals
+\newcommand{\ZZ}{\mathbb{Z}}          % integers
+\newcommand{\NN}{\mathbb{N}}
+\newcommand{\bphi}{\boldsymbol{\phi}} % feature map
+\newcommand{\bq}{\mathbf{q}}
+\newcommand{\bk}{\mathbf{k}}
+\newcommand{\bv}{\mathbf{v}}
+\newcommand{\bo}{\mathbf{o}}
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\bX}{\mathbf{X}}
+\newcommand{\by}{\mathbf{y}}
+\newcommand{\bz}{\mathbf{z}}
+\newcommand{\bW}{\mathbf{W}}
+\newcommand{\bE}{\mathbf{E}}
+\newcommand{\bM}{\mathbf{M}}
+\newcommand{\bT}{\mathbf{T}}
+\newcommand{\bQ}{\mathbf{Q}}
+\newcommand{\bH}{\mathbf{H}}
+\newcommand{\bK}{\mathbf{K}}
+\newcommand{\bPhi}{\mathbf{\Phi}}
+\newcommand{\bV}{\mathbf{V}}
+\newcommand{\bF}{\mathbf{F}}
+\newcommand{\bbeta}{\mathbf{\beta}}
+\newcommand{\bgamma}{\mathbf{\gamma}}
+\newcommand{\calL}{\mathcal{L}}
+\newcommand{\calP}{\mathcal{P}}
+\newcommand{\calV}{\mathcal{V}}
+\newcommand{\calA}{\mathcal{A}}
+\newcommand{\piproof}{\pi}
+\newcommand{\LLA}{\mathrm{LLA}}
+\newcommand{\polylog}{\mathrm{polylog}}
+\newcommand{\poly}{\mathrm{poly}}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\MLE}{\widetilde{f}}      % multilinear extension
+\newcommand{\bits}{b}                 % quantization bit-width
+\newcommand{\chunks}{c}               % decomposition factor
+\newcommand{\chunkbits}{\beta}        % bits per chunk: b/c
+\newcommand{\sys}{{$\pi$-Former }}
+\DeclareMathOperator{\LN}{LN}
+\DeclareMathOperator{\GELU}{GELU}
+\DeclareMathOperator{\Att}{Att}
+
+\renewcommand{\refname}{}
+
+%% Title
+\title{%
+  [Progress Report] \sys: Efficient ZK-SNARKs for Transformers
+  via Learnable Lookup Attention%
+}
+
+\author{
+Hideaki Takahashi \\
+Department of Computer Science \\
+Columbia University \\
+\texttt{ht2673@columbia.edu}
+}
+
+\begin{document}
+\maketitle
+
+%% ============================================================
+\begin{abstract}
+%% ============================================================
+
+Deploying large language models (LLMs) in high-stakes settings, legal
+contracts, medical diagnosis, and financial auditing, demands that \emph{both} the model owner and the user can cryptographically verify that a claimed output was indeed produced by a specific model on a specific input.  Zero-Knowledge Succinct Non-interactive Arguments of
+Knowledge (ZK-SNARKs) offers the right primitive, yet the fundamental complexity of the attention mechanism bottlenecks their application to transformers.
+
+We present \underline{\sys}, a transformer architecture and a matching SNARK prover that are \emph{co-designed} from scratch for verifiable inference.  Our main contributions are two-fold: (i)~\emph{Ternary Linformer Projection}, which restricts the key/value
+compression matrices to $\{-1,0,1\}$, converting complex finite-field multiplicative
+gates to pure additions; and (ii)~\emph{Learnable Lookup Attention} (LLA), a learnable linear-attention variant whose feature map $\bphi$ decomposes into additive sub-tables that plug directly into Lasso lookup arguments. 
+
+%Empirically, \sys matches the language-modeling perplexity of comparable softmax-attention baselines while reducing end-to-end SNARK proving time by over $100\times$ on standard settings.
+
+\end{abstract}
+
+\section{Preliminary}
+
+\subsection{Transformer Architecture}
+The Transformer architecture transforms an input sequence of tokens into a sequence of continuous embeddings $\bX^{(0)} \in \RR^{n \times d}$~\cite{vaswani2017attention}. The model consists of $L$ identical layers, where each layer $l$ maps the hidden state $\bH^{(l-1)}$ to $\bH^{(l)}$ through two primary sub-layers: Multi-Head Attention (MHA) and a Position-wise Feed-Forward Network (FFN).
+
+\paragraph{Attention}
+In each layer, the input $\bX$ is projected into query, key, and value matrices: $\bQ = \bX\bW_Q, \bK = \bX\bW_K, \bV = \bX\bW_V$, with weight matrices $\bW \in \RR^{d \times d}$. The self-attention mechanism computes the compatibility between tokens to produce a weighted context:
+\begin{equation}
+  \Att(\bQ, \bK, \bV) = \softmax\!\left(\frac{\bQ\bK^\top}{\sqrt{d}}\right)\bV,
+  \label{eq:softmax-attn}
+\end{equation}
+where the $\softmax$ operation is applied row-wise. Multi-head attention extends this by performing the operation across $h$ independent heads and concatenating the results.
+
+\paragraph{Activation and Feed-Forward Network}
+The output of the attention mechanism is passed to a Feed-Forward Network (FFN), which typically consists of two linear transformations and a non-linear activation. While earlier models used ReLU, modern LLMs favor Gaussian Error Linear Units (GELU) or SwiGLU variants. GELU is defined as:
+\begin{equation}
+  \GELU(x) = x \cdot \Phi(x) \approx 0.5x \left( 1 + \tanh\left( \sqrt{2/\pi}(x + 0.044715x^3) \right) \right),
+\end{equation}
+where $\Phi(x)$ is the CDF of the standard normal distribution.
+
+\paragraph{Full Pipeline and Normalization}
+To ensure numerical stability, Layer Normalization ($\LN$) and residual connections are applied around each sub-layer. The complete transformation for a single layer is defined as:
+\begin{align}
+    \bX' &= \LN(\bX + \Att(\bX\bW_Q, \bX\bW_K, \bX\bW_V)) \\
+    \bH^{(l)} &= \LN(\bX' + \GELU(\bX'\bW_1)\bW_2)
+\end{align}
+where $\LN(\bx) = \frac{\bx - \mu}{\sqrt{\sigma^2 + \epsilon}} \odot \bgamma + \bbeta$. This residual-norm structure allows for the training of very deep networks by preventing signal degradation.
+
+\subsection{Optimization for Transformer}
+Efficient scaling of LLMs requires structural and numerical optimizations to mitigate the quadratic bottlenecks of self-attention and the high memory requirements of model parameters. Current research focuses on approximating the attention matrix and reducing the precision of arithmetic operations to enable deployment on resource-constrained hardware.
+
+\paragraph{Linear Attention}
+To overcome the $O(n^2)$ complexity of standard attention, Linear Attention approximates the attention matrix $P = \softmax(\frac{\bQ\bK^\top}{\sqrt{d}})$ via low-rank decomposition. Specifically, let $E, F \in \RR^{n \times k}$ be projection matrices where $k \ll n$. The Linformer mechanism computes the context mapping as:
+\begin{equation}
+    \overline{\Att}(\bQ, \bK, \bV) = \softmax\!\left(\frac{\bQ(E\bK)^\top}{\sqrt{d}}\right)(F\bV)
+\end{equation}
+By computing $E\bK \in \RR^{k \times d}$ and $F\bV \in \RR^{k \times d}$ first, the attention operation is reduced to an $O(nk)$ operation. This transformation is theoretically supported by the Johnson-Lindenstrauss lemma, which guarantees that the self-attention matrix can be approximated by a lower-rank matrix with minimal error.
+
+
+\paragraph{Quantization}
+Quantization strategies reduce the bit-width of weights and activations. Native 1-bit architectures, such as BitNet b1.58~\cite{ma2025bitnet}, utilize ternary weights $w \in \{-1, 0, 1\}$. This removes the need for floating-point multiplications, replacing them with simple additions and subtractions, which drastically reduces energy consumption and latency.
+
+\subsection{Verifiable Machine Learning}
+Verifiable Machine Learning leverages cryptographic protocols to ensure that a given model inference was executed correctly according to a public or committed model specification~\cite{sun2024zkllm}. This is particularly critical in outsourced computation scenarios where a service provider might otherwise return fraudulent or low-quality results to save costs.
+
+\paragraph{Sumcheck Protocol}
+The sumcheck protocol is a cryptographic fundamental for verifying the sum of a $v$-variate polynomial $g(x_1, \dots, x_v)$ over a boolean hypercube $\{0,1\}^v$. Given a claimed value $C$, the prover convinces the verifier that:
+\begin{equation}
+    \sum_{b_1, \dots, b_v \in \{0,1\}^v} g(b_1, \dots, b_v) = C
+\end{equation}
+In the context of verifiable LLMs, matrix multiplication $C = A \cdot B$ is reduced to a sumcheck over the multilinear extensions (MLE) $\tilde{A}, \tilde{B}$. The verifier only needs to perform $O(v)$ work and a single evaluation of the MLEs, making it highly efficient for verifying large-scale tensor operations.
+
+\paragraph{Lookup Arguments}
+Non-arithmetic operations such as $\softmax$, $\GELU$, and $\LN$ are ``ZKP-unfriendly'' because they involve division or transcendental functions. Lookup arguments (e.g., Lasso) verify that each entry in a secret witness vector $a \in \FF^m$ is contained in a public table $T \in \FF^N$. Mathematically, this is expressed as verifying the identity of rational functions over a random challenge $\beta$:
+\begin{equation}
+    \sum_{i=1}^m \frac{1}{\beta + a_i} = \sum_{j=1}^N \frac{count_j}{\beta + T_j}
+\end{equation}
+where $count_j$ is the number of times $T_j$ appears in $a$. By utilizing the logarithmic derivative and the sumcheck protocol, this set inclusion check can be performed without explicitly constructing the arithmetic circuits for the underlying non-linear functions.
+
+%% ============================================================
+\section{\sys: Architecture and SNARK Co-Design}
+\label{sec:method}
+%% ============================================================
+
+\sys is built around a single design principle: \emph{every operation
+performed at inference time must map to an arithmetic relation that the
+underlying SNARK can prove with sub-linear verifier cost.}  Prior
+systems~\cite{sun2024zkllm,qu2025zkgpt} retrofit ZK proofs onto
+pre-trained softmax transformers, inheriting all of their
+ZKP-unfriendly operations (exponentiation, division, square root).
+Instead, we co-design the model architecture and the proof system
+simultaneously.  Our two principal contributions are
+\emph{Learnable Lookup Attention} (LLA) and \emph{Ternary Linear Projections}: together they reduce the SNARK complexity of a transformer
+block without sacrificing models' performance.
+
+
+%% ------------------------------------------------------------
+\subsection{Ternary Linear Projections}
+\label{subsec:ternary}
+%% ------------------------------------------------------------
+
+The Q/K/V/O projections and the FFN layers each require a dense
+matrix–vector product.  In a standard transformer with four
+$d\times d$ weight matrices per block, this amounts to $4d^2$
+multiplications per token per layer, the dominant cost in any finite-field SNARK~\cite{qu2025zkgpt}.  We eliminate general multiplications from \emph{all} linear layers by restricting weights to a ternary alphabet scaled by a single learnable scalar $\alpha$, following the BitNet 1.58b design~\cite{ma2025bitnet}.
+
+\paragraph{Weight quantization.}
+Given a float weight matrix $\bW\in\RR^{d_{\mathrm{out}}\times d_{\mathrm{in}}}$,
+define a ternary matrix for the sparsity threshold $\delta$
+\begin{equation}
+  \widehat{W}_{ij} =
+  \begin{cases}
+    +1 & W_{ij} > \delta, \\
+    -1 & W_{ij} < -\delta, \\
+     0 & \text{otherwise},
+  \end{cases}
+  \qquad
+  \widetilde{\bW} = \alpha\cdot\widehat{\bW},
+  \label{eq:ternary}
+\end{equation}
+where $\alpha\in\RR_{>0}$ is a per-layer learnable scale.  During
+training we apply the Straight-Through Estimator
+(STE)~\cite{bengio2013estimating} so gradients flow through the non-differentiable quantization step.
+
+\paragraph{SNARK interpretation.}
+Computing $\bx\,\widetilde{\bW}^\top = \alpha\cdot(\bx\,\widehat{\bW}^\top)$
+decomposes into two steps: (i)~forming
+$\bz = \bx\,\widehat{\bW}^\top$, which requires only additions and
+subtractions since every entry of $\widehat{\bW}$ lies in
+$\{-1,0,+1\}$; and (ii)~scaling by $\alpha$, a single field
+multiplication broadcast across the output vector.  The complete
+projection circuit therefore contains $O(d_{\mathrm{in}} d_{\mathrm{out}})$
+field additions and only $O(d_{\mathrm{out}})$ field multiplications,
+compared to $O(d_{\mathrm{in}} d_{\mathrm{out}})$ multiplications in a
+standard dense layer.
+
+We prove the ternary product $\bz=\bx\,\widehat{\bW}^\top$ using the GKR/sumcheck protocol for ML-friendly circuits~\cite{qu2025zkgpt}, with intermediate matrices committed via Hyrax~\cite{wahby2018doubly} over BN254.
+
+
+%% ------------------------------------------------------------
+\subsection{Learnable Lookup Attention (LLA)}
+\label{subsec:LLA}
+%% ------------------------------------------------------------
+
+
+\paragraph{The softmax bottleneck.}
+Standard self-attention (Equation~\eqref{eq:softmax-attn}) requires
+$n^2$ exponentials and $n$ row-wise divisions.  Proving these in a
+SNARK either (i)~requires polynomial approximations that introduce
+thousands of multiplication gates per element, or (ii)~requires a
+monolithic lookup table of size $2^b$ for $b$-bit fixed-point values,
+whose commitment cost is $O(2^b)$ per head~\cite{qu2025zkgpt}.
+
+\paragraph{Kernel attention.}
+We replace the softmax with a positive-definite kernel
+$\kappa(\bq,\bk)=\langle\bphi(\bq),\bphi(\bk)\rangle$, where
+$\bphi:\RR^{d_h}\to\RR^{d_h}$ is a learnable feature map applied
+element-wise to each scalar entry.  This yields
+\begin{equation}
+  \LLA(\bQ,\bK,\bV)_t
+  \;=\;
+  \frac{
+    \bphi(\bq_t)^\top
+    \underbrace{\!\left(\sum_{s=1}^{n}\bphi(\bk_s)\bv_s^\top\right)\!}_{\displaystyle\bM\;\in\;\RR^{d_h\times d_h}}
+  }{
+    \bphi(\bq_t)^\top\!\left(\sum_{s=1}^{n}\bphi(\bk_s)\right)
+  },
+  \label{eq:LLA}
+\end{equation}
+where $\bq_t,\bk_s\in\RR^{d_h}$ are per-head query and key vectors.
+By computing the \emph{context matrix} $\bM$ first, the per-token
+output reduces to the matrix–vector product $\bphi(\bq_t)^\top\bM$,
+giving $O(nd_h^2)$ total cost per layer rather than $O(n^2 d_h)$.
+The normalizer $Z_t=\bphi(\bq_t)^\top\!\sum_s\bphi(\bk_s)$ prevents
+unbounded growth and is computed with no additional table queries.
+
+\paragraph{Additive sub-table decomposition.}
+The crucial ZK-friendly choice is the structure of $\bphi$.  Rather
+than adopting a fixed kernel (e.g., $\mathrm{elu}(x){+}1$), we parametrize $\bphi$ as a
+\emph{sum of learnable sub-table lookups}.  Let $\bits$ be the
+quantization bit-width and $\chunks \mid \bits$ be the decomposition
+depth, with $\chunkbits = \bits/\chunks$ bits per chunk.  For scalar
+input $x$, define the integer index
+\begin{equation}
+  x_{\mathrm{int}}
+  = \mathrm{clamp}\!\left(\left\lfloor x / s \right\rfloor,\;
+                           0,\; 2^\bits - 1\right),
+  \label{eq:quant-index}
+\end{equation}
+where $s>0$ is a learned quantization scale.  Let the $i$-th chunk
+extractor be $\chi_i(x_{\mathrm{int}})
+=(x_{\mathrm{int}}\gg i\chunkbits)\mathbin{\&}(2^{\chunkbits}-1)$.
+The feature map is then
+\begin{equation}
+  \bphi(x) = \sum_{i=0}^{\chunks-1} T_i\!\left[\chi_i(x_{\mathrm{int}})\right],
+  \label{eq:phi-decomp}
+\end{equation}
+where $T_0,\ldots,T_{\chunks-1}\in\RR^{2^{\chunkbits}}$ are $\chunks$
+learnable sub-tables, each of size $2^{\chunkbits}$.
+
+Those tables are learnable by treating them as standard model parameters. During the forward pass, the input $x$ is scaled and quantized into a $B$-bit integer index, which is then decomposed into $c$ chunks that serve as indices for the corresponding sub-tables. To ensure stable convergence, these tables are initialized to approximate a target function like GELU; for instance, the most significant sub-table may be initialized to the GELU shape while the lower-order tables start at zero to prevent initial instability. The quantization and rounding steps are non-differentiable; the architecture employs a STE during backpropagation, which allows gradients to bypass the non-differentiable quantization and flow directly into the sub-table entries, enabling the model to learn an optimal activation function.
+
+\paragraph{Connection to Lasso.}
+Equation~\eqref{eq:phi-decomp} precisely matches the \emph{structured-table} condition exploited by the Lasso lookup argument~\cite{arun2024jolt,setty2024unlocking}: a single query $x_{\mathrm{int}}$ to the full $2^\bits$-entry table decomposes into $\chunks$ independent sub-table queries, with the output obtained by summing the $\chunks$ sub-table results. 
+
+%% ------------------------------------------------------------
+%\subsection{ZK-Friendly Layer Normalization}
+%\label{subsec:ln}
+%% ------------------------------------------------------------
+
+%Layer normalization~\cite{ba2016layer} involves a division by the empirical standard deviation $\sigma_i$—ZKP-unfriendly because the division is not a native field operation.  We handle it via an \emph{integer witness protocol} that avoids any field-level division, replacing it with range constraints that Lasso can prove.
+
+%\paragraph{Integer witness.}
+%All activations entering a LayerNorm are integer-quantized by a global
+%scale $Q_\mathrm{act}$.  LayerNorm parameters $\bgamma,\bbeta\in\ZZ^d$
+%are obtained by rounding float parameters at scale $Q_\mathrm{ln}$ and
+%adding an adaptive non-negativity floor $\delta_\beta$ (details in
+%Appendix~\ref{app:layernorm}).  Given integer row $\bx_i\in\ZZ^d$,
+%compute the witness tuple $(S_i, V_i, \sigma_i)$:
+
+%% ------------------------------------------------------------
+\subsection{End-to-End SNARK Pipeline}
+\label{subsec:circuit}
+%% ------------------------------------------------------------
+
+The following algorithm outlines the proof generation process for a single $\pi$-Former block. It leverages \textbf{Lasso} for non-linear lookups, \textbf{GKR/Sumcheck} for ternary matrix multiplications, and \textbf{Hyrax} for polynomial commitments.
+
+\begin{algorithm}
+\caption{$\pi$-Former Transformer Block Prover}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Input commitment $com(X_{in})$; Ternary weight matrices $\hat{W}_Q, \hat{W}_K, \hat{W}_V, \hat{W}_O$; LLA sub-tables $T_{0 \dots c-1}$; Residual scalars $\alpha_1, \alpha_2$.
+\State \textbf{Output:} Block proof $\pi_{block}$; Output commitment $com(X_{out})$.
+\State \textbf{Phase 1: Pre-Normalization ($LN_1$)}
+\State \indent Compute integer mean $\mu$ and variance $\sigma^2$ for $X_{in}$.
+\State \indent Generate \textbf{Lasso} range proofs $\pi_{rng}$ for $\sigma$ and normalized output $Y_1$.
+\State \indent $com(Y_1) \gets \text{Commit to normalized activations}$.
+\State \textbf{Phase 2: Batched Ternary Projections}
+\State \indent Compute $Q = Y_1 \hat{W}_Q^\top, K = Y_1 \hat{W}_K^\top, V = Y_1 \hat{W}_V^\top$ (Additions only).
+\State \indent $com(Q), com(K), com(V) \gets \text{Hyrax commitments to projections}$.
+\State \indent Sample challenge $r \in \mathbb{F}$ and run \textbf{Batched Sumcheck} for the identity: 
+\State \indent $\quad \sum_k Y_1(r, k) \cdot (\lambda_Q \hat{W}_Q + \lambda_K \hat{W}_K + \lambda_V \hat{W}_V) = \lambda_Q Q(r) + \lambda_K K(r) + \lambda_V V(r)$.
+\State \textbf{Phase 3: Learnable Lookup Attention (LLA)}
+\State \indent Decompose $Q$ and $K$ into $c$ chunks: $x_{int} \to \{ \chi_0, \dots, \chi_{c-1} \}$.
+\State \indent Compute feature maps $\Phi(Q) = \sum T_i[\chi_i(Q)]$ and $\Phi(K) = \sum T_i[\chi_i(K)]$.
+\State \indent Prove additive lookup correctness via \textbf{Lasso Structured Table Argument} $\pi_{lasso}$.
+\State \indent $com(\Phi(Q)), com(\Phi(K)) \gets \text{Commit to feature maps}$.
+\State \textbf{Phase 4: Context and Output Accumulation (GKR Fusion)}
+\State \indent Run \textbf{Sumcheck} for $M = \Phi(K)^\top V \in \mathbb{F}^{d_h \times d_h}$ over sequence length $n$.
+\State \indent Run \textbf{Sumcheck} for $O = \Phi(Q)M \in \mathbb{F}^{n \times d_h}$ over head dimension $d_h$.
+\State \indent \textit{// Optimization: Defer evaluation of $\Phi(Q), \Phi(K)$ and batch into one Hyrax opening.}
+\State \textbf{Phase 5: Output Projection and Residual 1}
+\State \indent Compute $O_{proj} = O \hat{W}_O^\top$ and residual $X_{mid} = X_{in} + \alpha_1 O_{proj}$.
+\State \indent $com(X_{mid}) \gets com(X_{in}) + \alpha_1 com(O_{proj})$ (Homomorphic addition).
+\State \textbf{Phase 6: FFN Sub-block}
+\State \indent Repeat $LN$ (Step 1-6) and FFN projections using Ternary GKR logic.
+\State \indent Compute $X_{out} = X_{mid} + \alpha_2 FFN(X_{mid})$.
+\State \Return $\pi_{block} = \{ \pi_{rng}, \pi_{proj}, \pi_{lasso}, \pi_{attn}, \pi_{comb} \}, com(X_{out})$.
+\end{algorithmic}
+\end{algorithm}
+
+%% ============================================================
+\renewcommand{\refname}{References}
+\bibliographystyle{plain}
+\bibliography{ref}
+%% ============================================================
+
+%% ============================================================
+\appendix
+%% ============================================================
+
+\end{document}
+
