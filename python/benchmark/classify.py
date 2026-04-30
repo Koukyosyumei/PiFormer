@@ -34,6 +34,7 @@ import torch.nn as nn
 from piformer.model import PiFormerModel
 
 from .baseline import BaselineTransformer
+from .data import load_trec
 from .run_compare import (
     count_params,
     maybe_compile_model,
@@ -88,12 +89,22 @@ class PooledClassifier(nn.Module):
 
     Works for both PiFormerModel and BaselineTransformer because they share
     the same encoder structure (embedding + pos_embedding + blocks + norm).
+
+    If pad_id is set, the mean is taken only over non-pad positions so short
+    sequences aren't diluted by padding tokens.
     """
 
-    def __init__(self, encoder: nn.Module, d_model: int, num_classes: int):
+    def __init__(
+        self,
+        encoder: nn.Module,
+        d_model: int,
+        num_classes: int,
+        pad_id: int | None = None,
+    ):
         super().__init__()
         self.encoder = encoder
         self.head = nn.Linear(d_model, num_classes)
+        self.pad_id = pad_id
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         m = self.encoder
@@ -103,7 +114,11 @@ class PooledClassifier(nn.Module):
         for block in m.blocks:
             x = block(x)
         x = m.norm(x)
-        pooled = x.mean(dim=1)
+        if self.pad_id is None:
+            pooled = x.mean(dim=1)
+        else:
+            mask = (input_ids != self.pad_id).to(x.dtype).unsqueeze(-1)
+            pooled = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
         return self.head(pooled)
 
 
@@ -208,8 +223,12 @@ def train_one(
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--dataset", default="synthetic", choices=["synthetic", "trec"],
+                   help="synthetic: bucket-majority (no download). "
+                        "trec: TREC question classification, 6 coarse classes.")
+    p.add_argument("--cache_dir", default="./.benchmark_cache")
 
-    # Task
+    # Task (synthetic only — for trec these come from the dataset)
     p.add_argument("--vocab_size", type=int, default=16)
     p.add_argument("--num_classes", type=int, default=4)
     p.add_argument("--seq_len", type=int, default=64)
@@ -255,27 +274,40 @@ def main():
     if device.type == "cuda":
         print(f"GPU:    {torch.cuda.get_device_name(0)}")
 
-    print(
-        f"Task: bucket-majority over V={args.vocab_size}, "
-        f"K={args.num_classes}, T={args.seq_len}"
-    )
-    train_x, train_y = make_bucket_majority_dataset(
-        args.n_train, args.seq_len, args.vocab_size, args.num_classes, args.seed
-    )
-    val_x, val_y = make_bucket_majority_dataset(
-        args.n_val, args.seq_len, args.vocab_size, args.num_classes, args.seed + 1
-    )
-    base_rate = (val_y.bincount(minlength=args.num_classes).max().item() / val_y.numel())
+    if args.dataset == "synthetic":
+        print(
+            f"Task: bucket-majority over V={args.vocab_size}, "
+            f"K={args.num_classes}, T={args.seq_len}"
+        )
+        train_x, train_y = make_bucket_majority_dataset(
+            args.n_train, args.seq_len, args.vocab_size, args.num_classes, args.seed
+        )
+        val_x, val_y = make_bucket_majority_dataset(
+            args.n_val, args.seq_len, args.vocab_size, args.num_classes, args.seed + 1
+        )
+        vocab_size = args.vocab_size
+        num_classes = args.num_classes
+        seq_len = args.seq_len
+        pad_id = None
+    else:  # trec
+        print(f"Task: TREC question classification (coarse, 6 classes), char-level")
+        train_x, train_y, val_x, val_y, vocab_size, num_classes, pad_id = load_trec(
+            Path(args.cache_dir), seq_len=args.seq_len
+        )
+        seq_len = args.seq_len
+        print(f"  vocab_size={vocab_size}  pad_id={pad_id}  seq_len={seq_len}")
+
+    base_rate = (val_y.bincount(minlength=num_classes).max().item() / val_y.numel())
     print(f"Train: {len(train_x):,}   Val: {len(val_x):,}   "
           f"majority-class baseline acc: {base_rate * 100:.2f}%")
 
     common = dict(
-        vocab_size=args.vocab_size,
+        vocab_size=vocab_size,
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         d_ff=args.d_ff,
-        max_seq_len=args.seq_len,
+        max_seq_len=seq_len,
     )
     piformer_kwargs = dict(
         num_bits=args.num_bits, c=args.c, scale=args.scale, max_exp=args.max_exp,
@@ -288,7 +320,7 @@ def main():
     if "baseline" in selected:
         torch.manual_seed(args.seed)
         encoder = BaselineTransformer(**common, causal=False)
-        model = PooledClassifier(encoder, args.d_model, args.num_classes).to(device)
+        model = PooledClassifier(encoder, args.d_model, num_classes, pad_id=pad_id).to(device)
         model = maybe_compile_model("baseline", model, args, device)
         results["models"]["baseline"] = train_one(
             "baseline", model, train_x, train_y, val_x, val_y, args, device
@@ -300,7 +332,7 @@ def main():
     if "piformer" in selected:
         torch.manual_seed(args.seed)
         encoder = PiFormerModel(**common, **piformer_kwargs)
-        model = PooledClassifier(encoder, args.d_model, args.num_classes).to(device)
+        model = PooledClassifier(encoder, args.d_model, num_classes, pad_id=pad_id).to(device)
         model = maybe_compile_model("piformer", model, args, device)
         results["models"]["piformer"] = train_one(
             "piformer", model, train_x, train_y, val_x, val_y, args, device

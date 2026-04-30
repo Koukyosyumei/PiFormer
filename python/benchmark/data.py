@@ -25,6 +25,10 @@ TINYSHAKESPEARE_URL = (
     "tinyshakespeare/input.txt"
 )
 
+TREC_TRAIN_URL = "https://cogcomp.seas.upenn.edu/Data/QA/QC/train_5500.label"
+TREC_TEST_URL = "https://cogcomp.seas.upenn.edu/Data/QA/QC/TREC_10.label"
+TREC_COARSE_LABELS = ["ABBR", "DESC", "ENTY", "HUM", "LOC", "NUM"]
+
 
 def _ensure_tinyshakespeare(cache_dir: Path) -> str:
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -92,6 +96,62 @@ def get_dataset(name: str, cache_dir: Path):
     if name == "wikitext2":
         return load_wikitext2(cache_dir)
     raise ValueError(f"unknown dataset: {name}")
+
+
+def _ensure_trec(cache_dir: Path) -> tuple[Path, Path]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    train_path = cache_dir / "trec_train_5500.label"
+    test_path = cache_dir / "trec_TREC_10.label"
+    for path, url in [(train_path, TREC_TRAIN_URL), (test_path, TREC_TEST_URL)]:
+        if not path.exists():
+            print(f"Downloading {url} → {path}")
+            urllib.request.urlretrieve(url, path)
+    return train_path, test_path
+
+
+def _parse_trec(path: Path) -> list[tuple[str, str]]:
+    pairs = []
+    with open(path, encoding="latin-1") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            label_field, _, text = line.partition(" ")
+            coarse = label_field.split(":")[0]
+            pairs.append((text.strip(), coarse))
+    return pairs
+
+
+def load_trec(cache_dir: Path, seq_len: int = 128):
+    """TREC question classification (coarse, 6 classes), char-level encoded.
+
+    Returns (train_x, train_y, val_x, val_y, vocab_size, num_classes, pad_id).
+    Reserved ids: 0 = PAD, 1 = UNK. seq_len is fixed; longer questions are
+    truncated, shorter ones right-padded with PAD.
+    """
+    train_path, test_path = _ensure_trec(cache_dir)
+    train_pairs = _parse_trec(train_path)
+    test_pairs = _parse_trec(test_path)
+
+    label_map = {l: i for i, l in enumerate(TREC_COARSE_LABELS)}
+    pad_id, unk_id = 0, 1
+    chars = sorted({c for text, _ in train_pairs for c in text})
+    stoi = {c: i + 2 for i, c in enumerate(chars)}
+    vocab_size = len(chars) + 2
+
+    def encode(text: str) -> list[int]:
+        ids = [stoi.get(c, unk_id) for c in text[:seq_len]]
+        ids += [pad_id] * (seq_len - len(ids))
+        return ids
+
+    def encode_pairs(pairs):
+        x = torch.tensor([encode(t) for t, _ in pairs], dtype=torch.long)
+        y = torch.tensor([label_map[lbl] for _, lbl in pairs], dtype=torch.long)
+        return x, y
+
+    train_x, train_y = encode_pairs(train_pairs)
+    val_x, val_y = encode_pairs(test_pairs)
+    return train_x, train_y, val_x, val_y, vocab_size, len(TREC_COARSE_LABELS), pad_id
 
 
 def random_batch(
