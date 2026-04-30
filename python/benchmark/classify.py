@@ -220,6 +220,43 @@ def train_one(
 # Main
 # ---------------------------------------------------------------------------
 
+def plot_accuracy_curves(results: dict, out_path: Path) -> None:
+    """Plot val accuracy vs. step for each trained model using plotnine."""
+    import pandas as pd
+    from plotnine import (
+        ggplot, aes, geom_line, geom_hline, labs, theme_bw,
+        scale_y_continuous,
+    )
+
+    rows = []
+    for name, r in results["models"].items():
+        h = r["history"]
+        for step, acc in zip(h["step"], h["val_acc"]):
+            rows.append({"model": name, "step": step, "val_acc": acc * 100.0})
+
+    if not rows:
+        print("No training history to plot.")
+        return
+
+    df = pd.DataFrame(rows)
+    base_rate_pct = results.get("base_rate", 0.0) * 100.0
+    plot = (
+        ggplot(df, aes(x="step", y="val_acc", color="model"))
+        + geom_line(size=0.8)
+        + geom_hline(yintercept=base_rate_pct, linetype="dashed", color="grey")
+        + scale_y_continuous(limits=[0, 100])
+        + labs(
+            title="Validation accuracy vs. step",
+            x="step",
+            y="val accuracy (%)",
+            color="model",
+        )
+        + theme_bw()
+    )
+    plot.save(str(out_path), width=7, height=4, dpi=140, verbose=False)
+    print(f"wrote {out_path}")
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -262,6 +299,9 @@ def parse_args():
     p.add_argument("--models", default="baseline,piformer",
                    help="Comma-separated subset of {baseline,piformer}.")
     p.add_argument("--out", default="classify_results.json")
+    p.add_argument("--acc_plot", default=None,
+                   help="Path for ggplot val-accuracy PNG. Defaults to <out>_acc.png. "
+                        "Pass an empty string to skip plotting.")
     return p.parse_args()
 
 
@@ -343,7 +383,8 @@ def main():
 
     # Summary
     print("\n" + "=" * 60)
-    print("SUMMARY  (bucket-majority classification, causal=False)")
+    task_label = "bucket-majority" if args.dataset == "synthetic" else "TREC (coarse)"
+    print(f"SUMMARY  ({task_label} classification, causal=False)")
     print("=" * 60)
     print(f"{'model':<10} {'params':>10} {'val_loss':>10} {'val_acc':>10} "
           f"{'steps/s':>10} {'peak_MB':>10}")
@@ -356,6 +397,16 @@ def main():
 
     Path(args.out).write_text(json.dumps(results, indent=2))
     print(f"\nWrote {args.out}")
+
+    if args.acc_plot != "":
+        acc_plot_path = Path(
+            args.acc_plot if args.acc_plot is not None
+            else Path(args.out).with_suffix("").as_posix() + "_acc.png"
+        )
+        try:
+            plot_accuracy_curves(results, acc_plot_path)
+        except ImportError as e:
+            print(f"Skipping accuracy plot — install plotnine to enable: {e}")
 
 
 if __name__ == "__main__":
