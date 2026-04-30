@@ -441,6 +441,10 @@ def parse_args():
                    help="torch.compile mode used when compilation is enabled.")
     p.add_argument("--piformer_init_from_baseline", action="store_true",
                    help="Warm-start PiFormer from the trained baseline run.")
+    p.add_argument("--piformer_no_causal", action="store_true",
+                   help="Run PiFormer in non-causal mode (matches the current "
+                        "prover/witness math). Default is causal so the LM "
+                        "comparison is fair; disable when reproducing proofs.")
 
     # Models to run
     p.add_argument("--models", default="baseline,piformer",
@@ -534,7 +538,8 @@ def main():
                         max(int(s) for s in args.inference_seq_lens.split(","))),
     )
     piformer_kwargs = dict(
-        num_bits=args.num_bits, c=args.c, scale=args.scale, max_exp=args.max_exp
+        num_bits=args.num_bits, c=args.c, scale=args.scale, max_exp=args.max_exp,
+        causal=not args.piformer_no_causal,
     )
 
     selected = [m.strip() for m in args.models.split(",") if m.strip()]

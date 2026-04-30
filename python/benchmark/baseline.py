@@ -15,8 +15,6 @@ attribution stays clean.
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,9 +38,7 @@ class SoftmaxAttention(nn.Module):
         K = self.k_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         V = self.v_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, V)
+        out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
         return self.out_proj(out)
