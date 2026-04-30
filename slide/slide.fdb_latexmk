@@ -1,12 +1,11 @@
 # Fdb version 3
-["biber slide"] 1777553784 "slide.bcf" "slide.bbl" "slide" 1777553879
-  "slide.bcf" 1777553878 106727 e49ec0b966fd3e57f22aa9c3b442f561 "pdflatex"
+["biber slide"] 1777553784 "slide.bcf" "slide.bbl" "slide" 1777554835
+  "slide.bcf" 1777554835 106727 e49ec0b966fd3e57f22aa9c3b442f561 "pdflatex"
   (generated)
   "slide.bbl"
   "slide.blg"
-["pdflatex"] 1777553877 "slide.tex" "slide.pdf" "slide" 1777553879
+["pdflatex"] 1777554832 "slide.tex" "slide.pdf" "slide" 1777554835
   "/etc/texmf/web2c/texmf.cnf" 1724264035 475 c0e671620eb5563b2130f56340a5fde8 ""
-  "/usr/share/texlive/texmf-dist/fonts/enc/dvips/newtx/ntx-ec-tlf-pc.enc" 1640468671 3136 aac2e2476de8af6c827239df395814ee ""
   "/usr/share/texlive/texmf-dist/fonts/enc/dvips/newtx/ntx-ec-tlf.enc" 1640468671 2914 8283dfc24eaf1964346f843d7605c2b0 ""
   "/usr/share/texlive/texmf-dist/fonts/map/fontname/texfonts.map" 1577235249 3524 cb3e574dea2d1052e39280babc910dc8 ""
   "/usr/share/texlive/texmf-dist/fonts/tfm/adobe/symbol/psyr.tfm" 1136768653 1408 5937f58aa508ea2cea4901c07d10f5fe ""
@@ -29,7 +28,6 @@
   "/usr/share/texlive/texmf-dist/fonts/tfm/public/newtx/NewTXMI7.tfm" 1572128992 1556 4df22ac3e5cc03ff0898d83d8817c6cf ""
   "/usr/share/texlive/texmf-dist/fonts/tfm/public/newtx/ntx-Bold-tlf-t1.tfm" 1640468671 11304 f2348f846c9496e73c2ffa3ee3e37703 ""
   "/usr/share/texlive/texmf-dist/fonts/tfm/public/newtx/ntx-Italic-tlf-t1.tfm" 1640468671 11264 513b3833c56ba193e1ac9fe3b3c77d6a ""
-  "/usr/share/texlive/texmf-dist/fonts/tfm/public/newtx/ntx-Regular-tlf-sc-t1.tfm" 1640468671 12284 97abb6b99f1a18a13ab05ee58dc70977 ""
   "/usr/share/texlive/texmf-dist/fonts/tfm/public/newtx/ntx-Regular-tlf-t1.tfm" 1640468671 11328 1877dd5dc191d4c03dc6042f510dbccf ""
   "/usr/share/texlive/texmf-dist/fonts/tfm/public/newtx/ntxbexa.tfm" 1589834365 800 4e4423c03e552840ed0c11d341cfc93b ""
   "/usr/share/texlive/texmf-dist/fonts/tfm/public/newtx/ntxbexx.tfm" 1617586172 1784 833162d473427df3c3a5b82b4602b185 ""
@@ -73,6 +71,7 @@
   "/usr/share/texlive/texmf-dist/fonts/tfm/public/txfonts/txsyb.tfm" 1136768653 988 098ca7e8cc5647b9ac21b82dbdce1f01 ""
   "/usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmss10.pfb" 1248133631 24457 5cbb7bdf209d5d1ce9892a9b80a307cc ""
   "/usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmss8.pfb" 1248133631 24420 52dbb8e8aa0069a1b987309557f8d303 ""
+  "/usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmss9.pfb" 1248133631 24373 a91d375736817a75026663adcb2190c1 ""
   "/usr/share/texlive/texmf-dist/fonts/type1/public/newtx/NewTXBMI.pfb" 1572128992 32541 18cc6d4a67e7278b3acd3373acd68025 ""
   "/usr/share/texlive/texmf-dist/fonts/type1/public/newtx/NewTXBMI7.pfb" 1572128992 35056 1183a6e094e4bf21484cb11978b3bb53 ""
   "/usr/share/texlive/texmf-dist/fonts/type1/public/newtx/NewTXMI.pfb" 1572128992 32409 1452fa0ce4fabfb48acd5d077e296f6d ""
@@ -378,12 +377,12 @@
   "/var/lib/texmf/fonts/map/pdftex/updmap/pdftex.map" 1777228966 4073795 a82a847ac97773bf4a607ab050efa3a1 ""
   "/var/lib/texmf/web2c/pdftex/pdflatex.fmt" 1777228969 1435943 395d447fbe9da88622c1b2d99bc52475 ""
   "settings.tex" 1777553422 1744 6ff3cebfd44dd00528723f27471eb512 ""
-  "slide.aux" 1777553878 3001 7cd6c6f974cab26f42c0478f2ad284d0 "pdflatex"
+  "slide.aux" 1777554835 3001 7cd6c6f974cab26f42c0478f2ad284d0 "pdflatex"
   "slide.bbl" 1777553784 466 ee04f40f768daeed26442158e95aba61 "biber slide"
-  "slide.nav" 1777553878 1574 f5abf7444d939a8c2cd188b6df8c9c87 "pdflatex"
-  "slide.out" 1777553878 0 d41d8cd98f00b204e9800998ecf8427e "pdflatex"
-  "slide.run.xml" 1777553878 2311 17972ce8c872dd5d0d5cde1f58ac5e2b "pdflatex"
-  "slide.tex" 1777553872 17823 8371abcef4a378e2eb542fbbf860b303 ""
+  "slide.nav" 1777554835 1574 f5abf7444d939a8c2cd188b6df8c9c87 "pdflatex"
+  "slide.out" 1777554834 0 d41d8cd98f00b204e9800998ecf8427e "pdflatex"
+  "slide.run.xml" 1777554835 2311 17972ce8c872dd5d0d5cde1f58ac5e2b "pdflatex"
+  "slide.tex" 1777554828 17725 1de22db84397c4af49b7e1411d9f98db ""
   (generated)
   "slide.aux"
   "slide.bcf"

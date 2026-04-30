@@ -40,6 +40,7 @@
 % ----- math shortcuts (kept consistent with the paper) -----
 \newcommand{\FF}{\mathbb{F}}
 \newcommand{\GG}{\mathbb{G}}
+\newcommand{\RR}{\mathbb{R}}
 \newcommand{\bX}{\mathbf{X}}
 \newcommand{\bY}{\mathbf{Y}}
 \newcommand{\bx}{\mathbf{x}}
@@ -70,6 +71,65 @@ via Structured Lookup Attention}
 \Front
 
 \pagestyle{empty}
+
+%======================================================================
+\begin{frame}{What Is a Transformer? (Intuition)}
+A transformer is a stack of $L$ identical \textbf{blocks}.
+Each block takes a sequence of $T$ token vectors
+$\bX\in\RR^{T\times d}$ and returns the same shape.
+
+\medskip
+Inside one block, two operations:
+\begin{enumerate}
+  \item \textbf{Attention}: each token looks at every other token
+        and pulls in information from the relevant ones.
+  \item \textbf{Feed-forward (FFN)}: each token is independently
+        passed through a small two-layer MLP.
+\end{enumerate}
+
+\medskip
+Each is wrapped with: \textbf{LayerNorm} (rescale the row),
+a \textbf{residual} ``$+$'' (add the input back).
+
+\medskip
+\begin{center}
+\small
+$\bX_{\mathrm{mid}} = \bX_{\mathrm{in}} + \Att(\LN(\bX_{\mathrm{in}}))$
+\hspace{1em}
+$\bX_{\mathrm{out}} = \bX_{\mathrm{mid}} + \mathrm{FFN}(\LN(\bX_{\mathrm{mid}}))$
+\end{center}
+
+\medskip
+That's it. Repeat $L$ times, project to vocabulary, predict next token.
+\end{frame}
+
+%======================================================================
+\begin{frame}{What Is Attention? (Intuition)}
+Each token is given three vectors:
+\begin{itemize}
+  \item \textbf{Query} $\bq$ -- ``what am I looking for?''
+  \item \textbf{Key} $\bk$ -- ``what do I offer?''
+  \item \textbf{Value} $\bv$ -- ``what info do I carry?''
+\end{itemize}
+all linear projections of the input row: $\bq=\bx\bW_Q$, etc.
+
+\medskip
+For token $t$, attention computes a \emph{weighted average of values},
+where the weight is how well its query matches each key:
+\[
+  \mathrm{out}_t \;=\; \sum_{s} \underbrace{\softmax_s\!\bigl(\langle\bq_t,\bk_s\rangle/\sqrt d\bigr)}_{\text{attention weight}}\;\bv_s.
+\]
+
+\medskip
+\textbf{What this gives the model.} Tokens can ``ask'' for
+information from other positions and aggregate it -- no fixed
+window, no recurrence.
+
+\medskip
+\textbf{What this costs the SNARK.} Softmax means
+$\exp(\cdot)$ and row-wise division -- both \emph{very} expensive
+in a finite field. This is what we will replace.
+\end{frame}
 
 %======================================================================
 \begin{frame}{Motivation \& Challenge}
@@ -324,68 +384,6 @@ prove
 \]
 with one inner sumcheck. Standard random-linear-combination argument
 $\Rightarrow$ extra error only $(L-1)/|\FF|$.
-\end{frame}
-
-%======================================================================
-\begin{frame}{Soundness Sketch}
-\begin{block}{Cross-block batching (Theorem)}
-$\textsc{CrossBatch}$ reduces $L$ claims to one with extra error
-\[
-  \varepsilon_{\mathrm{batch}} \;\le\;
-  \frac{L-1}{|\FF|} + \frac{n\delta}{|\FF|}.
-\]
-\end{block}
-
-\textbf{Why it works.} The challenge $\eta$ is drawn \emph{after}
-all per-block claims and commitments are absorbed. If any claim is
-false, $P(\eta) = \sum_\ell \eta^{\ell-1}(\hat H_\ell - H_\ell)$ is a
-non-zero polynomial of degree $\le L-1$. Schwartz--Zippel: at most
-$L-1$ bad $\eta$ over $|\FF|$.
-
-\medskip
-\textbf{End-to-end.} A union bound over sumchecks, batched openings,
-Lasso, and LN sub-proofs gives
-\[
-  \varepsilon_{\mathrm{sound}} \;\le\;
-  \frac{m_{\mathrm{sc}}\,n_{\max}\delta_{\max}+m_{\mathrm{batch}}(L-1)+m_{\mathrm{open}}}{|\FF|}
-  + \varepsilon_{\mathrm{DL}}.
-\]
-For $L\le12$, $n_{\max}\le 64$ over BN254: statistical term $<2^{-240}$,
-dominated by the discrete-log term.
-\end{frame}
-
-%======================================================================
-\begin{frame}{Implementation}
-\textbf{Two matched halves}, one shared integer arithmetic.
-
-\medskip
-\begin{itemize}
-  \item \textbf{Rust prover/verifier} ($\sim$14k LoC) over BN254.
-  \item \textbf{PyTorch training pipeline} with custom
-        \texttt{TernaryLinear}, \texttt{StructuredLookupActivation},
-        \texttt{LinearAttentionLayer}.
-  \item Same fixed-point quantisation on both sides
-        $\Rightarrow$ \emph{no train--prove gap}.
-\end{itemize}
-
-\medskip
-\begin{center}
-\small
-\begin{tabular}{lr}
-\toprule
-\textbf{Module} & \textbf{LoC} \\
-\midrule
-\texttt{poly/}, \texttt{pcs/} (MLE, Hyrax)        & $\sim$1.4k \\
-\texttt{subprotocols/} (sumcheck $\times$3, GKR)  & $\sim$1.5k \\
-\texttt{lookup/} (Lasso multi, range)             & $\sim$1.3k \\
-\texttt{attention/} (LN, projection, LLA)         & $\sim$3.2k \\
-\texttt{ffn/}, \texttt{cross\_layer/}             & $\sim$1.2k \\
-\texttt{prover.rs}, \texttt{verifier.rs}, CLI     & $\sim$5.4k \\
-\midrule
-\textbf{Total}                                     & $\sim$14k \\
-\bottomrule
-\end{tabular}
-\end{center}
 \end{frame}
 
 %======================================================================
