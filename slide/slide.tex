@@ -74,19 +74,19 @@ via Structured Lookup Attention}
 
 %======================================================================
 \begin{frame}{Overview}
-\textbf{Problem.} Prove $\by=\mathcal{M}_\theta(\bx)$ for a transformer
-with a short proof and cheap verifier. Standard ops -- softmax, GeLU,
-LayerNorm, dense $\bW$ -- are all SNARK-hostile.
+\textbf{Why transformers?} They are the backbone of essentially every
+state-of-the-art language, vision, and speech model today
+(GPT, Claude, Llama, ViT, Whisper). As inference moves to remote
+APIs, users need cryptographic evidence that the \emph{claimed} model
+produced the \emph{claimed} output -- not just a TLS certificate.
 
 \medskip
-\textbf{Two strategies.}
-\begin{itemize}
-  \item \emph{Prove-as-is} (zkLLM, zkGPT): keep the model, approximate
-        each hostile op with large lookups and fused constraints.
-  \item \textbf{$\pi$-Former (this work): co-design.} Modify the model
-        so its computation is natively sumcheck $+$ Lasso friendly,
-        then prove the new model \emph{exactly}.
-\end{itemize}
+\textbf{Problem.} Prove $\by=\mathcal{M}_\theta(\bx)$ for a transformer
+with a short proof and cheap verifier. Standard ops -- softmax, GeLU,
+LayerNorm, dense $\bW$ -- are all SNARK-hostile. Prior work
+(zkLLM, zkGPT) approximates them; \textbf{$\pi$-Former co-designs}
+the model so the new computation is natively sumcheck $+$ Lasso
+friendly, and proves it \emph{exactly}.
 
 \medskip
 \textbf{Three substitutions inside every block.}
@@ -104,14 +104,9 @@ LayerNorm         & $\Rightarrow$ & constraint-fused LN \emph{(zkGPT-style, re-u
 \end{center}
 
 \medskip
-\textbf{Toolbox.} sumcheck (contractions), Lasso (lookups), Hyrax
-(transparent PCS, additively homomorphic), GKR-style cross-block
-batching.
-
-\medskip
 \textbf{Headline.} 5.26M-param transformer, 12 CPU threads:
-\textbf{6.4\,s prove / 0.37\,s verify}
--- $\sim$\textbf{8$\times$ faster prover} than zkGPT, transparent setup.
+\textbf{6.4\,s prove / 0.37\,s verify} --
+$\sim$\textbf{8$\times$ faster prover} than zkGPT, transparent setup.
 \end{frame}
 
 %======================================================================
@@ -258,18 +253,9 @@ commitment size, $O(\sqrt N)$ open. Importantly: \textbf{additively
 homomorphic}.
 
 \medskip
-\textbf{Lasso.} A lookup argument that proves
+\textbf{Lasso Lookup.} A lookup argument that proves
 $v_j = T[\mathrm{idx}_j]$ for many queries against a table $T$,
 \emph{cheap when $T$ decomposes into small additive sub-tables}.
-
-\medskip
-\begin{block}{Strategy}
-Build the model so that:
-attention $=$ sumcheck $+$ Lasso,
-activation $=$ Lasso,
-LayerNorm $=$ sumchecks $+$ range checks,
-projection $=$ sumcheck with no field mults.
-\end{block}
 \end{frame}
 
 %======================================================================
@@ -445,34 +431,22 @@ Both models trained for 3{,}000 steps with the same optimizer.
 \begin{columns}[T]
 \begin{column}{0.58\textwidth}
 \centering
-\includegraphics[width=\linewidth]{classify_results_acc_modified.png}\\
-{\scriptsize dotted = chance ($1/6\approx16.7\%$),\;\;
-dashed = majority class ($27.6\%$).}
+\includegraphics[width=\linewidth]{classify_results_acc_modified.png}
 \end{column}
 \begin{column}{0.40\textwidth}
 \scriptsize
 \setlength{\tabcolsep}{3pt}
-\begin{tabular}{lrr}
+\begin{tabular}{lr}
 \toprule
-\textbf{Model} & \textbf{Val.\ acc.} & \textbf{Peak MB} \\
+\textbf{Model} & \textbf{Val.\ acc.} \\
 \midrule
-baseline (softmax)        & 74.4\%   & 70.0   \\
-\sys{} (LLA + ternary)    & 71.0\%   & 130.6  \\
-\midrule
-majority class            & 27.6\%   & --     \\
-chance ($1/6$)            & 16.7\%   & --     \\
+baseline (softmax)        & 74.4\%   \\
+\sys{} (LLA + ternary)    & 71.0\%   \\
 \bottomrule
 \end{tabular}
 
 \medskip
-\textbf{$\sim$82k params each, 3k steps.}
-Both models train cleanly above chance and majority baselines;
-\sys{} is within $\sim 3$ points of the standard softmax transformer
-despite ternary weights and lookup-based attention.
-
-\smallskip
-\sys{}'s extra peak memory comes from the structured-lookup
-activation tables.
+$\sim$82k params each, 3{,}000 steps.
 \end{column}
 \end{columns}
 \end{frame}
