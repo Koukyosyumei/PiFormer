@@ -332,7 +332,46 @@ def parse_args():
     p.add_argument("--skip_inference", action="store_true")
 
     p.add_argument("--out", default="benchmark_results.json")
+    p.add_argument("--loss_plot", default=None,
+                   help="Path for ggplot loss-curve PNG. Defaults to <out>_loss.png. "
+                        "Pass an empty string to skip plotting.")
     return p.parse_args()
+
+
+def plot_loss_curves(results: dict, out_path: Path) -> None:
+    """Plot train/val loss vs. step for each trained model using plotnine (ggplot)."""
+    import pandas as pd
+    from plotnine import (
+        ggplot, aes, geom_line, labs, theme_bw, scale_linetype_manual,
+    )
+
+    rows = []
+    for name, r in results["models"].items():
+        h = r["history"]
+        for step, train_loss, val_loss in zip(h["step"], h["train_loss"], h["val_loss"]):
+            rows.append({"model": name, "step": step, "split": "train", "loss": train_loss})
+            rows.append({"model": name, "step": step, "split": "val", "loss": val_loss})
+
+    if not rows:
+        print("No training history to plot.")
+        return
+
+    df = pd.DataFrame(rows)
+    plot = (
+        ggplot(df, aes(x="step", y="loss", color="model", linetype="split"))
+        + geom_line(size=0.8)
+        + scale_linetype_manual(values={"train": "dashed", "val": "solid"})
+        + labs(
+            title="Training curves: baseline vs. PiFormer",
+            x="step",
+            y="cross-entropy loss",
+            color="model",
+            linetype="split",
+        )
+        + theme_bw()
+    )
+    plot.save(str(out_path), width=7, height=4, dpi=140, verbose=False)
+    print(f"wrote {out_path}")
 
 
 def main():
@@ -422,6 +461,16 @@ def main():
 
     Path(args.out).write_text(json.dumps(results, indent=2))
     print(f"\nWrote {args.out}")
+
+    if args.loss_plot != "":
+        loss_plot_path = Path(
+            args.loss_plot if args.loss_plot is not None
+            else Path(args.out).with_suffix("").as_posix() + "_loss.png"
+        )
+        try:
+            plot_loss_curves(results, loss_plot_path)
+        except ImportError as e:
+            print(f"Skipping loss plot — install plotnine to enable: {e}")
 
 
 if __name__ == "__main__":
