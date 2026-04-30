@@ -1,10 +1,10 @@
 # Fdb version 3
-["biber slide"] 1777553784 "slide.bcf" "slide.bbl" "slide" 1777575329
-  "slide.bcf" 1777575329 106727 e49ec0b966fd3e57f22aa9c3b442f561 "pdflatex"
+["biber slide"] 1777553784 "slide.bcf" "slide.bbl" "slide" 1777577614
+  "slide.bcf" 1777577614 106727 e49ec0b966fd3e57f22aa9c3b442f561 "pdflatex"
   (generated)
   "slide.bbl"
   "slide.blg"
-["pdflatex"] 1777575326 "slide.tex" "slide.pdf" "slide" 1777575329
+["pdflatex"] 1777577611 "slide.tex" "slide.pdf" "slide" 1777577614
   "/etc/texmf/web2c/texmf.cnf" 1724264035 475 c0e671620eb5563b2130f56340a5fde8 ""
   "/usr/share/texlive/texmf-dist/fonts/enc/dvips/newtx/ntx-ec-tlf.enc" 1640468671 2914 8283dfc24eaf1964346f843d7605c2b0 ""
   "/usr/share/texlive/texmf-dist/fonts/map/fontname/texfonts.map" 1577235249 3524 cb3e574dea2d1052e39280babc910dc8 ""
@@ -374,12 +374,12 @@
   "/var/lib/texmf/web2c/pdftex/pdflatex.fmt" 1777228969 1435943 395d447fbe9da88622c1b2d99bc52475 ""
   "classify_results_acc.png" 1777574937 104021 3b441b86b3edc0aa74e1c9b7323f61de ""
   "settings.tex" 1777553422 1744 6ff3cebfd44dd00528723f27471eb512 ""
-  "slide.aux" 1777575329 2872 81e261618556624ac959a6757991b72c "pdflatex"
+  "slide.aux" 1777577614 2872 81e261618556624ac959a6757991b72c "pdflatex"
   "slide.bbl" 1777553784 466 ee04f40f768daeed26442158e95aba61 "biber slide"
-  "slide.nav" 1777575329 1481 4dff29d63ced408af8d13a7957e2a731 "pdflatex"
-  "slide.out" 1777575328 0 d41d8cd98f00b204e9800998ecf8427e "pdflatex"
-  "slide.run.xml" 1777575329 2311 17972ce8c872dd5d0d5cde1f58ac5e2b "pdflatex"
-  "slide.tex" 1777575313 16597 9c58bab13829bd9ada0740bcb727bbb5 ""
+  "slide.nav" 1777577614 1481 4dff29d63ced408af8d13a7957e2a731 "pdflatex"
+  "slide.out" 1777577613 0 d41d8cd98f00b204e9800998ecf8427e "pdflatex"
+  "slide.run.xml" 1777577614 2311 17972ce8c872dd5d0d5cde1f58ac5e2b "pdflatex"
+  "slide.tex" 1777577607 16531 d2a275de862336769a7f2dbd2feae30c ""
   (generated)
   "slide.aux"
   "slide.bcf"
