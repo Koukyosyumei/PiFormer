@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 
 from piformer.model import PiFormerModel
+from piformer.projection import TernaryLinear
 
 from .baseline import BaselineTransformer
 from .data import get_dataset, random_batch
@@ -85,6 +86,83 @@ def maybe_compile_model(name: str, model: nn.Module, args, device: torch.device)
 
     print(f"  torch.compile: compiling {name} (mode={args.compile_mode})")
     return torch.compile(model, mode=args.compile_mode)
+
+
+def unwrap_compiled_model(model: nn.Module) -> nn.Module:
+    return getattr(model, "_orig_mod", model)
+
+
+def copy_state_to_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in unwrap_compiled_model(model).state_dict().items()
+    }
+
+
+@torch.no_grad()
+def init_ternary_from_dense(dst: TernaryLinear, weight: torch.Tensor, bias: torch.Tensor | None):
+    """Initialize a ternary layer from a dense layer using one scalar alpha."""
+    weight = weight.to(device=dst.weight.device, dtype=dst.weight.dtype)
+    abs_w = weight.abs()
+    selected = abs_w > (0.7 * abs_w.mean())
+    if selected.any():
+        alpha = abs_w[selected].mean()
+    else:
+        alpha = abs_w.mean().clamp_min(1e-6)
+
+    dst.weight.copy_(weight)
+    dst.alpha.copy_(alpha.to(device=dst.alpha.device, dtype=dst.alpha.dtype))
+    if dst.bias is not None and bias is not None:
+        dst.bias.copy_(bias.to(device=dst.bias.device, dtype=dst.bias.dtype))
+
+
+@torch.no_grad()
+def init_piformer_from_baseline_state(model: PiFormerModel, state: dict[str, torch.Tensor]):
+    """Warm-start PiFormer from a trained baseline where the architectures overlap."""
+    model.embedding.weight.copy_(state["embedding.weight"].to(model.embedding.weight.device))
+    model.pos_embedding.weight.copy_(
+        state["pos_embedding.weight"].to(model.pos_embedding.weight.device)
+    )
+    model.norm.weight.copy_(state["norm.weight"].to(model.norm.weight.device))
+    model.norm.bias.copy_(state["norm.bias"].to(model.norm.bias.device))
+    init_ternary_from_dense(model.head, state["head.weight"], None)
+
+    for i, block in enumerate(model.blocks):
+        block.norm1.weight.copy_(state[f"blocks.{i}.norm1.weight"].to(block.norm1.weight.device))
+        block.norm1.bias.copy_(state[f"blocks.{i}.norm1.bias"].to(block.norm1.bias.device))
+        block.norm2.weight.copy_(state[f"blocks.{i}.norm2.weight"].to(block.norm2.weight.device))
+        block.norm2.bias.copy_(state[f"blocks.{i}.norm2.bias"].to(block.norm2.bias.device))
+
+        init_ternary_from_dense(
+            block.attn.q_proj,
+            state[f"blocks.{i}.attn.q_proj.weight"],
+            None,
+        )
+        init_ternary_from_dense(
+            block.attn.k_proj,
+            state[f"blocks.{i}.attn.k_proj.weight"],
+            None,
+        )
+        init_ternary_from_dense(
+            block.attn.v_proj,
+            state[f"blocks.{i}.attn.v_proj.weight"],
+            None,
+        )
+        init_ternary_from_dense(
+            block.attn.out_proj,
+            state[f"blocks.{i}.attn.out_proj.weight"],
+            state[f"blocks.{i}.attn.out_proj.bias"],
+        )
+        init_ternary_from_dense(
+            block.ffn.fc1,
+            state[f"blocks.{i}.ffn.fc1.weight"],
+            state[f"blocks.{i}.ffn.fc1.bias"],
+        )
+        init_ternary_from_dense(
+            block.ffn.fc2,
+            state[f"blocks.{i}.ffn.fc2.weight"],
+            state[f"blocks.{i}.ffn.fc2.bias"],
+        )
 
 
 def train_one(
@@ -240,6 +318,8 @@ def parse_args():
     p.add_argument("--compile_mode", default="reduce-overhead",
                    choices=["default", "reduce-overhead", "max-autotune"],
                    help="torch.compile mode used when compilation is enabled.")
+    p.add_argument("--piformer_init_from_baseline", action="store_true",
+                   help="Warm-start PiFormer from the trained baseline run.")
 
     # Models to run
     p.add_argument("--models", default="baseline,piformer",
@@ -284,6 +364,10 @@ def main():
 
     selected = [m.strip() for m in args.models.split(",") if m.strip()]
     results = {"args": vars(args), "models": {}, "inference": {}}
+    baseline_state_for_init = None
+
+    if args.piformer_init_from_baseline and "baseline" not in selected:
+        raise ValueError("--piformer_init_from_baseline requires --models to include baseline")
 
     if "baseline" in selected:
         torch.manual_seed(args.seed)
@@ -298,6 +382,9 @@ def main():
                 "baseline", model, seq_lens, vocab_size,
                 args.inference_batch_size, device,
             )
+        if args.piformer_init_from_baseline:
+            print("  saving trained baseline weights for PiFormer initialization")
+            baseline_state_for_init = copy_state_to_cpu(model)
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -305,6 +392,9 @@ def main():
     if "piformer" in selected:
         torch.manual_seed(args.seed)
         model = PiFormerModel(**common, **piformer_kwargs).to(device)
+        if args.piformer_init_from_baseline:
+            print("  initializing PiFormer from trained baseline weights")
+            init_piformer_from_baseline_state(model, baseline_state_for_init)
         model = maybe_compile_model("piformer", model, args, device)
         results["models"]["piformer"] = train_one(
             "piformer", model, train_ids, val_ids, args, device
