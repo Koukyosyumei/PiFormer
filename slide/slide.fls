@@ -2226,11 +2226,11 @@ INPUT /usr/share/texlive/texmf-dist/tex/latex/newtx/t1ntxtt.fd
 INPUT /usr/share/texlive/texmf-dist/tex/latex/newtx/t1ntxtt.fd
 INPUT /usr/share/texlive/texmf-dist/tex/latex/newtx/t1ntxtt.fd
 INPUT /usr/share/texlive/texmf-dist/fonts/tfm/public/txfonts/t1xtt.tfm
-INPUT ./classify_results_acc_modified.png
-INPUT ./classify_results_acc_modified.png
-INPUT classify_results_acc_modified.png
-INPUT ./classify_results_acc_modified.png
-INPUT ./classify_results_acc_modified.png
+INPUT ./classify_results_acc.png
+INPUT ./classify_results_acc.png
+INPUT classify_results_acc.png
+INPUT ./classify_results_acc.png
+INPUT ./classify_results_acc.png
 INPUT /usr/share/texlive/texmf-dist/fonts/tfm/public/txfonts/t1xtt.tfm
 OUTPUT slide.nav
 OUTPUT slide.toc
