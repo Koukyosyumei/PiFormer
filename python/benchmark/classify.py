@@ -233,8 +233,8 @@ def plot_accuracy_curves(results: dict, out_path: Path) -> None:
     """Plot val accuracy vs. step for each trained model using plotnine."""
     import pandas as pd
     from plotnine import (
-        ggplot, aes, geom_line, geom_hline, labs, theme_bw,
-        scale_y_continuous,
+        ggplot, aes, geom_line, geom_hline, labs, theme_bw, theme,
+        element_text, scale_y_continuous,
     )
 
     rows = []
@@ -256,11 +256,13 @@ def plot_accuracy_curves(results: dict, out_path: Path) -> None:
 
     plot = (
         ggplot(df, aes(x="step", y="val_acc", color="model"))
-        + geom_line(size=0.8)
-        + geom_hline(yintercept=base_rate_pct, linetype="dashed", color="grey")
+        + geom_line(size=2.2)
+        + geom_hline(yintercept=base_rate_pct, linetype="dashed", color="grey", size=1.0)
     )
     if chance_pct is not None:
-        plot = plot + geom_hline(yintercept=chance_pct, linetype="dotted", color="grey")
+        plot = plot + geom_hline(
+            yintercept=chance_pct, linetype="dotted", color="grey", size=1.0
+        )
     plot = (
         plot
         + scale_y_continuous(limits=[0, 100])
@@ -277,8 +279,16 @@ def plot_accuracy_curves(results: dict, out_path: Path) -> None:
             color="model",
         )
         + theme_bw()
+        + theme(
+            plot_title=element_text(size=24, weight="bold"),
+            plot_subtitle=element_text(size=16),
+            axis_title=element_text(size=22, weight="bold"),
+            axis_text=element_text(size=18, weight="bold"),
+            legend_title=element_text(size=20, weight="bold"),
+            legend_text=element_text(size=18, weight="bold"),
+        )
     )
-    plot.save(str(out_path), width=7, height=4, dpi=140, verbose=False)
+    plot.save(str(out_path), width=8, height=5, dpi=160, verbose=False)
     print(f"wrote {out_path}")
 
 
