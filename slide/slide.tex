@@ -159,19 +159,21 @@ non-arithmetic operations or a field multiplication per weight.
 \end{frame}
 
 %======================================================================
-\begin{frame}{Motivation, Challenge, and Our Angle}
-\textbf{Goal.} Prove $\by=\mathcal{M}_\theta(\bx)$ with a short
-proof and cheap verification.
+\begin{frame}{Two Approaches: Prove-As-Is vs.\ Co-Design}
+\textbf{Goal.} Prove $\by=\mathcal{M}_\theta(\bx)$ with a short proof
+and cheap verification.
 
 \medskip
-\textbf{Catch.} A SNARK only natively expresses additions and
-multiplications in $\FF$. State of the art (zkLLM, zkGPT)
-approximates the four hostile ops; prover time is still minutes
-per token at GPT scale.
+\textbf{Prior work (zkLLM, zkGPT).} Take a \emph{standard} transformer
+and prove its computation \emph{exactly}. Softmax, GeLU, LayerNorm
+are SNARK-hostile, so they are approximated with large lookup tables
+and fused constraints. The proven model is the original, but the
+prover pays minutes per token at GPT scale.
 
 \medskip
-\textbf{Our angle: co-design.} The narrative is driven by the dense
-projections, which dominate the prover's cost:
+\textbf{$\pi$-Former: co-design model and SNARK.}
+Change the model itself so its computation is natively
+SNARK-friendly, and the SNARK proves the \emph{new} model exactly:
 
 \smallskip
 \begin{center}
@@ -273,7 +275,31 @@ projection $=$ sumcheck with no field mults.
 \end{frame}
 
 %======================================================================
-\begin{frame}{Novel Idea 1: Learnable Lookup Attention (LLA)}
+\begin{frame}{Novel Idea 1: Ternary Projections}
+All projection matrices ($\bW_Q,\bW_K,\bW_V,\bW_O,\bW_1,\bW_2$, LM head)
+are constrained:
+\[
+  \bW \in \{-1, 0, +1\}^{m\times n},\qquad
+  \by = \alpha\cdot(\bx\bW) + \mathbf{b}
+\]
+with one learnable scalar $\alpha$ per layer (BitNet b1.58 style).
+
+\medskip
+\textbf{What changes inside the SNARK?} Consider the standard
+sumcheck for a contraction $\bY = \bX\bW$:
+\[
+  \widetilde\bY(r_t,r_d) - \mathbf{b}(r_d)
+  \;=\; \alpha \sum_k \widetilde\bX(r_t,k)\,\widetilde\bW(k,r_d).
+\]
+Because $\widetilde\bW(k,r_d)\in\{-1,0,+1\}$ after evaluation,
+each prover round is:
+\begin{center}
+``$+\!=$ / $-\!=$ / skip'' \quad -- no field multiplications.
+\end{center}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Novel Idea 2: Learnable Lookup Attention (LLA)}
 \textbf{Linear attention} replaces $\softmax(\bQ\bK^\top/\sqrt{d})$ by
 a positive-definite kernel
 $\kappa(\bq,\bk)=\langle\bphi(\bq),\bphi(\bk)\rangle$:
@@ -301,36 +327,6 @@ small table $T_i$ of size $2^{b/c}$, sum.
   \item Init so $\sum_i T_i \approx \mathrm{GeLU}$, then train end-to-end
         with the straight-through estimator.
 \end{itemize}
-\end{frame}
-
-%======================================================================
-\begin{frame}{Novel Idea 2: Ternary Projections}
-All projection matrices ($\bW_Q,\bW_K,\bW_V,\bW_O,\bW_1,\bW_2$, LM head)
-are constrained:
-\[
-  \bW \in \{-1, 0, +1\}^{m\times n},\qquad
-  \by = \alpha\cdot(\bx\bW) + \mathbf{b}
-\]
-with one learnable scalar $\alpha$ per layer (BitNet b1.58 style).
-
-\medskip
-\textbf{What changes inside the SNARK?} Consider the standard
-sumcheck for a contraction $\bY = \bX\bW$:
-\[
-  \widetilde\bY(r_t,r_d) - \mathbf{b}(r_d)
-  \;=\; \alpha \sum_k \widetilde\bX(r_t,k)\,\widetilde\bW(k,r_d).
-\]
-Because $\widetilde\bW(k,r_d)\in\{-1,0,+1\}$ after evaluation,
-each prover round is:
-\begin{center}
-``$+\!=$ / $-\!=$ / skip'' \quad -- no field multiplications.
-\end{center}
-
-\medskip
-\begin{block}{Bonus}
-The verifying key never holds raw weights -- only
-Hyrax \emph{commitments} to the ternary arrays.
-\end{block}
 \end{frame}
 
 %======================================================================
@@ -364,37 +360,50 @@ LayerNorm is the SNARK-friendly piece we \emph{re-use} from prior work.
 
 %======================================================================
 \begin{frame}{Optimization: GKR and Batching}
-Two orthogonal collapses make the proof short:
+Two orthogonal ``collapse many into one'' tricks.
 
 \medskip
-\textbf{(A) Cross-block batching} \emph{(over $L$ blocks)}.
-A transformer is the \emph{same protocol run $L$ times}. After
-absorbing per-block claims $\{H_\ell\}$, draw $\eta\!\leftarrow\!\mathsf{FS}$ and prove
-\[
-  H^\star \;=\; \sum_{\ell=1}^L \eta^{\ell-1} H_\ell
-\]
-with one inner sumcheck. $\Rightarrow$ 6 model-level sumchecks
-(QKV, $\bW_O$, attn-out, attn-ctx, FFN-Y, FFN-M) instead of $6L$.
-Soundness cost: only $(L-1)/|\FF|$.
-
-\medskip
-\textbf{(B) GKR-style combine} \emph{(per polynomial)}.
+\textbf{GKR-style combine.}
 The same committed witness $f$ (e.g.\ $\bX_{\mathrm{n1}}$) is evaluated
-at $k$ different random points $z_1,\dots,z_k$ across protocols.
-Naively that is $k$ Hyrax openings on $f$. Instead, with FS weights
-$r_i$, run \emph{one} sumcheck for
-\[
-  \sum_x G(x)\cdot f(x),\qquad G(x)=\sum_{i=1}^k r_i\,\widetilde{\mathrm{eq}}(z_i,x),
-\]
-ending in \textbf{one} Hyrax opening of $f$ at $r_{\mathrm{final}}$.
-The verifier computes $G(r_{\mathrm{final}})$ locally in $O(k\cdot n)$
-field ops; no PCS opening for $G$ is needed.
+by many sub-protocols at different points.
+\begin{center}
+\begin{tikzpicture}[font=\scriptsize, node distance=0.4cm]
+\node[draw, rounded corners, fill=blue!8] (c1) {claim $f(z_1){=}v_1$};
+\node[draw, rounded corners, fill=blue!8, below=0.05cm of c1] (c2) {claim $f(z_2){=}v_2$};
+\node[below=0.05cm of c2] (cd) {$\vdots$};
+\node[draw, rounded corners, fill=blue!8, below=0.05cm of cd] (ck) {claim $f(z_k){=}v_k$};
+\node[draw, rounded corners, fill=green!10, right=1.0cm of c2, yshift=-0.25cm] (sc) {one sumcheck};
+\node[draw, rounded corners, fill=orange!12, right=0.7cm of sc] (op) {one Hyrax opening};
+\draw[-latex] (c1.east) -- (sc.west);
+\draw[-latex] (c2.east) -- (sc.west);
+\draw[-latex] (ck.east) -- (sc.west);
+\draw[-latex] (sc.east) -- (op.west);
+\end{tikzpicture}
+\end{center}
+$k$ claims on the same $f$ $\;\longrightarrow\;$ \textbf{1 sumcheck $+$ 1 opening}.
 
 \medskip
-\textbf{Net effect.} Lasso $\to$ one global multi-instance proof;
-LN range $\to$ one shared multiplicity; residuals $\to$ no proof
-(homomorphic Hyrax addition); final openings $\to$ 10 deferred
-accumulators, 1 MSM pair each.
+\textbf{Cross-block batching.}
+Same protocol type runs once per block. Fold the $L$ per-block claims
+with Fiat--Shamir weights $\eta^{\ell-1}$ before the inner sumcheck.
+\begin{center}
+\begin{tikzpicture}[font=\scriptsize]
+\node[draw, rounded corners, fill=blue!8] (b1) {block 1: $H_1$};
+\node[draw, rounded corners, fill=blue!8, right=0.15cm of b1] (b2) {$H_2$};
+\node[right=0.15cm of b2] (bd) {$\cdots$};
+\node[draw, rounded corners, fill=blue!8, right=0.15cm of bd] (bL) {$H_L$};
+\node[draw, rounded corners, fill=green!10, right=0.6cm of bL] (sc) {one batched sumcheck};
+\draw[-latex] (bL.east) -- (sc.west);
+\end{tikzpicture}
+\end{center}
+
+\textbf{Where we apply it.}
+\begin{itemize}
+  \item 6 protocol types $\to$ 6 model-level sumchecks (not $6L$).
+  \item All Lasso instances $\to$ one global multi-Lasso.
+  \item All LayerNorm range proofs $\to$ one shared multiplicity.
+  \item Residuals $\to$ no proof at all (homomorphic Hyrax addition).
+\end{itemize}
 \end{frame}
 
 %======================================================================
@@ -429,43 +438,6 @@ medium & 128 & 4 & 512 & 32 & 924k  & \textbf{4.24\,s} & \textbf{0.28\,s} & 5.5\
   \item Verify time \emph{sub-linear}: each cross-block sumcheck is
         a $\log Td$-round transcript, accumulators finalise in 1 MSM
         pair each.
-\end{itemize}
-\end{frame}
-
-%======================================================================
-\begin{frame}{Comparison, Limitations, Roadmap}
-\begin{center}
-\scriptsize
-\begin{tabular}{lll}
-\toprule
-\textbf{System} & \textbf{Attention} & \textbf{Activation} \\
-\midrule
-zkLLM   & softmax (\texttt{tlookup}) & structured lookup \\
-zkGPT   & softmax (approx., Plonky2) & lookup table \\
-\sys{}  & \textbf{linear (LLA, exact)} & \textbf{learnable} additive lookup \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\textbf{Position.} \sys{} attention is not a softmax approximation:
-it is a different (kernelised) attention trained from scratch, so
-the SNARK proves the model \emph{exactly}. $\bphi$ is learnable.
-
-\medskip
-\textbf{Currently in the SNARK.} Single-head; un-normalised LLA
-numerator; no causal mask; \emph{not} zero-knowledge.
-
-\medskip
-\textbf{Engineering, not architecture.}
-\begin{itemize}
-  \item Multi-head: parallel batches of the same sumcheck.
-  \item Causal mask: an indicator polynomial inside the sumcheck.
-  \item ZK: standard blinding layer over committed witnesses.
-  \item GPU MSM + parallel sumcheck: every dominant inner loop is
-        data-parallel.
-  \item Streaming generation: Nova-style folding with
-        $\bM=\bphi(\bK)^\top\bV$ as the IVC accumulator
-        $\Rightarrow$ constant amortised cost per token.
 \end{itemize}
 \end{frame}
 

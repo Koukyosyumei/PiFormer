@@ -2225,12 +2225,10 @@ INPUT /usr/share/texlive/texmf-dist/fonts/tfm/public/newtx/NewTXBMI.tfm
 INPUT /usr/share/texlive/texmf-dist/fonts/vf/public/newtx/ntxmia.vf
 INPUT /usr/share/texlive/texmf-dist/fonts/tfm/public/newtx/txmiaX.tfm
 INPUT /usr/share/texlive/texmf-dist/fonts/tfm/public/newtx/txmiaSTbb.tfm
-INPUT /usr/share/texlive/texmf-dist/fonts/tfm/public/newtx/ntx-Bold-tlf-t1.tfm
 INPUT /usr/share/texlive/texmf-dist/tex/latex/newtx/t1ntxtt.fd
 INPUT /usr/share/texlive/texmf-dist/tex/latex/newtx/t1ntxtt.fd
 INPUT /usr/share/texlive/texmf-dist/tex/latex/newtx/t1ntxtt.fd
 INPUT /usr/share/texlive/texmf-dist/tex/latex/newtx/t1ntxtt.fd
-INPUT /usr/share/texlive/texmf-dist/fonts/tfm/public/txfonts/t1xtt.tfm
 INPUT /usr/share/texlive/texmf-dist/fonts/tfm/public/txfonts/t1xtt.tfm
 OUTPUT slide.nav
 OUTPUT slide.toc
