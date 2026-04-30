@@ -329,9 +329,7 @@ small table $T_i$ of size $2^{b/c}$, sum.
 
 %======================================================================
 \begin{frame}{Re-using zkGPT-style Constraint-Fused LayerNorm}
-\textbf{Not our novel idea.} Constraint fusion across a transformer
-block was introduced in \textbf{zkGPT}; we adopt and re-implement it
-here so that the LN step matches our sumcheck $+$ Lasso pipeline.
+We adopt \textbf{zkGPT}'s constraint-fused LayerNorm.
 
 \medskip
 \textbf{What it does.} Rewrite the LN identity as integer relations,
@@ -403,7 +401,7 @@ with Fiat--Shamir weights $\eta^{\ell-1}$ before the inner sumcheck.
 
 %======================================================================
 \begin{frame}{End-to-End Performance vs.\ zkGPT}
-Single-thread x86\_64 CPU. Times are pure compute; IO excluded.
+x86\_64 CPU, 12 threads. Times are pure compute; IO excluded.
 
 \medskip
 \begin{center}
@@ -451,7 +449,7 @@ large: $d{=}256,L{=}6,T{=}32$.}
         10 deferred openings.
   \item \textbf{Result.} 6-layer, 5.26M-parameter transformer:
         \textbf{6.4\,s prove / 0.37\,s verify / 14.5\,MB proof}
-        ($\sim$8$\times$ faster prover than zkGPT), single CPU core,
+        ($\sim$8$\times$ faster prover than zkGPT) on 12 CPU threads,
         transparent setup.
 \end{enumerate}
 
