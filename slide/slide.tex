@@ -77,8 +77,7 @@
 state-of-the-art language, vision, and speech model today
 (GPT, Claude, Llama, ViT, Whisper). As inference moves to remote
 APIs, users need cryptographic evidence that the \emph{claimed}
-model produced the \emph{claimed} output -- not just a TLS
-certificate.
+model produced the \emph{claimed} output.
 
 \medskip
 \textbf{What is a SNARK?} A \emph{succinct non-interactive argument
@@ -213,7 +212,7 @@ SNARK-friendly, and the SNARK proves the \emph{new} model exactly:
 \textbf{Standard op} & $\Rightarrow$ & \textbf{$\pi$-Former op} \\
 \midrule
 dense $\bW$ (FP)    & $\Rightarrow$ & \textbf{ternary} $\bW\!\in\!\{-1,0,+1\}\!\cdot\!\alpha$ \emph{(no field mults)} \\
-softmax attention   & $\Rightarrow$ & \textbf{LLA}: linear attention with learnable $\bphi$ \\
+softmax attention   & $\Rightarrow$ & \textbf{Leanable Lookup Activation}: linear attention with learnable $\bphi$ \\
 GeLU                & $\Rightarrow$ & same learnable additive sub-table lookup \\
 LayerNorm           & $\Rightarrow$ & constraint-fused LN \emph{(zkGPT-style)} \\
 \bottomrule
