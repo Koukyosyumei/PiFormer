@@ -73,6 +73,48 @@ via Structured Lookup Attention}
 \pagestyle{empty}
 
 %======================================================================
+\begin{frame}{Overview}
+\textbf{Problem.} Prove $\by=\mathcal{M}_\theta(\bx)$ for a transformer
+with a short proof and cheap verifier. Standard ops -- softmax, GeLU,
+LayerNorm, dense $\bW$ -- are all SNARK-hostile.
+
+\medskip
+\textbf{Two strategies.}
+\begin{itemize}
+  \item \emph{Prove-as-is} (zkLLM, zkGPT): keep the model, approximate
+        each hostile op with large lookups and fused constraints.
+  \item \textbf{$\pi$-Former (this work): co-design.} Modify the model
+        so its computation is natively sumcheck $+$ Lasso friendly,
+        then prove the new model \emph{exactly}.
+\end{itemize}
+
+\medskip
+\textbf{Three substitutions inside every block.}
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcl}
+\toprule
+softmax attention & $\Rightarrow$ & \textbf{LLA}: linear attn.\ with learnable lookup $\bphi$ \\
+GeLU              & $\Rightarrow$ & same learnable additive sub-table lookup \\
+dense $\bW$       & $\Rightarrow$ & \textbf{ternary} $\bW\!\in\!\{-1,0,+1\}\!\cdot\!\alpha$ \\
+LayerNorm         & $\Rightarrow$ & constraint-fused LN \emph{(zkGPT-style, re-used)} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip
+\textbf{Toolbox.} sumcheck (contractions), Lasso (lookups), Hyrax
+(transparent PCS, additively homomorphic), GKR-style cross-block
+batching.
+
+\medskip
+\textbf{Headline.} 5.26M-param transformer, 12 CPU threads:
+\textbf{6.4\,s prove / 0.37\,s verify}
+-- $\sim$\textbf{8$\times$ faster prover} than zkGPT, transparent setup.
+\end{frame}
+
+%======================================================================
 \begin{frame}{What Is a Transformer? (Intuition)}
 A transformer is a stack of $L$ identical \textbf{blocks}.
 Each block takes a sequence of $T$ token vectors
@@ -194,6 +236,17 @@ LayerNorm           & $\Rightarrow$ & constraint-fused LN \emph{(zkGPT-style)} \
 
 %======================================================================
 \begin{frame}{Toolbox (One-Line Reminders)}
+\textbf{Multilinear extension (MLE).} For a matrix
+$\bX\in\FF^{T\times d}$, its MLE
+$\widetilde\bX:\FF^{\log T+\log d}\to\FF$ is the \emph{unique}
+multilinear polynomial with
+$\widetilde\bX(\mathbf{r}_t,\mathbf{r}_d)=\bX[\mathbf{r}_t,\mathbf{r}_d]$
+for all boolean
+$(\mathbf{r}_t,\mathbf{r}_d)\in\{0,1\}^{\log T+\log d}$.
+We commit MLEs (not raw matrices) so the prover can answer
+evaluations at random field points.
+
+\medskip
 \textbf{Sumcheck.} Reduces $H=\sum_{x\in\{0,1\}^n} f(x)$ to a single
 evaluation $f(r)$ at random $r$. Verifier cost $O(n\delta)$,
 soundness error $\le n\delta/|\FF|$.
@@ -220,61 +273,6 @@ projection $=$ sumcheck with no field mults.
 \end{frame}
 
 %======================================================================
-\begin{frame}{The $\pi$-Former Block}
-\begin{center}
-\begin{tikzpicture}[
-  font=\scriptsize,
-  box/.style={rectangle, draw, rounded corners=2pt, minimum width=1.2cm,
-              minimum height=0.5cm, align=center, fill=blue!6},
-  op/.style={rectangle, draw, rounded corners=2pt, minimum width=1.2cm,
-             minimum height=0.5cm, align=center, fill=green!10},
-  add/.style={circle, draw, inner sep=0.5pt, font=\tiny, fill=white},
-  arrow/.style={-latex, thick}
-]
-  \node[box] (xin)        at (0,0)   {$\bX_{\mathrm{in}}$};
-  \node[op,  right=0.25cm of xin]  (ln1)  {$\LN_1$};
-  \node[op,  right=0.25cm of ln1]  (qkv)  {QKV\\(ternary)};
-  \node[op,  right=0.25cm of qkv]  (lla)  {LLA\\(Lasso $\bphi$)};
-  \node[op,  right=0.25cm of lla]  (woo)  {$\bW_O$\\(ternary)};
-  \node[add, right=0.25cm of woo]  (res1) {$+$};
-  \node[box, right=0.25cm of res1] (xmid) {$\bX_{\mathrm{mid}}$};
-
-  \draw[arrow] (xin) -- (ln1);
-  \draw[arrow] (ln1) -- (qkv);
-  \draw[arrow] (qkv) -- (lla);
-  \draw[arrow] (lla) -- (woo);
-  \draw[arrow] (woo) -- (res1);
-  \draw[arrow] (res1) -- (xmid);
-  \draw[arrow] (xin.north) |- ($(xin.north)+(0,0.45)$) -| (res1.north);
-
-  \node[op,  below=0.6cm of ln1]  (ln2)  {$\LN_2$};
-  \node[op,  right=0.25cm of ln2] (w1)   {$\bW_1$\\(ternary)};
-  \node[op,  right=0.25cm of w1]  (phi)  {$\bphi$\\(Lasso)};
-  \node[op,  right=0.25cm of phi] (w2)   {$\bW_2$\\(ternary)};
-  \node[add, right=0.25cm of w2]  (res2) {$+$};
-  \node[box, right=0.25cm of res2] (xout) {$\bX_{\mathrm{out}}$};
-
-  \draw[arrow] (xmid.south) |- (ln2.west);
-  \draw[arrow] (ln2) -- (w1);
-  \draw[arrow] (w1) -- (phi);
-  \draw[arrow] (phi) -- (w2);
-  \draw[arrow] (w2) -- (res2);
-  \draw[arrow] (res2) -- (xout);
-  \draw[arrow] (xmid.south west) |- ($(ln2.north)+(0,0.35)$) -| (res2.north);
-\end{tikzpicture}
-\end{center}
-
-\textbf{Color code.}
-\begin{itemize}
-  \item Green = an op the SNARK proves.
-  \item Ternary boxes have \emph{no} field multiplications inside.
-  \item LLA / $\bphi$ are proved via Lasso lookups.
-  \item ``$+$'' (residual) is checked by \textbf{homomorphic addition
-        of Hyrax commitments} -- no proof at all.
-\end{itemize}
-\end{frame}
-
-%======================================================================
 \begin{frame}{Novel Idea 1: Ternary Projections}
 All projection matrices ($\bW_Q,\bW_K,\bW_V,\bW_O,\bW_1,\bW_2$, LM head)
 are constrained:
@@ -286,7 +284,8 @@ with one learnable scalar $\alpha$ per layer (BitNet b1.58 style).
 
 \medskip
 \textbf{What changes inside the SNARK?} Consider the standard
-sumcheck for a contraction $\bY = \bX\bW$:
+sumcheck for a contraction $\bY = \bX\bW$
+(here $\widetilde\bX,\widetilde\bW,\widetilde\bY$ are the MLEs):
 \[
   \widetilde\bY(r_t,r_d) - \mathbf{b}(r_d)
   \;=\; \alpha \sum_k \widetilde\bX(r_t,k)\,\widetilde\bW(k,r_d).
@@ -406,14 +405,14 @@ x86\_64 CPU, 12 threads. Times are pure compute; IO excluded.
 \begin{center}
 \scriptsize
 \setlength{\tabcolsep}{4pt}
-\begin{tabular}{lrrrrrr}
+\begin{tabular}{lrrrrr}
 \toprule
-& & \multicolumn{2}{c}{\textbf{$\pi$-Former}} & & \multicolumn{2}{c}{\textbf{zkGPT}} \\
-\cmidrule(lr){3-4} \cmidrule(lr){6-7}
-\textbf{Model} & \textbf{Params} & Prove & Verify & \textbf{Proof} & Prove & Verify \\
+& & \multicolumn{2}{c}{\textbf{$\pi$-Former}} & \multicolumn{2}{c}{\textbf{zkGPT}} \\
+\cmidrule(lr){3-4} \cmidrule(lr){5-6}
+\textbf{Model} & \textbf{Params} & Prove & Verify & Prove & Verify \\
 \midrule
-medium  & 924k  & \textbf{2.92\,s} & 0.21\,s          & 5.5\,MB  & 19.99\,s  & 0.13\,s   \\
-large   & 5.26M & \textbf{6.39\,s} & 0.37\,s          & 14.5\,MB & 52.59\,s  & 0.44\,s   \\
+medium  & 924k  & \textbf{2.92\,s} & 0.21\,s          & 19.99\,s  & 0.13\,s   \\
+large   & 5.26M & \textbf{6.39\,s} & 0.37\,s          & 52.59\,s  & 0.44\,s   \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -435,6 +434,50 @@ large: $d{=}256,L{=}6,T{=}32$.}
 \end{frame}
 
 %======================================================================
+\begin{frame}{Accuracy Sanity Check: TREC Question Classification}
+\textbf{Task.} TREC-6 \emph{coarse} question type classification
+(Li \& Roth, 2002): 5{,}452 train / 500 test questions, 6 classes
+(\texttt{ABBR / DESC / ENTY / HUM / LOC / NUM}). Char-level encoding,
+$T{=}128$, mean-pooled non-causal classifier on top of the encoder.
+Both models trained for 3{,}000 steps with the same optimizer.
+
+\smallskip
+\begin{columns}[T]
+\begin{column}{0.58\textwidth}
+\centering
+\includegraphics[width=\linewidth]{classify_results_acc_modified.png}\\
+{\scriptsize dotted = chance ($1/6\approx16.7\%$),\;\;
+dashed = majority class ($27.6\%$).}
+\end{column}
+\begin{column}{0.40\textwidth}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Model} & \textbf{Val.\ acc.} & \textbf{Peak MB} \\
+\midrule
+baseline (softmax)        & 74.4\%   & 70.0   \\
+\sys{} (LLA + ternary)    & 71.0\%   & 130.6  \\
+\midrule
+majority class            & 27.6\%   & --     \\
+chance ($1/6$)            & 16.7\%   & --     \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\textbf{$\sim$82k params each, 3k steps.}
+Both models train cleanly above chance and majority baselines;
+\sys{} is within $\sim 3$ points of the standard softmax transformer
+despite ternary weights and lookup-based attention.
+
+\smallskip
+\sys{}'s extra peak memory comes from the structured-lookup
+activation tables.
+\end{column}
+\end{columns}
+\end{frame}
+
+%======================================================================
 \begin{frame}{Take-aways}
 \begin{enumerate}
   \item \textbf{Co-design beats approximation.}
@@ -447,7 +490,7 @@ large: $d{=}256,L{=}6,T{=}32$.}
         6 model-level sumchecks, 1 global Lasso, 1 global range,
         10 deferred openings.
   \item \textbf{Result.} 6-layer, 5.26M-parameter transformer:
-        \textbf{6.4\,s prove / 0.37\,s verify / 14.5\,MB proof}
+        \textbf{6.4\,s prove / 0.37\,s verify}
         ($\sim$8$\times$ faster prover than zkGPT) on 12 CPU threads,
         transparent setup.
 \end{enumerate}
