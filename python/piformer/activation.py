@@ -55,18 +55,19 @@ class StructuredLookupActivation(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 1. Quantize to non-negative integer index.
-        x_int = torch.clamp(
-            (x / self.scale).round(), 0, 2 ** self.num_bits - 1
-        ).long()
+        x_int = (x / self.scale).round().clamp_(0, 2 ** self.num_bits - 1).long()
 
         # 2. Decompose and sum sub-table lookups.
-        output = torch.zeros_like(x, dtype=torch.float32)
-        temp = x_int
-        for i in range(self.c):
-            chunk_idx = temp % self.chunk_size
-            output = output + self.tables[i][chunk_idx]
-            temp = temp // self.chunk_size
-        return output
+        # chunk_size is a power of two, so use bit-and / bit-shift instead of
+        # % / //. We also seed the accumulator from the first lookup rather
+        # than zeros_like(), saving one allocation + one add per call. This
+        # gets called twice per attention layer (φ(Q), φ(K)) plus once per
+        # FFN, so the kernel-count savings compound.
+        mask = self.chunk_size - 1
+        out = self.tables[0][x_int & mask]
+        for i in range(1, self.c):
+            out = out + self.tables[i][(x_int >> (i * self.bits_per_chunk)) & mask]
+        return out
 
     def export_tables(self) -> list[list[float]]:
         """Return detached sub-table values for the Rust prover."""

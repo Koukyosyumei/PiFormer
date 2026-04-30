@@ -39,25 +39,16 @@ class TernaryLinear(nn.Module):
 
     def _quantize(self, w: torch.Tensor) -> torch.Tensor:
         """
-        重みを {-1, 0, 1} に量子化する。
+        重みを {-α, 0, +α} に量子化する。
+
+        Vectorized: a single fused expression instead of boolean-indexed
+        assignment, which on GPU collapses ~8 kernel launches down to ~4.
+        torch.sign(w) returns 0 for w==0, so multiplying by the >δ mask gives
+        the correct {-1, 0, 1} result without any branch.
         """
-        # 1. 重みをスケーリング（平均を引いて中心を合わせる手法もあるが、ここではシンプルに）
-        # alpha は量子化後の値の大きさを決定する
-
-        # 2. 閾値の計算 (BitNet等の手法: 重みの絶対値の平均の一定割合を 0 にする)
-        # ここではシンプルに、全体の平均を基準に 0 領域を作る
-        delta = 0.7 * w.abs().mean()
-
-        # 3. 三値化プロセス
-        # w > delta  =>  1
-        # w < -delta => -1
-        # else       =>  0
-        w_q = torch.zeros_like(w)
-        w_q[w > delta] = 1
-        w_q[w < -delta] = -1
-
-        # 4. alpha を掛けて実スケールに戻す (W_final = alpha * {-1, 0, 1})
-        # ZKP上では alpha は行列演算の「後」に1回掛けるだけ。
+        abs_w = w.abs()
+        delta = abs_w.mean() * 0.7
+        w_q = torch.sign(w) * (abs_w > delta).to(w.dtype)
         return w_q * self.alpha
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
