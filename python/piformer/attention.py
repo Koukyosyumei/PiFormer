@@ -51,8 +51,12 @@ class LinearAttentionLayer(nn.Module):
         self.v_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=False)
         self.out_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=True)
 
-        # Single φ shared by Q and K projections.
-        self.phi = StructuredLookupActivation(num_bits=num_bits, c=c, scale=scale)
+        # Single strictly positive φ shared by Q and K projections. Linear
+        # attention normalizers are unstable if the kernel features can go
+        # negative or collapse to zero for half the signed input range.
+        self.phi = StructuredLookupActivation(
+            num_bits=num_bits, c=c, scale=scale, init="positive"
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

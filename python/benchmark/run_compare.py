@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -165,6 +166,48 @@ def init_piformer_from_baseline_state(model: PiFormerModel, state: dict[str, tor
         )
 
 
+def make_optimizer(model: nn.Module, args) -> torch.optim.Optimizer:
+    """AdamW with decay only on ordinary matrix weights."""
+    decay_params = []
+    no_decay_params = []
+
+    for module_name, module in model.named_modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if not param.requires_grad:
+                continue
+            full_name = f"{module_name}.{param_name}" if module_name else param_name
+            if (
+                param_name.endswith("bias")
+                or param_name == "alpha"
+                or "tables" in full_name
+                or isinstance(module, (nn.LayerNorm, nn.Embedding))
+            ):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+    return torch.optim.AdamW(
+        [
+            {"params": decay_params, "weight_decay": args.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+    )
+
+
+def learning_rate_for_step(step: int, steps: int, args) -> float:
+    if args.warmup_steps > 0 and step <= args.warmup_steps:
+        return args.lr * step / args.warmup_steps
+    if args.min_lr_ratio >= 1.0 or steps <= args.warmup_steps:
+        return args.lr
+
+    progress = (step - args.warmup_steps) / max(1, steps - args.warmup_steps)
+    cosine = 0.5 * (1.0 + math.cos(progress * math.pi))
+    return args.lr * (args.min_lr_ratio + (1.0 - args.min_lr_ratio) * cosine)
+
+
 def train_one(
     name: str,
     model: nn.Module,
@@ -172,11 +215,13 @@ def train_one(
     val_ids: torch.Tensor,
     args,
     device: torch.device,
+    steps: int,
 ):
     print(f"\n=== Training {name} ===")
     print(f"  params: {count_params(model):,}")
+    print(f"  steps:  {steps}")
 
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optim = make_optimizer(model, args)
     history = {"step": [], "train_loss": [], "val_loss": []}
 
     reset_peak_memory(device)
@@ -197,12 +242,18 @@ def train_one(
     t0 = time.perf_counter()
     running = 0.0
     log_start = 1
-    for step in range(1, args.steps + 1):
+    for step in range(1, steps + 1):
+        lr = learning_rate_for_step(step, steps, args)
+        for group in optim.param_groups:
+            group["lr"] = lr
+
         x, y = random_batch(train_ids, args.batch_size, args.seq_len, device)
         logits = model(x)
         loss = nn.functional.cross_entropy(
             logits.reshape(-1, logits.size(-1)), y.reshape(-1)
         )
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"{name} produced non-finite loss at step {step}: {loss}")
         optim.zero_grad(set_to_none=True)
         loss.backward()
         if args.grad_clip > 0:
@@ -210,7 +261,7 @@ def train_one(
         optim.step()
         running += loss.item()
 
-        if step % args.log_every == 0 or step == args.steps:
+        if step % args.log_every == 0 or step == steps:
             logged_steps = step - log_start + 1
             avg = running / logged_steps
             log_start = step + 1
@@ -229,9 +280,10 @@ def train_one(
     return {
         "name": name,
         "params": count_params(model),
+        "steps": steps,
         "train_seconds": elapsed,
-        "steps_per_sec": args.steps / elapsed,
-        "tokens_per_sec": args.steps * args.batch_size * args.seq_len / elapsed,
+        "steps_per_sec": steps / elapsed,
+        "tokens_per_sec": steps * args.batch_size * args.seq_len / elapsed,
         "final_val_loss": final_val,
         "final_val_ppl": float(torch.exp(torch.tensor(final_val))),
         "peak_mem_mb": peak_memory_mb(device),
@@ -307,8 +359,24 @@ def parse_args():
     # Training
     p.add_argument("--seq_len", type=int, default=128)
     p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--steps", type=int, default=3000)
+    p.add_argument("--steps", type=int, default=3000,
+                   help="Default training steps. Overridden per-model by "
+                        "--baseline_steps / --piformer_steps when set.")
+    p.add_argument("--baseline_steps", type=int, default=None,
+                   help="Training steps for the baseline transformer "
+                        "(falls back to --steps).")
+    p.add_argument("--piformer_steps", type=int, default=None,
+                   help="Training steps for PiFormer (falls back to --steps).")
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=0.01,
+                   help="AdamW weight decay for ordinary matrix weights only.")
+    p.add_argument("--beta1", type=float, default=0.9)
+    p.add_argument("--beta2", type=float, default=0.95)
+    p.add_argument("--adam_eps", type=float, default=1e-8)
+    p.add_argument("--warmup_steps", type=int, default=100,
+                   help="Linear LR warmup steps; set 0 to disable.")
+    p.add_argument("--min_lr_ratio", type=float, default=0.1,
+                   help="Final LR as a fraction of --lr for cosine decay; set 1 for constant LR.")
     p.add_argument("--grad_clip", type=float, default=1.0,
                    help="Clip global gradient norm during training; set <=0 to disable.")
     p.add_argument("--log_every", type=int, default=200)
@@ -408,12 +476,15 @@ def main():
     if args.piformer_init_from_baseline and "baseline" not in selected:
         raise ValueError("--piformer_init_from_baseline requires --models to include baseline")
 
+    baseline_steps = args.baseline_steps if args.baseline_steps is not None else args.steps
+    piformer_steps = args.piformer_steps if args.piformer_steps is not None else args.steps
+
     if "baseline" in selected:
         torch.manual_seed(args.seed)
         model = BaselineTransformer(**common).to(device)
         model = maybe_compile_model("baseline", model, args, device)
         results["models"]["baseline"] = train_one(
-            "baseline", model, train_ids, val_ids, args, device
+            "baseline", model, train_ids, val_ids, args, device, baseline_steps
         )
         if not args.skip_inference:
             seq_lens = [int(s) for s in args.inference_seq_lens.split(",")]
@@ -436,7 +507,7 @@ def main():
             init_piformer_from_baseline_state(model, baseline_state_for_init)
         model = maybe_compile_model("piformer", model, args, device)
         results["models"]["piformer"] = train_one(
-            "piformer", model, train_ids, val_ids, args, device
+            "piformer", model, train_ids, val_ids, args, device, piformer_steps
         )
         if not args.skip_inference:
             seq_lens = [int(s) for s in args.inference_seq_lens.split(",")]

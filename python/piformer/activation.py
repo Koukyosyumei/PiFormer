@@ -20,34 +20,50 @@ class StructuredLookupActivation(nn.Module):
     Args:
         num_bits: Total quantization bits for the input (e.g. 8 or 16).
         c: Number of sub-tables (decomposition depth). Must divide num_bits.
-        scale: Quantization scale; x_int = clamp(round(x / scale), 0, 2^num_bits - 1).
+        scale: Quantization scale; x_int = clamp(round(x / scale) + zero_point,
+            0, 2^num_bits - 1).
+        init: Initial table shape. ``"positive"`` is intended for attention
+            kernels; ``"gelu"`` is intended for feed-forward activations.
 
     In the SNARK, each sub-table lookup is proved via a Lasso sumcheck argument.
     The additive decomposition lets us commit to c tables of size 2^(num_bits/c)
     instead of one table of size 2^num_bits.
     """
 
-    def __init__(self, num_bits: int = 8, c: int = 2, scale: float = 1.0):
+    def __init__(
+        self,
+        num_bits: int = 8,
+        c: int = 2,
+        scale: float = 1.0,
+        init: str = "gelu",
+    ):
         super().__init__()
         assert num_bits % c == 0, "num_bits must be divisible by c"
+        if init not in {"gelu", "positive"}:
+            raise ValueError(f"unknown StructuredLookupActivation init: {init}")
         self.num_bits = num_bits
         self.c = c
         self.bits_per_chunk = num_bits // c
         self.chunk_size = 2 ** self.bits_per_chunk
         self.scale = scale
+        self.zero_point = 1 << (num_bits - 1)
+        self.init = init
 
         # Initialize sub-tables to approximate GeLU / c shape so training converges faster.
         self.tables = nn.ParameterList()
 
-        total_size = 2 ** num_bits
         for i in range(c):
             indices = torch.arange(self.chunk_size, dtype=torch.float32)
             if i == c - 1: # 最上位テーブル
                 # 上位ビットのインデックスがカバーする範囲の「代表値」でGeLUを計算
                 # 例: 8bit, c=2なら 16刻みで値をサンプリング
-                x_idx = indices * (self.chunk_size ** i) + (self.chunk_size ** i) / 2
-                x_approx = (x_idx / total_size - 0.5) * 8.0 # [-4, 4]スケール
-                init = F.gelu(x_approx)
+                stride = self.chunk_size ** i
+                x_idx = indices * stride + stride / 2
+                x_approx = (x_idx - self.zero_point) * self.scale
+                if init == "positive":
+                    init = F.elu(x_approx) + 1.0
+                else:
+                    init = F.gelu(x_approx).clamp_min(0.0)
             else:
                 # 下位テーブルは 0 で初期化してギザギザを防ぐ
                 init = torch.zeros(self.chunk_size)
@@ -58,7 +74,12 @@ class StructuredLookupActivation(nn.Module):
         # The integer index path is non-differentiable today, so avoid building
         # a throwaway autograd graph for division/rounding/clamping.
         with torch.no_grad():
-            x_int = (x / self.scale).round().clamp_(0, 2 ** self.num_bits - 1).long()
+            x_int = (
+                (x / self.scale).round()
+                .add_(self.zero_point)
+                .clamp_(0, 2 ** self.num_bits - 1)
+                .long()
+            )
 
         # 2. Decompose and sum sub-table lookups.
         # chunk_size is a power of two, so use bit-and / bit-shift instead of
