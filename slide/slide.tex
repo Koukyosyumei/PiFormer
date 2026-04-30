@@ -74,34 +74,28 @@ via Structured Lookup Attention}
 
 %======================================================================
 \begin{frame}{Overview}
-\textbf{Why transformers?} They are the backbone of essentially every
+\textbf{Why transformers?} The backbone of essentially every
 state-of-the-art language, vision, and speech model today
 (GPT, Claude, Llama, ViT, Whisper). As inference moves to remote
-APIs, users need cryptographic evidence that the \emph{claimed} model
-produced the \emph{claimed} output -- not just a TLS certificate.
+APIs, users need cryptographic evidence that the \emph{claimed}
+model produced the \emph{claimed} output -- not just a TLS
+certificate.
 
 \medskip
-\textbf{Problem.} Prove $\by=\mathcal{M}_\theta(\bx)$ for a transformer
-with a short proof and cheap verifier. Standard ops -- softmax, GeLU,
-LayerNorm, dense $\bW$ -- are all SNARK-hostile. Prior work
-(zkLLM, zkGPT) approximates them; \textbf{$\pi$-Former co-designs}
-the model so the new computation is natively sumcheck $+$ Lasso
-friendly, and proves it \emph{exactly}.
+\textbf{What is a SNARK?} A \emph{succinct non-interactive argument
+of knowledge}: a short proof that a specific computation was carried
+out correctly, verifiable in time far less than re-running it.
 
 \medskip
-\textbf{Three substitutions inside every block.}
-\begin{center}
-\small
-\setlength{\tabcolsep}{4pt}
-\begin{tabular}{lcl}
-\toprule
-softmax attention & $\Rightarrow$ & \textbf{LLA}: linear attn.\ with learnable lookup $\bphi$ \\
-GeLU              & $\Rightarrow$ & same learnable additive sub-table lookup \\
-dense $\bW$       & $\Rightarrow$ & \textbf{ternary} $\bW\!\in\!\{-1,0,+1\}\!\cdot\!\alpha$ \\
-LayerNorm         & $\Rightarrow$ & constraint-fused LN \emph{(zkGPT-style, re-used)} \\
-\bottomrule
-\end{tabular}
-\end{center}
+\textbf{Problem.} Build a SNARK for transformer inference
+$\by = \mathcal{M}_\theta(\bx)$ that the prover can actually run at
+scale.
+
+\medskip
+\textbf{Our approach: co-design.} Modify the model so that its
+computation is natively sumcheck $+$ Lasso friendly, then prove the
+new model \emph{exactly} -- rather than approximating a standard
+transformer.
 
 \medskip
 \textbf{Headline.} 5.26M-param transformer, 12 CPU threads:
@@ -379,7 +373,7 @@ with Fiat--Shamir weights $\eta^{\ell-1}$ before the inner sumcheck.
 \begin{itemize}
   \item All Lasso instances $\to$ one global multi-Lasso.
   \item All LayerNorm range proofs $\to$ one shared multiplicity.
-  \item Residuals $\to$ no proof at all (homomorphic Hyrax addition).
+  \item Residuals $\to$ \emph{no extra proof}; verifier just adds Hyrax commitments.
 \end{itemize}
 \end{frame}
 
