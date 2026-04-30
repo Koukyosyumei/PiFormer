@@ -161,6 +161,15 @@ def train_one(
     history = {"step": [], "train_loss": [], "val_loss": [], "val_acc": []}
 
     reset_peak_memory(device)
+
+    # Step 0: untrained baseline so the accuracy curve starts at the chance level.
+    init_acc, init_loss = eval_accuracy(model, val_x, val_y, args.batch_size, device)
+    history["step"].append(0)
+    history["train_loss"].append(init_loss)
+    history["val_loss"].append(init_loss)
+    history["val_acc"].append(init_acc)
+    print(f"  step     0  (init)         val_loss={init_loss:.4f}  val_acc={init_acc * 100:.2f}%")
+
     model.train()
 
     train_iter = iter_minibatches(train_x, train_y, args.batch_size, device, seed=args.seed)
@@ -240,13 +249,29 @@ def plot_accuracy_curves(results: dict, out_path: Path) -> None:
 
     df = pd.DataFrame(rows)
     base_rate_pct = results.get("base_rate", 0.0) * 100.0
+    num_classes = results["args"].get("num_classes")
+    if results["args"].get("dataset") == "trec":
+        num_classes = 6  # TREC coarse labels; args.num_classes only applies to synthetic
+    chance_pct = 100.0 / num_classes if num_classes else None
+
     plot = (
         ggplot(df, aes(x="step", y="val_acc", color="model"))
         + geom_line(size=0.8)
         + geom_hline(yintercept=base_rate_pct, linetype="dashed", color="grey")
+    )
+    if chance_pct is not None:
+        plot = plot + geom_hline(yintercept=chance_pct, linetype="dotted", color="grey")
+    plot = (
+        plot
         + scale_y_continuous(limits=[0, 100])
         + labs(
             title="Validation accuracy vs. step",
+            subtitle=(
+                f"dotted = chance ({chance_pct:.1f}%), "
+                f"dashed = majority class ({base_rate_pct:.1f}%)"
+                if chance_pct is not None
+                else f"dashed = majority class ({base_rate_pct:.1f}%)"
+            ),
             x="step",
             y="val accuracy (%)",
             color="model",
