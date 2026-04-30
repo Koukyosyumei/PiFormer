@@ -414,8 +414,7 @@ large: $d{=}256,L{=}6,T{=}32$.}
 %======================================================================
 \begin{frame}{Accuracy Sanity Check: TREC Question Classification}
 \textbf{Task.} TREC-6 \emph{coarse} question type classification
-(Li \& Roth, 2002): 5{,}452 train / 500 test questions, 6 classes
-(\texttt{ABBR / DESC / ENTY / HUM / LOC / NUM}). Char-level encoding,
+(Li \& Roth, 2002): 6 classes (\texttt{ABBR / DESC / ENTY / HUM / LOC / NUM}). Char-level encoding,
 $T{=}128$, mean-pooled non-causal classifier on top of the encoder.
 Both models trained for 3{,}000 steps with the same optimizer.
 
