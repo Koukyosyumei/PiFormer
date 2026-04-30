@@ -322,8 +322,6 @@ small table $T_i$ of size $2^{b/c}$, sum.
 \begin{itemize}
   \item For $b{=}16,\,c{=}2$: two 256-entry tables instead of one
         65{,}536-entry table.
-  \item This is \emph{exactly} the structured-decomposability
-        condition Lasso wants.
   \item Init so $\sum_i T_i \approx \mathrm{GeLU}$, then train end-to-end
         with the straight-through estimator.
 \end{itemize}
@@ -360,9 +358,6 @@ LayerNorm is the SNARK-friendly piece we \emph{re-use} from prior work.
 
 %======================================================================
 \begin{frame}{Optimization: GKR and Batching}
-Two orthogonal ``collapse many into one'' tricks.
-
-\medskip
 \textbf{GKR-style combine.}
 The same committed witness $f$ (e.g.\ $\bX_{\mathrm{n1}}$) is evaluated
 by many sub-protocols at different points.
@@ -407,37 +402,38 @@ with Fiat--Shamir weights $\eta^{\ell-1}$ before the inner sumcheck.
 \end{frame}
 
 %======================================================================
-\begin{frame}{End-to-End Performance}
+\begin{frame}{End-to-End Performance vs.\ zkGPT}
 Single-thread x86\_64 CPU. Times are pure compute; IO excluded.
 
 \medskip
 \begin{center}
-\small
+\scriptsize
 \setlength{\tabcolsep}{4pt}
-\begin{tabular}{lrrrrrrrr}
+\begin{tabular}{lrrrrrr}
 \toprule
-\textbf{Model} & \textbf{$d$} & \textbf{$L$} & \textbf{$d_{ff}$} & \textbf{$T$}
-   & \textbf{Params} & \textbf{Prove} & \textbf{Verify} & \textbf{Proof} \\
+& & \multicolumn{2}{c}{\textbf{$\pi$-Former}} & & \multicolumn{2}{c}{\textbf{zkGPT}} \\
+\cmidrule(lr){3-4} \cmidrule(lr){6-7}
+\textbf{Model} & \textbf{Params} & Prove & Verify & \textbf{Proof} & Prove & Verify \\
 \midrule
-tiny   & 8   & 1 & 16  & 8  & 1.1k  & 0.22\,s & 0.03\,s & 108\,KB \\
-small  & 64  & 2 & 256 & 16 & 133k  & 1.10\,s & 0.15\,s & 1.0\,MB \\
-medium & 128 & 4 & 512 & 32 & 924k  & \textbf{4.24\,s} & \textbf{0.28\,s} & 5.5\,MB \\
+medium  & 924k  & \textbf{2.92\,s} & 0.21\,s          & 5.5\,MB  & 19.99\,s  & 0.13\,s   \\
+large   & 5.26M & \textbf{6.39\,s} & 0.37\,s          & 14.5\,MB & 52.59\,s  & 0.44\,s   \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\medskip
-\textbf{Headline.} 4-layer, $\sim$924k-parameter transformer:
-\textbf{4.2\,s prove, 280\,ms verify, 5.5\,MB proof} on a single CPU core.
+\smallskip
+{\scriptsize medium: $d{=}128,L{=}4,T{=}32$;\;\;
+large: $d{=}256,L{=}6,T{=}32$.}
 
 \medskip
-\textbf{Scaling.}
+\textbf{Headline.}
 \begin{itemize}
-  \item Prove time $\sim$ linear in $L\cdot T\cdot d$ (per-block
-        arithmetic survives batching).
-  \item Verify time \emph{sub-linear}: each cross-block sumcheck is
-        a $\log Td$-round transcript, accumulators finalise in 1 MSM
-        pair each.
+  \item \textbf{Prover}: \sys{} is $\sim$\textbf{6.8$\times$} faster at
+        medium and $\sim$\textbf{8.2$\times$} faster at large.
+  \item \textbf{Verifier}: comparable -- zkGPT slightly faster at
+        medium (0.13\,s vs 0.21\,s), \sys{} faster at large
+        (0.37\,s vs 0.44\,s).
+  \item Both are transparent (no trusted setup).
 \end{itemize}
 \end{frame}
 
@@ -453,9 +449,10 @@ medium & 128 & 4 & 512 & 32 & 924k  & \textbf{4.24\,s} & \textbf{0.28\,s} & 5.5\
   \item \textbf{Cross-block batching} folds $L$ per-block proofs into
         6 model-level sumchecks, 1 global Lasso, 1 global range,
         10 deferred openings.
-  \item \textbf{Result.} 4-layer, 924k-parameter transformer:
-        \textbf{4.2\,s prove / 280\,ms verify / 5.5\,MB proof},
-        single CPU core, transparent setup.
+  \item \textbf{Result.} 6-layer, 5.26M-parameter transformer:
+        \textbf{6.4\,s prove / 0.37\,s verify / 14.5\,MB proof}
+        ($\sim$8$\times$ faster prover than zkGPT), single CPU core,
+        transparent setup.
 \end{enumerate}
 
 \bigskip
