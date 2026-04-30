@@ -48,6 +48,13 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def safe_ppl(loss: float) -> float:
+    try:
+        return math.exp(loss)
+    except OverflowError:
+        return float("inf")
+
+
 @torch.no_grad()
 def eval_loss(model, val_ids, batch_size, seq_len, device, n_batches: int = 20):
     model.eval()
@@ -222,7 +229,13 @@ def train_one(
     print(f"  steps:  {steps}")
 
     optim = make_optimizer(model, args)
-    history = {"step": [], "train_loss": [], "val_loss": []}
+    history = {
+        "step": [],
+        "train_loss": [],
+        "train_ppl": [],
+        "val_loss": [],
+        "val_ppl": [],
+    }
 
     reset_peak_memory(device)
     model.train()
@@ -267,10 +280,18 @@ def train_one(
             log_start = step + 1
             running = 0.0
             val = eval_loss(model, val_ids, args.batch_size, args.seq_len, device)
+            train_ppl = safe_ppl(avg)
+            val_ppl = safe_ppl(val)
             history["step"].append(step)
             history["train_loss"].append(avg)
+            history["train_ppl"].append(train_ppl)
             history["val_loss"].append(val)
-            print(f"  step {step:5d}  train={avg:.4f}  val={val:.4f}")
+            history["val_ppl"].append(val_ppl)
+            print(
+                f"  step {step:5d}  "
+                f"train={avg:.4f} (ppl={train_ppl:.2f})  "
+                f"val={val:.4f} (ppl={val_ppl:.2f})"
+            )
 
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -285,7 +306,7 @@ def train_one(
         "steps_per_sec": steps / elapsed,
         "tokens_per_sec": steps * args.batch_size * args.seq_len / elapsed,
         "final_val_loss": final_val,
-        "final_val_ppl": float(torch.exp(torch.tensor(final_val))),
+        "final_val_ppl": safe_ppl(final_val),
         "peak_mem_mb": peak_memory_mb(device),
         "history": history,
     }
@@ -331,6 +352,38 @@ def inference_scaling(
             else:
                 raise
     return rows
+
+
+@torch.no_grad()
+def generate_text(
+    model: nn.Module,
+    prompt_ids: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+    max_seq_len: int,
+    device: torch.device,
+) -> list[int]:
+    """Sample tokens autoregressively from a model. Returns prompt+generated ids."""
+    model.eval()
+    ids = prompt_ids.to(device).unsqueeze(0)
+    for _ in range(max_new_tokens):
+        ctx = ids if ids.size(1) <= max_seq_len else ids[:, -max_seq_len:]
+        logits = model(ctx)[:, -1, :]
+        if temperature <= 0:
+            next_id = torch.argmax(logits, dim=-1, keepdim=True)
+        else:
+            logits = logits / temperature
+            if top_k and top_k > 0:
+                k = min(top_k, logits.size(-1))
+                v, _ = torch.topk(logits, k)
+                logits = torch.where(
+                    logits < v[:, [-1]], torch.full_like(logits, float("-inf")), logits
+                )
+            probs = torch.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+        ids = torch.cat([ids, next_id], dim=1)
+    return ids[0].tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +452,21 @@ def parse_args():
     p.add_argument("--inference_batch_size", type=int, default=8)
     p.add_argument("--skip_inference", action="store_true")
 
+    # Text generation comparison
+    p.add_argument("--gen_prompt_len", type=int, default=64,
+                   help="Number of tokens taken from the start of val_ids to use as a "
+                        "shared prompt for the post-training generation comparison.")
+    p.add_argument("--gen_tokens", type=int, default=200,
+                   help="Number of tokens to generate from each trained model.")
+    p.add_argument("--gen_temperature", type=float, default=0.8,
+                   help="Sampling temperature for generation; <=0 uses greedy decoding.")
+    p.add_argument("--gen_top_k", type=int, default=40,
+                   help="Top-k filter for sampling; set 0 to disable.")
+    p.add_argument("--gen_seed", type=int, default=None,
+                   help="Seed used before each model's sampling; defaults to --seed.")
+    p.add_argument("--skip_generation", action="store_true",
+                   help="Skip the post-training text-generation comparison.")
+
     p.add_argument("--out", default="benchmark_results.json")
     p.add_argument("--loss_plot", default=None,
                    help="Path for ggplot loss-curve PNG. Defaults to <out>_loss.png. "
@@ -452,7 +520,7 @@ def main():
         print(f"GPU:    {torch.cuda.get_device_name(0)}")
 
     cache_dir = Path(args.cache_dir)
-    train_ids, val_ids, vocab_size, _decode = get_dataset(args.dataset, cache_dir)
+    train_ids, val_ids, vocab_size, decode = get_dataset(args.dataset, cache_dir)
     print(f"Dataset: {args.dataset}   vocab={vocab_size}   "
           f"train_tokens={len(train_ids):,}   val_tokens={len(val_ids):,}")
 
@@ -479,6 +547,46 @@ def main():
     baseline_steps = args.baseline_steps if args.baseline_steps is not None else args.steps
     piformer_steps = args.piformer_steps if args.piformer_steps is not None else args.steps
 
+    do_generation = not args.skip_generation and args.gen_tokens > 0
+    if do_generation:
+        prompt_len = max(1, min(args.gen_prompt_len, common["max_seq_len"], len(val_ids) - 1))
+        prompt_ids = val_ids[:prompt_len].clone()
+        gen_seed = args.gen_seed if args.gen_seed is not None else args.seed
+        prompt_text = decode(prompt_ids.tolist())
+        results["generation"] = {
+            "prompt": prompt_text,
+            "tokens": args.gen_tokens,
+            "temperature": args.gen_temperature,
+            "top_k": args.gen_top_k,
+            "seed": gen_seed,
+            "models": {},
+        }
+    else:
+        prompt_ids = None
+        gen_seed = None
+
+    def run_generation(name: str, model: nn.Module):
+        if not do_generation:
+            return
+        print(f"\n=== Generation: {name} ===")
+        torch.manual_seed(gen_seed)
+        ids = generate_text(
+            model,
+            prompt_ids,
+            max_new_tokens=args.gen_tokens,
+            temperature=args.gen_temperature,
+            top_k=args.gen_top_k,
+            max_seq_len=common["max_seq_len"],
+            device=device,
+        )
+        full_text = decode(ids)
+        completion = decode(ids[len(prompt_ids):])
+        results["generation"]["models"][name] = {
+            "completion": completion,
+            "full_text": full_text,
+        }
+        print(completion)
+
     if "baseline" in selected:
         torch.manual_seed(args.seed)
         model = BaselineTransformer(**common).to(device)
@@ -492,6 +600,7 @@ def main():
                 "baseline", model, seq_lens, vocab_size,
                 args.inference_batch_size, device,
             )
+        run_generation("baseline", model)
         if args.piformer_init_from_baseline:
             print("  saving trained baseline weights for PiFormer initialization")
             baseline_state_for_init = copy_state_to_cpu(model)
@@ -515,6 +624,7 @@ def main():
                 "piformer", model, seq_lens, vocab_size,
                 args.inference_batch_size, device,
             )
+        run_generation("piformer", model)
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -529,6 +639,21 @@ def main():
         print(f"{name:<10} {r['params']:>10,} {r['final_val_loss']:>10.4f} "
               f"{r['final_val_ppl']:>10.2f} {r['tokens_per_sec']:>10.0f} "
               f"{r['peak_mem_mb']:>10.1f}")
+
+    if "generation" in results and results["generation"]["models"]:
+        gen = results["generation"]
+        print("\n" + "=" * 60)
+        print("GENERATION COMPARISON")
+        print("=" * 60)
+        print(f"prompt (first {len(gen['prompt'])} chars from val set, "
+              f"temp={gen['temperature']}, top_k={gen['top_k']}, seed={gen['seed']}):")
+        print("-" * 60)
+        print(gen["prompt"])
+        for name, sample in gen["models"].items():
+            print("-" * 60)
+            print(f"[{name}] completion ({gen['tokens']} tokens):")
+            print(sample["completion"])
+        print("=" * 60)
 
     Path(args.out).write_text(json.dumps(results, indent=2))
     print(f"\nWrote {args.out}")

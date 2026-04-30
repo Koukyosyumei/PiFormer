@@ -39,7 +39,8 @@ class StructuredLookupActivation(nn.Module):
     ):
         super().__init__()
         assert num_bits % c == 0, "num_bits must be divisible by c"
-        if init not in {"gelu", "positive"}:
+        init_kind = init
+        if init_kind not in {"gelu", "positive"}:
             raise ValueError(f"unknown StructuredLookupActivation init: {init}")
         self.num_bits = num_bits
         self.c = c
@@ -47,7 +48,7 @@ class StructuredLookupActivation(nn.Module):
         self.chunk_size = 2 ** self.bits_per_chunk
         self.scale = scale
         self.zero_point = 1 << (num_bits - 1)
-        self.init = init
+        self.init = init_kind
 
         # Initialize sub-tables to approximate GeLU / c shape so training converges faster.
         self.tables = nn.ParameterList()
@@ -60,14 +61,14 @@ class StructuredLookupActivation(nn.Module):
                 stride = self.chunk_size ** i
                 x_idx = indices * stride + stride / 2
                 x_approx = (x_idx - self.zero_point) * self.scale
-                if init == "positive":
-                    init = F.elu(x_approx) + 1.0
+                if init_kind == "positive":
+                    init_values = F.elu(x_approx) + 1.0
                 else:
-                    init = F.gelu(x_approx).clamp_min(0.0)
+                    init_values = F.gelu(x_approx).clamp_min(0.0)
             else:
                 # 下位テーブルは 0 で初期化してギザギザを防ぐ
-                init = torch.zeros(self.chunk_size)
-            self.tables.append(nn.Parameter(init))
+                init_values = torch.zeros(self.chunk_size)
+            self.tables.append(nn.Parameter(init_values))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 1. Quantize to non-negative integer index.
