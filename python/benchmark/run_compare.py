@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -73,6 +72,21 @@ def peak_memory_mb(device) -> float:
     return torch.cuda.max_memory_allocated() / (1024 ** 2)
 
 
+def maybe_compile_model(name: str, model: nn.Module, args, device: torch.device) -> nn.Module:
+    """Compile models for long CUDA runs, where PiFormer's small kernels benefit most."""
+    if args.no_compile:
+        return model
+    if device.type != "cuda":
+        print(f"  torch.compile: skipped for {name} (CUDA device required)")
+        return model
+    if not hasattr(torch, "compile"):
+        print(f"  torch.compile: skipped for {name} (not available in this PyTorch)")
+        return model
+
+    print(f"  torch.compile: compiling {name} (mode={args.compile_mode})")
+    return torch.compile(model, mode=args.compile_mode)
+
+
 def train_one(
     name: str,
     model: nn.Module,
@@ -98,25 +112,30 @@ def train_one(
             logits.reshape(-1, logits.size(-1)), y.reshape(-1)
         )
         loss.backward()
-        optim.zero_grad()
+        optim.zero_grad(set_to_none=True)
     if device.type == "cuda":
         torch.cuda.synchronize()
 
     t0 = time.perf_counter()
     running = 0.0
+    log_start = 1
     for step in range(1, args.steps + 1):
         x, y = random_batch(train_ids, args.batch_size, args.seq_len, device)
         logits = model(x)
         loss = nn.functional.cross_entropy(
             logits.reshape(-1, logits.size(-1)), y.reshape(-1)
         )
-        optim.zero_grad()
+        optim.zero_grad(set_to_none=True)
         loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optim.step()
         running += loss.item()
 
         if step % args.log_every == 0 or step == args.steps:
-            avg = running / args.log_every
+            logged_steps = step - log_start + 1
+            avg = running / logged_steps
+            log_start = step + 1
             running = 0.0
             val = eval_loss(model, val_ids, args.batch_size, args.seq_len, device)
             history["step"].append(step)
@@ -212,8 +231,15 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--grad_clip", type=float, default=1.0,
+                   help="Clip global gradient norm during training; set <=0 to disable.")
     p.add_argument("--log_every", type=int, default=200)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--no_compile", action="store_true",
+                   help="Skip torch.compile. By default, CUDA runs compile each model.")
+    p.add_argument("--compile_mode", default="reduce-overhead",
+                   choices=["default", "reduce-overhead", "max-autotune"],
+                   help="torch.compile mode used when compilation is enabled.")
 
     # Models to run
     p.add_argument("--models", default="baseline,piformer",
@@ -262,6 +288,7 @@ def main():
     if "baseline" in selected:
         torch.manual_seed(args.seed)
         model = BaselineTransformer(**common).to(device)
+        model = maybe_compile_model("baseline", model, args, device)
         results["models"]["baseline"] = train_one(
             "baseline", model, train_ids, val_ids, args, device
         )
@@ -278,6 +305,7 @@ def main():
     if "piformer" in selected:
         torch.manual_seed(args.seed)
         model = PiFormerModel(**common, **piformer_kwargs).to(device)
+        model = maybe_compile_model("piformer", model, args, device)
         results["models"]["piformer"] = train_one(
             "piformer", model, train_ids, val_ids, args, device
         )

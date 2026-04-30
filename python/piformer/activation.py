@@ -55,7 +55,10 @@ class StructuredLookupActivation(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 1. Quantize to non-negative integer index.
-        x_int = (x / self.scale).round().clamp_(0, 2 ** self.num_bits - 1).long()
+        # The integer index path is non-differentiable today, so avoid building
+        # a throwaway autograd graph for division/rounding/clamping.
+        with torch.no_grad():
+            x_int = (x / self.scale).round().clamp_(0, 2 ** self.num_bits - 1).long()
 
         # 2. Decompose and sum sub-table lookups.
         # chunk_size is a power of two, so use bit-and / bit-shift instead of
@@ -67,6 +70,11 @@ class StructuredLookupActivation(nn.Module):
         out = self.tables[0][x_int & mask]
         for i in range(1, self.c):
             out = out + self.tables[i][(x_int >> (i * self.bits_per_chunk)) & mask]
+
+        if self.training:
+            # Straight-through estimator: forward uses the ZK-friendly lookup,
+            # backward lets gradients reach the projections before this layer.
+            out = out + (x - x.detach())
         return out
 
     def export_tables(self) -> list[list[float]]:
