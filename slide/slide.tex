@@ -1,0 +1,518 @@
+\documentclass[10pt]{beamer}
+%\usepackage[whole]{bxcjkjatype}
+
+\usepackage{newtxtext,newtxmath}
+\usepackage{stmaryrd}
+\usepackage{dsfont}
+\usepackage{xfrac}
+\usepackage{mathrsfs}
+
+\usepackage{booktabs}
+\usepackage{multirow}
+
+\usepackage[utf8]{inputenc}
+\usepackage{algorithm}
+\usepackage{algcompatible}
+\usepackage[noend]{algpseudocode}
+\usepackage{algpseudocode}
+\usepackage{multicol}
+
+\usepackage{arydshln}
+\usepackage{here}
+
+\usepackage{graphics}
+\usepackage{amsmath}
+
+\renewcommand{\algorithmicrequire}{\textbf{Input:}}
+\renewcommand{\algorithmicensure}{\textbf{Output:}}
+
+\newcommand{\argmin}{\mathop{\rm arg~min}}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem*{threatmodel}{Threat Model}
+\newtheorem{scenario}{Scenario}
+
+\newcommand{\hquad}{\hspace{0.5em}}
+
+\input{settings}
+\usetikzlibrary{positioning,arrows.meta,calc,fit,backgrounds,shapes.geometric}
+
+% ----- math shortcuts (kept consistent with the paper) -----
+\newcommand{\FF}{\mathbb{F}}
+\newcommand{\GG}{\mathbb{G}}
+\newcommand{\bX}{\mathbf{X}}
+\newcommand{\bY}{\mathbf{Y}}
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\by}{\mathbf{y}}
+\newcommand{\bO}{\mathbf{O}}
+\newcommand{\bQ}{\mathbf{Q}}
+\newcommand{\bK}{\mathbf{K}}
+\newcommand{\bV}{\mathbf{V}}
+\newcommand{\bM}{\mathbf{M}}
+\newcommand{\bW}{\mathbf{W}}
+\newcommand{\bphi}{\boldsymbol{\phi}}
+\newcommand{\bk}{\mathbf{k}}
+\newcommand{\bv}{\mathbf{v}}
+\newcommand{\bq}{\mathbf{q}}
+\newcommand{\softmax}{\mathrm{softmax}}
+\DeclareMathOperator{\LN}{LN}
+\DeclareMathOperator{\LLA}{LLA}
+\DeclareMathOperator{\Att}{Att}
+\DeclareMathOperator{\Com}{\mathsf{Com}}
+\newcommand{\sys}{\ensuremath{\pi\text{-Former}}}
+
+\title[$\pi$-Former]{$\pi$-Former: Succinct Proofs of Transformer Inference\\
+via Structured Lookup Attention}
+\author[H. Takahashi]{Hideaki Takahashi}
+\date[]{April 2026}
+
+\begin{document}
+\Front
+
+\pagestyle{empty}
+
+%======================================================================
+\begin{frame}{Motivation \& Challenge}
+\textbf{Setting.} A model owner runs $\mathcal{M}_\theta$ on user input
+$\bx$ and returns $\by$. The user wants a cryptographic proof that
+$\by=\mathcal{M}_\theta(\bx)$, with short proof and cheap verification.
+
+\medskip
+\textbf{The catch.} A SNARK only natively expresses
+\textbf{additions and multiplications in $\FF$}. But a transformer block has:
+\begin{itemize}
+  \item \textbf{Softmax}: $\exp(\cdot)$ + row-wise division.
+  \item \textbf{GeLU}: transcendental.
+  \item \textbf{LayerNorm}: $\sqrt{\sigma^2+\epsilon}$ + division.
+  \item \textbf{Dense linear}: one field multiplication per weight.
+\end{itemize}
+
+\medskip
+State of the art (zkLLM, zkGPT) approximates these with large lookup
+tables. Prover time still \textbf{minutes per token} for GPT-scale models.
+
+\medskip
+\begin{block}{Our angle}
+Don't fight the model. \textbf{Co-design} the model and the proof
+system so that every op is natively cheap.
+\end{block}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Co-Design in One Slide}
+We replace each painful operation with a SNARK-friendly twin:
+
+\medskip
+\begin{center}
+\begin{tabular}{l@{\hskip 0.6em}c@{\hskip 0.6em}l}
+\toprule
+\textbf{Standard op} & $\Rightarrow$ & \textbf{$\pi$-Former op} \\
+\midrule
+softmax attention   & $\Rightarrow$ & \textbf{LLA}: linear attention with lookup $\bphi$ \\
+GeLU                & $\Rightarrow$ & learnable additive sub-table lookup \\
+LayerNorm (div, $\sqrt{\,}$) & $\Rightarrow$ & constraint-fused LN, no div / $\sqrt{\,}$ \\
+dense $\bW$ (FP)    & $\Rightarrow$ & ternary $\bW\in\{-1,0,+1\}\cdot\alpha$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip
+\textbf{End result.} Every forward-pass operation becomes
+\begin{itemize}
+  \item a low-degree \textbf{sumcheck} claim, or
+  \item a \textbf{structured table lookup} (Lasso).
+\end{itemize}
+
+\medskip
+No ``ZK-unfriendly operation tax'' to pay.
+\end{frame}
+
+%======================================================================
+\begin{frame}{Toolbox (One-Line Reminders)}
+\textbf{Sumcheck.} Reduces $H=\sum_{x\in\{0,1\}^n} f(x)$ to a single
+evaluation $f(r)$ at random $r$. Verifier cost $O(n\delta)$,
+soundness error $\le n\delta/|\FF|$.
+
+\medskip
+\textbf{Hyrax PCS.} Transparent (no trusted setup) polynomial
+commitment based on Pedersen / DL on BN254 G1. $O(\sqrt N)$
+commitment size, $O(\sqrt N)$ open. Importantly: \textbf{additively
+homomorphic}.
+
+\medskip
+\textbf{Lasso.} A lookup argument that proves
+$v_j = T[\mathrm{idx}_j]$ for many queries against a table $T$,
+\emph{cheap when $T$ decomposes into small additive sub-tables}.
+
+\medskip
+\begin{block}{Strategy}
+Build the model so that:
+attention $=$ sumcheck $+$ Lasso,
+activation $=$ Lasso,
+LayerNorm $=$ sumchecks $+$ range checks,
+projection $=$ sumcheck with no field mults.
+\end{block}
+\end{frame}
+
+%======================================================================
+\begin{frame}{The $\pi$-Former Block}
+\begin{center}
+\begin{tikzpicture}[
+  font=\scriptsize,
+  box/.style={rectangle, draw, rounded corners=2pt, minimum width=1.2cm,
+              minimum height=0.5cm, align=center, fill=blue!6},
+  op/.style={rectangle, draw, rounded corners=2pt, minimum width=1.2cm,
+             minimum height=0.5cm, align=center, fill=green!10},
+  add/.style={circle, draw, inner sep=0.5pt, font=\tiny, fill=white},
+  arrow/.style={-latex, thick}
+]
+  \node[box] (xin)        at (0,0)   {$\bX_{\mathrm{in}}$};
+  \node[op,  right=0.25cm of xin]  (ln1)  {$\LN_1$};
+  \node[op,  right=0.25cm of ln1]  (qkv)  {QKV\\(ternary)};
+  \node[op,  right=0.25cm of qkv]  (lla)  {LLA\\(Lasso $\bphi$)};
+  \node[op,  right=0.25cm of lla]  (woo)  {$\bW_O$\\(ternary)};
+  \node[add, right=0.25cm of woo]  (res1) {$+$};
+  \node[box, right=0.25cm of res1] (xmid) {$\bX_{\mathrm{mid}}$};
+
+  \draw[arrow] (xin) -- (ln1);
+  \draw[arrow] (ln1) -- (qkv);
+  \draw[arrow] (qkv) -- (lla);
+  \draw[arrow] (lla) -- (woo);
+  \draw[arrow] (woo) -- (res1);
+  \draw[arrow] (res1) -- (xmid);
+  \draw[arrow] (xin.north) |- ($(xin.north)+(0,0.45)$) -| (res1.north);
+
+  \node[op,  below=0.6cm of ln1]  (ln2)  {$\LN_2$};
+  \node[op,  right=0.25cm of ln2] (w1)   {$\bW_1$\\(ternary)};
+  \node[op,  right=0.25cm of w1]  (phi)  {$\bphi$\\(Lasso)};
+  \node[op,  right=0.25cm of phi] (w2)   {$\bW_2$\\(ternary)};
+  \node[add, right=0.25cm of w2]  (res2) {$+$};
+  \node[box, right=0.25cm of res2] (xout) {$\bX_{\mathrm{out}}$};
+
+  \draw[arrow] (xmid.south) |- (ln2.west);
+  \draw[arrow] (ln2) -- (w1);
+  \draw[arrow] (w1) -- (phi);
+  \draw[arrow] (phi) -- (w2);
+  \draw[arrow] (w2) -- (res2);
+  \draw[arrow] (res2) -- (xout);
+  \draw[arrow] (xmid.south west) |- ($(ln2.north)+(0,0.35)$) -| (res2.north);
+\end{tikzpicture}
+\end{center}
+
+\textbf{Color code.}
+\begin{itemize}
+  \item Green = an op the SNARK proves.
+  \item Ternary boxes have \emph{no} field multiplications inside.
+  \item LLA / $\bphi$ are proved via Lasso lookups.
+  \item ``$+$'' (residual) is checked by \textbf{homomorphic addition
+        of Hyrax commitments} -- no proof at all.
+\end{itemize}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Idea 1: Learnable Lookup Attention (LLA)}
+\textbf{Linear attention} replaces $\softmax(\bQ\bK^\top/\sqrt{d})$ by
+a positive-definite kernel
+$\kappa(\bq,\bk)=\langle\bphi(\bq),\bphi(\bk)\rangle$:
+\[
+  \LLA(\bQ,\bK,\bV)_t \;=\;
+  \bphi(\bq_t)^{\!\top}\,\underbrace{\sum_{s}\bphi(\bk_s)\bv_s^{\!\top}}_{=\,\bM\;(\text{context, computed once})}.
+\]
+Cost: $O(n\,d^2)$ instead of $O(n^2 d)$, no exp, no row division.
+
+\medskip
+\textbf{Where's $\bphi$?} We make it learnable and SNARK-friendly:
+\[
+  \bphi(x) \;=\; \sum_{i=0}^{c-1} T_i\bigl[\chi_i(x_{\mathrm{int}})\bigr],
+\]
+i.e.\ split a $b$-bit input into $c$ chunks, look each up in a
+small table $T_i$ of size $2^{b/c}$, sum.
+
+\medskip
+\textbf{Why this matters.}
+\begin{itemize}
+  \item For $b{=}16,\,c{=}2$: two 256-entry tables instead of one
+        65{,}536-entry table.
+  \item This is \emph{exactly} the structured-decomposability
+        condition Lasso wants.
+  \item Init so $\sum_i T_i \approx \mathrm{GeLU}$, then train end-to-end
+        with the straight-through estimator.
+\end{itemize}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Idea 2: Ternary Projections}
+All projection matrices ($\bW_Q,\bW_K,\bW_V,\bW_O,\bW_1,\bW_2$, LM head)
+are constrained:
+\[
+  \bW \in \{-1, 0, +1\}^{m\times n},\qquad
+  \by = \alpha\cdot(\bx\bW) + \mathbf{b}
+\]
+with one learnable scalar $\alpha$ per layer (BitNet b1.58 style).
+
+\medskip
+\textbf{What changes inside the SNARK?} Consider the standard
+sumcheck for a contraction $\bY = \bX\bW$:
+\[
+  \widetilde\bY(r_t,r_d) - \mathbf{b}(r_d)
+  \;=\; \alpha \sum_k \widetilde\bX(r_t,k)\,\widetilde\bW(k,r_d).
+\]
+Because $\widetilde\bW(k,r_d)\in\{-1,0,+1\}$ after evaluation,
+each prover round is:
+\begin{center}
+``$+\!=$ / $-\!=$ / skip'' \quad -- no field multiplications.
+\end{center}
+
+\medskip
+\begin{block}{Bonus}
+The verifying key never holds raw weights -- only
+Hyrax \emph{commitments} to the ternary arrays.
+\end{block}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Idea 3: Constraint-Fused LayerNorm}
+Standard LN has $\sqrt{\sigma^2+\epsilon}$ and a division --
+both bad in $\FF$. We rewrite the identity as integer relations:
+
+\medskip
+For each row, audit at \emph{one} random index $r_t$ via four checks:
+\begin{enumerate}
+  \item \textbf{Mean}: degree-2 sumcheck for $\widetilde{\mathrm{sum\_x}}(r_t)$.
+  \item \textbf{Variance}: cubic sumcheck on the centered residual.
+  \item \textbf{Sigma range}: prove $\sigma=\lfloor\sqrt{\mathrm{var}}/d\rfloor$
+        by range-checking
+        $\mathrm{var}-(d\sigma)^2 \ge 0$ and
+        $(d\sigma+d)^2-1-\mathrm{var}\ge 0$.
+  \item \textbf{$\bY$ fusion}: a single multi-batched cubic sumcheck
+        for the $\gamma\bX$ and $\sigma\bY$ legs together.
+\end{enumerate}
+
+\medskip
+\textbf{Result.} No field divisions, no square roots. Verifier reads
+$\gamma,\beta$ from the VK; everything else is one Hyrax opening per
+witness.
+\end{frame}
+
+%======================================================================
+\begin{frame}{Cross-Block Batching: The Key Systems Trick}
+A transformer is the \emph{same protocol, run $L$ times}.
+So instead of $L$ independent proofs per protocol type, we batch:
+
+\medskip
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Resource} & \textbf{Folded across blocks into\dots} \\
+\midrule
+6 sumcheck types  & 6 \emph{model-level} sumchecks \\
+all Lasso instances     & one global multi-Lasso \\
+all LN range proofs     & one shared multiplicity commitment \\
+residual $+$            & no proof; just add Hyrax commitments \\
+final openings          & 10 deferred Hyrax accumulators \\
+                        & finalised in 1 MSM pair each \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip
+\textbf{The fold.} For each protocol type, after the verifier sees
+all per-block claims $H_\ell$, draw $\eta\leftarrow\mathsf{FS}$ and
+prove
+\[
+  H^\star \;=\; \sum_{\ell=1}^L \eta^{\ell-1} H_\ell
+\]
+with one inner sumcheck. Standard random-linear-combination argument
+$\Rightarrow$ extra error only $(L-1)/|\FF|$.
+\end{frame}
+
+%======================================================================
+\begin{frame}{Soundness Sketch}
+\begin{block}{Cross-block batching (Theorem)}
+$\textsc{CrossBatch}$ reduces $L$ claims to one with extra error
+\[
+  \varepsilon_{\mathrm{batch}} \;\le\;
+  \frac{L-1}{|\FF|} + \frac{n\delta}{|\FF|}.
+\]
+\end{block}
+
+\textbf{Why it works.} The challenge $\eta$ is drawn \emph{after}
+all per-block claims and commitments are absorbed. If any claim is
+false, $P(\eta) = \sum_\ell \eta^{\ell-1}(\hat H_\ell - H_\ell)$ is a
+non-zero polynomial of degree $\le L-1$. Schwartz--Zippel: at most
+$L-1$ bad $\eta$ over $|\FF|$.
+
+\medskip
+\textbf{End-to-end.} A union bound over sumchecks, batched openings,
+Lasso, and LN sub-proofs gives
+\[
+  \varepsilon_{\mathrm{sound}} \;\le\;
+  \frac{m_{\mathrm{sc}}\,n_{\max}\delta_{\max}+m_{\mathrm{batch}}(L-1)+m_{\mathrm{open}}}{|\FF|}
+  + \varepsilon_{\mathrm{DL}}.
+\]
+For $L\le12$, $n_{\max}\le 64$ over BN254: statistical term $<2^{-240}$,
+dominated by the discrete-log term.
+\end{frame}
+
+%======================================================================
+\begin{frame}{Implementation}
+\textbf{Two matched halves}, one shared integer arithmetic.
+
+\medskip
+\begin{itemize}
+  \item \textbf{Rust prover/verifier} ($\sim$14k LoC) over BN254.
+  \item \textbf{PyTorch training pipeline} with custom
+        \texttt{TernaryLinear}, \texttt{StructuredLookupActivation},
+        \texttt{LinearAttentionLayer}.
+  \item Same fixed-point quantisation on both sides
+        $\Rightarrow$ \emph{no train--prove gap}.
+\end{itemize}
+
+\medskip
+\begin{center}
+\small
+\begin{tabular}{lr}
+\toprule
+\textbf{Module} & \textbf{LoC} \\
+\midrule
+\texttt{poly/}, \texttt{pcs/} (MLE, Hyrax)        & $\sim$1.4k \\
+\texttt{subprotocols/} (sumcheck $\times$3, GKR)  & $\sim$1.5k \\
+\texttt{lookup/} (Lasso multi, range)             & $\sim$1.3k \\
+\texttt{attention/} (LN, projection, LLA)         & $\sim$3.2k \\
+\texttt{ffn/}, \texttt{cross\_layer/}             & $\sim$1.2k \\
+\texttt{prover.rs}, \texttt{verifier.rs}, CLI     & $\sim$5.4k \\
+\midrule
+\textbf{Total}                                     & $\sim$14k \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{frame}
+
+%======================================================================
+\begin{frame}{End-to-End Performance}
+Single-thread x86\_64 CPU. Times are pure compute; IO excluded.
+
+\medskip
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrrrrr}
+\toprule
+\textbf{Model} & \textbf{$d$} & \textbf{$L$} & \textbf{$d_{ff}$} & \textbf{$T$}
+   & \textbf{Params} & \textbf{Prove} & \textbf{Verify} & \textbf{Proof} \\
+\midrule
+tiny   & 8   & 1 & 16  & 8  & 1.1k  & 0.22\,s & 0.03\,s & 108\,KB \\
+small  & 64  & 2 & 256 & 16 & 133k  & 1.10\,s & 0.15\,s & 1.0\,MB \\
+medium & 128 & 4 & 512 & 32 & 924k  & \textbf{4.24\,s} & \textbf{0.28\,s} & 5.5\,MB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip
+\textbf{Headline.} 4-layer, $\sim$924k-parameter transformer:
+\textbf{4.2\,s prove, 280\,ms verify, 5.5\,MB proof} on a single CPU core.
+
+\medskip
+\textbf{Scaling.}
+\begin{itemize}
+  \item Prove time $\sim$ linear in $L\cdot T\cdot d$ (per-block
+        arithmetic survives batching).
+  \item Verify time \emph{sub-linear}: each cross-block sumcheck is
+        a $\log Td$-round transcript, accumulators finalise in 1 MSM
+        pair each.
+\end{itemize}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Where Does the Verifier Spend Time?}
+\begin{center}
+\small
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Phase} & \textbf{tiny} & \textbf{small} & \textbf{medium} \\
+\midrule
+6 cross-block sumchecks (combined) & $<$0.2 & $<$0.5 & $<$0.8 \\
+Final range / final LN / LM-head   & 1.7    & 1.9    & 3.9   \\
+Cross-block batched opens          & 3.6    & 44.5   & 46.6  \\
+Global Lasso                       & 1.6    & 25.6   & 40.9  \\
+Accumulator finalisation (10 MSMs) & 13.2   & 23.7   & 54.2  \\
+\midrule
+\textbf{Subtotal (ms)}             & 22     & 99     & 148   \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip
+\textbf{Take-aways.}
+\begin{itemize}
+  \item Cross-block sumcheck transcripts are \emph{negligible}
+        ($<\!1$\,ms) -- batching collapses transcript work.
+  \item Hyrax openings + accumulator MSMs dominate.
+  \item These are exactly the inner loops that GPU MSM /
+        parallel sumcheck accelerate.
+\end{itemize}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Comparison, Limitations, Roadmap}
+\begin{center}
+\scriptsize
+\begin{tabular}{lll}
+\toprule
+\textbf{System} & \textbf{Attention} & \textbf{Activation} \\
+\midrule
+zkLLM   & softmax (\texttt{tlookup}) & structured lookup \\
+zkGPT   & softmax (approx., Plonky2) & lookup table \\
+\sys{}  & \textbf{linear (LLA, exact)} & \textbf{learnable} additive lookup \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Position.} \sys{} attention is not a softmax approximation:
+it is a different (kernelised) attention trained from scratch, so
+the SNARK proves the model \emph{exactly}. $\bphi$ is learnable.
+
+\medskip
+\textbf{Currently in the SNARK.} Single-head; un-normalised LLA
+numerator; no causal mask; \emph{not} zero-knowledge.
+
+\medskip
+\textbf{Engineering, not architecture.}
+\begin{itemize}
+  \item Multi-head: parallel batches of the same sumcheck.
+  \item Causal mask: an indicator polynomial inside the sumcheck.
+  \item ZK: standard blinding layer over committed witnesses.
+  \item GPU MSM + parallel sumcheck: every dominant inner loop is
+        data-parallel.
+  \item Streaming generation: Nova-style folding with
+        $\bM=\bphi(\bK)^\top\bV$ as the IVC accumulator
+        $\Rightarrow$ constant amortised cost per token.
+\end{itemize}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Take-aways}
+\begin{enumerate}
+  \item \textbf{Co-design beats approximation.}
+        Replace softmax / GeLU / LN / dense $\bW$ with twins that
+        are \emph{natively} sumcheck $+$ Lasso.
+  \item \textbf{LLA + ternary + fused LN}: every transformer op has
+        sub-linear verifier cost.
+  \item \textbf{Cross-block batching} folds $L$ per-block proofs into
+        6 model-level sumchecks, 1 global Lasso, 1 global range,
+        10 deferred openings.
+  \item \textbf{Result.} 4-layer, 924k-parameter transformer:
+        \textbf{4.2\,s prove / 280\,ms verify / 5.5\,MB proof},
+        single CPU core, transparent setup.
+\end{enumerate}
+
+\bigskip
+\begin{center}
+\Large Thank you.\\
+\medskip
+\small \texttt{ht2673@columbia.edu}
+\end{center}
+\end{frame}
+
+\end{document}
