@@ -453,7 +453,7 @@ pub fn prove_layernorm(
             sum_x_at_rt: claim_s,
             sq_sum_x_at_rt: claim_q,
             rt_batch_proof: hyrax_open_batch(
-                &[&sum_x_mle.evaluations],
+                &[&sum_x_mle.evaluations, &sq_sum_x_mle.evaluations],
                 &r_t,
                 nu_t,
                 sigma_t,
@@ -752,10 +752,16 @@ pub fn verify_layernorm(
 
     // m_com verified globally via verify_range_batched before this call.
 
-    // 1. rt_batch_proof (Group 1)
+    // 1. rt_batch_proof (Group 1): bind both row statistics at the row audit point.
     acc_t.add_verify_batch(
-        &[proof.internal_coms.sum_x_com.clone()],
-        &[proof.openings.sum_x_at_rt],
+        &[
+            proof.internal_coms.sum_x_com.clone(),
+            proof.internal_coms.sq_sum_x_com.clone(),
+        ],
+        &[
+            proof.openings.sum_x_at_rt,
+            proof.openings.sq_sum_x_at_rt,
+        ],
         &r_t,
         &proof.openings.rt_batch_proof,
         transcript,
