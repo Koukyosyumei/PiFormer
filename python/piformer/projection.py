@@ -63,27 +63,18 @@ class TernaryLinear(nn.Module):
         return self._quantize_indices(w) * self.alpha
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Mix FP and ternary weights according to quant_strength.
-        # forward = (1-q)*w + q*w_quant ; backward = identity in self.weight (STE).
-        q = float(self.quant_strength)
-        if self.training:
-            if q == 0.0:
-                w_eff = self.weight
-            else:
-                # Build ternary indices without autograd bookkeeping, then let
-                # alpha learn normally and pass an identity STE to the real weight.
-                with torch.no_grad():
-                    w_idx = self._quantize_indices(self.weight)
-                w_quant = w_idx * self.alpha
-                w_eff = self.weight + q * (w_quant - self.weight.detach())
-        else:
-            if q == 0.0:
-                w_eff = self.weight
-            else:
-                w_quant = self._quantize(self.weight)
-                w_eff = (1.0 - q) * self.weight + q * w_quant
-
-        return F.linear(x, w_eff, self.bias)
+        # Forward value:  alpha * ((1-q) * w + q * sign-mask(w))
+        # Backward:       identity STE into self.weight (the explicit
+        #                 self.weight term is the only path with a gradient).
+        # Both regimes are alpha-scaled so the effective weight magnitude is
+        # consistent across the q-schedule and alpha receives gradient
+        # throughout (including the q=0 warmup phase).
+        # All ops are tensor-valued (no .item() / float() conversion) and there
+        # is no data-dependent branching, so torch.compile captures one static
+        # graph regardless of training/eval mode or the current value of q.
+        w_idx = self._quantize_indices(self.weight.detach())
+        w_blend = self.weight + self.quant_strength * (w_idx - self.weight.detach())
+        return F.linear(x, w_blend * self.alpha, self.bias)
 
     @torch.no_grad()
     def export_weights(self) -> dict:
