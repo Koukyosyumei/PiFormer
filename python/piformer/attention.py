@@ -46,6 +46,9 @@ class LinearAttentionLayer(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.eps = eps
+        # Causal mode uses cumulative sums and is for training/eval comparison
+        # only. The non-causal path is what the prover circuit and witness
+        # currently mirror; do not enable causal=True for proof generation.
         self.causal = causal
 
         self.q_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=False)
@@ -53,8 +56,12 @@ class LinearAttentionLayer(nn.Module):
         self.v_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=False)
         self.out_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=True)
 
-        # Single φ shared by Q and K projections.
-        self.phi = StructuredLookupActivation(num_bits=num_bits, c=c, scale=scale)
+        # Single strictly positive φ shared by Q and K projections. Linear
+        # attention normalizers are unstable if the kernel features can go
+        # negative or collapse to zero for half the signed input range.
+        self.phi = StructuredLookupActivation(
+            num_bits=num_bits, c=c, scale=scale, init="positive"
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -80,11 +87,14 @@ class LinearAttentionLayer(nn.Module):
         phiK = self.phi(K)
 
         if self.causal:
-            # Prefix context C_t = Σ_{s<=t} φ(K_s)^T · V_s.
-            kv = torch.einsum("bhnd,bhnm->bhndm", phiK, V)
-            context = kv.cumsum(dim=2)
-            out = torch.einsum("bhnd,bhndm->bhnm", phiQ, context)
-            k_sum = phiK.cumsum(dim=2)
+            # Per-position outer products φ(K_s) ⊗ V_s, cumulatively summed
+            # over the sequence so position t only sees s ≤ t.
+            kv = torch.einsum("bhnd,bhne->bhnde", phiK, V)   # (B, h, T, d, d)
+            kv_cum = kv.cumsum(dim=2)
+            out = torch.einsum("bhnd,bhnde->bhne", phiQ, kv_cum)
+
+            k_cum = phiK.cumsum(dim=2)                       # (B, h, T, d)
+            Z = (phiQ * k_cum).sum(dim=-1, keepdim=True).clamp(min=self.eps)
         else:
             # context = φ(K)^T · V  →  (B, n_heads, d_head, d_head)
             # Einsum: for each head, contract over the sequence dimension T.
@@ -92,10 +102,10 @@ class LinearAttentionLayer(nn.Module):
 
             # out = φ(Q) · context  →  (B, n_heads, T, d_head)
             out = torch.einsum("bhnd,bhdm->bhnm", phiQ, context)
-            k_sum = phiK.sum(dim=2, keepdim=True)
 
-        # Normalizer Z_t = φ(Q_t) · Σ_s φ(K_s), or causal prefix Σ_{s<=t}.
-        Z = (phiQ * k_sum).sum(dim=-1, keepdim=True).clamp(min=self.eps)
+            # Normalizer Z_t = φ(Q_t) · Σ_s φ(K_s)
+            k_sum = phiK.sum(dim=2, keepdim=True)            # (B, h, 1, d)
+            Z = (phiQ * k_sum).sum(dim=-1, keepdim=True).clamp(min=self.eps)
         out = out / Z
 
         # Merge heads and final projection

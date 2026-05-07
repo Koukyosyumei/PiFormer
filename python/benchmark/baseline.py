@@ -15,15 +15,13 @@ attribution stays clean.
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class SoftmaxAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, causal: bool = False):
+    def __init__(self, d_model: int, n_heads: int, causal: bool = True):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
@@ -41,12 +39,7 @@ class SoftmaxAttention(nn.Module):
         K = self.k_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         V = self.v_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
-        if self.causal:
-            mask = torch.ones(T, T, dtype=torch.bool, device=x.device).triu(1)
-            scores = scores.masked_fill(mask, float("-inf"))
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, V)
+        out = F.scaled_dot_product_attention(Q, K, V, is_causal=self.causal)
 
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
         return self.out_proj(out)
@@ -63,7 +56,7 @@ class BaselineFFN(nn.Module):
 
 
 class BaselineBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, causal: bool = False):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, causal: bool = True):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
         self.attn = SoftmaxAttention(d_model, n_heads, causal=causal)
@@ -87,7 +80,7 @@ class BaselineTransformer(nn.Module):
         n_layers: int,
         d_ff: int,
         max_seq_len: int = 512,
-        causal: bool = False,
+        causal: bool = True,
         # Quantization kwargs accepted and ignored so the comparison harness
         # can call both constructors with identical signatures.
         **_unused,
@@ -96,6 +89,11 @@ class BaselineTransformer(nn.Module):
         self.causal = causal
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
+        self.register_buffer(
+            "position_ids",
+            torch.arange(max_seq_len).unsqueeze(0),
+            persistent=False,
+        )
         self.blocks = nn.ModuleList(
             [BaselineBlock(d_model, n_heads, d_ff, causal=causal) for _ in range(n_layers)]
         )
@@ -104,7 +102,7 @@ class BaselineTransformer(nn.Module):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         B, T = input_ids.shape
-        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
+        pos = self.position_ids[:, :T]
         x = self.embedding(input_ids) + self.pos_embedding(pos)
         for block in self.blocks:
             x = block(x)

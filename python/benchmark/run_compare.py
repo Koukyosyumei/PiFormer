@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -46,6 +46,13 @@ from .data import get_dataset, random_batch
 
 def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
+
+
+def safe_ppl(loss: float) -> float:
+    try:
+        return math.exp(loss)
+    except OverflowError:
+        return float("inf")
 
 
 @torch.no_grad()
@@ -112,6 +119,140 @@ def _qat_schedule(step: int, total_steps: int, warmup_frac: float, ramp_frac: fl
     return 1.0, "finetune"
 
 
+def maybe_compile_model(name: str, model: nn.Module, args, device: torch.device) -> nn.Module:
+    """Compile models for long CUDA runs, where PiFormer's small kernels benefit most."""
+    if args.no_compile:
+        return model
+    if device.type != "cuda":
+        print(f"  torch.compile: skipped for {name} (CUDA device required)")
+        return model
+    if not hasattr(torch, "compile"):
+        print(f"  torch.compile: skipped for {name} (not available in this PyTorch)")
+        return model
+
+    print(f"  torch.compile: compiling {name} (mode={args.compile_mode})")
+    return torch.compile(model, mode=args.compile_mode)
+
+
+def unwrap_compiled_model(model: nn.Module) -> nn.Module:
+    return getattr(model, "_orig_mod", model)
+
+
+def copy_state_to_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in unwrap_compiled_model(model).state_dict().items()
+    }
+
+
+@torch.no_grad()
+def init_ternary_from_dense(dst: TernaryLinear, weight: torch.Tensor, bias: torch.Tensor | None):
+    """Initialize a ternary layer from a dense layer using one scalar alpha."""
+    weight = weight.to(device=dst.weight.device, dtype=dst.weight.dtype)
+    abs_w = weight.abs()
+    selected = abs_w > (0.7 * abs_w.mean())
+    if selected.any():
+        alpha = abs_w[selected].mean()
+    else:
+        alpha = abs_w.mean().clamp_min(1e-6)
+
+    dst.weight.copy_(weight)
+    dst.alpha.copy_(alpha.to(device=dst.alpha.device, dtype=dst.alpha.dtype))
+    if dst.bias is not None and bias is not None:
+        dst.bias.copy_(bias.to(device=dst.bias.device, dtype=dst.bias.dtype))
+
+
+@torch.no_grad()
+def init_piformer_from_baseline_state(model: PiFormerModel, state: dict[str, torch.Tensor]):
+    """Warm-start PiFormer from a trained baseline where the architectures overlap."""
+    model.embedding.weight.copy_(state["embedding.weight"].to(model.embedding.weight.device))
+    model.pos_embedding.weight.copy_(
+        state["pos_embedding.weight"].to(model.pos_embedding.weight.device)
+    )
+    model.norm.weight.copy_(state["norm.weight"].to(model.norm.weight.device))
+    model.norm.bias.copy_(state["norm.bias"].to(model.norm.bias.device))
+    init_ternary_from_dense(model.head, state["head.weight"], None)
+
+    for i, block in enumerate(model.blocks):
+        block.norm1.weight.copy_(state[f"blocks.{i}.norm1.weight"].to(block.norm1.weight.device))
+        block.norm1.bias.copy_(state[f"blocks.{i}.norm1.bias"].to(block.norm1.bias.device))
+        block.norm2.weight.copy_(state[f"blocks.{i}.norm2.weight"].to(block.norm2.weight.device))
+        block.norm2.bias.copy_(state[f"blocks.{i}.norm2.bias"].to(block.norm2.bias.device))
+
+        init_ternary_from_dense(
+            block.attn.q_proj,
+            state[f"blocks.{i}.attn.q_proj.weight"],
+            None,
+        )
+        init_ternary_from_dense(
+            block.attn.k_proj,
+            state[f"blocks.{i}.attn.k_proj.weight"],
+            None,
+        )
+        init_ternary_from_dense(
+            block.attn.v_proj,
+            state[f"blocks.{i}.attn.v_proj.weight"],
+            None,
+        )
+        init_ternary_from_dense(
+            block.attn.out_proj,
+            state[f"blocks.{i}.attn.out_proj.weight"],
+            state[f"blocks.{i}.attn.out_proj.bias"],
+        )
+        init_ternary_from_dense(
+            block.ffn.fc1,
+            state[f"blocks.{i}.ffn.fc1.weight"],
+            state[f"blocks.{i}.ffn.fc1.bias"],
+        )
+        init_ternary_from_dense(
+            block.ffn.fc2,
+            state[f"blocks.{i}.ffn.fc2.weight"],
+            state[f"blocks.{i}.ffn.fc2.bias"],
+        )
+
+
+def make_optimizer(model: nn.Module, args) -> torch.optim.Optimizer:
+    """AdamW with decay only on ordinary matrix weights."""
+    decay_params = []
+    no_decay_params = []
+
+    for module_name, module in model.named_modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if not param.requires_grad:
+                continue
+            full_name = f"{module_name}.{param_name}" if module_name else param_name
+            if (
+                param_name.endswith("bias")
+                or param_name == "alpha"
+                or "tables" in full_name
+                or isinstance(module, (nn.LayerNorm, nn.Embedding))
+            ):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+    return torch.optim.AdamW(
+        [
+            {"params": decay_params, "weight_decay": args.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+    )
+
+
+def learning_rate_for_step(step: int, steps: int, args) -> float:
+    if args.warmup_steps > 0 and step <= args.warmup_steps:
+        return args.lr * step / args.warmup_steps
+    if args.min_lr_ratio >= 1.0 or steps <= args.warmup_steps:
+        return args.lr
+
+    progress = (step - args.warmup_steps) / max(1, steps - args.warmup_steps)
+    cosine = 0.5 * (1.0 + math.cos(progress * math.pi))
+    return args.lr * (args.min_lr_ratio + (1.0 - args.min_lr_ratio) * cosine)
+
+
 def train_one(
     name: str,
     model: nn.Module,
@@ -119,12 +260,21 @@ def train_one(
     val_ids: torch.Tensor,
     args,
     device: torch.device,
+    steps: int,
 ):
     print(f"\n=== Training {name} ===")
     print(f"  params: {count_params(model):,}")
+    print(f"  steps:  {steps}")
 
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    history = {"step": [], "train_loss": [], "val_loss": [], "quant_strength": []}
+    optim = make_optimizer(model, args)
+    history = {
+        "step": [],
+        "train_loss": [],
+        "train_ppl": [],
+        "val_loss": [],
+        "val_ppl": [],
+        "quant_strength": [],
+    }
 
     # Identify ternary layers and decide whether to schedule quant_strength.
     tern_modules = _ternary_modules(model)
@@ -142,8 +292,6 @@ def train_one(
         # QAT disabled: keep the original behavior (always fully ternary).
         _set_quant_strength(tern_modules, 1.0)
 
-    finetune_lr_applied = False
-
     reset_peak_memory(device)
     model.train()
 
@@ -155,55 +303,63 @@ def train_one(
             logits.reshape(-1, logits.size(-1)), y.reshape(-1)
         )
         loss.backward()
-        optim.zero_grad()
+        optim.zero_grad(set_to_none=True)
     if device.type == "cuda":
         torch.cuda.synchronize()
 
     t0 = time.perf_counter()
     running = 0.0
+    log_start = 1
     cur_q = 1.0
     cur_phase = "finetune"
-    for step in range(1, args.steps + 1):
+    for step in range(1, steps + 1):
         if use_qat:
             cur_q, new_phase = _qat_schedule(
-                step, args.steps,
+                step, steps,
                 args.ternary_warmup_frac, args.ternary_ramp_frac,
             )
             _set_quant_strength(tern_modules, cur_q)
-            # Drop LR once when entering the finetune phase, so the now-snapped
-            # ternary weights settle without big optimizer steps disturbing them.
-            if (
-                not finetune_lr_applied
-                and new_phase == "finetune"
-                and args.ternary_finetune_lr_mult != 1.0
-            ):
-                for g in optim.param_groups:
-                    g["lr"] *= args.ternary_finetune_lr_mult
-                finetune_lr_applied = True
-                print(f"  [step {step}] entering finetune phase: lr → "
-                      f"{optim.param_groups[0]['lr']:.2e}")
             cur_phase = new_phase
+        lr = learning_rate_for_step(step, steps, args)
+        if use_qat and cur_phase == "finetune":
+            lr *= args.ternary_finetune_lr_mult
+        for group in optim.param_groups:
+            group["lr"] = lr
 
         x, y = random_batch(train_ids, args.batch_size, args.seq_len, device)
         logits = model(x)
         loss = nn.functional.cross_entropy(
             logits.reshape(-1, logits.size(-1)), y.reshape(-1)
         )
-        optim.zero_grad()
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"{name} produced non-finite loss at step {step}: {loss}")
+        optim.zero_grad(set_to_none=True)
         loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optim.step()
         running += loss.item()
 
-        if step % args.log_every == 0 or step == args.steps:
-            avg = running / args.log_every
+        if step % args.log_every == 0 or step == steps:
+            logged_steps = step - log_start + 1
+            avg = running / logged_steps
+            log_start = step + 1
             running = 0.0
             val = eval_loss(model, val_ids, args.batch_size, args.seq_len, device)
+            train_ppl = safe_ppl(avg)
+            val_ppl = safe_ppl(val)
             history["step"].append(step)
             history["train_loss"].append(avg)
+            history["train_ppl"].append(train_ppl)
             history["val_loss"].append(val)
+            history["val_ppl"].append(val_ppl)
             history["quant_strength"].append(cur_q)
             qat_tag = f"  q={cur_q:.2f} [{cur_phase}]" if use_qat else ""
-            print(f"  step {step:5d}  train={avg:.4f}  val={val:.4f}{qat_tag}")
+            print(
+                f"  step {step:5d}  "
+                f"train={avg:.4f} (ppl={train_ppl:.2f})  "
+                f"val={val:.4f} (ppl={val_ppl:.2f}){qat_tag}"
+            )
 
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -218,11 +374,12 @@ def train_one(
     return {
         "name": name,
         "params": count_params(model),
+        "steps": steps,
         "train_seconds": elapsed,
-        "steps_per_sec": args.steps / elapsed,
-        "tokens_per_sec": args.steps * args.batch_size * args.seq_len / elapsed,
+        "steps_per_sec": steps / elapsed,
+        "tokens_per_sec": steps * args.batch_size * args.seq_len / elapsed,
         "final_val_loss": final_val,
-        "final_val_ppl": float(torch.exp(torch.tensor(final_val))),
+        "final_val_ppl": safe_ppl(final_val),
         "peak_mem_mb": peak_memory_mb(device),
         "history": history,
     }
@@ -270,6 +427,38 @@ def inference_scaling(
     return rows
 
 
+@torch.no_grad()
+def generate_text(
+    model: nn.Module,
+    prompt_ids: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+    max_seq_len: int,
+    device: torch.device,
+) -> list[int]:
+    """Sample tokens autoregressively from a model. Returns prompt+generated ids."""
+    model.eval()
+    ids = prompt_ids.to(device).unsqueeze(0)
+    for _ in range(max_new_tokens):
+        ctx = ids if ids.size(1) <= max_seq_len else ids[:, -max_seq_len:]
+        logits = model(ctx)[:, -1, :]
+        if temperature <= 0:
+            next_id = torch.argmax(logits, dim=-1, keepdim=True)
+        else:
+            logits = logits / temperature
+            if top_k and top_k > 0:
+                k = min(top_k, logits.size(-1))
+                v, _ = torch.topk(logits, k)
+                logits = torch.where(
+                    logits < v[:, [-1]], torch.full_like(logits, float("-inf")), logits
+                )
+            probs = torch.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+        ids = torch.cat([ids, next_id], dim=1)
+    return ids[0].tolist()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -287,9 +476,9 @@ def parse_args():
     p.add_argument("--n_layers", type=int, default=4)
     p.add_argument("--d_ff", type=int, default=512)
     p.add_argument("--causal", action=argparse.BooleanOptionalAction,
-                   default=False,
-                   help="Use autoregressive attention. Applies a causal mask to "
-                        "the baseline and prefix linear attention to PiFormer.")
+                   default=True,
+                   help="Use autoregressive attention. Use --no-causal for "
+                        "bidirectional architecture comparisons.")
 
     # PiFormer-only knobs
     p.add_argument("--num_bits", type=int, default=8)
@@ -300,10 +489,39 @@ def parse_args():
     # Training
     p.add_argument("--seq_len", type=int, default=128)
     p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--steps", type=int, default=3000)
+    p.add_argument("--steps", type=int, default=3000,
+                   help="Default training steps. Overridden per-model by "
+                        "--baseline_steps / --piformer_steps when set.")
+    p.add_argument("--baseline_steps", type=int, default=None,
+                   help="Training steps for the baseline transformer "
+                        "(falls back to --steps).")
+    p.add_argument("--piformer_steps", type=int, default=None,
+                   help="Training steps for PiFormer (falls back to --steps).")
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=0.01,
+                   help="AdamW weight decay for ordinary matrix weights only.")
+    p.add_argument("--beta1", type=float, default=0.9)
+    p.add_argument("--beta2", type=float, default=0.95)
+    p.add_argument("--adam_eps", type=float, default=1e-8)
+    p.add_argument("--warmup_steps", type=int, default=100,
+                   help="Linear LR warmup steps; set 0 to disable.")
+    p.add_argument("--min_lr_ratio", type=float, default=0.1,
+                   help="Final LR as a fraction of --lr for cosine decay; set 1 for constant LR.")
+    p.add_argument("--grad_clip", type=float, default=1.0,
+                   help="Clip global gradient norm during training; set <=0 to disable.")
     p.add_argument("--log_every", type=int, default=200)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--no_compile", action="store_true",
+                   help="Skip torch.compile. By default, CUDA runs compile each model.")
+    p.add_argument("--compile_mode", default="reduce-overhead",
+                   choices=["default", "reduce-overhead", "max-autotune"],
+                   help="torch.compile mode used when compilation is enabled.")
+    p.add_argument("--piformer_init_from_baseline", action="store_true",
+                   help="Warm-start PiFormer from the trained baseline run.")
+    p.add_argument("--piformer_no_causal", action="store_true",
+                   help="Run PiFormer in non-causal mode (matches the current "
+                        "prover/witness math). Default is causal so the LM "
+                        "comparison is fair; disable when reproducing proofs.")
 
     # Gradual ternary QAT schedule (only affects models with TernaryLinear)
     p.add_argument("--ternary_qat", action=argparse.BooleanOptionalAction,
@@ -327,8 +545,62 @@ def parse_args():
     p.add_argument("--inference_batch_size", type=int, default=8)
     p.add_argument("--skip_inference", action="store_true")
 
+    # Text generation comparison
+    p.add_argument("--gen_prompt_len", type=int, default=64,
+                   help="Number of tokens taken from the start of val_ids to use as a "
+                        "shared prompt for the post-training generation comparison.")
+    p.add_argument("--gen_tokens", type=int, default=200,
+                   help="Number of tokens to generate from each trained model.")
+    p.add_argument("--gen_temperature", type=float, default=0.8,
+                   help="Sampling temperature for generation; <=0 uses greedy decoding.")
+    p.add_argument("--gen_top_k", type=int, default=40,
+                   help="Top-k filter for sampling; set 0 to disable.")
+    p.add_argument("--gen_seed", type=int, default=None,
+                   help="Seed used before each model's sampling; defaults to --seed.")
+    p.add_argument("--skip_generation", action="store_true",
+                   help="Skip the post-training text-generation comparison.")
+
     p.add_argument("--out", default="benchmark_results.json")
+    p.add_argument("--loss_plot", default=None,
+                   help="Path for ggplot loss-curve PNG. Defaults to <out>_loss.png. "
+                        "Pass an empty string to skip plotting.")
     return p.parse_args()
+
+
+def plot_loss_curves(results: dict, out_path: Path) -> None:
+    """Plot train/val loss vs. step for each trained model using plotnine (ggplot)."""
+    import pandas as pd
+    from plotnine import (
+        ggplot, aes, geom_line, labs, theme_bw, scale_linetype_manual,
+    )
+
+    rows = []
+    for name, r in results["models"].items():
+        h = r["history"]
+        for step, train_loss, val_loss in zip(h["step"], h["train_loss"], h["val_loss"]):
+            rows.append({"model": name, "step": step, "split": "train", "loss": train_loss})
+            rows.append({"model": name, "step": step, "split": "val", "loss": val_loss})
+
+    if not rows:
+        print("No training history to plot.")
+        return
+
+    df = pd.DataFrame(rows)
+    plot = (
+        ggplot(df, aes(x="step", y="loss", color="model", linetype="split"))
+        + geom_line(size=0.8)
+        + scale_linetype_manual(values={"train": "dashed", "val": "solid"})
+        + labs(
+            title="Training curves: baseline vs. PiFormer",
+            x="step",
+            y="cross-entropy loss",
+            color="model",
+            linetype="split",
+        )
+        + theme_bw()
+    )
+    plot.save(str(out_path), width=7, height=4, dpi=140, verbose=False)
+    print(f"wrote {out_path}")
 
 
 def main():
@@ -341,10 +613,12 @@ def main():
         print(f"GPU:    {torch.cuda.get_device_name(0)}")
 
     cache_dir = Path(args.cache_dir)
-    train_ids, val_ids, vocab_size, _decode = get_dataset(args.dataset, cache_dir)
+    train_ids, val_ids, vocab_size, decode = get_dataset(args.dataset, cache_dir)
     print(f"Dataset: {args.dataset}   vocab={vocab_size}   "
           f"train_tokens={len(train_ids):,}   val_tokens={len(val_ids):,}")
-    print(f"Attention mode: {'causal' if args.causal else 'bidirectional'}")
+    piformer_causal = args.causal and not args.piformer_no_causal
+    print(f"Baseline attention: {'causal' if args.causal else 'bidirectional'}")
+    print(f"PiFormer attention: {'causal' if piformer_causal else 'bidirectional'}")
 
     common = dict(
         vocab_size=vocab_size,
@@ -352,22 +626,70 @@ def main():
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         d_ff=args.d_ff,
-        causal=args.causal,
         max_seq_len=max(args.seq_len,
                         max(int(s) for s in args.inference_seq_lens.split(","))),
     )
     piformer_kwargs = dict(
-        num_bits=args.num_bits, c=args.c, scale=args.scale, max_exp=args.max_exp
+        num_bits=args.num_bits, c=args.c, scale=args.scale, max_exp=args.max_exp,
+        causal=piformer_causal,
     )
 
     selected = [m.strip() for m in args.models.split(",") if m.strip()]
     results = {"args": vars(args), "models": {}, "inference": {}}
+    baseline_state_for_init = None
+
+    if args.piformer_init_from_baseline and "baseline" not in selected:
+        raise ValueError("--piformer_init_from_baseline requires --models to include baseline")
+
+    baseline_steps = args.baseline_steps if args.baseline_steps is not None else args.steps
+    piformer_steps = args.piformer_steps if args.piformer_steps is not None else args.steps
+
+    do_generation = not args.skip_generation and args.gen_tokens > 0
+    if do_generation:
+        prompt_len = max(1, min(args.gen_prompt_len, common["max_seq_len"], len(val_ids) - 1))
+        prompt_ids = val_ids[:prompt_len].clone()
+        gen_seed = args.gen_seed if args.gen_seed is not None else args.seed
+        prompt_text = decode(prompt_ids.tolist())
+        results["generation"] = {
+            "prompt": prompt_text,
+            "tokens": args.gen_tokens,
+            "temperature": args.gen_temperature,
+            "top_k": args.gen_top_k,
+            "seed": gen_seed,
+            "models": {},
+        }
+    else:
+        prompt_ids = None
+        gen_seed = None
+
+    def run_generation(name: str, model: nn.Module):
+        if not do_generation:
+            return
+        print(f"\n=== Generation: {name} ===")
+        torch.manual_seed(gen_seed)
+        ids = generate_text(
+            model,
+            prompt_ids,
+            max_new_tokens=args.gen_tokens,
+            temperature=args.gen_temperature,
+            top_k=args.gen_top_k,
+            max_seq_len=common["max_seq_len"],
+            device=device,
+        )
+        full_text = decode(ids)
+        completion = decode(ids[len(prompt_ids):])
+        results["generation"]["models"][name] = {
+            "completion": completion,
+            "full_text": full_text,
+        }
+        print(completion)
 
     if "baseline" in selected:
         torch.manual_seed(args.seed)
-        model = BaselineTransformer(**common).to(device)
+        model = BaselineTransformer(**common, causal=args.causal).to(device)
+        model = maybe_compile_model("baseline", model, args, device)
         results["models"]["baseline"] = train_one(
-            "baseline", model, train_ids, val_ids, args, device
+            "baseline", model, train_ids, val_ids, args, device, baseline_steps
         )
         if not args.skip_inference:
             seq_lens = [int(s) for s in args.inference_seq_lens.split(",")]
@@ -375,6 +697,10 @@ def main():
                 "baseline", model, seq_lens, vocab_size,
                 args.inference_batch_size, device,
             )
+        run_generation("baseline", model)
+        if args.piformer_init_from_baseline:
+            print("  saving trained baseline weights for PiFormer initialization")
+            baseline_state_for_init = copy_state_to_cpu(model)
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -382,8 +708,12 @@ def main():
     if "piformer" in selected:
         torch.manual_seed(args.seed)
         model = PiFormerModel(**common, **piformer_kwargs).to(device)
+        if args.piformer_init_from_baseline:
+            print("  initializing PiFormer from trained baseline weights")
+            init_piformer_from_baseline_state(model, baseline_state_for_init)
+        model = maybe_compile_model("piformer", model, args, device)
         results["models"]["piformer"] = train_one(
-            "piformer", model, train_ids, val_ids, args, device
+            "piformer", model, train_ids, val_ids, args, device, piformer_steps
         )
         if not args.skip_inference:
             seq_lens = [int(s) for s in args.inference_seq_lens.split(",")]
@@ -391,6 +721,7 @@ def main():
                 "piformer", model, seq_lens, vocab_size,
                 args.inference_batch_size, device,
             )
+        run_generation("piformer", model)
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -406,8 +737,33 @@ def main():
               f"{r['final_val_ppl']:>10.2f} {r['tokens_per_sec']:>10.0f} "
               f"{r['peak_mem_mb']:>10.1f}")
 
+    if "generation" in results and results["generation"]["models"]:
+        gen = results["generation"]
+        print("\n" + "=" * 60)
+        print("GENERATION COMPARISON")
+        print("=" * 60)
+        print(f"prompt (first {len(gen['prompt'])} chars from val set, "
+              f"temp={gen['temperature']}, top_k={gen['top_k']}, seed={gen['seed']}):")
+        print("-" * 60)
+        print(gen["prompt"])
+        for name, sample in gen["models"].items():
+            print("-" * 60)
+            print(f"[{name}] completion ({gen['tokens']} tokens):")
+            print(sample["completion"])
+        print("=" * 60)
+
     Path(args.out).write_text(json.dumps(results, indent=2))
     print(f"\nWrote {args.out}")
+
+    if args.loss_plot != "":
+        loss_plot_path = Path(
+            args.loss_plot if args.loss_plot is not None
+            else Path(args.out).with_suffix("").as_posix() + "_loss.png"
+        )
+        try:
+            plot_loss_curves(results, loss_plot_path)
+        except ImportError as e:
+            print(f"Skipping loss plot — install plotnine to enable: {e}")
 
 
 if __name__ == "__main__":
