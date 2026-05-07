@@ -15,11 +15,12 @@
 use crate::field::F;
 use crate::pcs::absorb_com;
 use crate::pcs::{
-    hyrax_commit, hyrax_open, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
+    hyrax_commit, hyrax_commit_ternary_matrix, hyrax_open, hyrax_open_ternary_matrix,
+    params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
 };
+use crate::poly::utils::vec_to_mle;
 use crate::poly::utils::TernaryValue;
 use crate::poly::utils::{combine, eval_cols_ternary, eval_rows, mat_to_mle};
-use crate::poly::utils::{convert_tm_to_fm, vec_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, EvalClaim, SumcheckProof};
 use crate::transcript::{challenge_vec, Transcript};
@@ -75,12 +76,11 @@ pub fn preprocess_projection(
     alpha: F,     // 【追加】スケール因子
     bias: Vec<F>, // 【追加】バイアスベクトル
 ) -> ProjectionProvingKey {
-    let w_mle = mat_to_mle(&convert_tm_to_fm(&w), d_in, d_out);
     let (nu_w, _sigma_w, params_w) = params_from_vars(
         d_in.next_power_of_two().trailing_zeros() as usize
             + d_out.next_power_of_two().trailing_zeros() as usize,
     );
-    let w_com = hyrax_commit(&w_mle.evaluations, nu_w, &params_w);
+    let w_com = hyrax_commit_ternary_matrix(&w, d_in, d_out, nu_w, &params_w);
 
     let bias_mle = vec_to_mle(&bias, d_out);
     let (nu_b, _sigma_b, params_b) =
@@ -151,7 +151,6 @@ pub fn prove_projection(
 
     let x_mle = mat_to_mle(&witness.x, t, d_in);
     let y_mle = mat_to_mle(&witness.y, t, d_out);
-    let w_mle = mat_to_mle(&convert_tm_to_fm(&pk.w), d_in, d_out);
     let bias_mle = vec_to_mle(&pk.bias, d_out);
 
     let (nu_w, sigma_w, _) = params_from_vars(in_bits + out_bits);
@@ -190,6 +189,7 @@ pub fn prove_projection(
 
     let (sumcheck, r_k) = prove_sumcheck(&f_x_scaled, &g_w, target_z, transcript);
     transcript.append_field(b"claimed_y", &y_eval);
+    let w_eval = sumcheck.final_eval_g;
 
     let x_eval = x_mle.evaluate(&combine(&r_t, &r_k));
 
@@ -199,8 +199,15 @@ pub fn prove_projection(
             y_eval,
             x_eval,
             // W is (d_in × d_out): evaluate([r_k, r_out]) = combine(&r_k, &r_out)
-            w_eval: w_mle.evaluate(&combine(&r_k, &r_out)),
-            w_open: hyrax_open(&w_mle.evaluations, &combine(&r_k, &r_out), nu_w, sigma_w),
+            w_eval,
+            w_open: hyrax_open_ternary_matrix(
+                &pk.w,
+                d_in,
+                d_out,
+                &combine(&r_k, &r_out),
+                nu_w,
+                sigma_w,
+            ),
             bias_at_rj: bias_eval,
             bias_opening_proof: hyrax_open(&bias_mle.evaluations, &r_out, nu_b, sigma_b),
         },
@@ -380,9 +387,6 @@ pub fn prove_qkv_projections(
     let q_mle = mat_to_mle(&witness.q, t, d_out);
     let k_mle = mat_to_mle(&witness.k, t, d_out);
     let v_mle = mat_to_mle(&witness.v, t, d_out);
-    let w_q_mle = mat_to_mle(&convert_tm_to_fm(&pk_q.w), d_in, d_out);
-    let w_k_mle = mat_to_mle(&convert_tm_to_fm(&pk_k.w), d_in, d_out);
-    let w_v_mle = mat_to_mle(&convert_tm_to_fm(&pk_v.w), d_in, d_out);
     let bias_q_mle = vec_to_mle(&pk_q.bias, d_out);
     let bias_k_mle = vec_to_mle(&pk_k.bias, d_out);
     let bias_v_mle = vec_to_mle(&pk_v.bias, d_out);
@@ -451,9 +455,9 @@ pub fn prove_qkv_projections(
 
     // 5. Evaluate prover witnesses at r_k
     let x_eval = x_mle.evaluate(&combine(&r_t, &r_k));
-    let w_q_eval = w_q_mle.evaluate(&combine(&r_k, &r_out_q));
-    let w_k_eval = w_k_mle.evaluate(&combine(&r_k, &r_out_k));
-    let w_v_eval = w_v_mle.evaluate(&combine(&r_k, &r_out_v));
+    let w_q_eval = DenseMLPoly::from_vec_padded(g_w_q_evals).evaluate(&r_k);
+    let w_k_eval = DenseMLPoly::from_vec_padded(g_w_k_evals).evaluate(&r_k);
+    let w_v_eval = DenseMLPoly::from_vec_padded(g_w_v_evals).evaluate(&r_k);
 
     let proof = BatchedQKVProjectionProof {
         sumcheck,
@@ -468,20 +472,26 @@ pub fn prove_qkv_projections(
             bias_q_eval,
             bias_k_eval,
             bias_v_eval,
-            w_q_open: hyrax_open(
-                &w_q_mle.evaluations,
+            w_q_open: hyrax_open_ternary_matrix(
+                &pk_q.w,
+                d_in,
+                d_out,
                 &combine(&r_k, &r_out_q),
                 nu_w,
                 sigma_w,
             ),
-            w_k_open: hyrax_open(
-                &w_k_mle.evaluations,
+            w_k_open: hyrax_open_ternary_matrix(
+                &pk_k.w,
+                d_in,
+                d_out,
                 &combine(&r_k, &r_out_k),
                 nu_w,
                 sigma_w,
             ),
-            w_v_open: hyrax_open(
-                &w_v_mle.evaluations,
+            w_v_open: hyrax_open_ternary_matrix(
+                &pk_v.w,
+                d_in,
+                d_out,
                 &combine(&r_k, &r_out_v),
                 nu_w,
                 sigma_w,
@@ -529,7 +539,6 @@ pub fn verify_qkv_projections(
 ) -> Result<(EvalClaim, EvalClaim, EvalClaim, EvalClaim), String> {
     let t_bits = vk_q.seq_len.next_power_of_two().trailing_zeros() as usize;
     let in_bits = vk_q.d_in.next_power_of_two().trailing_zeros() as usize;
-    let out_bits = vk_q.d_out.next_power_of_two().trailing_zeros() as usize;
 
     // 1. Absorb (mirrors prover)
     absorb_com(transcript, b"qkv_w_q_com", &vk_q.w_com);
@@ -694,7 +703,6 @@ pub fn prove_projection_gkr(
     transcript.append_field(b"gkr_y_val", &y_claim.value);
 
     let x_mle = mat_to_mle(&witness.x, t, d_in);
-    let w_mle = mat_to_mle(&convert_tm_to_fm(&pk.w), d_in, d_out);
     let bias_mle = vec_to_mle(&pk.bias, d_out);
 
     let (nu_w, sigma_w, _) = params_from_vars(in_bits + out_bits);
@@ -711,15 +719,22 @@ pub fn prove_projection_gkr(
     let target_z = y_claim.value - bias_eval;
 
     let (sumcheck, r_k) = prove_sumcheck(&f_x_scaled, &g_w, target_z, transcript);
+    let w_eval = sumcheck.final_eval_g;
 
     let x_eval = x_mle.evaluate(&combine(&r_t, &r_k));
-    let w_eval = w_mle.evaluate(&combine(&r_k, &r_out));
 
     let proof = ProjectionGKRProof {
         sumcheck,
         x_eval,
         w_eval,
-        w_open: hyrax_open(&w_mle.evaluations, &combine(&r_k, &r_out), nu_w, sigma_w),
+        w_open: hyrax_open_ternary_matrix(
+            &pk.w,
+            d_in,
+            d_out,
+            &combine(&r_k, &r_out),
+            nu_w,
+            sigma_w,
+        ),
         bias_eval,
         bias_open: hyrax_open(&bias_mle.evaluations, &r_out, nu_b, sigma_b),
     };
@@ -825,17 +840,26 @@ mod projection_full_tests {
         let x_mle = mat_to_mle(&x, t, d_in);
         let _y_mle = mat_to_mle(&y, t, d_out);
         let b_mle = vec_to_mle(&bias, d_out);
-        let w_mle = mat_to_mle(&convert_tm_to_fm(&w), d_in, d_out);
 
         let vk = ProjectionVerifyingKey {
             seq_len: t,
             d_in,
             d_out,
             alpha,
-            w_com: hyrax_commit(
-                &w_mle.evaluations,
-                params_from_vars(w_mle.num_vars).0,
-                &params_from_vars(w_mle.num_vars).2,
+            w_com: hyrax_commit_ternary_matrix(
+                &w,
+                d_in,
+                d_out,
+                params_from_vars(
+                    d_in.next_power_of_two().trailing_zeros() as usize
+                        + d_out.next_power_of_two().trailing_zeros() as usize,
+                )
+                .0,
+                &params_from_vars(
+                    d_in.next_power_of_two().trailing_zeros() as usize
+                        + d_out.next_power_of_two().trailing_zeros() as usize,
+                )
+                .2,
             ),
             bias_com: hyrax_commit(
                 &b_mle.evaluations,

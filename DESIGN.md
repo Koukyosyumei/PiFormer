@@ -189,6 +189,15 @@ $$\sum_{x \in \{0,1\}^m} \widetilde{T}_k(x) \cdot L_k(x) = \sum_{j=1}^N \rho^j \
 
 **Complexity (per sub-table):** Prover O($N \cdot 2^m + m \cdot 2^m$); verifier O($N \cdot m$) plus O($m$) sumcheck.
 
+**Model-level multi-Lasso.** The end-to-end prover does not emit independent lookup proofs for every block. Instead, it uses `LassoMultiProof` to batch:
+
+- all attention $\phi(Q)$ and $\phi(K)$ lookup instances across all blocks into `all_lasso_proof`;
+- all FFN activation $A = \phi(M)$ lookup instances across all blocks into `ffn_lasso_proof`.
+
+For committed-output mode, the prover first absorbs the output commitments (`attn_phi_q_com`, `attn_phi_k_com`, or `ffn_a_com`) into the Fiat-Shamir transcript, then samples the multi-Lasso batching challenges. A second sumcheck proves that the combined lookup output grand sum equals the corresponding committed output polynomials, and one Hyrax batch opening binds those committed outputs at the sumcheck terminal point.
+
+The proof still carries raw lookup query indices. To prevent those indices from being chosen independently of the committed lookup inputs, the model proof also binds them to the committed input tensors (`q_com`, `k_com`, or `ffn_m_com`) by evaluating the index vector as an MLE at a transcript-derived point and verifying one Hyrax batch opening.
+
 ### 3.6 Global Batched Range Proof
 
 The range proof proves that field elements lie in $[0, 2^{32})$ using a chunked Lasso approach. Because all range constraints in a transformer block check the same table $[0, 2^{32})$, the multiplicity commitments are **globally batched** across all witnesses.
@@ -276,11 +285,11 @@ Steps 3–4 use a random-entry reduction. The verifier draws $(r_{out}, r_i)$ vi
 Proves $\mathsf{Out} = \phi(X \cdot W_1) \cdot W_2$:
 
 **GKR backward ordering:**
-1. **Activation** $A = \phi(M)$: Lasso lookup argument runs *first* (commits activation outputs to transcript).
-2. **Second projection** $\mathsf{Out} = A \cdot W_2$: degree-2 sumcheck at a random entry. Verifier checks $A(r_k)$ from the Lasso outputs MLE — no separate $A_{\mathsf{com}}$ needed.
+1. **Activation** $A = \phi(M)$: the prover commits `ffn_a_com = Com(A)` and includes the block in the model-level `ffn_lasso_proof`.
+2. **Second projection** $\mathsf{Out} = A \cdot W_2$: degree-2 sumcheck at a random entry. Verifier checks the sampled $A(r)$ evaluation against `ffn_a_com` through `ffn_a_batch_open`.
 3. **First projection** $M = X \cdot W_1$: degree-2 sumcheck at a random entry. $M_{\mathsf{com}}$ is kept (field values of $M$ can be negative, unlike Lasso query indices).
 
-This ordering eliminates $A_{\mathsf{com}}$ while maintaining transcript soundness.
+The global FFN Lasso binds lookup outputs to `ffn_a_com`, while `ffn_lasso_bind_open` binds the raw lookup indices to `ffn_m_com`. This keeps the GKR-style backward ordering without relying on proof-carried activation outputs.
 
 ### 3.11 Multi-Claim Combine Protocol
 
@@ -384,14 +393,22 @@ Algorithm Prove(PK, witness W, instances inst):
   (batch_attn_ctx, batch_r_attn_ctx) ← ProveSumcheckMulti({phi_k_ℓ@(·, batch_r_attn_out)},
                                                            {v_ℓ@(·, r_k_o)}, ...)
 
-  // ── 7. Per-block FFN: Lasso (commits A) → commit M ──────────────────────
+  // ── 7. Global FFN activation Lasso + M index binding ───────────────────
   For ℓ = 0 to L-1:
     Absorb (W1, W2) commitments
-    ffn_lasso_proof_ℓ ← ProveLasso(inst.ffn.activation_lasso, ...)  // commits A
-    M_ℓ ← W.ffn.m;  m_com_ℓ ← Com(M_ℓ);  FS.absorb(m_com_ℓ)
+    A_ℓ ← W.ffn.a;  ffn_a_com_ℓ ← Com(A_ℓ)
+    M_ℓ ← W.ffn.m;  ffn_m_com_ℓ ← Com(M_ℓ);  FS.absorb(ffn_m_com_ℓ)
+    Collect activation lookup instance, query indices, and output binding
+      (ffn_a_com_ℓ, A_ℓ)
+
+  ffn_lasso_π ← ProveLassoMulti(
+      [inst.ffn.activation_lasso for ℓ in 0..L-1],
+      query_indices=[indices(M_ℓ)]_ℓ,
+      output_bindings=[(ffn_a_com_ℓ, A_ℓ)]_ℓ,
+      FS)
 
   // Bind FFN lasso indices to a shared (rx, ry) point and open all M_ℓ at once
-  Absorb concatenated lasso indices
+  Absorb concatenated ffn_lasso_π query indices
   ffn_lasso_bind_point ← FS.challenge_vec(t_bits + f_bits)
   ffn_lasso_bind_open ← HyraxOpenBatch({M_ℓ}, ffn_lasso_bind_point, ...)
 
@@ -429,15 +446,23 @@ Algorithm Prove(PK, witness W, instances inst):
   // One HyraxOpenBatch per (matrix-type, evaluation-point) pair:
   //   x_norm1 @ (r_t, r_k_qkv);   Wq, Wk, Wv @ (r_k_qkv, r_out);   bq, bk, bv @ r_out
   //   Wo @ (r_k_o, r_out);        bo @ r_out
-  //   W2 @ (r_k_fy, r_out);       W1 @ (r_k_m, ry_m);   x_norm2 @ (rx_m, r_k_m)
+  //   W2 @ (r_k_fy, r_out);       A @ (r_t, r_k_fy);
+  //   W1 @ (r_k_m, ry_m);         x_norm2 @ (rx_m, r_k_m)
   //   M  @ (rx_m, ry_m)
   //   phi_q @ (r_t, batch_r_attn_out);   phi_k @ (batch_r_attn_ctx, batch_r_attn_out)
   //   v @ (batch_r_attn_ctx, r_k_o)      (per-block opening; v_attn_batch_open)
-  // (See prover.rs §15 for the full list of 17 batch opens.)
+  // (See prover.rs cross-block batch-open section for the full list.)
 
-  // ── 14. Global Lasso batch (all φ(Q) and φ(K) across all blocks) ────────
+  // ── 14. Global attention Lasso batch (all φ(Q), φ(K) blocks) ───────────
+  Absorb concatenated Q/K lasso indices
+  qk_lasso_bind_point ← FS.challenge_vec(t_bits + d_bits)
+  qk_lasso_bind_open ← HyraxOpenBatch({Q_ℓ, K_ℓ}_{ℓ=0..L-1},
+                                       qk_lasso_bind_point, ...)
   all_lasso_π ← ProveLassoMulti(
-      [inst.attn[ℓ].q_lasso, inst.attn[ℓ].k_lasso for ℓ in 0..L-1], PK.lasso_pk, FS)
+      [inst.attn[ℓ].q_lasso, inst.attn[ℓ].k_lasso for ℓ in 0..L-1],
+      query_indices=[indices(Q_ℓ), indices(K_ℓ)]_ℓ,
+      output_bindings=[(phi_q_com_ℓ, ΦQ_ℓ), (phi_k_com_ℓ, ΦK_ℓ)]_ℓ,
+      FS)
 
   return TransformerModelProof {
     x_in_com, block_proofs[0..L-1],
@@ -448,12 +473,13 @@ Algorithm Prove(PK, witness W, instances inst):
     inter_batch_open,
     {x_norm1, w_q, w_k, w_v, bias_q, bias_k, bias_v,
      w_o, bias_o, w2, w1, x_norm2,
-     ffn_m_com, ffn_lasso_bind, phi_q, phi_k, v_attn, qk_lasso_bind}_batch_open,
-    all_lasso_π
+     ffn_a, ffn_m_com, ffn_lasso_bind, phi_q, phi_k, v_attn,
+     qk_lasso_bind}_batch_open,
+    ffn_lasso_π, all_lasso_π
   }
 ```
 
-Each `TransformerBlockProof` carries the 7 intermediate commitments, the LN1/LN2 sub-proofs, the per-block range-multiplicity commitment, the FFN Lasso proof + `M` commitment, and the per-block scalar evaluations consumed by the cross-block batch sumchecks (`q_eval`, `k_eval`, `v_eval`, `attn_phi_q_eval`, `attn_phi_k_eval`, `attn_ctx_eval`, `attn_v_eval`, etc.).
+Each `TransformerBlockProof` carries the 7 intermediate commitments, the LN1/LN2 sub-proofs, the per-block range-multiplicity commitment, the FFN `A` and `M` commitments, the `phi_q`/`phi_k` commitments, and the per-block scalar evaluations consumed by the cross-block batch sumchecks (`q_eval`, `k_eval`, `v_eval`, `attn_phi_q_eval`, `attn_phi_k_eval`, `attn_ctx_eval`, `attn_v_eval`, etc.). The per-block FFN Lasso field is now an empty compatibility placeholder; the real FFN activation lookup proof is the model-level `ffn_lasso_proof`.
 
 ### 4.3 Block Phase 1 (Per-Block Commit + LayerNorm)
 
@@ -702,7 +728,7 @@ Algorithm Verify(VK, π, inst_attn, inst_ffn, public_x_in, public_logits):
   Verify batch_oproj    → recover r_k_o
   Verify batch_attn_out → recover batch_r_attn_out
   Verify batch_attn_ctx → recover batch_r_attn_ctx
-  Verify per-block FFN Lasso proofs and ffn_lasso_bind opening
+  Verify global FFN Lasso committed to ffn_a_com and ffn_lasso_bind opening
   Verify batch_ffn_y    → recover r_k_fy
   Verify batch_ffn_m    → recover r_k_m
   // Each sumcheck reduces L per-block claims to one batched final claim,
@@ -719,7 +745,7 @@ Algorithm Verify(VK, π, inst_attn, inst_ffn, public_x_in, public_logits):
                    {x_com: π.final_ln_out_com}, FS, lmh_acc_w, lmh_acc_b)
   Assert HyraxVerify(π.logits_com, lm_y_claim, π.lm_head_logits_open, FS)
 
-  // ── 11–13. Global intermediate batch open + 17 cross-block batch opens ─
+  // ── 11–13. Global intermediate batch open + cross-block batch opens ───
   Assert HyraxVerifyBatch({Q_ℓ, K_ℓ, V_ℓ, Out_attn_ℓ, Out_ffn_ℓ}_ℓ at r_td,
                            π.inter_batch_open, …) == ACCEPT
   For each (matrices, point, batch_open) listed in §4.2 step 13:
@@ -737,10 +763,16 @@ Algorithm Verify(VK, π, inst_attn, inst_ffn, public_x_in, public_logits):
   Assert acc_range_m.finalize(FS) == ACCEPT
   Assert inter_acc.finalize(FS) == ACCEPT
 
-  // ── 15. Global Lasso verification (all φ(Q), φ(K) across all blocks) ───
-  Assert VerifyLassoMulti(
+  // ── 15. Global Lasso verification ──────────────────────────────────────
+  Assert VerifyLassoMultiCommittedOutputs(
+      [inst_ffn.activation_lasso for ℓ in 0..L-1],
+      π.ffn_lasso_proof, [bp.ffn_a_com]_ℓ, FS) == ACCEPT
+  Assert ffn_lasso query indices are bound to [bp.ffn_m_com]_ℓ
+
+  Assert qk_lasso query indices are bound to [bp.q_com, bp.k_com]_ℓ
+  Assert VerifyLassoMultiCommittedOutputs(
       [inst_attn[ℓ].q_lasso, inst_attn[ℓ].k_lasso for ℓ in 0..L-1],
-      π.all_lasso_proof, VK.lasso_vk, FS) == ACCEPT
+      π.all_lasso_proof, [bp.attn_phi_q_com, bp.attn_phi_k_com]_ℓ, FS) == ACCEPT
 
   return ACCEPT
 ```
@@ -964,9 +996,9 @@ Algorithm VerifyLayerNorm(proof, io_coms, vk, σ_rv, y_rv, FS, acc_t, acc_td):
 
 *Proof.* Since $\mathsf{Com}(A) + \mathsf{Com}(B) = \mathsf{Com}(A + B)$ holds by the linearity of MSM (Pedersen-style commitment), the verifier's local computation of $C_{\mathsf{mid}}$ is deterministically correct given the binding of $C_{\mathsf{in}}$ and $C_{\mathsf{out\_attn}}$. Binding of these two commitments is guaranteed by Lemma 2. $\square$
 
-**Theorem 4 (FFN Lasso-First Ordering Soundness).** *Running the activation Lasso before any cross-block FFN sumcheck challenges (so that $A$ is bound to the transcript prior to $r_{k,fy}$ and $r_{k,m}$) does not reduce soundness.*
+**Theorem 4 (Global FFN Lasso Soundness).** *Batching all FFN activation lookups into one committed-output `LassoMultiProof` does not reduce soundness, provided the output commitments and lookup-index bindings are absorbed before their Fiat-Shamir challenges.*
 
-*Proof.* The per-block FFN Lasso is absorbed into the transcript in Phase 7 of `Prove` (§4.2), strictly before the cross-block FFN-Y and FFN-M sumcheck challenges are derived. Therefore the prover is committed to specific Lasso outputs before learning the binding points. The verifier opens $A$ at the shared `ffn_lasso_bind_point` via a single batched Hyrax open (`ffn_lasso_bind_open`) and consumes those evaluations as public inputs to the cross-block FFN-Y batch sumcheck. A cheating prover who forges any $A_\ell(\cdot)$ value must either forge the Lasso outputs (caught by Lemma 4), forge the Hyrax opening (caught by Lemma 2), or forge the batched sumcheck (caught by Theorem 2). $\square$
+*Proof.* For each block, the prover commits `ffn_a_com` and `ffn_m_com` before the global FFN lookup proof and FFN-Y/M batch challenges. `prove_lasso_multi` absorbs all `ffn_a_com` commitments before sampling the multi-Lasso batching challenges `instance_batch_alpha` and `lookup_batch_rho`. The committed-output sumcheck then binds the combined lookup grand sum to the committed $A_\ell$ polynomials, and `ffn_a_batch_open` later binds the $A_\ell(r)$ evaluations used by `batch_ffn_y`. Separately, the proof's lookup query indices are absorbed before `ffn_lasso_bind_point`, and `ffn_lasso_bind_open` proves that those indices are the committed $M_\ell$ values evaluated at that point. A cheating prover must therefore either forge the Lasso sumcheck, open `ffn_a_com` / `ffn_m_com` inconsistently, or forge the FFN sumchecks; these are caught by Lemma 1, Lemma 2, and Theorem 2. $\square$
 
 **Theorem 5 (Batched QKV Soundness).** *The single shared-$r_k$ sumcheck for Q, K, V projections is as sound as three independent sumchecks.*
 
@@ -997,13 +1029,13 @@ $$\varepsilon_{\mathsf{sound}} \leq L \cdot n_{\max} \cdot \delta_{\max} / |\mat
    - Each LayerNorm is sound (sumcheck error + range proof soundness, Lemma 5).
    - Batched QKV soundness (Theorem 5).
    - GKR fusion soundness (Theorem 2).
-   - FFN GKR ordering soundness (Theorem 4).
+   - Global FFN Lasso soundness (Theorem 4).
    - Homomorphic residuals require no proof (Theorem 3).
    - Lasso soundness (Lemma 4) for all activation tables.
 
 4. **Final layer + LM head:** Same argument as a single block.
 
-5. **Global Lasso batch:** Indexed over all $Q, K$ lookups; soundness follows from Lemma 4 applied per sub-table, with the batch error bounded by the number of sub-tables times the per-table error.
+5. **Global Lasso batches:** The FFN activation proof covers all $A=\phi(M)$ lookups, and the attention proof covers all $\phi(Q)$ / $\phi(K)$ lookups. Soundness follows from Lemma 4 plus the committed-output and committed-index bindings described in §3.5.
 
 6. **Union bound:** Summing over all $L$ blocks, sub-protocols, and sumcheck rounds, the total statistical error is bounded by $L \cdot n_{\max} \cdot \delta_{\max} / |\mathbb{F}_r|$. For $L=12$, $n_{\max} = 64$, $\delta_{\max} = 3$: error $\leq 2^4 \cdot 2^6 \cdot 2^2 / 2^{254} = 2^{-242}$. $\square$
 
@@ -1060,8 +1092,9 @@ Let $L$ = layers, $T$ = sequence length, $d$ = embedding dimension, $d_{ff}$ = F
 | Cross-block batch sumchecks (1 sumcheck per type vs $L$) | $(L-1)$ sumcheck transcripts × 6 protocol types | §4.2 steps 4–9 |
 | Batched QKV inside each cross-block sumcheck (1 vs 3) | 2 sumcheck transcripts per block | `batch_qkv` |
 | Global intermediate batch open ($5L$ matrices at one point) | $5L - 1$ Hyrax opening proofs | `inter_batch_open` |
-| Cross-block batch opens (one per matrix type, not per block) | $(L-1)$ Hyrax opens per type, $\times \sim 17$ types | §4.2 step 13 |
-| FFN Lasso-first (no separate $A_{\mathsf{com}}$) | $\sqrt{Td_{ff}}$ G1 points | per block |
+| Cross-block batch opens (one per tensor family, not per block) | $(L-1)$ Hyrax opens per committed/opened tensor family | §4.2 step 13 |
+| Global FFN activation Lasso (one `LassoMultiProof` vs $L$ local proofs) | $(L-1)$ lookup sumcheck transcripts and table-opening batches | model-level `ffn_lasso_proof` |
+| Committed-output Lasso (no proof-carried lookup outputs) | $O(N)$ field elements per lookup instance | `ffn_lasso_proof`, `all_lasso_proof` |
 | Homomorphic residuals (no proof) | 2 Hyrax opens per block | per block |
 | Global range batch (1 $m_{\mathsf{com}}$ vs $B_{rng}$) | $(B_{rng}-1) \times \sqrt{2^{16}}$ G1 | per block + final |
 | Deferred batch accumulators (10 cross-cutting groups) | $(K-1) \times 2$ MSMs per group | model-level |
@@ -1082,16 +1115,16 @@ Key advantages of π-Former:
 - **Exact computation:** linear attention is not an approximation of softmax; it is a different (learnable) attention mechanism trained to be useful and provable.
 - **End-to-end co-design:** weights and activation tables are trained to match the exact integer/field arithmetic in the circuit, eliminating approximation errors.
 - **Transparent setup:** Hyrax requires no trusted setup; all parameters are derived from a public hash function.
-- **Structured optimizations:** GKR fusion, homomorphic residuals, global range batching, and batched QKV reduce concrete proof size and prover time without sacrificing soundness.
+- **Structured optimizations:** GKR-style fusion, homomorphic residuals, global range batching, global committed-output Lasso, and batched QKV reduce concrete proof size and prover time without sacrificing soundness.
 - **Extensible:** lookup decomposition depth $c$ and chunk size $m$ are configurable trade-offs between model expressivity and proof cost.
 
 ---
 
 ## 9. Planned Extensions
 
-### 9.1 Memory-Consistency Check for Lasso
+### 9.1 Committed Lasso Indices
 
-The current Lasso argument proves that query outputs are consistent with a *claimed* table. To prevent a dishonest prover from using a different table per query, add an offline memory-consistency argument (Spice / Lasso grand-product check) that ties all queries back to a single committed table across all invocations.
+The current model proof still serializes lookup query indices and then binds them to committed tensors with one random-point Hyrax batch opening. A more succinct variant can replace the raw indices with the existing `LassoIndexProof` machinery: commit chunk polynomials for the lookup input tensor and prove the selector values used by Lasso with high-degree selector sumchecks. This reduces proof-carried index vectors at the cost of extra selector proofs, so it is currently kept as an optional protocol path rather than the default.
 
 ### 9.2 IVC for Autoregressive Generation
 
@@ -1134,9 +1167,11 @@ The implementation enforces several strict transcript-ordering rules that the so
 
 3. **Per-block QKV/O-proj/FFN absorbs precede the corresponding batch $\eta$**. Inside the cross-block QKV loop, each block's $(W_Q, W_K, W_V, \alpha, b_Q, b_K, b_V)$ commitments and the per-block $(\lambda_\ell, \mu_\ell)$ challenges are absorbed before the model-level $\eta_{\mathsf{qkv}}$ is sampled. The same pattern holds for `batch_oproj`, `batch_ffn_y`, `batch_ffn_m`, `batch_attn_out`, and `batch_attn_ctx`.
 
-4. **FFN Lasso commits $A$ before the FFN-Y/M batch challenges**. `prove_lasso` is invoked once per block before the corresponding $\eta_{\mathsf{ffn\_y}}$ challenge is drawn, ensuring the Theorem 4 ordering.
+4. **Committed-output Lasso absorbs output commitments before lookup batching challenges**. `prove_lasso_multi` / `verify_lasso_multi_committed_outputs` absorb `lasso_output_com` for every committed output before deriving `instance_batch_alpha` and `lookup_batch_rho`. This applies to `ffn_lasso_proof` (`ffn_a_com`) and `all_lasso_proof` (`attn_phi_q_com`, `attn_phi_k_com`).
 
-5. **Ten deferred μ-challenges** are advanced after the LM-head proof and before the global intermediate batch open. The verifier mirrors this `for _ in 0..10 { transcript.challenge_field(b"hyrax_group_mu") }` loop so that the Hyrax accumulators consume the same μ values the prover used.
+5. **Lookup indices are transcript-bound before index-opening challenges**. The raw query-index vectors in both global Lasso proofs are absorbed before deriving `ffn_lasso_bind_r` or `qk_lasso_bind_r`. The corresponding Hyrax batch openings bind those index vectors to `ffn_m_com` or to the `q_com` / `k_com` commitments.
+
+6. **Ten deferred μ-challenges** are advanced after the LM-head proof and before the global intermediate batch open. The verifier mirrors this `for _ in 0..10 { transcript.challenge_field(b"hyrax_group_mu") }` loop so that the Hyrax accumulators consume the same μ values the prover used.
 
 ### Bit-Ordering Convention
 
@@ -1218,17 +1253,17 @@ All field elements are serialized as lowercase hex strings with `0x` prefix, zer
 
 ```
 Magic:      b"PFMR_PK\0"  (8 bytes)
-Version:    u8             (1 byte)
-num_blocks: u64 LE
-seq_len:    u64 LE
-d_model:    u64 LE
-vocab_size: u64 LE
+Version:    u8             (1 byte; current key version = 2)
+num_blocks: varint u64
+seq_len:    varint u64
+d_model:    varint u64
+vocab_size: varint u64
 final_ln_vk:  [LayerNormVK]
 lm_head_pk:   [ProjectionPK with weights]
 block_pks:    [num_blocks × TransformerBlockPK with weights]
 ```
 
-Each field element occupies 32 bytes (uncompressed). Each G1Affine occupies 33 bytes (compressed). Lengths are prefixed as `u64 LE`.
+Each field element occupies 32 bytes (uncompressed). Each G1Affine occupies 33 bytes (compressed). Vector lengths and integer dimensions are encoded as little-endian base-128 varints in current files.
 
 ### Binary Verifying Key (`.vk`)
 
@@ -1238,18 +1273,16 @@ Same layout as `.pk` but all `ProjectionPK` / `FFN_PK` weight fields are replace
 
 ```
 Magic:       b"PFMR_PR\0"  (8 bytes)
-Version:     u8
-lasso_sigma: u64 LE
-inst_attn:   [LinearAttentionInstance]
-inst_ffn:    [FFNInstance]
+Version:     u8             (current proof version = 7)
 proof:       [TransformerModelProof]
+lasso_sigma: varint u64
 ```
 
 `TransformerModelProof` carries:
 
-- One `TransformerBlockProof` per block with the LN1/LN2 sub-proofs, the block-level `GlobalRangeM`, the seven intermediate Hyrax commitments, the per-block FFN Lasso proof and `M` commitment, the per-block `phi_q`/`phi_k` commitments, and the per-block scalar evaluations consumed by the cross-block batch sumchecks.
+- One `TransformerBlockProof` per block with the LN1/LN2 sub-proofs, the block-level `GlobalRangeM`, the seven intermediate Hyrax commitments, `ffn_a_com`, `ffn_m_com`, the per-block `phi_q`/`phi_k` commitments, and the per-block scalar evaluations consumed by the cross-block batch sumchecks. The per-block `ffn_lasso_proof` is an empty compatibility field; the real FFN lookup proof is model-level.
 - Six model-level cross-block batched sumcheck proofs: `batch_qkv`, `batch_oproj`, `batch_attn_out`, `batch_attn_ctx`, `batch_ffn_y`, `batch_ffn_m`.
 - One `inter_batch_open` covering the 5L intermediate matrices (Q, K, V, Out_attn, Out_ffn for each block) opened jointly at `r_td`.
-- Roughly 17 cross-block batch opens for the per-type weight, bias, activation, and intermediate matrices at their respective shared evaluation points (`x_norm1`, `w_q`, `w_k`, `w_v`, `bias_q`, `bias_k`, `bias_v`, `w_o`, `bias_o`, `w2`, `w1`, `x_norm2`, `ffn_m_com`, `ffn_lasso_bind`, `phi_q`, `phi_k`, `v_attn`, `qk_lasso_bind`).
-- One model-level `LassoMultiProof` (`all_lasso_proof`) covering all $\phi(Q)$ / $\phi(K)$ Lasso instances across every block.
+- Cross-block batch opens for the per-type weight, bias, activation, and intermediate matrices at their respective shared evaluation points (`x_norm1`, `w_q`, `w_k`, `w_v`, `bias_q`, `bias_k`, `bias_v`, `w_o`, `bias_o`, `w2`, `ffn_a`, `w1`, `x_norm2`, `ffn_m_com`, `ffn_lasso_bind`, `phi_q`, `phi_k`, `v_attn`, `qk_lasso_bind`).
+- Two model-level committed-output `LassoMultiProof`s: `ffn_lasso_proof` covers all FFN activations $A=\phi(M)$; `all_lasso_proof` covers all $\phi(Q)$ / $\phi(K)$ Lasso instances across every block.
 - The final-LayerNorm sub-proof + `GlobalRangeM`, the LM-head projection sub-proof, the LM-head logits opening, and Hyrax commitments for the final-LN output and logits.

@@ -28,14 +28,6 @@ fn zero_ternary_mat(rows: usize, cols: usize) -> Vec<Vec<TernaryValue>> {
     vec![vec![TernaryValue::ZERO; cols]; rows]
 }
 
-fn ones_vec(n: usize) -> Vec<F> {
-    vec![F::ONE; n]
-}
-
-fn zeros_vec(n: usize) -> Vec<F> {
-    vec![F::ZERO; n]
-}
-
 fn make_block(d_model: usize, d_ff: usize, m_bits: usize) -> TransformerBlockWeights {
     let table_size = 1usize << m_bits;
     let dummy_table = vec![vec![F::ZERO; table_size]];

@@ -10,7 +10,7 @@
 
 use crate::field::F;
 use crate::lookup::lasso::{
-    verify_lasso, verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey,
+    verify_lasso_multi_committed_outputs, LassoMultiInstance, LassoMultiVerifyingKey,
 };
 use crate::lookup::range::verify_range_batched;
 use crate::pcs::{
@@ -27,8 +27,7 @@ use crate::attention::layernorm::{
     verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey,
 };
 use crate::attention::projection::{
-    verify_projection, verify_qkv_projections, BatchedQKVProjectionIOCommitments,
-    ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
+    verify_projection, ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
 };
 use crate::ffn::ffn::{FFNInstance, FFNProvingKey, FFNVerifyingKey};
 use ark_ec::{AffineRepr, CurveGroup};
@@ -241,15 +240,15 @@ pub fn verify(
 
     let mut ln_acc_t = HyraxBatchAccumulator::new();
     let mut ln_acc_td = HyraxBatchAccumulator::new();
-    let mut proj_acc_w = HyraxBatchAccumulator::new();
-    let mut proj_acc_b = HyraxBatchAccumulator::new();
+    let proj_acc_w = HyraxBatchAccumulator::new();
+    let proj_acc_b = HyraxBatchAccumulator::new();
     let mut lmh_acc_w = HyraxBatchAccumulator::new();
     let mut lmh_acc_b = HyraxBatchAccumulator::new();
     let mut acc_range_sig = HyraxBatchAccumulator::new();
     let mut acc_range_y = HyraxBatchAccumulator::new();
     let mut acc_range_m = HyraxBatchAccumulator::new();
     // inter_acc: per-block v_attn opens (different eval point per block)
-    let mut inter_acc = HyraxBatchAccumulator::new();
+    let inter_acc = HyraxBatchAccumulator::new();
 
     // =========================================================================
     // 2. Phase 1: verify range proofs + LN1 + LN2 for all blocks
@@ -546,26 +545,47 @@ pub fn verify(
         absorb_com(transcript, b"w1_com", &bvk.ffn_vk.w1_com);
         absorb_com(transcript, b"w2_com", &bvk.ffn_vk.w2_com);
 
-        let _t0 = Instant::now();
-        verify_lasso(
-            &bp.ffn_lasso_proof,
-            &inst_ffn.activation_lasso,
-            &bvk.ffn_vk.activation_lasso_vk,
-            transcript,
-            lasso_params,
-        )?;
-        eprintln!(
-            "[block {}] ffn_lasso:{:>8.3}ms",
-            i,
-            _t0.elapsed().as_secs_f64() * 1000.0
-        );
-
         absorb_com(transcript, b"m_com", &bp.ffn_m_com);
     }
-    let ffn_index_refs: Vec<&[usize]> = proof
+    let _tffn_lasso = Instant::now();
+    if proof.ffn_lasso_proof.all_query_indices.len() != num_blocks {
+        return Err(format!(
+            "FFN Lasso query index count mismatch: got {}, expected {}",
+            proof.ffn_lasso_proof.all_query_indices.len(),
+            num_blocks
+        ));
+    }
+    let ffn_lasso_instances = LassoMultiInstance {
+        instances: (0..num_blocks)
+            .map(|_| inst_ffn.activation_lasso.clone())
+            .collect(),
+    };
+    let ffn_lasso_vk = LassoMultiVerifyingKey {
+        instance_table_coms: vk
+            .block_vks
+            .iter()
+            .map(|bvk| bvk.ffn_vk.activation_lasso_vk.table_coms.clone())
+            .collect(),
+    };
+    let ffn_output_coms: Vec<(HyraxCommitment, usize)> = proof
         .block_proofs
         .iter()
-        .map(|bp| bp.ffn_lasso_proof.query_indices.as_slice())
+        .map(|bp| (bp.ffn_a_com.clone(), t_bits + f_bits))
+        .collect();
+    verify_lasso_multi_committed_outputs(
+        &proof.ffn_lasso_proof,
+        &ffn_lasso_instances,
+        &ffn_lasso_vk,
+        &ffn_output_coms,
+        transcript,
+        lasso_params,
+    )
+    .map_err(|e| format!("FFN global Lasso: {e}"))?;
+    let ffn_index_refs: Vec<&[usize]> = proof
+        .ffn_lasso_proof
+        .all_query_indices
+        .iter()
+        .map(|v| v.as_slice())
         .collect();
     absorb_index_vectors(transcript, b"ffn_lasso_indices", &ffn_index_refs);
     let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
@@ -586,7 +606,10 @@ pub fn verify(
         &params_mff_bind,
         transcript,
     )?;
-
+    eprintln!(
+        "[model] ffn_lasso:{:>8.3}ms",
+        _tffn_lasso.elapsed().as_secs_f64() * 1000.0
+    );
     // =========================================================================
     // 8. Batch FFN-Y (sumcheck only)
     // =========================================================================
@@ -874,10 +897,9 @@ pub fn verify(
         .iter()
         .map(|bp| bp.x_norm1_com.clone())
         .collect();
-    let x_norm1_evals: Vec<F> = proof.batch_qkv.final_evals_f.clone();
     hyrax_verify_batch(
         &x_norm1_coms,
-        &x_norm1_evals,
+        &proof.batch_qkv.final_evals_f,
         &x_norm1_point,
         &proof.x_norm1_batch_open,
         &params_td,
@@ -1058,16 +1080,32 @@ pub fn verify(
         .iter()
         .map(|bvk| bvk.ffn_vk.w2_com.clone())
         .collect();
-    let w2_evals: Vec<F> = proof.batch_ffn_y.final_evals_g.clone();
     hyrax_verify_batch(
         &w2_coms,
-        &w2_evals,
+        &proof.batch_ffn_y.final_evals_g,
         &w2_point,
         &proof.w2_batch_open,
         &params_wff,
         transcript,
     )
     .map_err(|e| format!("w2_batch: {e}"))?;
+
+    // A at combine(r_t, r_k_fy)
+    let ffn_a_point = combine(&r_t, &r_k_fy);
+    let ffn_a_coms: Vec<HyraxCommitment> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.ffn_a_com.clone())
+        .collect();
+    hyrax_verify_batch(
+        &ffn_a_coms,
+        &proof.batch_ffn_y.final_evals_f,
+        &ffn_a_point,
+        &proof.ffn_a_batch_open,
+        &params_mff,
+        transcript,
+    )
+    .map_err(|e| format!("ffn_a_batch: {e}"))?;
 
     // w1 at combine(r_k_m, ry_m) — uses same params as prover (params_qkvo_w)
     let w1_point = combine(&r_k_m, &ry_m);
@@ -1076,10 +1114,9 @@ pub fn verify(
         .iter()
         .map(|bvk| bvk.ffn_vk.w1_com.clone())
         .collect();
-    let w1_evals: Vec<F> = proof.batch_ffn_m.final_evals_g.clone();
     hyrax_verify_batch(
         &w1_coms,
-        &w1_evals,
+        &proof.batch_ffn_m.final_evals_g,
         &w1_point,
         &proof.w1_batch_open,
         &params_wff,
@@ -1094,10 +1131,9 @@ pub fn verify(
         .iter()
         .map(|bp| bp.x_norm2_com.clone())
         .collect();
-    let x_norm2_evals: Vec<F> = proof.batch_ffn_m.final_evals_f.clone();
     hyrax_verify_batch(
         &x_norm2_coms,
-        &x_norm2_evals,
+        &proof.batch_ffn_m.final_evals_f,
         &x_norm2_point,
         &proof.x_norm2_batch_open,
         &params_td,
@@ -1130,10 +1166,9 @@ pub fn verify(
         .iter()
         .map(|bp| bp.attn_phi_q_com.clone())
         .collect();
-    let phi_q_evals: Vec<F> = proof.batch_attn_out.final_evals_f.clone();
     hyrax_verify_batch(
         &phi_q_coms,
-        &phi_q_evals,
+        &proof.batch_attn_out.final_evals_f,
         &phi_q_attn_point,
         &proof.phi_q_batch_open,
         &params_td,
@@ -1148,10 +1183,9 @@ pub fn verify(
         .iter()
         .map(|bp| bp.attn_phi_k_com.clone())
         .collect();
-    let phi_k_evals: Vec<F> = proof.batch_attn_ctx.final_evals_f.clone();
     hyrax_verify_batch(
         &phi_k_coms,
-        &phi_k_evals,
+        &proof.batch_attn_ctx.final_evals_f,
         &phi_k_attn_point,
         &proof.phi_k_batch_open,
         &params_td,
@@ -1166,10 +1200,9 @@ pub fn verify(
         .iter()
         .map(|bp| bp.v_com.clone())
         .collect();
-    let v_attn_evals: Vec<F> = proof.batch_attn_ctx.final_evals_g.clone();
     hyrax_verify_batch(
         &v_attn_coms,
-        &v_attn_evals,
+        &proof.batch_attn_ctx.final_evals_g,
         &v_attn_batch_point,
         &proof.v_attn_batch_open,
         &params_td,
@@ -1235,7 +1268,7 @@ pub fn verify(
         &params_td,
         transcript,
     )?;
-    verify_lasso_multi(
+    verify_lasso_multi_committed_outputs(
         &proof.all_lasso_proof,
         &global_multi_inst,
         &global_lasso_vk,

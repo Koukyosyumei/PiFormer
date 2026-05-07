@@ -1,0 +1,292 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1220" viewBox="0 0 1800 1220" role="img" aria-labelledby="title desc">
+  <title id="title">PiFormer transformer architecture proving and verification flow</title>
+  <desc id="desc">A transformer architecture diagram showing the PiFormer data path from input embeddings through LayerNorm, projections, attention, FFN, final LayerNorm and LM head, with proof gadgets attached to each computation.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="0.55" stop-color="#eef8f6"/>
+      <stop offset="1" stop-color="#fff7ed"/>
+    </linearGradient>
+    <linearGradient id="tensor" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f766e"/>
+      <stop offset="1" stop-color="#14b8a6"/>
+    </linearGradient>
+    <linearGradient id="compute" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="lookup" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#c084fc"/>
+    </linearGradient>
+    <linearGradient id="proof" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b45309"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </linearGradient>
+    <filter id="shadow" x="-12%" y="-12%" width="124%" height="138%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#0f172a" flood-opacity="0.14"/>
+    </filter>
+    <marker id="arrowTensor" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
+    </marker>
+    <marker id="arrowProof" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309"/>
+    </marker>
+    <marker id="arrowCheck" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+    <style>
+      .page { fill: url(#bg); }
+      .title { font: 800 42px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; letter-spacing: 0; }
+      .subtitle { font: 500 17px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .section-title { font: 800 17px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; letter-spacing: 0.08em; }
+      .block { fill: #ffffff; stroke: #d5e2e8; stroke-width: 1.4; rx: 8; filter: url(#shadow); }
+      .inner { fill: #f8fafc; stroke: #dbe4ea; stroke-width: 1.1; rx: 8; }
+      .tensor-head { fill: url(#tensor); rx: 8; }
+      .compute-head { fill: url(#compute); rx: 8; }
+      .lookup-head { fill: url(#lookup); rx: 8; }
+      .proof-head { fill: url(#proof); rx: 8; }
+      .head-text { font: 800 15px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; }
+      .node-title { font: 800 18px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .node-sub { font: 600 12px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; }
+      .body { font: 500 13px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+      .small { font: 500 12px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; }
+      .mono { font: 700 12px "SFMono-Regular", Consolas, "Liberation Mono", monospace; fill: #475569; }
+      .badge { font: 800 11px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; }
+      .data-flow { stroke: #0f766e; stroke-width: 4; fill: none; marker-end: url(#arrowTensor); }
+      .proof-flow { stroke: #b45309; stroke-width: 2.5; fill: none; marker-end: url(#arrowProof); stroke-dasharray: 7 7; }
+      .check-flow { stroke: #475569; stroke-width: 2.2; fill: none; marker-end: url(#arrowCheck); stroke-dasharray: 5 7; }
+      .skip-flow { stroke: #64748b; stroke-width: 3; fill: none; marker-end: url(#arrowCheck); }
+    </style>
+  </defs>
+
+  <rect class="page" x="0" y="0" width="1800" height="1220"/>
+
+  <text class="title" x="80" y="74">PiFormer architecture proof flow</text>
+  <text class="subtitle" x="80" y="106">The transformer computation is the main path; proof objects certify each layer and the verifier replays the same architecture-level checks.</text>
+
+  <g transform="translate(80 140)">
+    <text class="section-title" x="0" y="0">MODEL DATA PATH</text>
+    <text class="small" x="0" y="24">Tensor flow through one repeated transformer block, then final normalization and LM head.</text>
+  </g>
+
+  <!-- Inputs -->
+  <g transform="translate(80 192)">
+    <rect class="block" x="0" y="0" width="240" height="112"/>
+    <rect class="tensor-head" x="0" y="0" width="240" height="34"/>
+    <text class="head-text" x="18" y="22">Public input</text>
+    <text class="node-title" x="18" y="61">X_l</text>
+    <text class="body" x="18" y="84">current hidden state</text>
+    <text class="mono" x="18" y="103">shape: t x d</text>
+  </g>
+
+  <!-- Repeated block container -->
+  <g transform="translate(365 162)">
+    <rect class="block" x="0" y="0" width="1355" height="722"/>
+    <text class="section-title" x="26" y="34">TRANSFORMER BLOCK LAYER l</text>
+    <text class="small" x="26" y="58">Repeated for each block; commitments from every block are batched at the model level.</text>
+
+    <!-- LN1 -->
+    <g transform="translate(38 96)">
+      <rect class="inner" x="0" y="0" width="205" height="116"/>
+      <rect class="compute-head" x="0" y="0" width="205" height="32"/>
+      <text class="head-text" x="16" y="21">LayerNorm 1</text>
+      <text class="node-title" x="16" y="58">x_norm1</text>
+      <text class="body" x="16" y="81">normalize X_l</text>
+      <text class="mono" x="16" y="101">LN proof + range</text>
+    </g>
+
+    <!-- QKV projection -->
+    <g transform="translate(300 96)">
+      <rect class="inner" x="0" y="0" width="230" height="116"/>
+      <rect class="compute-head" x="0" y="0" width="230" height="32"/>
+      <text class="head-text" x="16" y="21">QKV projections</text>
+      <text class="node-title" x="16" y="58">Q, K, V</text>
+      <text class="body" x="16" y="81">x_norm1 · Wq/Wk/Wv + b</text>
+      <text class="mono" x="16" y="101">batched sumcheck</text>
+    </g>
+
+    <!-- Feature maps -->
+    <g transform="translate(595 80)">
+      <rect class="inner" x="0" y="0" width="230" height="148"/>
+      <rect class="lookup-head" x="0" y="0" width="230" height="32"/>
+      <text class="head-text" x="16" y="21">Attention lookup</text>
+      <text class="node-title" x="16" y="58">phi_q, phi_k</text>
+      <text class="body" x="16" y="81">lookup feature maps from Q and K</text>
+      <text class="body" x="16" y="104">query indices are bound globally</text>
+      <text class="mono" x="16" y="128">LassoMulti</text>
+    </g>
+
+    <!-- Linear attention -->
+    <g transform="translate(895 80)">
+      <rect class="inner" x="0" y="0" width="230" height="148"/>
+      <rect class="compute-head" x="0" y="0" width="230" height="32"/>
+      <text class="head-text" x="16" y="21">Linear attention</text>
+      <text class="node-title" x="16" y="58">context, attn_out</text>
+      <text class="body" x="16" y="81">context = phi_k^T · V</text>
+      <text class="body" x="16" y="104">attn_out = phi_q · context</text>
+      <text class="mono" x="16" y="128">two batched sumchecks</text>
+    </g>
+
+    <!-- O projection -->
+    <g transform="translate(1185 96)">
+      <rect class="inner" x="0" y="0" width="130" height="116"/>
+      <rect class="compute-head" x="0" y="0" width="130" height="32"/>
+      <text class="head-text" x="16" y="21">O proj</text>
+      <text class="node-title" x="16" y="58">out_attn</text>
+      <text class="body" x="16" y="81">attn_out · Wo + b</text>
+      <text class="mono" x="16" y="101">sumcheck</text>
+    </g>
+
+    <!-- Residual 1 -->
+    <g transform="translate(820 292)">
+      <rect class="inner" x="0" y="0" width="250" height="104"/>
+      <rect class="tensor-head" x="0" y="0" width="250" height="32"/>
+      <text class="head-text" x="16" y="21">Residual add</text>
+      <text class="node-title" x="16" y="58">x_mid = X_l + out_attn</text>
+      <text class="body" x="16" y="82">commitment homomorphism binds the sum</text>
+    </g>
+
+    <!-- LN2 -->
+    <g transform="translate(595 470)">
+      <rect class="inner" x="0" y="0" width="205" height="116"/>
+      <rect class="compute-head" x="0" y="0" width="205" height="32"/>
+      <text class="head-text" x="16" y="21">LayerNorm 2</text>
+      <text class="node-title" x="16" y="58">x_norm2</text>
+      <text class="body" x="16" y="81">normalize x_mid</text>
+      <text class="mono" x="16" y="101">LN proof + range</text>
+    </g>
+
+    <!-- FFN W1 -->
+    <g transform="translate(855 470)">
+      <rect class="inner" x="0" y="0" width="205" height="116"/>
+      <rect class="compute-head" x="0" y="0" width="205" height="32"/>
+      <text class="head-text" x="16" y="21">FFN W1</text>
+      <text class="node-title" x="16" y="58">M</text>
+      <text class="body" x="16" y="81">x_norm2 · W1</text>
+      <text class="mono" x="16" y="101">ternary eval</text>
+    </g>
+
+    <!-- FFN activation -->
+    <g transform="translate(1115 450)">
+      <rect class="inner" x="0" y="0" width="205" height="156"/>
+      <rect class="lookup-head" x="0" y="0" width="205" height="32"/>
+      <text class="head-text" x="16" y="21">Activation lookup</text>
+      <text class="node-title" x="16" y="58">A = act(M)</text>
+      <text class="body" x="16" y="81">lookup-backed activation table</text>
+      <text class="body" x="16" y="104">A is committed before FFN-Y challenge</text>
+      <text class="mono" x="16" y="128">FFN LassoMulti</text>
+    </g>
+
+    <!-- FFN W2 -->
+    <g transform="translate(855 628)">
+      <rect class="inner" x="0" y="0" width="205" height="84"/>
+      <rect class="compute-head" x="0" y="0" width="205" height="32"/>
+      <text class="head-text" x="16" y="21">FFN W2</text>
+      <text class="node-title" x="16" y="58">out_ffn = A · W2</text>
+      <text class="mono" x="16" y="76">ternary eval</text>
+    </g>
+
+    <!-- Residual 2 -->
+    <g transform="translate(595 628)">
+      <rect class="inner" x="0" y="0" width="205" height="84"/>
+      <rect class="tensor-head" x="0" y="0" width="205" height="32"/>
+      <text class="head-text" x="16" y="21">Residual add</text>
+      <text class="node-title" x="16" y="58">X_{l+1}</text>
+      <text class="body" x="16" y="76">x_mid + out_ffn</text>
+    </g>
+
+    <!-- Data arrows inside block -->
+    <path class="data-flow" d="M 243 154 L 296 154"/>
+    <path class="data-flow" d="M 530 154 L 590 154"/>
+    <path class="data-flow" d="M 825 154 L 890 154"/>
+    <path class="data-flow" d="M 1125 154 L 1180 154"/>
+    <path class="data-flow" d="M 1250 212 C 1250 270, 1135 312, 1074 342"/>
+    <path class="skip-flow" d="M 38 154 C -24 154, -24 344, 815 344"/>
+    <path class="data-flow" d="M 945 396 C 945 435, 740 437, 700 466"/>
+    <path class="data-flow" d="M 800 528 L 850 528"/>
+    <path class="data-flow" d="M 1060 528 L 1110 528"/>
+    <path class="data-flow" d="M 1218 606 C 1218 664, 1122 670, 1065 670"/>
+    <path class="data-flow" d="M 855 670 L 805 670"/>
+    <path class="skip-flow" d="M 820 344 C 504 410, 504 634, 590 670"/>
+  </g>
+
+  <!-- Connect input to block and block to final -->
+  <path class="data-flow" d="M 320 248 L 365 316"/>
+  <path class="data-flow" d="M 960 884 C 960 925, 960 945, 960 980"/>
+
+  <!-- Final layers -->
+  <g transform="translate(680 980)">
+    <rect class="block" x="0" y="0" width="560" height="116"/>
+    <rect class="compute-head" x="0" y="0" width="560" height="34"/>
+    <text class="head-text" x="20" y="22">After L blocks</text>
+    <g transform="translate(26 54)">
+      <text class="node-title" x="0" y="0">Final LayerNorm</text>
+      <text class="body" x="0" y="25">certified with the same LayerNorm and range machinery</text>
+    </g>
+    <g transform="translate(302 54)">
+      <text class="node-title" x="0" y="0">LM head projection</text>
+      <text class="body" x="0" y="25">logits = final_norm · W_lm + b</text>
+    </g>
+  </g>
+
+  <g transform="translate(1290 980)">
+    <rect class="block" x="0" y="0" width="230" height="116"/>
+    <rect class="tensor-head" x="0" y="0" width="230" height="34"/>
+    <text class="head-text" x="18" y="22">Output</text>
+    <text class="node-title" x="18" y="62">logits</text>
+    <text class="body" x="18" y="86">opened at claimed point</text>
+  </g>
+  <path class="data-flow" d="M 1240 1038 L 1285 1038"/>
+
+  <!-- Proof rail -->
+  <g transform="translate(80 932)">
+    <rect class="block" x="0" y="0" width="530" height="196"/>
+    <rect class="proof-head" x="0" y="0" width="530" height="36"/>
+    <text class="head-text" x="20" y="24">Proof layer attached to the architecture</text>
+    <text class="node-title" x="22" y="70">What the prover emits</text>
+    <text class="body" x="22" y="98">Hyrax commitments for intermediate tensors and weights</text>
+    <text class="body" x="22" y="121">Sumcheck proofs for projection, attention, and FFN products</text>
+    <text class="body" x="22" y="144">Lasso proofs for Q/K feature-map lookups and FFN activation</text>
+    <text class="body" x="22" y="167">Global batch openings for shared evaluation points across blocks</text>
+  </g>
+
+  <g transform="translate(80 1148)">
+    <rect class="inner" x="0" y="0" width="1440" height="44"/>
+    <circle cx="24" cy="22" r="7" fill="#0f766e"/>
+    <text class="small" x="42" y="26">solid teal arrows: tensor data flow</text>
+    <circle cx="268" cy="22" r="7" fill="#64748b"/>
+    <text class="small" x="286" y="26">gray arrows: residual connections</text>
+    <circle cx="540" cy="22" r="7" fill="#b45309"/>
+    <text class="small" x="558" y="26">dashed amber arrows: proof obligations bind computations to commitments</text>
+    <circle cx="1020" cy="22" r="7" fill="#7c3aed"/>
+    <text class="small" x="1038" y="26">purple modules: lookup-certified nonlinearities</text>
+  </g>
+
+  <!-- Verifier panel -->
+  <g transform="translate(1262 192)">
+    <rect class="block" x="0" y="0" width="458" height="430"/>
+    <rect class="proof-head" x="0" y="0" width="458" height="36"/>
+    <text class="head-text" x="20" y="24">Verifier mirrors the architecture</text>
+    <text class="node-title" x="24" y="72">Checks in model order</text>
+    <text class="body" x="24" y="102">1. replay transcript commitments from X_l through X_{l+1}</text>
+    <text class="body" x="24" y="130">2. verify LN constraints and batched range proofs</text>
+    <text class="body" x="24" y="158">3. verify QKV, O-proj, attention, FFN sumchecks</text>
+    <text class="body" x="24" y="186">4. verify Lasso lookup bindings for phi and activation</text>
+    <text class="body" x="24" y="214">5. verify Hyrax openings against all committed tensors</text>
+    <text class="body" x="24" y="242">6. accept only if every residual, opening, and lookup is consistent</text>
+    <rect class="inner" x="24" y="278" width="410" height="118"/>
+    <text class="node-title" x="44" y="314">Global batching</text>
+    <text class="body" x="44" y="342">All blocks share challenges where possible.</text>
+    <text class="body" x="44" y="366">This keeps verifier work and proof size tied to batched checks,</text>
+    <text class="body" x="44" y="390">not to separate standalone proofs per layer instance.</text>
+  </g>
+
+  <!-- Proof arrows from architecture to proof rail/verifier -->
+  <path class="proof-flow" d="M 610 470 C 465 700, 375 820, 330 930"/>
+  <path class="proof-flow" d="M 960 390 C 690 662, 510 820, 390 930"/>
+  <path class="proof-flow" d="M 1280 690 C 925 824, 630 875, 500 930"/>
+  <path class="proof-flow" d="M 610 1030 C 908 994, 1095 854, 1260 606"/>
+  <path class="check-flow" d="M 1262 402 C 1190 430, 1170 486, 1160 612"/>
+
+</svg>

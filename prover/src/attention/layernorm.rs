@@ -65,7 +65,7 @@ pub struct LayerNormWitness {
 
 #[derive(Clone)]
 pub struct LayerNormInternalCommitments {
-    // 統計量(row-level)のコミットメントは RangeProof との紐付けに必要だが、
+    // 統計量(row-level)のコミットメントは RangeWitnessProof との紐付けに必要だが、
     // 積や二乗 (sum_x_sq, sigma_sq, sigma_y, gamma_x) は削除。
     pub sum_x_com: HyraxCommitment,
     pub sigma_com: HyraxCommitment,
@@ -453,7 +453,7 @@ pub fn prove_layernorm(
             sum_x_at_rt: claim_s,
             sq_sum_x_at_rt: claim_q,
             rt_batch_proof: hyrax_open_batch(
-                &[&sum_x_mle.evaluations],
+                &[&sum_x_mle.evaluations, &sq_sum_x_mle.evaluations],
                 &r_t,
                 nu_t,
                 sigma_t,
@@ -752,10 +752,16 @@ pub fn verify_layernorm(
 
     // m_com verified globally via verify_range_batched before this call.
 
-    // 1. rt_batch_proof (Group 1)
+    // 1. rt_batch_proof (Group 1): bind both row statistics at the row audit point.
     acc_t.add_verify_batch(
-        &[proof.internal_coms.sum_x_com.clone()],
-        &[proof.openings.sum_x_at_rt],
+        &[
+            proof.internal_coms.sum_x_com.clone(),
+            proof.internal_coms.sq_sum_x_com.clone(),
+        ],
+        &[
+            proof.openings.sum_x_at_rt,
+            proof.openings.sq_sum_x_at_rt,
+        ],
         &r_t,
         &proof.openings.rt_batch_proof,
         transcript,

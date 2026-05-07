@@ -30,7 +30,7 @@ use crate::attention::projection::{
 };
 use crate::ffn::ffn::{FFNInstance, FFNWitness};
 use crate::lookup::lasso::{
-    prove_lasso, prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
+    prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
     LassoOutputBinding, LassoProof,
 };
 use crate::lookup::range::{prove_range_batched, GlobalRangeM};
@@ -49,8 +49,9 @@ pub struct TransformerBlockProof {
     pub ln2_proof: LayerNormProof,
     pub block_range_m: GlobalRangeM,
 
-    // FFN per-block: Lasso for activation + M commitment
+    // FFN per-block: Lasso for activation + A/M commitments
     pub ffn_lasso_proof: LassoProof,
+    pub ffn_a_com: HyraxCommitment,
     pub ffn_m_com: HyraxCommitment,
 
     // Committed intermediate matrices (7 per block)
@@ -272,6 +273,7 @@ pub struct TransformerModelProof {
     pub final_ln_out_com: HyraxCommitment,
     pub logits_com: HyraxCommitment,
     pub lm_head_logits_open: HyraxProof,
+    pub ffn_lasso_proof: LassoMultiProof,
     pub all_lasso_proof: LassoMultiProof,
     pub final_range_m: GlobalRangeM,
 
@@ -297,6 +299,7 @@ pub struct TransformerModelProof {
     pub w_o_batch_open: HyraxProof,
     pub bias_o_batch_open: HyraxProof,
     pub w2_batch_open: HyraxProof,
+    pub ffn_a_batch_open: HyraxProof,
     pub w1_batch_open: HyraxProof,
     pub x_norm2_batch_open: HyraxProof,
     pub ffn_m_com_batch_open: HyraxProof,
@@ -321,6 +324,21 @@ fn powers_of(base: F, n: usize) -> Vec<F> {
         cur *= base;
     }
     v
+}
+
+fn empty_lasso_proof() -> LassoProof {
+    LassoProof {
+        outputs: Vec::new(),
+        query_indices: Vec::new(),
+        sub_claims: Vec::new(),
+        sumcheck_proofs: Vec::new(),
+        table_openings: Vec::new(),
+        hyrax_proofs: Vec::new(),
+        output_sumcheck: None,
+        output_open: None,
+        l_k_evals: Vec::new(),
+        index_proof: None,
+    }
 }
 
 fn absorb_index_vectors(transcript: &mut Transcript, label: &[u8], vectors: &[&[usize]]) {
@@ -418,6 +436,9 @@ pub fn prove(
     let mut fs_qkv: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut gs_qkv: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut qkv_targets: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut q_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut k_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut v_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     // Per-block QKV data needed for proof construction
     let mut pb_q_eval: Vec<F> = Vec::with_capacity(num_blocks);
     let mut pb_k_eval: Vec<F> = Vec::with_capacity(num_blocks);
@@ -493,6 +514,9 @@ pub fn prove(
         pb_bias_q_eval.push(bias_q_eval);
         pb_bias_k_eval.push(bias_k_eval);
         pb_bias_v_eval.push(bias_v_eval);
+        q_mles.push(q_mle);
+        k_mles.push(k_mle);
+        v_mles.push(v_mle);
     }
 
     // Cross-block QKV batch sumcheck
@@ -526,6 +550,7 @@ pub fn prove(
     let mut fs_oproj: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut gs_oproj: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut oproj_targets: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut out_attn_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut pb_oproj_bias_o_eval: Vec<F> = Vec::with_capacity(num_blocks);
 
     for i in 0..num_blocks {
@@ -539,10 +564,11 @@ pub fn prove(
         // x_com = None (GKR backward)
 
         let x_inner_mle = mat_to_mle(&bw.o_proj_wit.x, t, d);
+        let out_attn_mle = mat_to_mle(&bw.o_proj_wit.y, t, d);
         let bias_o_mle = vec_to_mle(&bpk.o_pk.bias, d);
 
         let bias_o_eval = bias_o_mle.evaluate(&r_out);
-        let out_attn_eval = mat_to_mle(&bw.o_proj_wit.y, t, d).evaluate(&combine(&r_t, &r_out));
+        let out_attn_eval = out_attn_mle.evaluate(&combine(&r_t, &r_out));
 
         // f_i(k) = alpha_o * X_inner_i[r_t, k]
         let alpha_o = bpk.o_pk.vk.alpha;
@@ -560,6 +586,7 @@ pub fn prove(
         fs_oproj.push(DenseMLPoly::from_vec_padded(f_x));
         gs_oproj.push(DenseMLPoly::from_vec_padded(g_wo));
         oproj_targets.push(target);
+        out_attn_mles.push(out_attn_mle);
         pb_oproj_bias_o_eval.push(bias_o_eval);
     }
 
@@ -597,7 +624,6 @@ pub fn prove(
     // 6a. Commit phi_q, phi_k per block and absorb into transcript.
     let mut phi_q_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut phi_k_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
-    let mut v_mles_attn: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut ctx_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut attn_phi_q_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
     let mut attn_phi_k_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
@@ -609,7 +635,6 @@ pub fn prove(
 
         let phi_q_mle = mat_to_mle(&bw.attn_wit.phi_q, t, d);
         let phi_k_mle = mat_to_mle(&bw.attn_wit.phi_k, t, d);
-        let v_mle = mat_to_mle(&bw.attn_wit.v, t, d);
         let ctx_mle = mat_to_mle(&bw.attn_wit.context, d, d);
 
         let phi_q_com = commit_mat(&bw.attn_wit.phi_q, t, d);
@@ -627,7 +652,6 @@ pub fn prove(
 
         phi_q_mles.push(phi_q_mle);
         phi_k_mles.push(phi_k_mle);
-        v_mles_attn.push(v_mle);
         ctx_mles.push(ctx_mle);
         attn_phi_q_coms.push(phi_q_com);
         attn_phi_k_coms.push(phi_k_com);
@@ -668,7 +692,7 @@ pub fn prove(
         transcript.append_field(b"attn_ctx_eval", &attn_ctx_evals[i]);
         let f_ctx =
             DenseMLPoly::from_vec_padded(eval_cols(&phi_k_mles[i], t_bits, &batch_r_attn_out));
-        let g_v = DenseMLPoly::from_vec_padded(eval_cols(&v_mles_attn[i], t_bits, &r_k_o));
+        let g_v = DenseMLPoly::from_vec_padded(eval_cols(&v_mles[i], t_bits, &r_k_o));
         fs_attn_ctx.push(f_ctx);
         gs_attn_ctx.push(g_v);
     }
@@ -689,9 +713,15 @@ pub fn prove(
     // =========================================================================
     // 7. Per-block FFN: Lasso + M commit + absorb coms
     // =========================================================================
-    let mut ffn_lasso_proofs: Vec<LassoProof> = Vec::with_capacity(num_blocks);
+    let mut ffn_a_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
+    let mut ffn_a_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut ffn_m_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
     let mut ffn_m_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut ffn_lasso_instances = Vec::with_capacity(num_blocks);
+    let mut ffn_query_indices_all: Vec<Vec<usize>> = Vec::with_capacity(num_blocks);
+    let mut ffn_output_bindings = Vec::with_capacity(num_blocks);
+    let mut ffn_instance_coms = Vec::with_capacity(num_blocks);
+    let mut ffn_lasso_nu = 0usize;
 
     for i in 0..num_blocks {
         let bpk = &pk.block_pks[i];
@@ -713,30 +743,49 @@ pub fn prove(
             outputs: flatten_mat_values(&bw.ffn_wit.a),
             bits_per_chunk: inst_ffn.activation_lasso.bits_per_chunk,
         };
-        let ffn_lasso_proof = prove_lasso(
-            &ffn_lasso_instance,
-            &ffn_query_indices,
-            &bpk.ffn_pk.activation_lasso_pk,
-            transcript,
-            lasso_params,
-        );
-
-        // Commit M
+        let a_mle = mat_to_mle(&bw.ffn_wit.a, t, d_ff);
+        let (nu_a, _, params_a) = params_from_vars(t_bits + f_bits);
+        let ffn_a_com = hyrax_commit(&a_mle.evaluations, nu_a, &params_a);
         let m_mle = mat_to_mle(&bw.ffn_wit.m, t, d_ff);
         let (nu_m, _, params_m) = params_from_vars(t_bits + f_bits);
         let ffn_m_com = hyrax_commit(&m_mle.evaluations, nu_m, &params_m);
         absorb_com(transcript, b"m_com", &ffn_m_com);
 
-        ffn_lasso_proofs.push(ffn_lasso_proof);
+        ffn_instance_coms.push(bpk.ffn_pk.activation_lasso_pk.table_coms.clone());
+        ffn_lasso_nu = bpk.ffn_pk.activation_lasso_pk.nu;
+        ffn_lasso_instances.push(ffn_lasso_instance);
+        ffn_query_indices_all.push(ffn_query_indices);
+        ffn_output_bindings.push(LassoOutputBinding {
+            com: ffn_a_com.clone(),
+            num_vars: t_bits + f_bits,
+            mle_evals: a_mle.evaluations.clone(),
+        });
+        ffn_a_coms.push(ffn_a_com);
+        ffn_a_mles.push(a_mle);
         ffn_m_coms.push(ffn_m_com);
         ffn_m_mles.push(m_mle);
     }
 
-    let ffn_index_refs: Vec<&[usize]> = witness
-        .block_witnesses
+    let global_ffn_lasso_inst = LassoMultiInstance {
+        instances: ffn_lasso_instances,
+    };
+    let global_ffn_lasso_pk = LassoMultiProvingKey {
+        instance_table_coms: ffn_instance_coms,
+        nu: ffn_lasso_nu,
+    };
+    let ffn_lasso_proof = prove_lasso_multi(
+        &global_ffn_lasso_inst,
+        &ffn_query_indices_all,
+        &global_ffn_lasso_pk,
+        &ffn_output_bindings,
+        transcript,
+        lasso_params,
+    );
+
+    let ffn_index_refs: Vec<&[usize]> = ffn_lasso_proof
+        .all_query_indices
         .iter()
-        .zip(ffn_lasso_proofs.iter())
-        .map(|(_bw, proof)| proof.query_indices.as_slice())
+        .map(|v| v.as_slice())
         .collect();
     absorb_index_vectors(transcript, b"ffn_lasso_indices", &ffn_index_refs);
     let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
@@ -759,13 +808,13 @@ pub fn prove(
     let mut fs_ffn_y: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut gs_ffn_y: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut ffn_y_targets: Vec<F> = Vec::with_capacity(num_blocks);
+    let mut out_ffn_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
 
     for i in 0..num_blocks {
         let bpk = &pk.block_pks[i];
         let bw = &witness.block_witnesses[i];
 
-        let a_mle = mat_to_mle(&bw.ffn_wit.a, t, d_ff);
-        let w2_mle = mat_to_mle(&convert_tm_to_fm(&bpk.ffn_pk.w2), d_ff, d);
+        let a_mle = &ffn_a_mles[i];
         let y_mle = mat_to_mle(&bw.ffn_wit.y, t, d);
 
         let y_eval = y_mle.evaluate(&combine(&r_t, &r_out));
@@ -774,13 +823,14 @@ pub fn prove(
         transcript.append_field(b"claim_y", &y_eval);
 
         // f_i(k) = A_i[r_t, k]
-        let f_a = eval_rows(&a_mle, t_bits, &r_t);
+        let f_a = eval_rows(a_mle, t_bits, &r_t);
         // g_i(k) = W2_i[k, r_out]
-        let g_w2 = eval_cols(&w2_mle, f_bits, &r_out);
+        let g_w2 = eval_cols_ternary(&bpk.ffn_pk.w2, &r_out, d_ff, d);
 
         fs_ffn_y.push(DenseMLPoly::from_vec_padded(f_a));
         gs_ffn_y.push(DenseMLPoly::from_vec_padded(g_w2));
         ffn_y_targets.push(y_eval);
+        out_ffn_mles.push(y_mle);
     }
 
     // Cross-block FFN-Y batch sumcheck
@@ -809,22 +859,24 @@ pub fn prove(
     let mut gs_ffn_m: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut ffn_m_targets: Vec<F> = Vec::with_capacity(num_blocks);
     let mut pb_ffn_m_eval: Vec<F> = Vec::with_capacity(num_blocks);
+    let x_norm2_mles: Vec<DenseMLPoly> = witness
+        .block_witnesses
+        .iter()
+        .map(|bw| mat_to_mle(&bw.ln2_wit.y, t, d))
+        .collect();
 
     for i in 0..num_blocks {
         let bpk = &pk.block_pks[i];
-        let bw = &witness.block_witnesses[i];
 
-        let x_norm2_mle = mat_to_mle(&bw.ln2_wit.y, t, d);
-        let w1_mle = mat_to_mle(&convert_tm_to_fm(&bpk.ffn_pk.w1), d, d_ff);
         let m_eval = ffn_m_mles[i].evaluate(&combine(&rx_m, &ry_m));
 
         // Bind m_eval claim to transcript
         transcript.append_field(b"claim_m", &m_eval);
 
         // f_i(k) = X2_i[rx_m, k]
-        let f_x = eval_rows(&x_norm2_mle, t_bits, &rx_m);
+        let f_x = eval_rows(&x_norm2_mles[i], t_bits, &rx_m);
         // g_i(k) = W1_i[k, ry_m]
-        let g_w1 = eval_cols(&w1_mle, d_bits, &ry_m);
+        let g_w1 = eval_cols_ternary(&bpk.ffn_pk.w1, &ry_m, d, d_ff);
 
         fs_ffn_m.push(DenseMLPoly::from_vec_padded(f_x));
         gs_ffn_m.push(DenseMLPoly::from_vec_padded(g_w1));
@@ -854,13 +906,13 @@ pub fn prove(
     let mut block_proofs: Vec<TransformerBlockProof> = Vec::with_capacity(num_blocks);
     for i in 0..num_blocks {
         let p1 = &phase1_data[i];
-        let bw = &witness.block_witnesses[i];
 
         block_proofs.push(TransformerBlockProof {
             ln1_proof: p1.ln1_proof.clone(),
             ln2_proof: p1.ln2_proof.clone(),
             block_range_m: p1.block_range_m.clone(),
-            ffn_lasso_proof: ffn_lasso_proofs.remove(0),
+            ffn_lasso_proof: empty_lasso_proof(),
+            ffn_a_com: ffn_a_coms[i].clone(),
             ffn_m_com: ffn_m_coms[i].clone(),
             x_norm1_com: p1.x_norm1_com.clone(),
             q_com: p1.q_com.clone(),
@@ -872,7 +924,7 @@ pub fn prove(
             q_eval: pb_q_eval[i],
             k_eval: pb_k_eval[i],
             v_eval_rtd: pb_v_eval[i],
-            out_attn_eval: mat_to_mle(&bw.o_proj_wit.y, t, d).evaluate(&combine(&r_t, &r_out)),
+            out_attn_eval: out_attn_mles[i].evaluate(&combine(&r_t, &r_out)),
             out_ffn_eval: ffn_y_targets[i],
             qkv_w_q_eval: pb_w_q_eval[i],
             qkv_w_k_eval: pb_w_k_eval[i],
@@ -945,16 +997,14 @@ pub fn prove(
     // =========================================================================
     // 14. Global hyrax_open_batch for 5L intermediate matrices at r_td
     // =========================================================================
-    let mut all_evals_vecs: Vec<Vec<F>> = Vec::with_capacity(5 * num_blocks);
+    let mut evals_refs: Vec<&[F]> = Vec::with_capacity(5 * num_blocks);
     for i in 0..num_blocks {
-        let bw = &witness.block_witnesses[i];
-        all_evals_vecs.push(mat_to_mle(&bw.attn_wit.q, t, d).evaluations);
-        all_evals_vecs.push(mat_to_mle(&bw.attn_wit.k, t, d).evaluations);
-        all_evals_vecs.push(mat_to_mle(&bw.attn_wit.v, t, d).evaluations);
-        all_evals_vecs.push(mat_to_mle(&bw.o_proj_wit.y, t, d).evaluations);
-        all_evals_vecs.push(mat_to_mle(&bw.ffn_wit.y, t, d).evaluations);
+        evals_refs.push(q_mles[i].evaluations.as_slice());
+        evals_refs.push(k_mles[i].evaluations.as_slice());
+        evals_refs.push(v_mles[i].evaluations.as_slice());
+        evals_refs.push(out_attn_mles[i].evaluations.as_slice());
+        evals_refs.push(out_ffn_mles[i].evaluations.as_slice());
     }
-    let evals_refs: Vec<&[F]> = all_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let inter_batch_open = hyrax_open_batch(&evals_refs, &r_td, nu_td, sigma_td, transcript);
 
     // =========================================================================
@@ -1032,6 +1082,15 @@ pub fn prove(
     let w2_refs: Vec<&[F]> = w2_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let w2_batch_open = hyrax_open_batch(&w2_refs, &w2_point, nu_wff, sigma_wff, transcript);
 
+    // ffn_a_batch: L A_i at combine(r_t, r_k_fy) [t_bits + f_bits]
+    let ffn_a_point = combine(&r_t, &r_k_fy);
+    let ffn_a_refs: Vec<&[F]> = ffn_a_mles
+        .iter()
+        .map(|m| m.evaluations.as_slice())
+        .collect();
+    let ffn_a_batch_open =
+        hyrax_open_batch(&ffn_a_refs, &ffn_a_point, nu_mff, sigma_mff, transcript);
+
     // w1_batch: L W1_i at combine(r_k_m, ry_m) [d_bits + f_bits]
     let w1_point = combine(&r_k_m, &ry_m);
     let w1_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
@@ -1042,39 +1101,43 @@ pub fn prove(
 
     // x_norm2_batch: L x_norm2_i at combine(rx_m, r_k_m) [td_num_vars]
     let x_norm2_point = combine(&rx_m, &r_k_m);
-    let x_norm2_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
-        .map(|i| mat_to_mle(&witness.block_witnesses[i].ln2_wit.y, t, d).evaluations)
+    let x_norm2_refs: Vec<&[F]> = x_norm2_mles
+        .iter()
+        .map(|m| m.evaluations.as_slice())
         .collect();
-    let x_norm2_refs: Vec<&[F]> = x_norm2_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let x_norm2_batch_open =
         hyrax_open_batch(&x_norm2_refs, &x_norm2_point, nu_td, sigma_td, transcript);
 
     // ffn_m_com_batch: L M_i at combine(rx_m, ry_m) [t_bits + f_bits]
     let ffn_m_point = combine(&rx_m, &ry_m);
-    let ffn_m_evals_vecs: Vec<Vec<F>> = ffn_m_mles.iter().map(|m| m.evaluations.clone()).collect();
-    let ffn_m_refs: Vec<&[F]> = ffn_m_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let ffn_m_refs: Vec<&[F]> = ffn_m_mles
+        .iter()
+        .map(|m| m.evaluations.as_slice())
+        .collect();
     let ffn_m_com_batch_open =
         hyrax_open_batch(&ffn_m_refs, &ffn_m_point, nu_mff, sigma_mff, transcript);
 
     // phi_q_batch: L phi_q_i at combine(r_t, batch_r_attn_out) [td_num_vars]
     let phi_q_attn_point = combine(&r_t, &batch_r_attn_out);
-    let phi_q_evals_vecs: Vec<Vec<F>> = phi_q_mles.iter().map(|m| m.evaluations.clone()).collect();
-    let phi_q_refs: Vec<&[F]> = phi_q_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let phi_q_refs: Vec<&[F]> = phi_q_mles
+        .iter()
+        .map(|m| m.evaluations.as_slice())
+        .collect();
     let phi_q_batch_open =
         hyrax_open_batch(&phi_q_refs, &phi_q_attn_point, nu_td, sigma_td, transcript);
 
     // phi_k_batch: L phi_k_i at combine(batch_r_attn_ctx, batch_r_attn_out) [td_num_vars]
     let phi_k_attn_point = combine(&batch_r_attn_ctx, &batch_r_attn_out);
-    let phi_k_evals_vecs: Vec<Vec<F>> = phi_k_mles.iter().map(|m| m.evaluations.clone()).collect();
-    let phi_k_refs: Vec<&[F]> = phi_k_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let phi_k_refs: Vec<&[F]> = phi_k_mles
+        .iter()
+        .map(|m| m.evaluations.as_slice())
+        .collect();
     let phi_k_batch_open =
         hyrax_open_batch(&phi_k_refs, &phi_k_attn_point, nu_td, sigma_td, transcript);
 
     // v_attn_batch: L v_i at combine(batch_r_attn_ctx, r_k_o) [td_num_vars]
     let v_attn_batch_point = combine(&batch_r_attn_ctx, &r_k_o);
-    let v_attn_evals_vecs: Vec<Vec<F>> =
-        v_mles_attn.iter().map(|m| m.evaluations.clone()).collect();
-    let v_attn_refs: Vec<&[F]> = v_attn_evals_vecs.iter().map(|v| v.as_slice()).collect();
+    let v_attn_refs: Vec<&[F]> = v_mles.iter().map(|m| m.evaluations.as_slice()).collect();
     let v_attn_batch_open = hyrax_open_batch(
         &v_attn_refs,
         &v_attn_batch_point,
@@ -1169,6 +1232,7 @@ pub fn prove(
         final_ln_out_com,
         logits_com,
         lm_head_logits_open,
+        ffn_lasso_proof,
         all_lasso_proof,
         final_range_m,
         batch_qkv,
@@ -1188,6 +1252,7 @@ pub fn prove(
         w_o_batch_open,
         bias_o_batch_open,
         w2_batch_open,
+        ffn_a_batch_open,
         w1_batch_open,
         x_norm2_batch_open,
         ffn_m_com_batch_open,
@@ -1233,10 +1298,6 @@ mod tests {
     const D_FF: usize = 4;
     const V: usize = 2;
     const M_BITS: usize = 4;
-
-    fn zero_mat(rows: usize, cols: usize) -> Vec<Vec<F>> {
-        vec![vec![F::ZERO; cols]; rows]
-    }
 
     fn zero_ternary_mat(rows: usize, cols: usize) -> Vec<Vec<TernaryValue>> {
         vec![vec![TernaryValue::ZERO; cols]; rows]
@@ -1684,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn test_model_rejects_tampered_lasso_query_indices() {
+    fn test_model_rejects_tampered_lasso_indices() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
         let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
@@ -1692,7 +1753,7 @@ mod tests {
 
         let mut pt = Transcript::new(b"model_tamper_lasso_indices");
         let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
-        proof.block_proofs[0].ffn_lasso_proof.query_indices[0] += 1;
+        proof.ffn_lasso_proof.all_query_indices[0][0] += 1;
 
         let mut vt = Transcript::new(b"model_tamper_lasso_indices");
         let result = verify(
@@ -1707,7 +1768,7 @@ mod tests {
         );
         assert!(
             result.is_err(),
-            "Should reject tampered FFN Lasso query indices"
+            "Should reject tampered FFN Lasso committed indices"
         );
 
         let mut pt = Transcript::new(b"model_tamper_global_lasso_indices");
@@ -1758,6 +1819,119 @@ mod tests {
             result.is_err(),
             "Should reject tampered batch_qkv final_evals_f"
         );
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_ffn_a_com() {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_tamper_ffn_a_com");
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        proof.block_proofs[0].ffn_a_com =
+            commit_mat_test(&vec![vec![F::from(3u64); D_FF]; T], T, D_FF);
+
+        let mut vt = Transcript::new(b"model_tamper_ffn_a_com");
+        let result = verify(
+            &proof,
+            &pk.vk,
+            &inst_attn,
+            &inst_ffn,
+            &model_wit.x_in,
+            &model_wit.lm_head_wit.y,
+            &mut vt,
+            &lp,
+        );
+        assert!(result.is_err(), "Should reject tampered FFN A commitment");
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_ffn_lasso_output_sumcheck() {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_tamper_ffn_lasso_output_sc");
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        proof
+            .ffn_lasso_proof
+            .output_sumcheck
+            .as_mut()
+            .expect("FFN Lasso must use committed outputs")
+            .final_evals_f[0] += F::ONE;
+
+        let mut vt = Transcript::new(b"model_tamper_ffn_lasso_output_sc");
+        let result = verify(
+            &proof,
+            &pk.vk,
+            &inst_attn,
+            &inst_ffn,
+            &model_wit.x_in,
+            &model_wit.lm_head_wit.y,
+            &mut vt,
+            &lp,
+        );
+        assert!(
+            result.is_err(),
+            "Should reject tampered FFN Lasso committed-output sumcheck"
+        );
+    }
+
+    #[test]
+    fn test_model_rejects_missing_ffn_lasso_output_binding() {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_missing_ffn_lasso_output_binding");
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        proof.ffn_lasso_proof.output_sumcheck = None;
+        proof.ffn_lasso_proof.output_batch_open = None;
+
+        let mut vt = Transcript::new(b"model_missing_ffn_lasso_output_binding");
+        let result = verify(
+            &proof,
+            &pk.vk,
+            &inst_attn,
+            &inst_ffn,
+            &model_wit.x_in,
+            &model_wit.lm_head_wit.y,
+            &mut vt,
+            &lp,
+        );
+        assert!(
+            result.is_err(),
+            "Should reject missing FFN Lasso committed-output binding"
+        );
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_batch_ffn_y_a_eval() {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_tamper_ffn_y_a_eval");
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        proof.batch_ffn_y.final_evals_f[0] += F::ONE;
+
+        let mut vt = Transcript::new(b"model_tamper_ffn_y_a_eval");
+        let result = verify(
+            &proof,
+            &pk.vk,
+            &inst_attn,
+            &inst_ffn,
+            &model_wit.x_in,
+            &model_wit.lm_head_wit.y,
+            &mut vt,
+            &lp,
+        );
+        assert!(result.is_err(), "Should reject tampered FFN-Y A evaluation");
     }
 
     #[test]

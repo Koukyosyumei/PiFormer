@@ -1,0 +1,275 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200" role="img" aria-labelledby="title desc">
+  <title id="title">PiFormer full proving and verification flow</title>
+  <desc id="desc">A phase-by-phase diagram of the PiFormer prover, proof object, Fiat-Shamir transcript, and verifier checks.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="0.52" stop-color="#f2f7f6"/>
+      <stop offset="1" stop-color="#fbf7ef"/>
+    </linearGradient>
+    <linearGradient id="proverGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f766e"/>
+      <stop offset="1" stop-color="#14b8a6"/>
+    </linearGradient>
+    <linearGradient id="verifierGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1d4ed8"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="proofGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#c084fc"/>
+    </linearGradient>
+    <linearGradient id="transcriptGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b45309"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#0f172a" flood-opacity="0.13"/>
+    </filter>
+    <marker id="arrowTeal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1d4ed8"/>
+    </marker>
+    <marker id="arrowAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309"/>
+    </marker>
+    <marker id="arrowSlate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+    <style>
+      .page { fill: url(#bg); }
+      .title { font: 800 40px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; letter-spacing: 0; }
+      .subtitle { font: 500 17px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .lane-title { font: 800 22px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; letter-spacing: 0; }
+      .lane-subtitle { font: 600 13px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: rgba(255,255,255,0.86); }
+      .card { fill: #ffffff; stroke: #dbe4ea; stroke-width: 1.4; rx: 8; filter: url(#shadow); }
+      .card-tight { fill: #ffffff; stroke: #dbe4ea; stroke-width: 1.2; rx: 8; }
+      .card-title { font: 800 18px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .card-kicker { font: 800 12px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; letter-spacing: 0.08em; }
+      .body { font: 500 13px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+      .small { font: 500 12px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; }
+      .mono { font: 700 12px "SFMono-Regular", Consolas, "Liberation Mono", monospace; fill: #475569; }
+      .pill-text { font: 800 12px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; }
+      .flow-teal { stroke: #0f766e; stroke-width: 3; fill: none; marker-end: url(#arrowTeal); }
+      .flow-blue { stroke: #1d4ed8; stroke-width: 3; fill: none; marker-end: url(#arrowBlue); }
+      .flow-amber { stroke: #b45309; stroke-width: 3; fill: none; marker-end: url(#arrowAmber); }
+      .flow-slate { stroke: #475569; stroke-width: 2.4; fill: none; marker-end: url(#arrowSlate); }
+      .flow-dashed { stroke-dasharray: 8 8; }
+      .divider { stroke: #cbd5e1; stroke-width: 1.2; stroke-dasharray: 4 6; }
+    </style>
+  </defs>
+
+  <rect class="page" x="0" y="0" width="1600" height="1200"/>
+
+  <text class="title" x="80" y="76">PiFormer proving and verification flow</text>
+  <text class="subtitle" x="80" y="108">Full model proof: block-local commitments, cross-block sumchecks, Hyrax batch openings, and global Lasso checks.</text>
+
+  <g transform="translate(80 142)">
+    <rect x="0" y="0" width="430" height="54" rx="8" fill="url(#proverGrad)"/>
+    <text class="lane-title" x="24" y="33">Prover</text>
+    <text class="lane-subtitle" x="116" y="33">builds commitments, claims, sumchecks, and openings</text>
+  </g>
+
+  <g transform="translate(585 142)">
+    <rect x="0" y="0" width="430" height="54" rx="8" fill="url(#proofGrad)"/>
+    <text class="lane-title" x="24" y="33">Proof object</text>
+    <text class="lane-subtitle" x="158" y="33">serialized transcript evidence and openings</text>
+  </g>
+
+  <g transform="translate(1090 142)">
+    <rect x="0" y="0" width="430" height="54" rx="8" fill="url(#verifierGrad)"/>
+    <text class="lane-title" x="24" y="33">Verifier</text>
+    <text class="lane-subtitle" x="126" y="33">replays transcript and checks algebraic bindings</text>
+  </g>
+
+  <line class="divider" x1="545" y1="140" x2="545" y2="1115"/>
+  <line class="divider" x1="1055" y1="140" x2="1055" y2="1115"/>
+
+  <!-- Prover cards -->
+  <g transform="translate(80 232)">
+    <rect class="card" x="0" y="0" width="430" height="102"/>
+    <text class="card-kicker" x="22" y="28">INPUT</text>
+    <text class="card-title" x="22" y="54">Witness, proving key, public instance</text>
+    <text class="body" x="22" y="80">Model tensors, ternary weights, Lasso tables, Hyrax parameters</text>
+  </g>
+
+  <g transform="translate(80 365)">
+    <rect class="card" x="0" y="0" width="430" height="134"/>
+    <text class="card-kicker" x="22" y="28">PHASE 1</text>
+    <text class="card-title" x="22" y="54">Per-block commitments and LayerNorm</text>
+    <text class="body" x="22" y="80">Commit x_norm1, Q, K, V, out_attn, x_norm2, out_ffn</text>
+    <text class="body" x="22" y="103">Run range proofs plus LN1 and LN2 subproofs for every block</text>
+  </g>
+
+  <g transform="translate(80 530)">
+    <rect class="card" x="0" y="0" width="430" height="154"/>
+    <text class="card-kicker" x="22" y="28">GLOBAL CHALLENGE</text>
+    <text class="card-title" x="22" y="54">Derive shared r_td</text>
+    <text class="body" x="22" y="80">All block commitments are absorbed before sampling r_td</text>
+    <text class="body" x="22" y="103">Use r_t and r_out across QKV, O-proj, FFN-Y, and openings</text>
+    <text class="mono" x="22" y="130">r_td = transcript.challenge_vec(t_bits + d_bits)</text>
+  </g>
+
+  <g transform="translate(80 715)">
+    <rect class="card" x="0" y="0" width="430" height="172"/>
+    <text class="card-kicker" x="22" y="28">CROSS-BLOCK SUMCHECKS</text>
+    <text class="card-title" x="22" y="54">Batch algebra over all blocks</text>
+    <text class="body" x="22" y="80">QKV: combine Q, K, V projection equations</text>
+    <text class="body" x="22" y="103">O-proj: bind attention output to output projection</text>
+    <text class="body" x="22" y="126">Attention: phi_q/context and phi_k/V context checks</text>
+    <text class="body" x="22" y="149">FFN-Y and FFN-M: use ternary-aware W2 and W1 column evals</text>
+  </g>
+
+  <g transform="translate(80 918)">
+    <rect class="card" x="0" y="0" width="430" height="148"/>
+    <text class="card-kicker" x="22" y="28">LOOKUPS AND OPENINGS</text>
+    <text class="card-title" x="22" y="54">Lasso plus Hyrax batch openings</text>
+    <text class="body" x="22" y="80">FFN activation Lasso binds A to committed outputs</text>
+    <text class="body" x="22" y="103">Global attention Lasso checks Q/K lookup relations</text>
+    <text class="body" x="22" y="126">Intermediates and weights are opened in shared Hyrax batches</text>
+  </g>
+
+  <!-- Proof object center -->
+  <g transform="translate(585 232)">
+    <rect class="card" x="0" y="0" width="430" height="102"/>
+    <text class="card-kicker" x="22" y="28">PER-BLOCK PROOFS</text>
+    <text class="card-title" x="22" y="54">TransformerBlockProof[L]</text>
+    <text class="body" x="22" y="80">LN proofs, range proofs, commitments, claimed evaluations</text>
+  </g>
+
+  <g transform="translate(585 365)">
+    <rect class="card" x="0" y="0" width="430" height="134"/>
+    <text class="card-kicker" x="22" y="28">SUMCHECK PROOFS</text>
+    <text class="card-title" x="22" y="54">Cross-block SumcheckProofMulti</text>
+    <text class="body" x="22" y="80">batch_qkv, batch_oproj, batch_attn_out, batch_attn_ctx</text>
+    <text class="body" x="22" y="103">batch_ffn_y, batch_ffn_m with final evaluations f and g</text>
+  </g>
+
+  <g transform="translate(585 530)">
+    <rect class="card" x="0" y="0" width="430" height="154"/>
+    <text class="card-kicker" x="22" y="28">LASSO PROOFS</text>
+    <text class="card-title" x="22" y="54">Lookup arguments</text>
+    <text class="body" x="22" y="80">ffn_lasso_proof binds activation outputs to A commitment</text>
+    <text class="body" x="22" y="103">all_lasso_proof batches attention Q/K lookups globally</text>
+    <text class="body" x="22" y="126">Query indices are serialized compactly in bit-packed form</text>
+  </g>
+
+  <g transform="translate(585 715)">
+    <rect class="card" x="0" y="0" width="430" height="172"/>
+    <text class="card-kicker" x="22" y="28">HYRAX OPENINGS</text>
+    <text class="card-title" x="22" y="54">Batched polynomial openings</text>
+    <text class="body" x="22" y="80">inter_batch_open for 5L intermediate matrices at r_td</text>
+    <text class="body" x="22" y="103">13 cross-block opens for x_norm, weights, biases, A, M, phi, V</text>
+    <text class="body" x="22" y="126">lm_head_logits_open and accumulator finalization openings</text>
+    <text class="mono" x="22" y="151">Hyrax: commitments + evals + w_prime + inner proof</text>
+  </g>
+
+  <g transform="translate(585 918)">
+    <rect class="card" x="0" y="0" width="430" height="148"/>
+    <text class="card-kicker" x="22" y="28">FIAT-SHAMIR STATE</text>
+    <text class="card-title" x="22" y="54">Transcript order is part of the proof</text>
+    <text class="body" x="22" y="80">Commitments and claims are absorbed before challenges</text>
+    <text class="body" x="22" y="103">Verifier replays the exact same labels and ordering</text>
+    <text class="body" x="22" y="126">Any tampered commitment, eval, proof, or index changes challenges</text>
+  </g>
+
+  <!-- Verifier cards -->
+  <g transform="translate(1090 232)">
+    <rect class="card" x="0" y="0" width="430" height="102"/>
+    <text class="card-kicker" x="22" y="28">LOAD</text>
+    <text class="card-title" x="22" y="54">Public input, verifying key, proof</text>
+    <text class="body" x="22" y="80">Initialize matching transcript and Hyrax batch accumulators</text>
+  </g>
+
+  <g transform="translate(1090 365)">
+    <rect class="card" x="0" y="0" width="430" height="134"/>
+    <text class="card-kicker" x="22" y="28">REPLAY PHASE 1</text>
+    <text class="card-title" x="22" y="54">Verify block-local proofs</text>
+    <text class="body" x="22" y="80">Check range proofs, LN1, LN2, and absorbed commitments</text>
+    <text class="body" x="22" y="103">Queue Hyrax verification work into accumulators where possible</text>
+  </g>
+
+  <g transform="translate(1090 530)">
+    <rect class="card" x="0" y="0" width="430" height="154"/>
+    <text class="card-kicker" x="22" y="28">REPLAY CHALLENGES</text>
+    <text class="card-title" x="22" y="54">Verify cross-block algebra</text>
+    <text class="body" x="22" y="80">Recompute r_td, eta weights, r_k points, and claims</text>
+    <text class="body" x="22" y="103">Verify QKV, O-proj, attention, FFN-Y, FFN-M sumchecks</text>
+    <text class="body" x="22" y="126">Check final evaluations against committed opening claims</text>
+  </g>
+
+  <g transform="translate(1090 715)">
+    <rect class="card" x="0" y="0" width="430" height="172"/>
+    <text class="card-kicker" x="22" y="28">OPENING CHECKS</text>
+    <text class="card-title" x="22" y="54">Verify Hyrax batches</text>
+    <text class="body" x="22" y="80">inter_batch: Q, K, V, out_attn, out_ffn at r_td</text>
+    <text class="body" x="22" y="103">cross_batch_opens: weights, biases, x_norm, FFN, phi, V</text>
+    <text class="body" x="22" y="126">LM head and accumulated subprotocol openings are finalized</text>
+    <text class="body" x="22" y="149">All openings bind scalar claims back to commitments</text>
+  </g>
+
+  <g transform="translate(1090 918)">
+    <rect class="card" x="0" y="0" width="430" height="148"/>
+    <text class="card-kicker" x="22" y="28">LOOKUP CHECKS AND RESULT</text>
+    <text class="card-title" x="22" y="54">Verify global Lasso proofs</text>
+    <text class="body" x="22" y="80">FFN activation lookups bind outputs to committed A</text>
+    <text class="body" x="22" y="103">Attention Q/K lookups bind phi commitments and query indices</text>
+    <text class="body" x="22" y="126">Accept only if every sumcheck, lookup, and opening verifies</text>
+  </g>
+
+  <!-- Vertical flows -->
+  <path class="flow-teal" d="M 295 334 L 295 360"/>
+  <path class="flow-teal" d="M 295 499 L 295 525"/>
+  <path class="flow-teal" d="M 295 684 L 295 710"/>
+  <path class="flow-teal" d="M 295 887 L 295 913"/>
+
+  <path class="flow-slate" d="M 800 334 L 800 360"/>
+  <path class="flow-slate" d="M 800 499 L 800 525"/>
+  <path class="flow-slate" d="M 800 684 L 800 710"/>
+  <path class="flow-amber flow-dashed" d="M 800 887 L 800 913"/>
+
+  <path class="flow-blue" d="M 1305 334 L 1305 360"/>
+  <path class="flow-blue" d="M 1305 499 L 1305 525"/>
+  <path class="flow-blue" d="M 1305 684 L 1305 710"/>
+  <path class="flow-blue" d="M 1305 887 L 1305 913"/>
+
+  <!-- Cross-lane flows -->
+  <path class="flow-slate" d="M 510 283 C 545 283, 550 283, 585 283"/>
+  <path class="flow-slate" d="M 510 432 C 545 432, 550 432, 585 432"/>
+  <path class="flow-slate" d="M 510 607 C 545 607, 550 607, 585 607"/>
+  <path class="flow-slate" d="M 510 801 C 545 801, 550 801, 585 801"/>
+  <path class="flow-slate" d="M 1015 283 C 1050 283, 1055 283, 1090 283"/>
+  <path class="flow-slate" d="M 1015 432 C 1050 432, 1055 432, 1090 432"/>
+  <path class="flow-slate" d="M 1015 607 C 1050 607, 1055 607, 1090 607"/>
+  <path class="flow-slate" d="M 1015 801 C 1050 801, 1055 801, 1090 801"/>
+  <path class="flow-amber flow-dashed" d="M 1015 992 C 1050 992, 1055 992, 1090 992"/>
+
+  <!-- Transcript spine -->
+  <g transform="translate(544 1092)">
+    <rect x="0" y="0" width="512" height="44" rx="8" fill="url(#transcriptGrad)" filter="url(#shadow)"/>
+    <text class="pill-text" x="22" y="27">Fiat-Shamir transcript: commitments -> claims -> challenges -> proofs -> replayed checks</text>
+  </g>
+  <path class="flow-amber flow-dashed" d="M 802 1092 C 802 1025, 802 1005, 802 960"/>
+  <path class="flow-amber flow-dashed" d="M 800 960 C 642 944, 498 888, 425 814"/>
+  <path class="flow-amber flow-dashed" d="M 800 960 C 976 940, 1106 879, 1182 815"/>
+
+  <!-- Legend -->
+  <g transform="translate(80 1120)">
+    <rect class="card-tight" x="0" y="0" width="420" height="44"/>
+    <circle cx="24" cy="22" r="7" fill="#0f766e"/>
+    <text class="small" x="40" y="26">Prover phase order</text>
+    <circle cx="164" cy="22" r="7" fill="#475569"/>
+    <text class="small" x="180" y="26">Proof data flow</text>
+    <circle cx="298" cy="22" r="7" fill="#b45309"/>
+    <text class="small" x="314" y="26">Transcript binding</text>
+  </g>
+  <g transform="translate(1100 1120)">
+    <rect class="card-tight" x="0" y="0" width="420" height="44"/>
+    <circle cx="24" cy="22" r="7" fill="#1d4ed8"/>
+    <text class="small" x="40" y="26">Verifier replay order</text>
+    <text class="small" x="190" y="26">Proof format version 8</text>
+    <text class="small" x="320" y="26">Soundness unchanged</text>
+  </g>
+</svg>

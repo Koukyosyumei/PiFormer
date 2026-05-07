@@ -13,7 +13,7 @@ use crate::poly::utils::compute_eq_evals;
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::sumcheck::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
-use ark_ff::{One, Zero};
+use ark_ff::One;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -234,7 +234,6 @@ mod combine_tests {
     use super::*;
     use crate::pcs::{hyrax_commit, params_from_vars};
     use crate::transcript::Transcript;
-    use ark_ff::Zero;
 
     #[test]
     fn test_combine_single_claim() {

@@ -3,8 +3,6 @@
 //! Field elements (F) are encoded as lowercase hex strings prefixed with "0x".
 //! This format is compatible with Python's `hex(int_value)` output and web3 tooling.
 
-use std::io;
-
 use ark_ff::{BigInteger, Field, PrimeField};
 use serde::{Deserialize, Serialize};
 
@@ -121,10 +119,6 @@ fn vec_from_json(json: Vec<String>) -> Result<Vec<F>, String> {
         .enumerate()
         .map(|(i, s)| f_from_hex(&s).map_err(|e| format!("vec[{i}]: {e}")))
         .collect()
-}
-
-fn io_err(msg: impl ToString) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
 }
 
 // ---------------------------------------------------------------------------

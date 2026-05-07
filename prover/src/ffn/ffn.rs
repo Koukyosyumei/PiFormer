@@ -17,12 +17,10 @@ use crate::lookup::lasso::{
     LassoVerifyingKey,
 };
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_open, hyrax_verify, params_from_vars, HyraxCommitment,
-    HyraxParams, HyraxProof,
+    absorb_com, hyrax_commit, hyrax_commit_ternary_matrix, hyrax_open, hyrax_open_ternary_matrix,
+    hyrax_verify, params_from_vars, HyraxCommitment, HyraxParams, HyraxProof,
 };
-use crate::poly::utils::{
-    combine, convert_tm_to_fm, eval_cols, eval_rows, mat_to_mle, TernaryValue,
-};
+use crate::poly::utils::{combine, eval_cols_ternary, eval_rows, mat_to_mle, TernaryValue};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, EvalClaim, SumcheckProof};
 use crate::transcript::{challenge_vec, Transcript};
@@ -90,17 +88,14 @@ pub fn preprocess_ffn(
     activation_bits_per_chunk: usize,
     lasso_params: &HyraxParams,
 ) -> FFNProvingKey {
-    let w1_mle = mat_to_mle(&convert_tm_to_fm(&w1), d_model, d_ff);
-    let w2_mle = mat_to_mle(&convert_tm_to_fm(&w2), d_ff, d_model);
-
     let in_bits = d_model.next_power_of_two().trailing_zeros() as usize;
     let ff_bits = d_ff.next_power_of_two().trailing_zeros() as usize;
 
     let (nu_w1, _, params_w1) = params_from_vars(in_bits + ff_bits);
     let (nu_w2, _, params_w2) = params_from_vars(ff_bits + in_bits);
 
-    let w1_com = hyrax_commit(&w1_mle.evaluations, nu_w1, &params_w1);
-    let w2_com = hyrax_commit(&w2_mle.evaluations, nu_w2, &params_w2);
+    let w1_com = hyrax_commit_ternary_matrix(&w1, d_model, d_ff, nu_w1, &params_w1);
+    let w2_com = hyrax_commit_ternary_matrix(&w2, d_ff, d_model, nu_w2, &params_w2);
 
     let activation_lasso_pk =
         precommit_lasso_tables(&activation_tables, activation_bits_per_chunk, lasso_params);
@@ -189,8 +184,6 @@ pub fn prove_ffn(
     let m_mle = mat_to_mle(&witness.m, t, f);
     let a_mle = mat_to_mle(&witness.a, t, f);
     let y_mle = mat_to_mle(&witness.y, t, d);
-    let w1_mle = mat_to_mle(&convert_tm_to_fm(&pk.w1), d, f);
-    let w2_mle = mat_to_mle(&convert_tm_to_fm(&pk.w2), f, d);
 
     let (nu_m, sigma_m, params_m) = params_from_vars(t_bits + f_bits);
     let (nu_w1, sigma_w1, _) = params_from_vars(d_bits + f_bits);
@@ -235,7 +228,7 @@ pub fn prove_ffn(
     transcript.append_field(b"claim_y", &y_eval);
 
     let f_a = DenseMLPoly::from_vec_padded(eval_rows(&a_mle, t_bits, &rx_y));
-    let g_w2 = DenseMLPoly::from_vec_padded(eval_cols(&w2_mle, f_bits, &ry_y));
+    let g_w2 = DenseMLPoly::from_vec_padded(eval_cols_ternary(&pk.w2, &ry_y, f, d));
     let (y_sumcheck, r_k) = prove_sumcheck(&f_a, &g_w2, y_eval, transcript);
 
     let a_eval = y_sumcheck.final_eval_f;
@@ -248,15 +241,15 @@ pub fn prove_ffn(
     transcript.append_field(b"claim_m", &m_eval);
 
     let f_x = DenseMLPoly::from_vec_padded(eval_rows(&x_mle, t_bits, &rx_m));
-    let g_w1 = DenseMLPoly::from_vec_padded(eval_cols(&w1_mle, d_bits, &ry_m));
+    let g_w1 = DenseMLPoly::from_vec_padded(eval_cols_ternary(&pk.w1, &ry_m, d, f));
     let (m_sumcheck, r_j) = prove_sumcheck(&f_x, &g_w1, m_eval, transcript);
 
     let x_eval = m_sumcheck.final_eval_f;
     let w1_eval = m_sumcheck.final_eval_g;
 
     // 6. Static weight openings (w1, w2 are public model weights — must keep).
-    let w2_open = hyrax_open(&w2_mle.evaluations, &combine(&r_k, &ry_y), nu_w2, sigma_w2);
-    let w1_open = hyrax_open(&w1_mle.evaluations, &combine(&r_j, &ry_m), nu_w1, sigma_w1);
+    let w2_open = hyrax_open_ternary_matrix(&pk.w2, f, d, &combine(&r_k, &ry_y), nu_w2, sigma_w2);
+    let w1_open = hyrax_open_ternary_matrix(&pk.w1, d, f, &combine(&r_j, &ry_m), nu_w1, sigma_w1);
 
     // 7. Direct Hyrax opening for M (kept — verifier cannot recover m_eval from query_indices).
     let m_open = hyrax_open(&m_mle.evaluations, &combine(&rx_m, &ry_m), nu_m, sigma_m);
@@ -422,6 +415,7 @@ pub fn verify_ffn(
 #[cfg(test)]
 mod ffn_tests {
     use super::*;
+    use crate::poly::utils::convert_tm_to_fm;
     use crate::poly::utils::TernaryValue;
     use ark_ff::One;
     use ark_ff::PrimeField;
