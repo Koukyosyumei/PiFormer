@@ -391,16 +391,29 @@ fn run_inspect(path: &Path) -> io::Result<()> {
             }
         }
         "bin" => {
-            let (proof, q_outputs, k_outputs, ffn_outputs, lasso_sigma) =
+            let (proof, lasso_sigma) =
                 codec::decode_proof_bundle_public_parts(&bytes).map_err(io_err)?;
             println!("File type    : Proof Bundle");
             println!("Path         : {}", path.display());
             println!("Size         : {} bytes", bytes.len());
             println!("Blocks       : {}", proof.block_proofs.len());
             println!("Lasso sigma  : {}", lasso_sigma);
-            println!("Q lasso queries : {}", q_outputs.len());
-            println!("K lasso queries : {}", k_outputs.len());
-            println!("FFN lasso queries: {}", ffn_outputs.len());
+            println!(
+                "Q/K lasso queries : {}",
+                proof
+                    .all_lasso_proof
+                    .all_query_indices
+                    .iter()
+                    .map(|indices| indices.len())
+                    .sum::<usize>()
+            );
+            let ffn_queries: usize = proof
+                .ffn_lasso_proof
+                .all_query_indices
+                .iter()
+                .map(|indices| indices.len())
+                .sum();
+            println!("FFN lasso queries: {}", ffn_queries);
         }
         _ => {
             return Err(io_err(format!(

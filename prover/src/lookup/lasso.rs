@@ -93,14 +93,74 @@ pub struct LassoProof {
     pub table_openings: Vec<F>,
     /// Hyrax opening proofs for T_k(r_k).
     pub hyrax_proofs: Vec<HyraxProof>,
-    /// Committed counting polynomial L_k (size 2^m, one per sub-table).
-    /// L_k[ch] = Σ_{j: chunk_k(idx_j)==ch} ρ^j.
-    /// Committing L_k lets the verifier bind the opened L_k(r) to this polynomial.
-    pub l_k_coms: Vec<HyraxCommitment>,
+    /// Optional committed-output binding for model mode:
+    /// proves Σ_j ρ^j O[j] = Σ_k sub_claim_k, where O is committed by the
+    /// surrounding protocol.
+    pub output_sumcheck: Option<SumcheckProof>,
+    pub output_open: Option<HyraxProof>,
     /// L_k evaluated at the sumcheck output point r (one per sub-table).
+    /// The verifier recomputes the same value from `query_indices`, so no PCS
+    /// opening is needed for this deterministic selector polynomial.
     pub l_k_evals: Vec<F>,
-    /// Hyrax opening proofs for L_k(r).
-    pub l_k_opens: Vec<HyraxProof>,
+    /// Optional committed-index binding. In model mode this replaces the raw
+    /// proof-carried query indices with commitments to the chunk polynomials
+    /// of the lookup input tensor.
+    pub index_proof: Option<LassoIndexProof>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HighDegreeRoundPoly {
+    pub evals: Vec<F>,
+}
+
+impl HighDegreeRoundPoly {
+    pub fn evaluate(&self, x: F) -> F {
+        let mut acc = F::ZERO;
+        for (i, &yi) in self.evals.iter().enumerate() {
+            let xi = F::from(i as u64);
+            let mut num = F::ONE;
+            let mut den = F::ONE;
+            for j in 0..self.evals.len() {
+                if i == j {
+                    continue;
+                }
+                let xj = F::from(j as u64);
+                num *= x - xj;
+                den *= xi - xj;
+            }
+            acc += yi * num * den.inverse().expect("distinct interpolation points");
+        }
+        acc
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SelectorSumcheckProof {
+    pub round_polys: Vec<HighDegreeRoundPoly>,
+    pub final_eval_chunk: F,
+}
+
+#[derive(Clone)]
+pub struct SelectorBindingProof {
+    pub sumcheck: SelectorSumcheckProof,
+    pub chunk_open: HyraxProof,
+}
+
+#[derive(Clone)]
+pub struct LassoIndexProof {
+    pub query_len: usize,
+    pub rho: F,
+    pub chunk_coms: Vec<HyraxCommitment>,
+    pub selector_points: Vec<Vec<F>>,
+    pub bind_chunk_evals: Vec<F>,
+    pub bind_open: HyraxProof,
+    pub selector_proofs: Vec<SelectorBindingProof>,
+}
+
+pub struct LassoIndexBinding {
+    pub com: HyraxCommitment,
+    pub num_vars: usize,
+    pub mle_evals: Vec<F>,
 }
 
 pub fn prove_lasso(
@@ -137,9 +197,7 @@ pub fn prove_lasso(
     let mut table_openings = Vec::with_capacity(c);
     let mut hyrax_proofs = Vec::with_capacity(c);
     let mut sub_claims = Vec::with_capacity(c);
-    let mut l_k_coms = Vec::with_capacity(c);
     let mut l_k_evals = Vec::with_capacity(c);
-    let mut l_k_opens = Vec::with_capacity(c);
 
     for k in 0..c {
         let t_poly = DenseMLPoly::new(instance.tables[k].clone());
@@ -155,10 +213,6 @@ pub fn prove_lasso(
         }
         let l_poly = DenseMLPoly::new(l_hist.clone());
 
-        // Commit L_k so the verifier can check L_k(r) via Hyrax instead of O(n) recomputation.
-        let l_com = hyrax_commit(&l_hist, nu, params);
-        absorb_com(transcript, b"lasso_l_com", &l_com);
-
         // Claimed sum for this sub-table: Σ_j ρ^j * T_k[chunk_k(idx_j)]
         let claimed: F = (0..n)
             .map(|j| rho_pows[j] * instance.tables[k][chunk(query_indices[j], k, m, mask)])
@@ -172,16 +226,12 @@ pub fn prove_lasso(
         transcript.append_field(b"lasso_opening", &t_opening);
         let hyrax_proof = hyrax_open(&instance.tables[k], &r_vec, nu, sigma);
 
-        // Hyrax opening for L_k at the same r_vec (replaces O(n) hist recomputation in verifier)
         let l_eval = l_poly.evaluate(&r_vec);
-        let l_open = hyrax_open(&l_hist, &r_vec, nu, sigma);
 
         table_openings.push(t_opening);
         sumcheck_proofs.push(sc_proof);
         hyrax_proofs.push(hyrax_proof);
-        l_k_coms.push(l_com);
         l_k_evals.push(l_eval);
-        l_k_opens.push(l_open);
     }
 
     LassoProof {
@@ -191,10 +241,145 @@ pub fn prove_lasso(
         sumcheck_proofs,
         table_openings,
         hyrax_proofs,
-        l_k_coms,
+        output_sumcheck: None,
+        output_open: None,
         l_k_evals,
-        l_k_opens,
+        index_proof: None,
     }
+}
+
+fn prove_lasso_committed_output_inner(
+    instance: &LassoInstance,
+    query_indices: &[usize],
+    pk: &LassoProvingKey,
+    output_binding: &LassoOutputBinding,
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> (LassoProof, Vec<Vec<F>>, F) {
+    let c = instance.tables.len();
+    let m = instance.bits_per_chunk;
+    let n = query_indices.len();
+    let mask = (1usize << m) - 1;
+
+    let nu = pk.nu;
+    let sigma = params.sigma;
+    assert_eq!(nu + sigma, instance.bits_per_chunk);
+    for k in 0..c {
+        absorb_com(transcript, b"hyrax_com", &pk.table_coms[k]);
+    }
+    absorb_com(transcript, b"lasso_output_com", &output_binding.com);
+
+    let rho = transcript.challenge_field::<F>(b"lasso_rho");
+    let rho_pows = powers_of(rho, n);
+
+    let mut sumcheck_proofs = Vec::with_capacity(c);
+    let mut table_openings = Vec::with_capacity(c);
+    let mut hyrax_proofs = Vec::with_capacity(c);
+    let mut sub_claims = Vec::with_capacity(c);
+    let mut l_k_evals = Vec::with_capacity(c);
+    let mut selector_points = Vec::with_capacity(c);
+
+    for k in 0..c {
+        let t_poly = DenseMLPoly::new(instance.tables[k].clone());
+        let size = 1usize << m;
+        let mut l_hist = vec![F::ZERO; size];
+        for j in 0..n {
+            let ch = chunk(query_indices[j], k, m, mask);
+            l_hist[ch] += rho_pows[j];
+        }
+        let l_poly = DenseMLPoly::new(l_hist);
+        let claimed: F = (0..n)
+            .map(|j| rho_pows[j] * instance.tables[k][chunk(query_indices[j], k, m, mask)])
+            .sum();
+        sub_claims.push(claimed);
+        let (sc_proof, r_vec) = prove_sumcheck(&t_poly, &l_poly, claimed, transcript);
+        let t_opening = t_poly.evaluate(&r_vec);
+        transcript.append_field(b"lasso_opening", &t_opening);
+        let hyrax_proof = hyrax_open(&instance.tables[k], &r_vec, nu, sigma);
+        table_openings.push(t_opening);
+        sumcheck_proofs.push(sc_proof);
+        hyrax_proofs.push(hyrax_proof);
+        l_k_evals.push(l_poly.evaluate(&r_vec));
+        selector_points.push(r_vec);
+    }
+
+    let combined_output_claim: F = sub_claims.iter().sum();
+    let output_poly = DenseMLPoly::new(output_binding.mle_evals.clone());
+    let mut weight_evals = vec![F::ZERO; 1usize << output_binding.num_vars];
+    for j in 0..n {
+        weight_evals[j] = rho_pows[j];
+    }
+    let weight_poly = DenseMLPoly::new(weight_evals);
+    let (output_sumcheck, r_out) =
+        prove_sumcheck(&output_poly, &weight_poly, combined_output_claim, transcript);
+    let (nu_out, sigma_out, _) = params_from_vars(output_binding.num_vars);
+    let output_open = hyrax_open(&output_binding.mle_evals, &r_out, nu_out, sigma_out);
+
+    let proof = LassoProof {
+        outputs: Vec::new(),
+        query_indices: query_indices.to_vec(),
+        sub_claims,
+        sumcheck_proofs,
+        table_openings,
+        hyrax_proofs,
+        output_sumcheck: Some(output_sumcheck),
+        output_open: Some(output_open),
+        l_k_evals,
+        index_proof: None,
+    };
+    (proof, selector_points, rho)
+}
+
+pub fn prove_lasso_committed_output(
+    instance: &LassoInstance,
+    query_indices: &[usize],
+    pk: &LassoProvingKey,
+    output_binding: &LassoOutputBinding,
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> LassoProof {
+    prove_lasso_committed_output_inner(
+        instance,
+        query_indices,
+        pk,
+        output_binding,
+        transcript,
+        params,
+    )
+    .0
+}
+
+pub fn prove_lasso_committed_output_and_indices(
+    instance: &LassoInstance,
+    query_indices: &[usize],
+    pk: &LassoProvingKey,
+    output_binding: &LassoOutputBinding,
+    input_binding: &LassoIndexBinding,
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> LassoProof {
+    let (mut proof, selector_points, rho) = prove_lasso_committed_output_inner(
+        instance,
+        query_indices,
+        pk,
+        output_binding,
+        transcript,
+        params,
+    );
+    let c = instance.tables.len();
+    let index_proof = prove_index_binding(
+        query_indices,
+        c,
+        instance.bits_per_chunk,
+        input_binding,
+        &proof.l_k_evals,
+        &selector_points,
+        rho,
+        transcript,
+    );
+    proof.query_indices.clear();
+    proof.index_proof = Some(index_proof);
+    proof
 }
 
 pub fn verify_lasso(
@@ -204,15 +389,112 @@ pub fn verify_lasso(
     transcript: &mut Transcript,
     params: &HyraxParams,
 ) -> Result<(), String> {
+    verify_lasso_with_outputs(
+        proof,
+        instance,
+        vk,
+        &instance.outputs,
+        None,
+        transcript,
+        params,
+    )
+}
+
+pub fn verify_lasso_from_proof_outputs(
+    proof: &LassoProof,
+    instance: &LassoInstance,
+    vk: &LassoVerifyingKey,
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> Result<(), String> {
+    verify_lasso_with_outputs(
+        proof,
+        instance,
+        vk,
+        &proof.outputs,
+        None,
+        transcript,
+        params,
+    )
+}
+
+pub fn verify_lasso_committed_output(
+    proof: &LassoProof,
+    instance: &LassoInstance,
+    vk: &LassoVerifyingKey,
+    output_com: &HyraxCommitment,
+    output_num_vars: usize,
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> Result<(), String> {
+    verify_lasso_with_outputs(
+        proof,
+        instance,
+        vk,
+        &[],
+        Some((output_com, output_num_vars)),
+        transcript,
+        params,
+    )
+}
+
+pub fn verify_lasso_committed_output_and_indices(
+    proof: &LassoProof,
+    instance: &LassoInstance,
+    vk: &LassoVerifyingKey,
+    output_com: &HyraxCommitment,
+    output_num_vars: usize,
+    input_com: &HyraxCommitment,
+    input_num_vars: usize,
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> Result<(), String> {
+    verify_lasso_with_outputs(
+        proof,
+        instance,
+        vk,
+        &[],
+        Some((output_com, output_num_vars)),
+        transcript,
+        params,
+    )?;
+    verify_index_binding(
+        proof,
+        instance.tables.len(),
+        instance.bits_per_chunk,
+        input_com,
+        input_num_vars,
+        transcript,
+    )
+}
+
+fn verify_lasso_with_outputs(
+    proof: &LassoProof,
+    instance: &LassoInstance,
+    vk: &LassoVerifyingKey,
+    transcript_outputs: &[F],
+    committed_output: Option<(&HyraxCommitment, usize)>,
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> Result<(), String> {
     let c = instance.tables.len();
     let m = instance.bits_per_chunk;
-    let n = proof.outputs.len();
+    let committed_index_mode = proof.index_proof.is_some();
+    let n = if committed_index_mode {
+        proof
+            .index_proof
+            .as_ref()
+            .map(|p| p.query_len)
+            .unwrap_or(0)
+    } else {
+        proof.query_indices.len()
+    };
 
     let nu = m / 2;
     let sigma = m - nu;
     assert_eq!(params.sigma, sigma, "HyraxParams sigma mismatch");
 
-    if proof.l_k_coms.len() != c || proof.l_k_evals.len() != c || proof.l_k_opens.len() != c {
+    if proof.l_k_evals.len() != c {
         return Err("LassoProof l_k fields length mismatch".into());
     }
 
@@ -220,13 +502,23 @@ pub fn verify_lasso(
     for k in 0..c {
         absorb_com(transcript, b"hyrax_com", &vk.table_coms[k]);
     }
+    if let Some((output_com, _)) = committed_output {
+        absorb_com(transcript, b"lasso_output_com", output_com);
+    }
 
-    for &out in &instance.outputs {
+    if committed_output.is_none() && (transcript_outputs.len() != n || proof.outputs.len() != n) {
+        return Err(format!(
+            "Lasso output length mismatch: transcript has {}, proof has {}, expected {n}",
+            transcript_outputs.len(),
+            proof.outputs.len()
+        ));
+    }
+    for &out in transcript_outputs {
         transcript.append_field(b"lasso_out", &out);
     }
     let rho = transcript.challenge_field::<F>(b"lasso_rho");
     let rho_pows = powers_of(rho, n);
-    if proof.query_indices.len() != n {
+    if !committed_index_mode && proof.query_indices.len() != n {
         return Err(format!(
             "Lasso query index length mismatch: got {}, expected {}",
             proof.query_indices.len(),
@@ -236,24 +528,15 @@ pub fn verify_lasso(
 
     // Grand Sum Identity: Σ_j ρ^j · output_j = Σ_k sub_claim_k.
     // This is still O(n) but unavoidable given public outputs.
-    let output_batched_sum: F = (0..n).map(|j| rho_pows[j] * proof.outputs[j]).sum();
     let sub_claims_combined_sum: F = proof.sub_claims.iter().sum();
-    if output_batched_sum != sub_claims_combined_sum {
-        return Err("Lasso Grand Sum Identity failed".to_string());
+    if committed_output.is_none() {
+        let output_batched_sum: F = (0..n).map(|j| rho_pows[j] * proof.outputs[j]).sum();
+        if output_batched_sum != sub_claims_combined_sum {
+            return Err("Lasso Grand Sum Identity failed".to_string());
+        }
     }
 
     for k in 0..c {
-        let size = 1usize << m;
-        let mask = size - 1;
-        let mut expected_l_hist = vec![F::ZERO; size];
-        for j in 0..n {
-            let ch = chunk(proof.query_indices[j], k, m, mask);
-            expected_l_hist[ch] += rho_pows[j];
-        }
-
-        // Absorb committed L_k into transcript (matches prover's absorb_com call).
-        absorb_com(transcript, b"lasso_l_com", &proof.l_k_coms[k]);
-
         let (r_vec, _) = verify_sumcheck(
             &proof.sumcheck_proofs[k],
             proof.sub_claims[k],
@@ -268,11 +551,30 @@ pub fn verify_lasso(
         // Verify sumcheck final and bind L_k(r) to the proof-carried indices.
         // The Hyrax opening still binds L_k(r) to the committed L_k polynomial.
         let l_at_r = proof.l_k_evals[k];
-        let expected_l_at_r = DenseMLPoly::new(expected_l_hist).evaluate(&r_vec);
-        if l_at_r != expected_l_at_r {
-            return Err(format!(
-                "Table {k} selector is not derived from query indices"
-            ));
+        if !committed_index_mode {
+            let size = 1usize << m;
+            let mask = size - 1;
+            let mut expected_l_hist = vec![F::ZERO; size];
+            for j in 0..n {
+                let ch = chunk(proof.query_indices[j], k, m, mask);
+                expected_l_hist[ch] += rho_pows[j];
+            }
+            let expected_l_at_r = DenseMLPoly::new(expected_l_hist).evaluate(&r_vec);
+            if l_at_r != expected_l_at_r {
+                return Err(format!(
+                    "Table {k} selector is not derived from query indices"
+                ));
+            }
+        } else {
+            let index_proof = proof.index_proof.as_ref().unwrap();
+            if index_proof.rho != rho {
+                return Err("committed Lasso index challenge mismatch".into());
+            }
+            if index_proof.selector_points.get(k) != Some(&r_vec) {
+                return Err(format!(
+                    "Table {k} committed selector point does not match Lasso sumcheck point"
+                ));
+            }
         }
         let expected_final = t_opening * l_at_r;
         let actual_final =
@@ -293,16 +595,39 @@ pub fn verify_lasso(
         )
         .map_err(|e| format!("Table {k} Hyrax T: {e}"))?;
 
-        // Verify L_k(r) via Hyrax of committed counting polynomial (replaces O(n) histogram).
-        hyrax_verify(
-            &proof.l_k_coms[k],
-            l_at_r,
-            &r_vec,
-            &proof.l_k_opens[k],
-            params,
-        )
-        .map_err(|e| format!("Table {k} Hyrax L: {e}"))?;
     }
+
+    if let Some((output_com, output_num_vars)) = committed_output {
+        let output_sumcheck = proof
+            .output_sumcheck
+            .as_ref()
+            .ok_or_else(|| "missing committed Lasso output sumcheck".to_string())?;
+        let output_open = proof
+            .output_open
+            .as_ref()
+            .ok_or_else(|| "missing committed Lasso output opening".to_string())?;
+        let (r_out, _) =
+            verify_sumcheck(output_sumcheck, sub_claims_combined_sum, output_num_vars, transcript)
+                .map_err(|e| format!("Lasso committed output sumcheck: {e}"))?;
+        let mut weight_evals = vec![F::ZERO; 1usize << output_num_vars];
+        for j in 0..n {
+            weight_evals[j] = rho_pows[j];
+        }
+        let expected_weight_eval = DenseMLPoly::new(weight_evals).evaluate(&r_out);
+        if output_sumcheck.final_eval_g != expected_weight_eval {
+            return Err("Lasso committed output weight eval mismatch".into());
+        }
+        let (_, _, params_out) = params_from_vars(output_num_vars);
+        hyrax_verify(
+            output_com,
+            output_sumcheck.final_eval_f,
+            &r_out,
+            output_open,
+            &params_out,
+        )
+        .map_err(|e| format!("Lasso committed output opening: {e}"))?;
+    }
+
     Ok(())
 }
 
@@ -391,12 +716,15 @@ pub struct LassoMultiProof {
     /// the MLE of instance.outputs at a Fiat-Shamir challenge point.
     /// Order matches `output_bindings` passed to `prove_lasso_multi`.
     pub output_opening_proofs: Vec<HyraxProof>,
-    /// Committed counting polynomials L_{t,k}: l_k_coms_multi[t][k] = Hyrax commit of L_{t,k}.
-    pub l_k_coms_multi: Vec<Vec<HyraxCommitment>>,
+    /// Optional committed-output binding for model mode:
+    /// proves combined_grand_sum = Σ_t α^t Σ_j ρ^j O_t[j], where O_t is
+    /// already committed by the surrounding protocol.
+    pub output_sumcheck: Option<SumcheckProofMulti>,
+    /// Batched Hyrax opening for all committed output polynomials at the
+    /// output_sumcheck challenge point.
+    pub output_batch_open: Option<HyraxProof>,
     /// L_{t,k}(r) at the combined sumcheck output point r.
     pub l_k_evals_multi: Vec<Vec<F>>,
-    /// Hyrax opening proofs for L_{t,k}(r).
-    pub l_k_opens_multi: Vec<Vec<HyraxProof>>,
 }
 
 pub fn prove_lasso_multi(
@@ -407,7 +735,7 @@ pub fn prove_lasso_multi(
     // One binding per instance (same order as multi_instance.instances).
     output_bindings: &[LassoOutputBinding],
     transcript: &mut Transcript,
-    params: &HyraxParams,
+    _params: &HyraxParams,
 ) -> LassoMultiProof {
     let t_count = multi_instance.instances.len();
     let m = multi_instance.instances[0].bits_per_chunk;
@@ -439,10 +767,15 @@ pub fn prove_lasso_multi(
         }
     }
 
-    // --- STEP 2: 公開出力の吸収 ---
-    for instance in &multi_instance.instances {
-        for out in &instance.outputs {
-            transcript.append_field(b"lasso_out", out);
+    // --- STEP 2: Output absorption ---
+    // In committed-output model mode, the outputs are bound by a later
+    // sumcheck against existing commitments, so we do not stream them into the
+    // transcript or outer proof.
+    if output_bindings.is_empty() {
+        for instance in &multi_instance.instances {
+            for out in &instance.outputs {
+                transcript.append_field(b"lasso_out", out);
+            }
         }
     }
 
@@ -487,12 +820,8 @@ pub fn prove_lasso_multi(
     let mut all_t_polys = Vec::new();
     let mut all_l_polys = Vec::new();
     let mut flatten_tables = Vec::new();
-    // Per-instance-per-table counting polynomial histograms (for committing after sumcheck).
-    let mut all_l_hists: Vec<Vec<Vec<F>>> = Vec::new();
-
     for (t, instance) in multi_instance.instances.iter().enumerate() {
         let query_indices = &all_query_indices[t];
-        let mut inst_l_hists = Vec::new();
 
         for (k, table_evals) in instance.tables.iter().enumerate() {
             let t_poly = DenseMLPoly::new(table_evals.clone());
@@ -504,9 +833,7 @@ pub fn prove_lasso_multi(
             all_t_polys.push(t_poly);
             all_l_polys.push(DenseMLPoly::new(l_hist.clone()));
             flatten_tables.push(table_evals);
-            inst_l_hists.push(l_hist);
         }
-        all_l_hists.push(inst_l_hists);
     }
 
     // --- STEP 4: Combined Sumcheck ---
@@ -531,65 +858,92 @@ pub fn prove_lasso_multi(
     let flatten_tables_slices: Vec<&[F]> = flatten_tables.iter().map(|v| v.as_slice()).collect();
     let hyrax_proof = hyrax_open_batch(&flatten_tables_slices, &r_vec, nu, sigma, transcript);
 
-    // Commit L_{t,k} for each instance and sub-table so the verifier can use Hyrax
-    // instead of O(n) histogram recomputation.
-    let mut l_k_coms_multi: Vec<Vec<HyraxCommitment>> = Vec::new();
     let mut l_k_evals_multi: Vec<Vec<F>> = Vec::new();
-    let mut l_k_opens_multi: Vec<Vec<HyraxProof>> = Vec::new();
     for (t, instance) in multi_instance.instances.iter().enumerate() {
-        let mut t_coms = Vec::new();
         let mut t_evals = Vec::new();
-        let mut t_opens = Vec::new();
         for k in 0..instance.tables.len() {
-            let l_hist = &all_l_hists[t][k];
-            let l_com = hyrax_commit(l_hist, nu, params);
-            absorb_com(transcript, b"lasso_multi_l_com", &l_com);
             let l_eval = all_l_polys[t * instance.tables.len() + k].evaluate(&r_vec);
-            let l_open = hyrax_open(l_hist, &r_vec, nu, sigma);
-            t_coms.push(l_com);
             t_evals.push(l_eval);
-            t_opens.push(l_open);
         }
-        l_k_coms_multi.push(t_coms);
         l_k_evals_multi.push(t_evals);
-        l_k_opens_multi.push(t_opens);
     }
 
     // --- OUTPUT BINDING ---
-    // For each instance, open the module-level output commitment at a fresh
-    // Fiat-Shamir challenge point and verify it matches the MLE of instance.outputs.
-    // This binds a_com / phi_q_com / phi_k_com to the outputs used above.
-    // Empty slice means no binding (used in unit tests that don't have real commitments).
-    let mut output_opening_proofs = Vec::new();
+    // Model mode: bind the combined output grand sum directly to committed
+    // output polynomials. This removes the need for the verifier to receive
+    // every output value for the multi-Lasso instances.
+    let output_opening_proofs = Vec::new();
+    let mut output_sumcheck = None;
+    let mut output_batch_open = None;
     if !output_bindings.is_empty() {
         assert_eq!(
             output_bindings.len(),
             multi_instance.instances.len(),
             "output_bindings length must equal number of Lasso instances"
         );
-        for binding in output_bindings {
-            let r_out = challenge_vec(transcript, binding.num_vars, b"lasso_output_r");
-            let (nu, sigma, _) = params_from_vars(binding.num_vars);
-            let hp = hyrax_open(&binding.mle_evals, &r_out, nu, sigma);
-            output_opening_proofs.push(hp);
-        }
+        let output_num_vars = output_bindings[0].num_vars;
+        assert!(
+            output_bindings
+                .iter()
+                .all(|binding| binding.num_vars == output_num_vars),
+            "committed multi-Lasso outputs must share a domain"
+        );
+        let padded_len = 1usize << output_num_vars;
+        let output_polys: Vec<DenseMLPoly> = output_bindings
+            .iter()
+            .map(|binding| DenseMLPoly::new(binding.mle_evals.clone()))
+            .collect();
+        let weight_polys: Vec<DenseMLPoly> = (0..t_count)
+            .map(|t| {
+                let mut evals = vec![F::ZERO; padded_len];
+                for j in 0..n {
+                    evals[j] = alpha_pows[t] * rho_pows[j];
+                }
+                DenseMLPoly::new(evals)
+            })
+            .collect();
+        let weights = vec![F::ONE; t_count];
+        let (sc, r_out) = prove_sumcheck_multi_batched(
+            &output_polys,
+            &weight_polys,
+            &weights,
+            combined_grand_sum,
+            transcript,
+        );
+        let (nu, sigma, _) = params_from_vars(output_num_vars);
+        let output_refs: Vec<&[F]> = output_bindings
+            .iter()
+            .map(|binding| binding.mle_evals.as_slice())
+            .collect();
+        output_batch_open = Some(hyrax_open_batch(
+            &output_refs,
+            &r_out,
+            nu,
+            sigma,
+            transcript,
+        ));
+        output_sumcheck = Some(sc);
     }
 
     LassoMultiProof {
-        all_outputs: multi_instance
-            .instances
-            .iter()
-            .map(|inst| inst.outputs.clone())
-            .collect(),
+        all_outputs: if output_bindings.is_empty() {
+            multi_instance
+                .instances
+                .iter()
+                .map(|inst| inst.outputs.clone())
+                .collect()
+        } else {
+            Vec::new()
+        },
         all_query_indices: all_query_indices.to_vec(),
         combined_grand_sum,
         combined_sumcheck_proof,
         table_openings,
         hyrax_proof,
         output_opening_proofs,
-        l_k_coms_multi,
+        output_sumcheck,
+        output_batch_open,
         l_k_evals_multi,
-        l_k_opens_multi,
     }
 }
 
@@ -603,6 +957,75 @@ pub fn verify_lasso_multi(
     transcript: &mut Transcript,
     params: &HyraxParams,
 ) -> Result<(), String> {
+    let transcript_outputs: Vec<&[F]> = multi_instance
+        .instances
+        .iter()
+        .map(|instance| instance.outputs.as_slice())
+        .collect();
+    verify_lasso_multi_with_outputs(
+        proof,
+        multi_instance,
+        vk,
+        output_coms,
+        &transcript_outputs,
+        transcript,
+        params,
+    )
+}
+
+pub fn verify_lasso_multi_from_proof_outputs(
+    proof: &LassoMultiProof,
+    multi_instance: &LassoMultiInstance,
+    vk: &LassoMultiVerifyingKey,
+    output_coms: &[(HyraxCommitment, usize)],
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> Result<(), String> {
+    let transcript_outputs: Vec<&[F]> = proof
+        .all_outputs
+        .iter()
+        .map(|outputs| outputs.as_slice())
+        .collect();
+    verify_lasso_multi_with_outputs(
+        proof,
+        multi_instance,
+        vk,
+        output_coms,
+        &transcript_outputs,
+        transcript,
+        params,
+    )
+}
+
+pub fn verify_lasso_multi_committed_outputs(
+    proof: &LassoMultiProof,
+    multi_instance: &LassoMultiInstance,
+    vk: &LassoMultiVerifyingKey,
+    output_coms: &[(HyraxCommitment, usize)],
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> Result<(), String> {
+    let empty_outputs: Vec<&[F]> = vec![&[]; multi_instance.instances.len()];
+    verify_lasso_multi_with_outputs(
+        proof,
+        multi_instance,
+        vk,
+        output_coms,
+        &empty_outputs,
+        transcript,
+        params,
+    )
+}
+
+fn verify_lasso_multi_with_outputs(
+    proof: &LassoMultiProof,
+    multi_instance: &LassoMultiInstance,
+    vk: &LassoMultiVerifyingKey,
+    output_coms: &[(HyraxCommitment, usize)],
+    transcript_outputs: &[&[F]],
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> Result<(), String> {
     let t_count = multi_instance.instances.len();
     let m = multi_instance.instances[0].bits_per_chunk;
 
@@ -612,9 +1035,18 @@ pub fn verify_lasso_multi(
             absorb_com(transcript, b"hyrax_com", com);
         }
     }
-    for instance in &multi_instance.instances {
-        for out in &instance.outputs {
-            transcript.append_field(b"lasso_out", out);
+    if transcript_outputs.len() != t_count {
+        return Err(format!(
+            "Multi-Lasso transcript output count mismatch: got {}, expected {t_count}",
+            transcript_outputs.len()
+        ));
+    }
+    let committed_output_mode = proof.output_sumcheck.is_some();
+    if !committed_output_mode {
+        for outputs in transcript_outputs {
+            for out in *outputs {
+                transcript.append_field(b"lasso_out", out);
+            }
         }
     }
 
@@ -629,7 +1061,7 @@ pub fn verify_lasso_multi(
         ));
     }
 
-    if proof.all_outputs.len() != t_count {
+    if !committed_output_mode && proof.all_outputs.len() != t_count {
         return Err(format!(
             "Multi-Lasso output instance count mismatch: got {}, expected {}",
             proof.all_outputs.len(),
@@ -637,10 +1069,11 @@ pub fn verify_lasso_multi(
         ));
     }
 
-    // Grand Sum: Σ_t α^t * Σ_j ρ^j * output_{t,j}
-    // Compute rho_pows once (all instances share the same output length n),
-    // then evaluate each instance's weighted sum in parallel via rayon.
-    let n = proof.all_outputs[0].len();
+    let n = proof
+        .all_query_indices
+        .first()
+        .map(|qi| qi.len())
+        .ok_or_else(|| "Multi-Lasso has no query-index instances".to_string())?;
     for (t, qi) in proof.all_query_indices.iter().enumerate() {
         if qi.len() != n {
             return Err(format!(
@@ -649,30 +1082,32 @@ pub fn verify_lasso_multi(
             ));
         }
     }
-    for (t, outputs) in proof.all_outputs.iter().enumerate() {
-        if outputs.len() != n {
-            return Err(format!(
-                "Multi-Lasso output length mismatch at instance {t}: got {}, expected {n}",
-                outputs.len()
-            ));
-        }
-    }
     let rho_pows = powers_of(rho, n);
-    let expected_grand_sum: F = proof
-        .all_outputs
-        .par_iter()
-        .enumerate()
-        .map(|(t, outputs)| {
-            let inst_sum: F = outputs
-                .iter()
-                .zip(rho_pows.iter())
-                .map(|(&out, &rp)| rp * out)
-                .sum();
-            alpha_pows[t] * inst_sum
-        })
-        .sum();
-    if expected_grand_sum != proof.combined_grand_sum {
-        return Err("Multi-Lasso Grand Sum mismatch".into());
+    if !committed_output_mode {
+        for (t, outputs) in proof.all_outputs.iter().enumerate() {
+            if outputs.len() != n {
+                return Err(format!(
+                    "Multi-Lasso output length mismatch at instance {t}: got {}, expected {n}",
+                    outputs.len()
+                ));
+            }
+        }
+        let expected_grand_sum: F = proof
+            .all_outputs
+            .par_iter()
+            .enumerate()
+            .map(|(t, outputs)| {
+                let inst_sum: F = outputs
+                    .iter()
+                    .zip(rho_pows.iter())
+                    .map(|(&out, &rp)| rp * out)
+                    .sum();
+                alpha_pows[t] * inst_sum
+            })
+            .sum();
+        if expected_grand_sum != proof.combined_grand_sum {
+            return Err("Multi-Lasso Grand Sum mismatch".into());
+        }
     }
 
     // --- STEP 2: Sumcheck verification ---
@@ -749,15 +1184,66 @@ pub fn verify_lasso_multi(
         transcript,
     )?;
 
-    // --- OUTPUT BINDING verification ---
-    // If output_coms is non-empty, verify that each instance's output commitment
-    // opens correctly to the MLE of instance.outputs at a fresh random point.
-    //
-    // Two-phase design for parallelism:
-    //   Phase 1 (sequential): derive all r_out challenge vectors from transcript.
-    //   Phase 2 (parallel):   compute expected MLE evaluations in parallel.
-    //   Phase 3 (sequential): verify Hyrax proofs against the computed evaluations.
-    if !output_coms.is_empty() {
+    if committed_output_mode {
+        if output_coms.len() != t_count {
+            return Err(format!(
+                "output_coms length {} does not match instance count {t_count}",
+                output_coms.len()
+            ));
+        }
+        let output_num_vars = output_coms[0].1;
+        if !output_coms
+            .iter()
+            .all(|(_, num_vars)| *num_vars == output_num_vars)
+        {
+            return Err("committed multi-Lasso outputs must share a domain".into());
+        }
+        let sc = proof
+            .output_sumcheck
+            .as_ref()
+            .ok_or_else(|| "missing committed output sumcheck".to_string())?;
+        let output_batch_open = proof
+            .output_batch_open
+            .as_ref()
+            .ok_or_else(|| "missing committed output batch opening".to_string())?;
+        let weights = vec![F::ONE; t_count];
+        let (r_out, _) = verify_sumcheck_multi_batched(
+            sc,
+            &weights,
+            proof.combined_grand_sum,
+            output_num_vars,
+            transcript,
+        )
+        .map_err(|e| format!("Committed output sumcheck: {e}"))?;
+
+        let padded_len = 1usize << output_num_vars;
+        for t in 0..t_count {
+            let mut evals = vec![F::ZERO; padded_len];
+            for j in 0..n {
+                evals[j] = alpha_pows[t] * rho_pows[j];
+            }
+            let expected_weight_eval = DenseMLPoly::new(evals).evaluate(&r_out);
+            if sc.final_evals_g[t] != expected_weight_eval {
+                return Err(format!(
+                    "Committed output weight eval mismatch at instance {t}"
+                ));
+            }
+        }
+
+        let commitments: Vec<HyraxCommitment> =
+            output_coms.iter().map(|(com, _)| com.clone()).collect();
+        let evals = sc.final_evals_f.clone();
+        let (_, _, params_out) = params_from_vars(output_num_vars);
+        hyrax_verify_batch(
+            &commitments,
+            &evals,
+            &r_out,
+            output_batch_open,
+            &params_out,
+            transcript,
+        )
+        .map_err(|e| format!("Committed output batch opening: {e}"))?;
+    } else if !output_coms.is_empty() {
         if output_coms.len() != multi_instance.instances.len() {
             return Err(format!(
                 "output_coms length {} does not match instance count {}",
@@ -802,6 +1288,298 @@ pub fn verify_lasso_multi(
     }
 
     Ok(())
+}
+
+fn prove_index_binding(
+    query_indices: &[usize],
+    chunks: usize,
+    bits_per_chunk: usize,
+    input_binding: &LassoIndexBinding,
+    l_k_evals: &[F],
+    selector_points: &[Vec<F>],
+    rho: F,
+    transcript: &mut Transcript,
+) -> LassoIndexProof {
+    let n = query_indices.len();
+    let padded_len = 1usize << input_binding.num_vars;
+    assert!(n <= padded_len, "lookup index domain exceeds input binding");
+    let (nu, sigma, params) = params_from_vars(input_binding.num_vars);
+    let mask = (1usize << bits_per_chunk) - 1;
+
+    let mut chunk_mles = Vec::with_capacity(chunks);
+    let mut chunk_coms = Vec::with_capacity(chunks);
+    for k in 0..chunks {
+        let mut evals = vec![F::ZERO; padded_len];
+        for j in 0..n {
+            evals[j] = F::from(chunk(query_indices[j], k, bits_per_chunk, mask) as u64);
+        }
+        let com = hyrax_commit(&evals, nu, &params);
+        absorb_com(transcript, b"lasso_idx_chunk_com", &com);
+        chunk_coms.push(com);
+        chunk_mles.push(DenseMLPoly::new(evals));
+    }
+
+    let bind_r = challenge_vec(transcript, input_binding.num_vars, b"lasso_idx_bind_r");
+    let bind_chunk_evals: Vec<F> = chunk_mles.iter().map(|m| m.evaluate(&bind_r)).collect();
+    transcript.append_field_vec(b"lasso_idx_bind_chunk_evals", &bind_chunk_evals);
+    let bind_refs: Vec<&[F]> = std::iter::once(input_binding.mle_evals.as_slice())
+        .chain(chunk_mles.iter().map(|m| m.evaluations.as_slice()))
+        .collect();
+    let bind_open = hyrax_open_batch(&bind_refs, &bind_r, nu, sigma, transcript);
+
+    let mut weight_evals = vec![F::ZERO; padded_len];
+    let mut cur = F::ONE;
+    for j in 0..n {
+        weight_evals[j] = cur;
+        cur *= rho;
+    }
+    let weight_poly = DenseMLPoly::new(weight_evals);
+
+    let mut selector_proofs = Vec::with_capacity(chunks);
+    for k in 0..chunks {
+        transcript.append_field(b"lasso_idx_selector_claim", &l_k_evals[k]);
+        let (sumcheck, r_sel) = prove_selector_sumcheck(
+            &chunk_mles[k],
+            &weight_poly,
+            l_k_evals[k],
+            bits_per_chunk,
+            &selector_points[k],
+            transcript,
+        );
+        let chunk_open = hyrax_open(&chunk_mles[k].evaluations, &r_sel, nu, sigma);
+        selector_proofs.push(SelectorBindingProof {
+            sumcheck,
+            chunk_open,
+        });
+    }
+
+    LassoIndexProof {
+        query_len: n,
+        rho,
+        chunk_coms,
+        selector_points: selector_points.to_vec(),
+        bind_chunk_evals,
+        bind_open,
+        selector_proofs,
+    }
+}
+
+fn verify_index_binding(
+    proof: &LassoProof,
+    chunks: usize,
+    bits_per_chunk: usize,
+    input_com: &HyraxCommitment,
+    input_num_vars: usize,
+    transcript: &mut Transcript,
+) -> Result<(), String> {
+    let index_proof = proof
+        .index_proof
+        .as_ref()
+        .ok_or_else(|| "missing committed Lasso index proof".to_string())?;
+    if index_proof.chunk_coms.len() != chunks
+        || index_proof.bind_chunk_evals.len() != chunks
+        || index_proof.selector_proofs.len() != chunks
+        || index_proof.selector_points.len() != chunks
+    {
+        return Err("committed Lasso index proof chunk count mismatch".into());
+    }
+    let (_, _, params) = params_from_vars(input_num_vars);
+    for com in &index_proof.chunk_coms {
+        absorb_com(transcript, b"lasso_idx_chunk_com", com);
+    }
+
+    let bind_r = challenge_vec(transcript, input_num_vars, b"lasso_idx_bind_r");
+    transcript.append_field_vec(
+        b"lasso_idx_bind_chunk_evals",
+        &index_proof.bind_chunk_evals,
+    );
+    let shift_mult = F::from(1u64 << bits_per_chunk);
+    let mut shift = F::ONE;
+    let mut input_eval = F::ZERO;
+    for &chunk_eval in &index_proof.bind_chunk_evals {
+        input_eval += shift * chunk_eval;
+        shift *= shift_mult;
+    }
+    let commitments: Vec<HyraxCommitment> = std::iter::once(input_com.clone())
+        .chain(index_proof.chunk_coms.iter().cloned())
+        .collect();
+    let evals: Vec<F> = std::iter::once(input_eval)
+        .chain(index_proof.bind_chunk_evals.iter().copied())
+        .collect();
+    hyrax_verify_batch(
+        &commitments,
+        &evals,
+        &bind_r,
+        &index_proof.bind_open,
+        &params,
+        transcript,
+    )
+    .map_err(|e| format!("committed Lasso index fusion opening: {e}"))?;
+
+    let rho = index_proof.rho;
+    let padded_len = 1usize << input_num_vars;
+    let mut weight_evals = vec![F::ZERO; padded_len];
+    let mut cur = F::ONE;
+    for j in 0..index_proof.query_len {
+        weight_evals[j] = cur;
+        cur *= rho;
+    }
+    let weight_poly = DenseMLPoly::new(weight_evals);
+
+    for k in 0..chunks {
+        let claim = proof.l_k_evals[k];
+        transcript.append_field(b"lasso_idx_selector_claim", &claim);
+        let selector = &index_proof.selector_proofs[k];
+        let r_sel = verify_selector_sumcheck(
+            &selector.sumcheck,
+            &weight_poly,
+            claim,
+            bits_per_chunk,
+            &index_proof.selector_points[k],
+            transcript,
+        )
+        .map_err(|e| format!("committed Lasso selector {k}: {e}"))?;
+        hyrax_verify(
+            &index_proof.chunk_coms[k],
+            selector.sumcheck.final_eval_chunk,
+            &r_sel,
+            &selector.chunk_open,
+            &params,
+        )
+        .map_err(|e| format!("committed Lasso selector chunk opening {k}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn prove_selector_sumcheck(
+    chunk_poly: &DenseMLPoly,
+    weight_poly: &DenseMLPoly,
+    claim: F,
+    bits_per_chunk: usize,
+    table_point: &[F],
+    transcript: &mut Transcript,
+) -> (SelectorSumcheckProof, Vec<F>) {
+    assert_eq!(chunk_poly.num_vars, weight_poly.num_vars);
+    let mut chunk_cur = chunk_poly.clone();
+    let mut weight_cur = weight_poly.clone();
+    let degree = 1usize << bits_per_chunk;
+    let mut running_claim = claim;
+    let mut round_polys = Vec::with_capacity(chunk_poly.num_vars);
+    let mut challenges = Vec::with_capacity(chunk_poly.num_vars);
+
+    for _ in 0..chunk_poly.num_vars {
+        let half = chunk_cur.evaluations.len() >> 1;
+        let mut evals = Vec::with_capacity(degree + 1);
+        for z_i in 0..=degree {
+            let z = F::from(z_i as u64);
+            let mut sum = F::ZERO;
+            for i in 0..half {
+                let c0 = chunk_cur.evaluations[i];
+                let c1 = chunk_cur.evaluations[i + half];
+                let w0 = weight_cur.evaluations[i];
+                let w1 = weight_cur.evaluations[i + half];
+                let c_z = c0 + z * (c1 - c0);
+                let w_z = w0 + z * (w1 - w0);
+                sum += w_z * selector_eq_eval(bits_per_chunk, c_z, table_point);
+            }
+            evals.push(sum);
+        }
+        let round = HighDegreeRoundPoly { evals };
+        if round.evals[0] + round.evals[1] != running_claim {
+            debug_assert_eq!(round.evals[0] + round.evals[1], running_claim);
+        }
+        transcript.append_field_vec(b"lasso_idx_sc_round", &round.evals);
+        let r = transcript.challenge_field::<F>(b"lasso_idx_sc_r");
+        running_claim = round.evaluate(r);
+        round_polys.push(round);
+        challenges.push(r);
+        chunk_cur = fold_poly(&chunk_cur, r);
+        weight_cur = fold_poly(&weight_cur, r);
+    }
+
+    (
+        SelectorSumcheckProof {
+            round_polys,
+            final_eval_chunk: chunk_cur.evaluations[0],
+        },
+        challenges,
+    )
+}
+
+fn verify_selector_sumcheck(
+    proof: &SelectorSumcheckProof,
+    weight_poly: &DenseMLPoly,
+    claim: F,
+    bits_per_chunk: usize,
+    table_point: &[F],
+    transcript: &mut Transcript,
+) -> Result<Vec<F>, String> {
+    if proof.round_polys.len() != weight_poly.num_vars {
+        return Err("selector sumcheck round count mismatch".into());
+    }
+    let mut running_claim = claim;
+    let mut r = Vec::with_capacity(weight_poly.num_vars);
+    for round in &proof.round_polys {
+        if round.evals.len() != (1usize << bits_per_chunk) + 1 {
+            return Err("selector sumcheck degree mismatch".into());
+        }
+        if round.evals[0] + round.evals[1] != running_claim {
+            return Err("selector sumcheck claim mismatch".into());
+        }
+        transcript.append_field_vec(b"lasso_idx_sc_round", &round.evals);
+        let ch = transcript.challenge_field::<F>(b"lasso_idx_sc_r");
+        running_claim = round.evaluate(ch);
+        r.push(ch);
+    }
+    let final_weight = weight_poly.evaluate(&r);
+    let expected = final_weight * selector_eq_eval(bits_per_chunk, proof.final_eval_chunk, table_point);
+    if running_claim != expected {
+        return Err("selector sumcheck final check failed".into());
+    }
+    Ok(r)
+}
+
+fn fold_poly(poly: &DenseMLPoly, r: F) -> DenseMLPoly {
+    let half = poly.evaluations.len() >> 1;
+    let evals = (0..half)
+        .map(|i| poly.evaluations[i] + r * (poly.evaluations[i + half] - poly.evaluations[i]))
+        .collect();
+    DenseMLPoly::new(evals)
+}
+
+fn selector_eq_eval(bits_per_chunk: usize, z: F, _prefix: &[F]) -> F {
+    let size = 1usize << bits_per_chunk;
+    let mut acc = F::ZERO;
+    for a in 0..size {
+        let y = if z == F::from(a as u64) {
+            F::ONE
+        } else {
+            let xa = F::from(a as u64);
+            let mut num = F::ONE;
+            let mut den = F::ONE;
+            for b in 0..size {
+                if a == b {
+                    continue;
+                }
+                let xb = F::from(b as u64);
+                num *= z - xb;
+                den *= xa - xb;
+            }
+            num * den.inverse().expect("distinct interpolation points")
+        };
+        acc += eq_table_point(bits_per_chunk, a, _prefix) * y;
+    }
+    acc
+}
+
+fn eq_table_point(bits_per_chunk: usize, value: usize, point: &[F]) -> F {
+    let mut acc = F::ONE;
+    for i in 0..bits_per_chunk {
+        let bit = (value >> (bits_per_chunk - 1 - i)) & 1;
+        let r = point.get(i).copied().unwrap_or(F::ZERO);
+        acc *= if bit == 1 { r } else { F::ONE - r };
+    }
+    acc
 }
 
 // ---------------------------------------------------------------------------

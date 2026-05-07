@@ -10,7 +10,7 @@
 
 use crate::field::F;
 use crate::lookup::lasso::{
-    verify_lasso, verify_lasso_multi, LassoMultiInstance, LassoMultiVerifyingKey,
+    verify_lasso_multi_committed_outputs, LassoMultiInstance, LassoMultiVerifyingKey,
 };
 use crate::lookup::range::verify_range_batched;
 use crate::pcs::{
@@ -546,26 +546,47 @@ pub fn verify(
         absorb_com(transcript, b"w1_com", &bvk.ffn_vk.w1_com);
         absorb_com(transcript, b"w2_com", &bvk.ffn_vk.w2_com);
 
-        let _t0 = Instant::now();
-        verify_lasso(
-            &bp.ffn_lasso_proof,
-            &inst_ffn.activation_lasso,
-            &bvk.ffn_vk.activation_lasso_vk,
-            transcript,
-            lasso_params,
-        )?;
-        eprintln!(
-            "[block {}] ffn_lasso:{:>8.3}ms",
-            i,
-            _t0.elapsed().as_secs_f64() * 1000.0
-        );
-
         absorb_com(transcript, b"m_com", &bp.ffn_m_com);
     }
-    let ffn_index_refs: Vec<&[usize]> = proof
+    let _tffn_lasso = Instant::now();
+    if proof.ffn_lasso_proof.all_query_indices.len() != num_blocks {
+        return Err(format!(
+            "FFN Lasso query index count mismatch: got {}, expected {}",
+            proof.ffn_lasso_proof.all_query_indices.len(),
+            num_blocks
+        ));
+    }
+    let ffn_lasso_instances = LassoMultiInstance {
+        instances: (0..num_blocks)
+            .map(|_| inst_ffn.activation_lasso.clone())
+            .collect(),
+    };
+    let ffn_lasso_vk = LassoMultiVerifyingKey {
+        instance_table_coms: vk
+            .block_vks
+            .iter()
+            .map(|bvk| bvk.ffn_vk.activation_lasso_vk.table_coms.clone())
+            .collect(),
+    };
+    let ffn_output_coms: Vec<(HyraxCommitment, usize)> = proof
         .block_proofs
         .iter()
-        .map(|bp| bp.ffn_lasso_proof.query_indices.as_slice())
+        .map(|bp| (bp.ffn_a_com.clone(), t_bits + f_bits))
+        .collect();
+    verify_lasso_multi_committed_outputs(
+        &proof.ffn_lasso_proof,
+        &ffn_lasso_instances,
+        &ffn_lasso_vk,
+        &ffn_output_coms,
+        transcript,
+        lasso_params,
+    )
+    .map_err(|e| format!("FFN global Lasso: {e}"))?;
+    let ffn_index_refs: Vec<&[usize]> = proof
+        .ffn_lasso_proof
+        .all_query_indices
+        .iter()
+        .map(|v| v.as_slice())
         .collect();
     absorb_index_vectors(transcript, b"ffn_lasso_indices", &ffn_index_refs);
     let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
@@ -586,7 +607,10 @@ pub fn verify(
         &params_mff_bind,
         transcript,
     )?;
-
+    eprintln!(
+        "[model] ffn_lasso:{:>8.3}ms",
+        _tffn_lasso.elapsed().as_secs_f64() * 1000.0
+    );
     // =========================================================================
     // 8. Batch FFN-Y (sumcheck only)
     // =========================================================================
@@ -1069,6 +1093,24 @@ pub fn verify(
     )
     .map_err(|e| format!("w2_batch: {e}"))?;
 
+    // A at combine(r_t, r_k_fy)
+    let ffn_a_point = combine(&r_t, &r_k_fy);
+    let ffn_a_coms: Vec<HyraxCommitment> = proof
+        .block_proofs
+        .iter()
+        .map(|bp| bp.ffn_a_com.clone())
+        .collect();
+    let ffn_a_evals: Vec<F> = proof.batch_ffn_y.final_evals_f.clone();
+    hyrax_verify_batch(
+        &ffn_a_coms,
+        &ffn_a_evals,
+        &ffn_a_point,
+        &proof.ffn_a_batch_open,
+        &params_mff,
+        transcript,
+    )
+    .map_err(|e| format!("ffn_a_batch: {e}"))?;
+
     // w1 at combine(r_k_m, ry_m) — uses same params as prover (params_qkvo_w)
     let w1_point = combine(&r_k_m, &ry_m);
     let w1_coms: Vec<HyraxCommitment> = vk
@@ -1235,7 +1277,7 @@ pub fn verify(
         &params_td,
         transcript,
     )?;
-    verify_lasso_multi(
+    verify_lasso_multi_committed_outputs(
         &proof.all_lasso_proof,
         &global_multi_inst,
         &global_lasso_vk,
