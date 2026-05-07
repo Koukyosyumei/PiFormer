@@ -54,12 +54,14 @@ class PiFormerBlock(nn.Module):
         c: int = 2,
         scale: float = 0.1,
         max_exp: int = 4,
+        causal: bool = False,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
         self.attn = LinearAttentionLayer(
             d_model, n_heads,
             num_bits=num_bits, c=c, scale=scale, max_exp=max_exp,
+            causal=causal,
         )
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = PiFormerFFN(
@@ -102,16 +104,23 @@ class PiFormerModel(nn.Module):
         c: int = 2,
         scale: float = 0.1,
         max_exp: int = 4,
+        causal: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
+        self.register_buffer(
+            "position_ids",
+            torch.arange(max_seq_len).unsqueeze(0),
+            persistent=False,
+        )
         self.blocks = nn.ModuleList(
             [
                 PiFormerBlock(
                     d_model, n_heads, d_ff,
                     num_bits=num_bits, c=c, scale=scale, max_exp=max_exp,
+                    causal=causal,
                 )
                 for _ in range(n_layers)
             ]
@@ -127,7 +136,7 @@ class PiFormerModel(nn.Module):
             logits: (B, T, vocab_size)
         """
         B, T = input_ids.shape
-        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
+        pos = self.position_ids[:, :T]
         x = self.embedding(input_ids) + self.pos_embedding(pos)
         for block in self.blocks:
             x = block(x)

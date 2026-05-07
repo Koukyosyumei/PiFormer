@@ -1,0 +1,472 @@
+\documentclass[10pt]{beamer}
+%\usepackage[whole]{bxcjkjatype}
+
+\usepackage{newtxtext,newtxmath}
+\usepackage{stmaryrd}
+\usepackage{dsfont}
+\usepackage{xfrac}
+\usepackage{mathrsfs}
+
+\usepackage{booktabs}
+\usepackage{multirow}
+
+\usepackage[utf8]{inputenc}
+\usepackage{algorithm}
+\usepackage{algcompatible}
+\usepackage[noend]{algpseudocode}
+\usepackage{algpseudocode}
+\usepackage{multicol}
+
+\usepackage{arydshln}
+\usepackage{here}
+
+\usepackage{graphics}
+\usepackage{amsmath}
+
+\renewcommand{\algorithmicrequire}{\textbf{Input:}}
+\renewcommand{\algorithmicensure}{\textbf{Output:}}
+
+\newcommand{\argmin}{\mathop{\rm arg~min}}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem*{threatmodel}{Threat Model}
+\newtheorem{scenario}{Scenario}
+
+\newcommand{\hquad}{\hspace{0.5em}}
+
+\input{settings}
+\usetikzlibrary{positioning,arrows.meta,calc,fit,backgrounds,shapes.geometric}
+
+% ----- math shortcuts (kept consistent with the paper) -----
+\newcommand{\FF}{\mathbb{F}}
+\newcommand{\GG}{\mathbb{G}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\bX}{\mathbf{X}}
+\newcommand{\bY}{\mathbf{Y}}
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\by}{\mathbf{y}}
+\newcommand{\bO}{\mathbf{O}}
+\newcommand{\bQ}{\mathbf{Q}}
+\newcommand{\bK}{\mathbf{K}}
+\newcommand{\bV}{\mathbf{V}}
+\newcommand{\bM}{\mathbf{M}}
+\newcommand{\bW}{\mathbf{W}}
+\newcommand{\bphi}{\boldsymbol{\phi}}
+\newcommand{\bk}{\mathbf{k}}
+\newcommand{\bv}{\mathbf{v}}
+\newcommand{\bq}{\mathbf{q}}
+\newcommand{\softmax}{\mathrm{softmax}}
+\DeclareMathOperator{\LN}{LN}
+\DeclareMathOperator{\LLA}{LLA}
+\DeclareMathOperator{\Att}{Att}
+\DeclareMathOperator{\Com}{\mathsf{Com}}
+\newcommand{\sys}{\ensuremath{\pi\text{-Former}}}
+
+\title[$\pi$-Former]{$\pi$-Former:\\ Succinct Proofs of Transformer Inference}
+\author[H. Takahashi]{Hideaki Takahashi}
+\date[]{April 2026}
+
+\begin{document}
+\Front
+
+\pagestyle{empty}
+
+%======================================================================
+\begin{frame}{Overview}
+\textbf{Why transformers?} The backbone of essentially every
+state-of-the-art language, vision, and speech model today
+(GPT, Claude, Llama, ViT, Whisper). As inference moves to remote
+APIs, users need cryptographic evidence that the \emph{claimed}
+model produced the \emph{claimed} output.
+
+\medskip
+\textbf{What is a SNARK?} A \emph{succinct non-interactive argument
+of knowledge}: a short proof that a specific computation was carried
+out correctly, verifiable in time far less than re-running it.
+
+\medskip
+\textbf{Problem.} Build a SNARK for transformer inference
+$\by = \mathcal{M}_\theta(\bx)$ that the prover can actually run at
+scale.
+
+\medskip
+\textbf{Our approach: co-design.} Modify the model so that its
+computation is natively sumcheck $+$ Lasso friendly, then prove the
+new model \emph{exactly} -- rather than approximating a standard
+transformer.
+
+\medskip
+\textbf{Headline.} 5.26M-param transformer, 12 CPU threads:
+\textbf{6.4\,s prove / 0.37\,s verify} --
+$\sim$\textbf{8$\times$ faster prover} than zkGPT, transparent setup.
+\end{frame}
+
+%======================================================================
+\begin{frame}{What Is a Transformer? (Intuition)}
+A transformer is a stack of $L$ identical \textbf{blocks}.
+Each block takes a sequence of $T$ token vectors
+$\bX\in\RR^{T\times d}$ and returns the same shape.
+
+\medskip
+Inside one block, two operations:
+\begin{enumerate}
+  \item \textbf{Attention}: each token looks at every other token
+        and pulls in information from the relevant ones.
+  \item \textbf{Feed-forward (FFN)}: each token is independently
+        passed through a small two-layer neural network.
+\end{enumerate}
+
+\medskip
+Each is wrapped with: \textbf{LayerNorm} (rescale the row),
+a \textbf{residual} ``$+$'' (add the input back).
+
+\medskip
+\begin{center}
+\small
+$\bX_{\mathrm{mid}} = \bX_{\mathrm{in}} + \Att(\LN(\bX_{\mathrm{in}}))$
+\hspace{1em}
+$\bX_{\mathrm{out}} = \bX_{\mathrm{mid}} + \mathrm{FFN}(\LN(\bX_{\mathrm{mid}}))$
+\end{center}
+
+\medskip
+That's it. Repeat $L$ times, project to vocabulary, predict next token.
+\end{frame}
+
+%======================================================================
+\begin{frame}{What Is Attention? (Intuition)}
+Each token is given three vectors:
+\begin{itemize}
+  \item \textbf{Query} $\bq$ -- ``what am I looking for?''
+  \item \textbf{Key} $\bk$ -- ``what do I offer?''
+  \item \textbf{Value} $\bv$ -- ``what info do I carry?''
+\end{itemize}
+all linear projections of the input row: $\bq=\bx\bW_Q$, etc.
+
+\medskip
+For token $t$, attention computes a \emph{weighted average of values},
+where the weight is how well its query matches each key:
+\[
+  \mathrm{out}_t \;=\; \sum_{s} \underbrace{\softmax_s\!\bigl(\langle\bq_t,\bk_s\rangle/\sqrt d\bigr)}_{\text{attention weight}}\;\bv_s.
+\]
+
+\medskip
+\textbf{What this gives the model.} Tokens can ``ask'' for
+information from other positions and aggregate it -- no fixed
+window, no recurrence.
+
+\medskip
+\textbf{What this costs the SNARK.} Softmax means
+$\exp(\cdot)$ and row-wise division -- both \emph{very} expensive
+in a finite field. This is what we will replace.
+\end{frame}
+
+%======================================================================
+\begin{frame}{The Other Two: GeLU and LayerNorm}
+\textbf{GeLU.} A smooth nonlinearity used inside the FFN, applied
+element-wise:
+\[
+  \mathrm{GeLU}(x) \;=\; x\cdot\Phi(x),\qquad \Phi=\text{Gaussian CDF}.
+\]
+Like a soft ReLU. Lets the FFN learn nonlinear features.\\
+\emph{SNARK pain:} transcendental (CDF / $\exp$).
+
+\medskip
+\textbf{LayerNorm.} Stabilises training by rescaling each row to
+zero-mean / unit-variance, then re-scaling with learned
+$\gamma,\beta$:
+\[
+  \LN(\bx) \;=\; \gamma\odot\frac{\bx-\mu(\bx)}{\sqrt{\sigma^2(\bx)+\epsilon}}+\beta.
+\]
+Without it, deep stacks blow up.\\
+\emph{SNARK pain:} a square root and a division per row.
+
+\medskip
+\begin{block}{So a transformer block has \emph{four} hostile pieces}
+softmax, GeLU, LayerNorm, dense $\bW$ -- each adds either
+non-arithmetic operations or a field multiplication per weight.
+\end{block}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Two Approaches: Prove-As-Is vs.\ Co-Design}
+\textbf{Goal.} Prove $\by=\mathcal{M}_\theta(\bx)$ with a short proof
+and cheap verification.
+
+\medskip
+\textbf{Prior work (zkLLM, zkGPT).} Take a \emph{standard} transformer
+and prove its computation \emph{exactly}. Softmax, GeLU, LayerNorm
+are SNARK-hostile, so they are approximated with large lookup tables
+and fused constraints. The proven model is the original, but the
+prover pays minutes per token at GPT scale.
+
+\medskip
+\textbf{$\pi$-Former: co-design model and SNARK.}
+Change the model itself so its computation is natively
+SNARK-friendly, and the SNARK proves the \emph{new} model exactly:
+
+\smallskip
+\begin{center}
+\small
+\begin{tabular}{l@{\hskip 0.6em}c@{\hskip 0.6em}l}
+\toprule
+\textbf{Standard op} & $\Rightarrow$ & \textbf{$\pi$-Former op} \\
+\midrule
+dense $\bW$ (FP)    & $\Rightarrow$ & \textbf{ternary} $\bW\!\in\!\{-1,0,+1\}\!\cdot\!\alpha$ \emph{(no field mults)} \\
+softmax attention   & $\Rightarrow$ & \textbf{Leanable Lookup Activation}: linear attention with learnable $\bphi$ \\
+GeLU                & $\Rightarrow$ & same learnable additive sub-table lookup \\
+LayerNorm           & $\Rightarrow$ & constraint-fused LN \emph{(zkGPT-style)} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{frame}
+
+%======================================================================
+\begin{frame}{Toolbox (One-Line Reminders)}
+\textbf{Multilinear extension (MLE).} For a matrix
+$\bX\in\FF^{T\times d}$, its MLE
+$\widetilde\bX:\FF^{\log T+\log d}\to\FF$ is the \emph{unique}
+multilinear polynomial with
+$\widetilde\bX(\mathbf{r}_t,\mathbf{r}_d)=\bX[\mathbf{r}_t,\mathbf{r}_d]$
+for all boolean
+$(\mathbf{r}_t,\mathbf{r}_d)\in\{0,1\}^{\log T+\log d}$.
+We commit MLEs so the prover can answer
+evaluations at random field points.
+
+\medskip
+\textbf{Sumcheck.} Reduces $H=\sum_{x\in\{0,1\}^n} f(x)$ to a single
+evaluation $f(r)$ at random $r$. Verifier cost $O(n\delta)$,
+soundness error $\le n\delta/|\FF|$.
+
+\medskip
+\textbf{Hyrax Polynomial Commitment Scheme (PCS).} Transparent
+(no trusted setup) polynomial commitment based on Pedersen / DL on
+BN254 G1. $O(\sqrt N)$ commitment size, $O(\sqrt N)$ open.
+Importantly: \textbf{additively homomorphic}.
+
+\medskip
+\textbf{Lasso Lookup.} A lookup argument that proves
+$v_j = T[\mathrm{idx}_j]$ for many queries against a table $T$,
+\emph{cheap when $T$ decomposes into small additive sub-tables}.
+\end{frame}
+
+%======================================================================
+\begin{frame}{Novel Idea 1: Ternary Projections}
+All projection matrices ($\bW_Q,\bW_K,\bW_V,\bW_O,\bW_1,\bW_2$, LM head)
+are constrained:
+\[
+  \bW \in \{-1, 0, +1\}^{m\times n},\qquad
+  \by = \alpha\cdot(\bx\bW) + \mathbf{b}
+\]
+with one learnable scalar $\alpha$ per layer (BitNet b1.58 style).
+
+\medskip
+\textbf{What changes inside the SNARK?} Consider the standard
+sumcheck for a contraction $\bY = \bX\bW$
+(here $\widetilde\bX,\widetilde\bW,\widetilde\bY$ are the MLEs):
+\[
+  \widetilde\bY(r_t,r_d) - \mathbf{b}(r_d)
+  \;=\; \alpha \sum_k \widetilde\bX(r_t,k)\,\widetilde\bW(k,r_d).
+\]
+Because $\widetilde\bW(k,r_d)\in\{-1,0,+1\}$ after evaluation,
+each prover round is:
+\begin{center}
+``$+\!=$ / $-\!=$ / skip'' \quad -- no field multiplications.
+\end{center}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Novel Idea 2: Learnable Lookup Attention (LLA)}
+\textbf{Linear attention} replaces $\softmax(\bQ\bK^\top/\sqrt{d})$ by
+a positive-definite kernel
+$\kappa(\bq,\bk)=\langle\bphi(\bq),\bphi(\bk)\rangle$:
+\[
+  \LLA(\bQ,\bK,\bV)_t \;=\;
+  \bphi(\bq_t)^{\!\top}\,\underbrace{\sum_{s}\bphi(\bk_s)\bv_s^{\!\top}}_{=\,\bM\;(\text{context, computed once})}.
+\]
+
+\medskip
+\textbf{Where's $\bphi$?} We make it learnable and SNARK-friendly:
+\[
+  \bphi(x) \;=\; \sum_{i=0}^{c-1} T_i\bigl[\chi_i(x_{\mathrm{int}})\bigr],
+\]
+i.e.\ split a $b$-bit input into $c$ chunks, look each up in a
+small table $T_i$ of size $2^{b/c}$, sum.
+
+\medskip
+\textbf{Why this matters.}
+\begin{itemize}
+  \item For $b{=}16,\,c{=}2$: two 256-entry tables instead of one
+        65{,}536-entry table.
+  \item Init so $\sum_i T_i \approx \mathrm{GeLU}$, then train end-to-end
+        with the straight-through estimator.
+\end{itemize}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Re-using zkGPT-style Constraint-Fused LayerNorm}
+We adopt \textbf{zkGPT}'s constraint-fused LayerNorm.
+
+\medskip
+\textbf{What it does.} Rewrite the LN identity as integer relations,
+prove them at \emph{one} random row index $r_t$ in four steps:
+\begin{enumerate}
+  \item \textbf{Mean}: degree-2 sumcheck.
+  \item \textbf{Variance}: cubic sumcheck on the centered residual.
+  \item \textbf{Sigma range}: prove
+        $\sigma=\lfloor\sqrt{\mathrm{var}}/d\rfloor$ via two
+        range checks (no $\sqrt{\,}$ in the circuit).
+  \item \textbf{$\bY$ fusion}: one multi-batched cubic sumcheck for
+        the $\gamma\bX$ and $\sigma\bY$ legs together.
+\end{enumerate}
+
+\medskip
+\textbf{Result.} No field divisions, no square roots. Verifier reads
+$\gamma,\beta$ from the VK; everything else is a Hyrax opening.
+
+\medskip
+\begin{block}{Our novel pieces are LLA + ternary projections}
+LayerNorm is the SNARK-friendly piece we \emph{re-use} from prior work.
+\end{block}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Optimization: GKR and Batching}
+\textbf{GKR-style combine.}
+The same committed witness $f$ (e.g.\ $\bX_{\mathrm{n1}}$) is evaluated
+by many sub-protocols at different points.
+\begin{center}
+\begin{tikzpicture}[font=\scriptsize, node distance=0.4cm]
+\node[draw, rounded corners, fill=blue!8] (c1) {claim $f(z_1){=}v_1$};
+\node[draw, rounded corners, fill=blue!8, below=0.05cm of c1] (c2) {claim $f(z_2){=}v_2$};
+\node[below=0.05cm of c2] (cd) {$\vdots$};
+\node[draw, rounded corners, fill=blue!8, below=0.05cm of cd] (ck) {claim $f(z_k){=}v_k$};
+\node[draw, rounded corners, fill=green!10, right=1.0cm of c2, yshift=-0.25cm] (sc) {one sumcheck};
+\node[draw, rounded corners, fill=orange!12, right=0.7cm of sc] (op) {one Hyrax opening};
+\draw[-latex] (c1.east) -- (sc.west);
+\draw[-latex] (c2.east) -- (sc.west);
+\draw[-latex] (ck.east) -- (sc.west);
+\draw[-latex] (sc.east) -- (op.west);
+\end{tikzpicture}
+\end{center}
+$k$ claims on the same $f$ $\;\longrightarrow\;$ \textbf{1 sumcheck $+$ 1 opening}.
+
+\medskip
+\textbf{Cross-block batching.}
+Same protocol type runs once per block. Fold the $L$ per-block claims
+with Fiat--Shamir weights $\eta^{\ell-1}$ before the inner sumcheck.
+\begin{center}
+\begin{tikzpicture}[font=\scriptsize]
+\node[draw, rounded corners, fill=blue!8] (b1) {block 1: $H_1$};
+\node[draw, rounded corners, fill=blue!8, right=0.15cm of b1] (b2) {$H_2$};
+\node[right=0.15cm of b2] (bd) {$\cdots$};
+\node[draw, rounded corners, fill=blue!8, right=0.15cm of bd] (bL) {$H_L$};
+\node[draw, rounded corners, fill=green!10, right=0.6cm of bL] (sc) {one batched sumcheck};
+\draw[-latex] (bL.east) -- (sc.west);
+\end{tikzpicture}
+\end{center}
+
+\textbf{Where we apply it.}
+\begin{itemize}
+  \item All Lasso instances $\to$ one global multi-Lasso.
+  \item All LayerNorm range proofs $\to$ one shared multiplicity.
+  \item Residuals $\to$ \emph{no extra proof}; verifier just adds Hyrax commitments.
+\end{itemize}
+\end{frame}
+
+%======================================================================
+\begin{frame}{End-to-End Performance vs.\ zkGPT}
+x86\_64 CPU, 12 threads. Times are pure compute; IO excluded.
+
+\medskip
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrr}
+\toprule
+& & \multicolumn{2}{c}{\textbf{$\pi$-Former}} & \multicolumn{2}{c}{\textbf{zkGPT}} \\
+\cmidrule(lr){3-4} \cmidrule(lr){5-6}
+\textbf{Model} & \textbf{Params} & Prove & Verify & Prove & Verify \\
+\midrule
+medium  & 924k  & \textbf{2.92\,s} & 0.21\,s          & 19.99\,s  & 0.13\,s   \\
+large   & 5.26M & \textbf{6.39\,s} & 0.37\,s          & 52.59\,s  & 0.44\,s   \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\smallskip
+{\scriptsize medium: $d{=}128,L{=}4,T{=}32$;\;\;
+large: $d{=}256,L{=}6,T{=}32$.}
+
+\medskip
+\textbf{Headline.}
+\begin{itemize}
+  \item \textbf{Prover}: \sys{} is $\sim$\textbf{6.8$\times$} faster at
+        medium and $\sim$\textbf{8.2$\times$} faster at large.
+  \item \textbf{Verifier}: comparable -- zkGPT slightly faster at
+        medium (0.13\,s vs 0.21\,s), \sys{} faster at large
+        (0.37\,s vs 0.44\,s).
+  \item Both are transparent (no trusted setup).
+\end{itemize}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Accuracy Sanity Check: TREC Question Classification}
+\textbf{Task.} TREC-6 \emph{coarse} question type classification
+(Li \& Roth, 2002): 6 classes (\texttt{ABBR / DESC / ENTY / HUM / LOC / NUM}). Char-level encoding,
+$T{=}128$, mean-pooled non-causal classifier on top of the encoder.
+Both models trained for 3{,}000 steps with the same optimizer.
+
+\smallskip
+\smallskip
+
+\begin{columns}[T]
+\begin{column}{0.58\textwidth}
+\centering
+\includegraphics[width=\linewidth]{classify_results_acc.png}
+\end{column}
+\begin{column}{0.40\textwidth}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lr}
+\toprule
+\textbf{Model} & \textbf{Val.\ acc.} \\
+\midrule
+Baseline                  & 74.4\%   \\
+\sys{}                    & 71.0\%   \\
+\bottomrule
+\end{tabular}
+
+\medskip
+$\sim$82k params each, 3{,}000 steps.
+\end{column}
+\end{columns}
+\end{frame}
+
+%======================================================================
+\begin{frame}{Take-aways}
+\begin{enumerate}
+  \item \textbf{Co-design beats approximation.}
+        Replace softmax / GeLU / LN / dense $\bW$ with twins that
+        are \emph{natively} sumcheck $+$ Lasso.
+  \item \textbf{Our novel pieces}: LLA (linear, lookup-based attention)
+        and ternary projections (no in-circuit field mults). LN
+        re-uses zkGPT-style fusion.
+  \item \textbf{Cross-block batching} folds $L$ per-block proofs into
+        6 model-level sumchecks, 1 global Lasso, 1 global range,
+        10 deferred openings.
+  \item \textbf{Result.} 6-layer, 5.26M-parameter transformer:
+        \textbf{6.4\,s prove / 0.37\,s verify}
+        ($\sim$8$\times$ faster prover than zkGPT) on 12 CPU threads,
+        transparent setup.
+\end{enumerate}
+
+\bigskip
+\begin{center}
+\Large Thank you.\\
+\medskip
+\small \texttt{ht2673@columbia.edu}
+\end{center}
+\end{frame}
+
+\end{document}

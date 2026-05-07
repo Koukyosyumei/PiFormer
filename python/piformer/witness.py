@@ -11,8 +11,9 @@ Design contract
   arbitrary signed Python ints converted to BN254 field elements on output.
   Field arithmetic in the Rust prover reproduces the same arithmetic mod p.
 
-* The phi activation clamps inputs to [0, 2^num_bits − 1], so Lasso
-  query_indices are always small non-negative integers.
+* The phi activation uses centered clamp-round quantization into
+  [0, 2^num_bits − 1], so Lasso query_indices are always small
+  non-negative integers while preserving negative inputs.
 
 * LayerNorm witnesses (sum_x, var_x, sigma, y) are small non-negative Python
   ints computed with the exact formula from ``layernorm.rs``.

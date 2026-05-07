@@ -87,9 +87,10 @@ def vec_to_json(v: List[int]) -> List[str]:
 
 
 def quantize_to_int(x: float, scale: float, num_bits: int) -> int:
-    """Clamp-round quantize: returns integer in [0, 2^num_bits - 1]."""
+    """Centered clamp-round quantize: returns integer in [0, 2^num_bits - 1]."""
     max_val = (1 << num_bits) - 1
-    return max(0, min(max_val, round(x / scale)))
+    zero_point = 1 << (num_bits - 1)
+    return max(0, min(max_val, round(x / scale) + zero_point))
 
 
 def apply_phi_int(

@@ -59,12 +59,14 @@ python -m benchmark.plot benchmark_results.json
 | `--seq_len` / `--batch_size` | `128` / `64` | Training shape. |
 | `--d_model` / `--n_heads` / `--n_layers` / `--d_ff` | `128 / 4 / 4 / 512` | Model size. Both models share these. |
 | `--num_bits` / `--c` / `--scale` / `--max_exp` | `8 / 2 / 0.1 / 4` | PiFormer quantization knobs (ignored by baseline). |
+| `--weight_decay` | `0.01` | Applied only to ordinary matrix weights; norm/bias/lookup-table/ternary-scale parameters are excluded. |
+| `--warmup_steps` / `--min_lr_ratio` | `100 / 0.1` | Linear warmup followed by cosine decay; set `--warmup_steps 0 --min_lr_ratio 1` for constant LR. |
 | `--inference_seq_lens` | `64,128,256,512,1024` | Lengths swept for forward-pass timing. |
 | `--skip_inference` | off | Skip the scaling sweep. |
 
 ## What to look for
 
-- **Quality gap.** PiFormer's val perplexity should track the baseline closely at this scale; a large gap suggests the quantization knobs (`num_bits`, `max_exp`, `scale`) need tuning.
+- **Quality gap.** PiFormer's val perplexity should track the baseline more closely after the centered activation quantizer and positive attention kernel initialization. A large remaining gap suggests the quantization knobs (`num_bits`, `max_exp`, `scale`) or PiFormer-specific step budget need tuning.
 - **Throughput at long T.** Linear attention's O(T·d²) compute beats softmax's O(T²·d) once `T > d`. Expect the gap to widen on the inference-scaling plot beyond `T ≈ d_model`.
 - **Peak memory.** Linear attention stores the d×d context matrix, not the T×T attention matrix — memory should grow linearly in T rather than quadratically.
 
