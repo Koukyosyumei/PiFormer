@@ -147,7 +147,17 @@ def copy_state_to_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
 
 @torch.no_grad()
 def init_ternary_from_dense(dst: TernaryLinear, weight: torch.Tensor, bias: torch.Tensor | None):
-    """Initialize a ternary layer from a dense layer using one scalar alpha."""
+    """Initialize a ternary layer from a dense layer using one scalar alpha.
+
+    TernaryLinear.forward computes ``w_eff = blend(w, sign-mask(w)) * alpha``,
+    so we store ``weight / alpha`` in ``dst.weight`` to make the q=0 forward
+    reproduce the original dense weight exactly:
+        q=0:  w_eff = (weight/alpha) * alpha   = weight
+        q=1:  w_eff = sign(weight/alpha) * alpha = sign(weight) * alpha
+    Positive rescaling preserves both the sign pattern and the 0.7-mean
+    threshold mask, so the inherited ternary structure is identical to the
+    one computed from ``weight`` directly.
+    """
     weight = weight.to(device=dst.weight.device, dtype=dst.weight.dtype)
     abs_w = weight.abs()
     selected = abs_w > (0.7 * abs_w.mean())
@@ -155,8 +165,9 @@ def init_ternary_from_dense(dst: TernaryLinear, weight: torch.Tensor, bias: torc
         alpha = abs_w[selected].mean()
     else:
         alpha = abs_w.mean().clamp_min(1e-6)
+    alpha = alpha.clamp_min(1e-6)
 
-    dst.weight.copy_(weight)
+    dst.weight.copy_(weight / alpha)
     dst.alpha.copy_(alpha.to(device=dst.alpha.device, dtype=dst.alpha.dtype))
     if dst.bias is not None and bias is not None:
         dst.bias.copy_(bias.to(device=dst.bias.device, dtype=dst.bias.dtype))
@@ -711,6 +722,22 @@ def main():
         if args.piformer_init_from_baseline:
             print("  initializing PiFormer from trained baseline weights")
             init_piformer_from_baseline_state(model, baseline_state_for_init)
+            # The dense FP weights are already trained, so a long FP warmup
+            # phase wastes budget. If the user is still on the schedule
+            # defaults (0.4 / 0.4), shrink warmup and lengthen ramp.
+            if (
+                args.ternary_qat
+                and args.ternary_warmup_frac == 0.4
+                and args.ternary_ramp_frac == 0.4
+            ):
+                args.ternary_warmup_frac = 0.05
+                args.ternary_ramp_frac = 0.55
+                print(
+                    f"  init_from_baseline: shrinking QAT schedule to "
+                    f"warmup={args.ternary_warmup_frac:.2f} "
+                    f"ramp={args.ternary_ramp_frac:.2f} "
+                    f"(pass --ternary_warmup_frac/--ternary_ramp_frac to override)"
+                )
         model = maybe_compile_model("piformer", model, args, device)
         results["models"]["piformer"] = train_one(
             "piformer", model, train_ids, val_ids, args, device, piformer_steps
