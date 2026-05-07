@@ -1866,6 +1866,35 @@ mod tests {
     }
 
     #[test]
+    fn test_model_rejects_missing_ffn_lasso_output_binding() {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_missing_ffn_lasso_output_binding");
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        proof.ffn_lasso_proof.output_sumcheck = None;
+        proof.ffn_lasso_proof.output_batch_open = None;
+
+        let mut vt = Transcript::new(b"model_missing_ffn_lasso_output_binding");
+        let result = verify(
+            &proof,
+            &pk.vk,
+            &inst_attn,
+            &inst_ffn,
+            &model_wit.x_in,
+            &model_wit.lm_head_wit.y,
+            &mut vt,
+            &lp,
+        );
+        assert!(
+            result.is_err(),
+            "Should reject missing FFN Lasso committed-output binding"
+        );
+    }
+
+    #[test]
     fn test_model_rejects_tampered_batch_ffn_y_a_eval() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);

@@ -777,6 +777,10 @@ pub fn prove_lasso_multi(
                 transcript.append_field(b"lasso_out", out);
             }
         }
+    } else {
+        for binding in output_bindings {
+            absorb_com(transcript, b"lasso_output_com", &binding.com);
+        }
     }
 
     // --- STEP 3: チャレンジの生成 ---
@@ -1005,6 +1009,9 @@ pub fn verify_lasso_multi_committed_outputs(
     transcript: &mut Transcript,
     params: &HyraxParams,
 ) -> Result<(), String> {
+    if proof.output_sumcheck.is_none() || proof.output_batch_open.is_none() {
+        return Err("committed multi-Lasso proof is missing output binding".into());
+    }
     let empty_outputs: Vec<&[F]> = vec![&[]; multi_instance.instances.len()];
     verify_lasso_multi_with_outputs(
         proof,
@@ -1047,6 +1054,16 @@ fn verify_lasso_multi_with_outputs(
             for out in *outputs {
                 transcript.append_field(b"lasso_out", out);
             }
+        }
+    } else {
+        if output_coms.len() != t_count {
+            return Err(format!(
+                "output_coms length {} does not match instance count {t_count}",
+                output_coms.len()
+            ));
+        }
+        for (com, _) in output_coms {
+            absorb_com(transcript, b"lasso_output_com", com);
         }
     }
 
