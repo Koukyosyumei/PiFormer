@@ -24,7 +24,7 @@ use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::{field::F, poly::DenseMLPoly, transcript::Transcript};
+use crate::{field::F, poly::utils::TernaryValue, poly::DenseMLPoly, transcript::Transcript};
 
 // ---------------------------------------------------------------------------
 // Global HyraxParams cache: HyraxParams::new(sigma) is expensive (2^sigma G1
@@ -107,6 +107,53 @@ pub fn hyrax_commit(evals: &[F], nu: usize, params: &HyraxParams) -> HyraxCommit
     }
 }
 
+/// Commit to a row-major ternary matrix as the same padded multilinear
+/// polynomial produced by `mat_to_mle(convert_tm_to_fm(w), rows, cols)`.
+pub fn hyrax_commit_ternary_matrix(
+    w: &[Vec<TernaryValue>],
+    rows: usize,
+    cols: usize,
+    nu: usize,
+    params: &HyraxParams,
+) -> HyraxCommitment {
+    let sigma = params.sigma;
+    let num_rows = 1 << nu;
+    let num_cols = 1 << sigma;
+    let padded_cols = cols.next_power_of_two().max(1);
+    assert_eq!(
+        rows.next_power_of_two().max(1) * padded_cols,
+        num_rows * num_cols,
+        "ternary matrix shape does not match Hyrax dimensions"
+    );
+
+    let row_coms = (0..num_rows)
+        .into_par_iter()
+        .map(|i| {
+            let mut acc = G1Projective::zero();
+            for j in 0..num_cols {
+                let flat_idx = i * num_cols + j;
+                let row = flat_idx / padded_cols;
+                let col = flat_idx % padded_cols;
+                if row >= rows || col >= cols {
+                    continue;
+                }
+                match w[row][col] {
+                    TernaryValue::ONE => acc += params.gens[j].into_group(),
+                    TernaryValue::MINUSONE => acc -= params.gens[j].into_group(),
+                    TernaryValue::ZERO => {}
+                }
+            }
+            acc.into_affine()
+        })
+        .collect();
+
+    HyraxCommitment {
+        row_coms,
+        nu,
+        sigma,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Opening
 // ---------------------------------------------------------------------------
@@ -143,6 +190,53 @@ pub fn hyrax_open(evals: &[F], point: &[F], nu: usize, sigma: usize) -> HyraxPro
                 .enumerate()
                 .map(|(i, &l_i)| l_i * evals[i * num_cols + j])
                 .sum()
+        })
+        .collect();
+
+    HyraxProof { w_prime }
+}
+
+/// Open a ternary matrix committed by `hyrax_commit_ternary_matrix`.
+///
+/// The proof format is unchanged: `w_prime[j] = sum_i L_i * W[i,j]`.
+pub fn hyrax_open_ternary_matrix(
+    w: &[Vec<TernaryValue>],
+    rows: usize,
+    cols: usize,
+    point: &[F],
+    nu: usize,
+    sigma: usize,
+) -> HyraxProof {
+    let num_cols = 1 << sigma;
+    let padded_cols = cols.next_power_of_two().max(1);
+    assert_eq!(point.len(), nu + sigma, "point dimension mismatch");
+    assert_eq!(
+        rows.next_power_of_two().max(1) * padded_cols,
+        (1 << nu) * num_cols,
+        "ternary matrix shape does not match Hyrax dimensions"
+    );
+
+    let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
+    let l_vec = lagrange_basis(&r_l_rev);
+
+    let w_prime: Vec<F> = (0..num_cols)
+        .into_par_iter()
+        .map(|j| {
+            let mut acc = F::ZERO;
+            for (i, &l_i) in l_vec.iter().enumerate() {
+                let flat_idx = i * num_cols + j;
+                let row = flat_idx / padded_cols;
+                let col = flat_idx % padded_cols;
+                if row >= rows || col >= cols {
+                    continue;
+                }
+                match w[row][col] {
+                    TernaryValue::ONE => acc += l_i,
+                    TernaryValue::MINUSONE => acc -= l_i,
+                    TernaryValue::ZERO => {}
+                }
+            }
+            acc
         })
         .collect();
 
