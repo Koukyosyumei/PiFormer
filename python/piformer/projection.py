@@ -32,6 +32,11 @@ class TernaryLinear(nn.Module):
         # 3値重みにこれを掛けることで、モデルの表現力を維持する
         self.alpha = nn.Parameter(torch.tensor(1.0))
 
+        # Gradual QAT knob: 0.0 → pure FP weights, 1.0 → pure ternary.
+        # Trainers can ramp this from 0 to 1 over the course of training so the
+        # FP weights first find a good basin, then are gently snapped to {-1,0,1}.
+        self.register_buffer("quant_strength", torch.tensor(1.0))
+
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
@@ -61,14 +66,23 @@ class TernaryLinear(nn.Module):
         return w_q * self.alpha
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 学習時は STE (Straight-Through Estimator)
+        # Mix FP and ternary weights according to quant_strength.
+        # forward = (1-q)*w + q*w_quant ; backward = identity in self.weight (STE).
+        q = float(self.quant_strength)
         if self.training:
-            w_q = self._quantize(self.weight).detach() + (self.weight - self.weight.detach())
+            if q == 0.0:
+                w_eff = self.weight
+            else:
+                w_quant = self._quantize(self.weight).detach()
+                w_eff = self.weight + q * (w_quant - self.weight.detach())
         else:
-            w_q = self._quantize(self.weight)
+            if q == 0.0:
+                w_eff = self.weight
+            else:
+                w_quant = self._quantize(self.weight)
+                w_eff = (1.0 - q) * self.weight + q * w_quant
 
-        # 行列演算 (ZKP側では加減算のみになる)
-        return F.linear(x, w_q, self.bias)
+        return F.linear(x, w_eff, self.bias)
 
     @torch.no_grad()
     def export_weights(self) -> dict:

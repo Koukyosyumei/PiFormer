@@ -172,6 +172,8 @@ pub struct JsonWeights {
     pub d_model: usize,
     pub d_ff: usize,
     pub vocab_size: usize,
+    #[serde(default)]
+    pub causal: bool,
     pub blocks: Vec<JsonBlockWeights>,
     pub final_ln_gamma: Vec<String>,
     pub final_ln_beta: Vec<String>,
@@ -233,6 +235,7 @@ pub fn weights_to_json(w: &TransformerModelWeights) -> JsonWeights {
         d_model: w.d_model,
         d_ff: w.d_ff,
         vocab_size: w.vocab_size,
+        causal: w.causal,
         blocks,
         final_ln_gamma: vec_to_json(&w.final_ln_gamma),
         final_ln_beta: vec_to_json(&w.final_ln_beta),
@@ -279,6 +282,7 @@ pub fn weights_from_json(j: JsonWeights) -> Result<TransformerModelWeights, Stri
         d_model: j.d_model,
         d_ff: j.d_ff,
         vocab_size: j.vocab_size,
+        causal: j.causal,
         blocks: blocks?,
         final_ln_gamma: vec_from_json(j.final_ln_gamma)?,
         final_ln_beta: vec_from_json(j.final_ln_beta)?,
@@ -303,6 +307,8 @@ pub struct JsonLassoInstance {
 pub struct JsonAttnInstance {
     pub seq_len: usize,
     pub d_head: usize,
+    #[serde(default)]
+    pub causal: bool,
     pub q_lasso: JsonLassoInstance,
     pub k_lasso: JsonLassoInstance,
     #[serde(default)]
@@ -343,6 +349,8 @@ pub struct JsonAttnWitness {
     #[serde(default)]
     pub k_query_indices: Vec<usize>,
     pub context: Vec<Vec<String>>,
+    #[serde(default)]
+    pub causal_context: Option<Vec<Vec<String>>>,
     pub out: Vec<Vec<String>>,
 }
 
@@ -466,6 +474,7 @@ fn attn_wit_to_json(w: &LinearAttentionWitness) -> JsonAttnWitness {
         q_query_indices: w.q_query_indices.clone(),
         k_query_indices: w.k_query_indices.clone(),
         context: mat_to_json(&w.context),
+        causal_context: w.causal_context.as_ref().map(|m| mat_to_json(m)),
         out: mat_to_json(&w.out),
     }
 }
@@ -480,6 +489,11 @@ fn attn_wit_from_json(j: JsonAttnWitness) -> Result<LinearAttentionWitness, Stri
         q_query_indices: j.q_query_indices,
         k_query_indices: j.k_query_indices,
         context: mat_from_json(j.context)?,
+        causal_context: j
+            .causal_context
+            .map(mat_from_json)
+            .transpose()
+            .map_err(|e| format!("causal_context: {e}"))?,
         out: mat_from_json(j.out)?,
     })
 }
@@ -533,6 +547,7 @@ pub fn witness_to_json(
         inst_attn: JsonAttnInstance {
             seq_len: inst_attn.seq_len,
             d_head: inst_attn.d_head,
+            causal: inst_attn.causal,
             q_lasso: lasso_to_json(&inst_attn.q_lasso),
             k_lasso: lasso_to_json(&inst_attn.k_lasso),
             q_query_indices: inst_attn.q_query_indices.clone(),
@@ -564,6 +579,7 @@ pub fn witness_from_json(
     let inst_attn = LinearAttentionInstance {
         seq_len: j.inst_attn.seq_len,
         d_head: j.inst_attn.d_head,
+        causal: j.inst_attn.causal,
         q_lasso: lasso_from_json(j.inst_attn.q_lasso)?,
         k_lasso: lasso_from_json(j.inst_attn.k_lasso)?,
         q_query_indices: j.inst_attn.q_query_indices,

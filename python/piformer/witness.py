@@ -116,6 +116,38 @@ def _attn_out(
     return mat_mul_int(phi_q, context)
 
 
+def _causal_context_matrix(
+    phi_k: List[List[int]], v: List[List[int]]
+) -> List[List[int]]:
+    """Flattened prefix contexts C_i = Σ_{s<=i} φ(K_s)^T · V_s as (T*d, d)."""
+    t, d = len(phi_k), len(phi_k[0])
+    prefix = [[0 for _ in range(d)] for _ in range(d)]
+    context: List[List[int]] = []
+    for i in range(t):
+        for a in range(d):
+            k_ia = phi_k[i][a]
+            for b in range(d):
+                prefix[a][b] += k_ia * v[i][b]
+        for a in range(d):
+            context.append(prefix[a][:])
+    return context
+
+
+def _causal_attn_out(
+    phi_q: List[List[int]], causal_context: List[List[int]]
+) -> List[List[int]]:
+    """out_i = φ(Q_i) · C_i for flattened C_i rows (i*d + a, b)."""
+    t, d = len(phi_q), len(phi_q[0])
+    out = [[0 for _ in range(d)] for _ in range(t)]
+    for i in range(t):
+        for a in range(d):
+            q_ia = phi_q[i][a]
+            ctx_row = causal_context[i * d + a]
+            for b in range(d):
+                out[i][b] += q_ia * ctx_row[b]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # LN weight preparation
 # ---------------------------------------------------------------------------
@@ -244,8 +276,14 @@ def _gen_block_witness(
     )
 
     # ---- Linear attention ----
+    causal = bool(getattr(attn, "causal", False))
     context = _context_matrix(phi_k, v_raw)  # (d_head, d_head)
-    attn_out = _attn_out(phi_q, context)     # (T, d_head)
+    causal_context = None
+    if causal:
+        causal_context = _causal_context_matrix(phi_k, v_raw)
+        attn_out = _causal_attn_out(phi_q, causal_context)  # (T, d_head)
+    else:
+        attn_out = _attn_out(phi_q, context)  # (T, d_head)
 
     # ---- Output projection ----
     w_o = extract_ternary_weight_matrix(
@@ -364,6 +402,8 @@ def _gen_block_witness(
         },
         "x_out": mat_to_json(x_out),
     }
+    if causal_context is not None:
+        block_wit["attn"]["causal_context"] = mat_to_json(causal_context)
 
     # Return metadata needed to build LassoInstances at the top level
     block_wit["_attn_lasso"] = (q_lasso, k_lasso)
@@ -432,6 +472,7 @@ class WitnessGenerator:
         model.eval()
         seq_len = len(token_ids)
         d_model = model.d_model
+        causal = bool(getattr(model, "causal", False))
 
         # ---- Initial embeddings (float → integer) ----
         with torch.no_grad():
@@ -507,6 +548,7 @@ class WitnessGenerator:
             "inst_attn": {
                 "seq_len": seq_len,
                 "d_head": d_model,
+                "causal": causal,
                 "q_lasso": q_lasso_last,
                 "k_lasso": k_lasso_last,
                 "q_query_indices": q_lasso_last["query_indices"],

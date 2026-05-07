@@ -38,6 +38,7 @@ class LinearAttentionLayer(nn.Module):
         scale: float = 0.1,
         max_exp: int = 4,
         eps: float = 1e-6,
+        causal: bool = False,
     ):
         super().__init__()
         assert d_model % n_heads == 0
@@ -45,6 +46,7 @@ class LinearAttentionLayer(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.eps = eps
+        self.causal = causal
 
         self.q_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=False)
         self.k_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=False)
@@ -77,15 +79,22 @@ class LinearAttentionLayer(nn.Module):
         phiQ = self.phi(Q)  # (B, n_heads, T, d_head)
         phiK = self.phi(K)
 
-        # context = φ(K)^T · V  →  (B, n_heads, d_head, d_head)
-        # Einsum: for each head, contract over the sequence dimension T.
-        context = torch.einsum("bhnd,bhnm->bhdm", phiK, V)
+        if self.causal:
+            # Prefix context C_t = Σ_{s<=t} φ(K_s)^T · V_s.
+            kv = torch.einsum("bhnd,bhnm->bhndm", phiK, V)
+            context = kv.cumsum(dim=2)
+            out = torch.einsum("bhnd,bhndm->bhnm", phiQ, context)
+            k_sum = phiK.cumsum(dim=2)
+        else:
+            # context = φ(K)^T · V  →  (B, n_heads, d_head, d_head)
+            # Einsum: for each head, contract over the sequence dimension T.
+            context = torch.einsum("bhnd,bhnm->bhdm", phiK, V)
 
-        # out = φ(Q) · context  →  (B, n_heads, T, d_head)
-        out = torch.einsum("bhnd,bhdm->bhnm", phiQ, context)
+            # out = φ(Q) · context  →  (B, n_heads, T, d_head)
+            out = torch.einsum("bhnd,bhdm->bhnm", phiQ, context)
+            k_sum = phiK.sum(dim=2, keepdim=True)
 
-        # Normalizer Z_t = φ(Q_t) · Σ_s φ(K_s)
-        k_sum = phiK.sum(dim=2, keepdim=True)              # (B, n_heads, 1, d_head)
+        # Normalizer Z_t = φ(Q_t) · Σ_s φ(K_s), or causal prefix Σ_{s<=t}.
         Z = (phiQ * k_sum).sum(dim=-1, keepdim=True).clamp(min=self.eps)
         out = out / Z
 

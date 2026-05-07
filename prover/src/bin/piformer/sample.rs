@@ -70,6 +70,7 @@ pub fn build_zero_weights(
         d_model,
         d_ff,
         vocab_size,
+        causal: false,
         blocks: (0..num_blocks)
             .map(|_| make_block(d_model, d_ff, 4))
             .collect(),
@@ -146,6 +147,7 @@ pub fn build_zero_witness(
             q_query_indices: vec![0; seq_len * d_model],
             k_query_indices: vec![0; seq_len * d_model],
             context: zero_dd,
+            causal_context: None,
             out: zero_td.clone(),
         },
         o_proj_wit: ProjectionWitness {
@@ -178,6 +180,7 @@ pub fn build_zero_witness(
     let inst_attn = LinearAttentionInstance {
         seq_len,
         d_head: d_model,
+        causal: false,
         q_lasso: make_lasso(num_queries_td),
         k_lasso: make_lasso(num_queries_td),
         q_query_indices: vec![0usize; num_queries_td],

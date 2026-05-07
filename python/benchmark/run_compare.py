@@ -34,6 +34,7 @@ import torch
 import torch.nn as nn
 
 from piformer.model import PiFormerModel
+from piformer.projection import TernaryLinear
 
 from .baseline import BaselineTransformer
 from .data import get_dataset, random_batch
@@ -73,6 +74,44 @@ def peak_memory_mb(device) -> float:
     return torch.cuda.max_memory_allocated() / (1024 ** 2)
 
 
+# ---------------------------------------------------------------------------
+# Gradual ternary QAT schedule
+# ---------------------------------------------------------------------------
+#
+# Training a ternary network from scratch tends to underfit because the
+# {-1, 0, +1} constraint is too aggressive for the optimizer to find a good
+# basin. Instead we ramp every TernaryLinear's `quant_strength` from 0 → 1
+# across three phases:
+#
+#   phase 1: warmup    (q = 0)        full-precision pretrain
+#   phase 2: ramp      (q: 0 → 1)     gentle interpolation to ternary
+#   phase 3: finetune  (q = 1)        pure ternary, optionally lower LR
+#
+# Phase boundaries are expressed as fractions of args.steps. The default split
+# (0.4 / 0.4 / 0.2) gives the FP weights time to settle, then ramps long
+# enough that any single step's quantization shock is small.
+
+def _ternary_modules(model: nn.Module):
+    return [m for m in model.modules() if isinstance(m, TernaryLinear)]
+
+
+def _set_quant_strength(modules, q: float):
+    for m in modules:
+        m.quant_strength.fill_(q)
+
+
+def _qat_schedule(step: int, total_steps: int, warmup_frac: float, ramp_frac: float):
+    """Return (q, phase) for a given step. Phase ∈ {'warmup','ramp','finetune'}."""
+    warmup_end = int(round(total_steps * warmup_frac))
+    ramp_end = int(round(total_steps * (warmup_frac + ramp_frac)))
+    if step <= warmup_end:
+        return 0.0, "warmup"
+    if step <= ramp_end:
+        span = max(1, ramp_end - warmup_end)
+        return (step - warmup_end) / span, "ramp"
+    return 1.0, "finetune"
+
+
 def train_one(
     name: str,
     model: nn.Module,
@@ -85,7 +124,25 @@ def train_one(
     print(f"  params: {count_params(model):,}")
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    history = {"step": [], "train_loss": [], "val_loss": []}
+    history = {"step": [], "train_loss": [], "val_loss": [], "quant_strength": []}
+
+    # Identify ternary layers and decide whether to schedule quant_strength.
+    tern_modules = _ternary_modules(model)
+    use_qat = bool(tern_modules) and args.ternary_qat
+    if use_qat:
+        print(
+            f"  gradual QAT: warmup={args.ternary_warmup_frac:.2f} "
+            f"ramp={args.ternary_ramp_frac:.2f} "
+            f"finetune_lr_mult={args.ternary_finetune_lr_mult:g} "
+            f"({len(tern_modules)} TernaryLinear layers)"
+        )
+        # Start in the warmup phase (q=0) so weights train at full precision.
+        _set_quant_strength(tern_modules, 0.0)
+    elif tern_modules:
+        # QAT disabled: keep the original behavior (always fully ternary).
+        _set_quant_strength(tern_modules, 1.0)
+
+    finetune_lr_applied = False
 
     reset_peak_memory(device)
     model.train()
@@ -104,7 +161,29 @@ def train_one(
 
     t0 = time.perf_counter()
     running = 0.0
+    cur_q = 1.0
+    cur_phase = "finetune"
     for step in range(1, args.steps + 1):
+        if use_qat:
+            cur_q, new_phase = _qat_schedule(
+                step, args.steps,
+                args.ternary_warmup_frac, args.ternary_ramp_frac,
+            )
+            _set_quant_strength(tern_modules, cur_q)
+            # Drop LR once when entering the finetune phase, so the now-snapped
+            # ternary weights settle without big optimizer steps disturbing them.
+            if (
+                not finetune_lr_applied
+                and new_phase == "finetune"
+                and args.ternary_finetune_lr_mult != 1.0
+            ):
+                for g in optim.param_groups:
+                    g["lr"] *= args.ternary_finetune_lr_mult
+                finetune_lr_applied = True
+                print(f"  [step {step}] entering finetune phase: lr → "
+                      f"{optim.param_groups[0]['lr']:.2e}")
+            cur_phase = new_phase
+
         x, y = random_batch(train_ids, args.batch_size, args.seq_len, device)
         logits = model(x)
         loss = nn.functional.cross_entropy(
@@ -122,11 +201,18 @@ def train_one(
             history["step"].append(step)
             history["train_loss"].append(avg)
             history["val_loss"].append(val)
-            print(f"  step {step:5d}  train={avg:.4f}  val={val:.4f}")
+            history["quant_strength"].append(cur_q)
+            qat_tag = f"  q={cur_q:.2f} [{cur_phase}]" if use_qat else ""
+            print(f"  step {step:5d}  train={avg:.4f}  val={val:.4f}{qat_tag}")
 
     if device.type == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
+
+    # Pin to fully ternary weights for final evaluation and downstream
+    # inference benchmarks — that's the model we'll actually ship.
+    if tern_modules:
+        _set_quant_strength(tern_modules, 1.0)
 
     final_val = eval_loss(model, val_ids, args.batch_size, args.seq_len, device, n_batches=50)
     return {
@@ -200,6 +286,10 @@ def parse_args():
     p.add_argument("--n_heads", type=int, default=4)
     p.add_argument("--n_layers", type=int, default=4)
     p.add_argument("--d_ff", type=int, default=512)
+    p.add_argument("--causal", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Use autoregressive attention. Applies a causal mask to "
+                        "the baseline and prefix linear attention to PiFormer.")
 
     # PiFormer-only knobs
     p.add_argument("--num_bits", type=int, default=8)
@@ -214,6 +304,18 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--log_every", type=int, default=200)
     p.add_argument("--seed", type=int, default=0)
+
+    # Gradual ternary QAT schedule (only affects models with TernaryLinear)
+    p.add_argument("--ternary_qat", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Enable warmup → ramp → finetune schedule for ternary weights. "
+                        "Use --no-ternary_qat to fall back to ternary-from-scratch.")
+    p.add_argument("--ternary_warmup_frac", type=float, default=0.4,
+                   help="Fraction of steps with full-precision weights (q=0).")
+    p.add_argument("--ternary_ramp_frac", type=float, default=0.4,
+                   help="Fraction of steps over which q ramps 0 → 1.")
+    p.add_argument("--ternary_finetune_lr_mult", type=float, default=0.1,
+                   help="LR multiplier applied once at the start of the q=1 finetune phase.")
 
     # Models to run
     p.add_argument("--models", default="baseline,piformer",
@@ -242,6 +344,7 @@ def main():
     train_ids, val_ids, vocab_size, _decode = get_dataset(args.dataset, cache_dir)
     print(f"Dataset: {args.dataset}   vocab={vocab_size}   "
           f"train_tokens={len(train_ids):,}   val_tokens={len(val_ids):,}")
+    print(f"Attention mode: {'causal' if args.causal else 'bidirectional'}")
 
     common = dict(
         vocab_size=vocab_size,
@@ -249,6 +352,7 @@ def main():
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         d_ff=args.d_ff,
+        causal=args.causal,
         max_seq_len=max(args.seq_len,
                         max(int(s) for s in args.inference_seq_lens.split(","))),
     )

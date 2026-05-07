@@ -23,12 +23,13 @@ import torch.nn.functional as F
 
 
 class SoftmaxAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int):
+    def __init__(self, d_model: int, n_heads: int, causal: bool = False):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
+        self.causal = causal
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
@@ -41,6 +42,9 @@ class SoftmaxAttention(nn.Module):
         V = self.v_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
+        if self.causal:
+            mask = torch.ones(T, T, dtype=torch.bool, device=x.device).triu(1)
+            scores = scores.masked_fill(mask, float("-inf"))
         attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, V)
 
@@ -59,10 +63,10 @@ class BaselineFFN(nn.Module):
 
 
 class BaselineBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, causal: bool = False):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = SoftmaxAttention(d_model, n_heads)
+        self.attn = SoftmaxAttention(d_model, n_heads, causal=causal)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = BaselineFFN(d_model, d_ff)
 
@@ -83,15 +87,17 @@ class BaselineTransformer(nn.Module):
         n_layers: int,
         d_ff: int,
         max_seq_len: int = 512,
+        causal: bool = False,
         # Quantization kwargs accepted and ignored so the comparison harness
         # can call both constructors with identical signatures.
         **_unused,
     ):
         super().__init__()
+        self.causal = causal
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
         self.blocks = nn.ModuleList(
-            [BaselineBlock(d_model, n_heads, d_ff) for _ in range(n_layers)]
+            [BaselineBlock(d_model, n_heads, d_ff, causal=causal) for _ in range(n_layers)]
         )
         self.norm = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)

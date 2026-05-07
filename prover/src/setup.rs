@@ -58,6 +58,7 @@ pub struct TransformerModelWeights {
     pub d_model: usize,
     pub d_ff: usize,
     pub vocab_size: usize,
+    pub causal: bool,
 
     pub blocks: Vec<TransformerBlockWeights>,
 
@@ -192,6 +193,7 @@ pub fn preprocess_transformer_model(
         seq_len: t,
         d_model: d,
         vocab_size: v,
+        causal: weights.causal,
         block_vks,
         final_ln_vk,
         lm_head_vk: lm_head_pk.vk.clone(),
