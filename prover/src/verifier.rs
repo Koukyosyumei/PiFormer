@@ -897,10 +897,9 @@ pub fn verify(
         .iter()
         .map(|bp| bp.x_norm1_com.clone())
         .collect();
-    let x_norm1_evals: Vec<F> = proof.batch_qkv.final_evals_f.clone();
     hyrax_verify_batch(
         &x_norm1_coms,
-        &x_norm1_evals,
+        &proof.batch_qkv.final_evals_f,
         &x_norm1_point,
         &proof.x_norm1_batch_open,
         &params_td,
@@ -1081,10 +1080,9 @@ pub fn verify(
         .iter()
         .map(|bvk| bvk.ffn_vk.w2_com.clone())
         .collect();
-    let w2_evals: Vec<F> = proof.batch_ffn_y.final_evals_g.clone();
     hyrax_verify_batch(
         &w2_coms,
-        &w2_evals,
+        &proof.batch_ffn_y.final_evals_g,
         &w2_point,
         &proof.w2_batch_open,
         &params_wff,
@@ -1099,10 +1097,9 @@ pub fn verify(
         .iter()
         .map(|bp| bp.ffn_a_com.clone())
         .collect();
-    let ffn_a_evals: Vec<F> = proof.batch_ffn_y.final_evals_f.clone();
     hyrax_verify_batch(
         &ffn_a_coms,
-        &ffn_a_evals,
+        &proof.batch_ffn_y.final_evals_f,
         &ffn_a_point,
         &proof.ffn_a_batch_open,
         &params_mff,
@@ -1117,10 +1114,9 @@ pub fn verify(
         .iter()
         .map(|bvk| bvk.ffn_vk.w1_com.clone())
         .collect();
-    let w1_evals: Vec<F> = proof.batch_ffn_m.final_evals_g.clone();
     hyrax_verify_batch(
         &w1_coms,
-        &w1_evals,
+        &proof.batch_ffn_m.final_evals_g,
         &w1_point,
         &proof.w1_batch_open,
         &params_wff,
@@ -1135,10 +1131,9 @@ pub fn verify(
         .iter()
         .map(|bp| bp.x_norm2_com.clone())
         .collect();
-    let x_norm2_evals: Vec<F> = proof.batch_ffn_m.final_evals_f.clone();
     hyrax_verify_batch(
         &x_norm2_coms,
-        &x_norm2_evals,
+        &proof.batch_ffn_m.final_evals_f,
         &x_norm2_point,
         &proof.x_norm2_batch_open,
         &params_td,
@@ -1171,10 +1166,9 @@ pub fn verify(
         .iter()
         .map(|bp| bp.attn_phi_q_com.clone())
         .collect();
-    let phi_q_evals: Vec<F> = proof.batch_attn_out.final_evals_f.clone();
     hyrax_verify_batch(
         &phi_q_coms,
-        &phi_q_evals,
+        &proof.batch_attn_out.final_evals_f,
         &phi_q_attn_point,
         &proof.phi_q_batch_open,
         &params_td,
@@ -1189,10 +1183,9 @@ pub fn verify(
         .iter()
         .map(|bp| bp.attn_phi_k_com.clone())
         .collect();
-    let phi_k_evals: Vec<F> = proof.batch_attn_ctx.final_evals_f.clone();
     hyrax_verify_batch(
         &phi_k_coms,
-        &phi_k_evals,
+        &proof.batch_attn_ctx.final_evals_f,
         &phi_k_attn_point,
         &proof.phi_k_batch_open,
         &params_td,
@@ -1207,10 +1200,9 @@ pub fn verify(
         .iter()
         .map(|bp| bp.v_com.clone())
         .collect();
-    let v_attn_evals: Vec<F> = proof.batch_attn_ctx.final_evals_g.clone();
     hyrax_verify_batch(
         &v_attn_coms,
-        &v_attn_evals,
+        &proof.batch_attn_ctx.final_evals_g,
         &v_attn_batch_point,
         &proof.v_attn_batch_open,
         &params_td,

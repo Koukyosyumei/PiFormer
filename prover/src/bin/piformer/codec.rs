@@ -50,7 +50,7 @@ const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
 const VERSION: u8 = 2;
-const PROOF_VERSION: u8 = 7;
+const PROOF_VERSION: u8 = 8;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -178,6 +178,77 @@ fn write_vec_usize<W: Write>(w: &mut W, v: &[usize]) -> io::Result<()> {
 fn read_vec_usize<R: Read>(r: &mut R) -> io::Result<Vec<usize>> {
     read_vec(r, read_usize)
 }
+fn bits_required_usize(value: usize) -> u8 {
+    if value == 0 {
+        1
+    } else {
+        (usize::BITS - value.leading_zeros()) as u8
+    }
+}
+fn write_packed_vec_usize<W: Write>(w: &mut W, v: &[usize]) -> io::Result<()> {
+    write_usize(w, v.len())?;
+    let bits = v
+        .iter()
+        .copied()
+        .max()
+        .map(bits_required_usize)
+        .unwrap_or(0);
+    w.write_all(&[bits])?;
+    if v.is_empty() {
+        return Ok(());
+    }
+    let bit_len = v.len().checked_mul(bits as usize).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "packed usize vector too large")
+    })?;
+    let mut packed = vec![0u8; bit_len.div_ceil(8)];
+    for (i, &value) in v.iter().enumerate() {
+        for bit in 0..bits as usize {
+            if ((value >> bit) & 1) != 0 {
+                let pos = i * bits as usize + bit;
+                packed[pos / 8] |= 1u8 << (pos % 8);
+            }
+        }
+    }
+    w.write_all(&packed)
+}
+fn read_packed_vec_usize<R: Read>(r: &mut R) -> io::Result<Vec<usize>> {
+    let len = read_usize(r)?;
+    let mut bits_buf = [0u8; 1];
+    r.read_exact(&mut bits_buf)?;
+    let bits = bits_buf[0] as usize;
+    if len == 0 {
+        if bits != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty packed usize vector has non-zero bit width",
+            ));
+        }
+        return Ok(Vec::new());
+    }
+    if bits == 0 || bits > usize::BITS as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid packed usize bit width",
+        ));
+    }
+    let bit_len = len.checked_mul(bits).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "packed usize vector too large")
+    })?;
+    let mut packed = vec![0u8; bit_len.div_ceil(8)];
+    r.read_exact(&mut packed)?;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let mut value = 0usize;
+        for bit in 0..bits {
+            let pos = i * bits + bit;
+            if ((packed[pos / 8] >> (pos % 8)) & 1) != 0 {
+                value |= 1usize << bit;
+            }
+        }
+        out.push(value);
+    }
+    Ok(out)
+}
 fn write_bool<W: Write>(w: &mut W, b: bool) -> io::Result<()> {
     w.write_all(&[b as u8])
 }
@@ -288,10 +359,7 @@ fn read_selector_sumcheck<R: Read>(r: &mut R) -> io::Result<SelectorSumcheckProo
         final_eval_chunk: read_f(r)?,
     })
 }
-fn write_selector_binding_proof<W: Write>(
-    w: &mut W,
-    p: &SelectorBindingProof,
-) -> io::Result<()> {
+fn write_selector_binding_proof<W: Write>(w: &mut W, p: &SelectorBindingProof) -> io::Result<()> {
     write_selector_sumcheck(w, &p.sumcheck)?;
     write_hyrax_proof(w, &p.chunk_open)
 }
@@ -442,7 +510,7 @@ fn read_sumcheck_cubic_proof_multi<R: Read>(r: &mut R) -> io::Result<SumcheckCub
 fn write_lasso_multi_proof<W: Write>(w: &mut W, p: &LassoMultiProof) -> io::Result<()> {
     write_vec(w, &p.all_outputs, |w, v: &Vec<F>| write_vec_f(w, v))?;
     write_vec(w, &p.all_query_indices, |w, v: &Vec<usize>| {
-        write_vec_usize(w, v)
+        write_packed_vec_usize(w, v)
     })?;
     write_f(w, &p.combined_grand_sum)?;
     write_sumcheck_proof_multi(w, &p.combined_sumcheck_proof)?;
@@ -454,16 +522,16 @@ fn write_lasso_multi_proof<W: Write>(w: &mut W, p: &LassoMultiProof) -> io::Resu
         write_sumcheck_proof_multi(w, sc)?;
         write_hyrax_proof(
             w,
-            p.output_batch_open
-                .as_ref()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing output_batch_open"))?,
+            p.output_batch_open.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing output_batch_open")
+            })?,
         )?;
     }
     write_vec(w, &p.l_k_evals_multi, |w, v: &Vec<F>| write_vec_f(w, v))
 }
 fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
     let all_outputs = read_vec(r, |r| read_vec_f(r))?;
-    let all_query_indices = read_vec(r, |r| read_vec_usize(r))?;
+    let all_query_indices = read_vec(r, |r| read_packed_vec_usize(r))?;
     let combined_grand_sum = read_f(r)?;
     let combined_sumcheck_proof = read_sumcheck_proof_multi(r)?;
     let table_openings = read_vec(r, |r| read_vec_f(r))?;
