@@ -252,7 +252,6 @@ pub fn hyrax_verify_batch(
     let count = commitments.len();
     assert_eq!(evals.len(), count);
     let nu = commitments[0].nu;
-    let sigma = commitments[0].sigma;
 
     // 1. チャレンジ η の再現
     let eta = transcript.challenge_field::<F>(b"hyrax_batch_eta");
@@ -1051,7 +1050,7 @@ mod batched_hyrax_tests {
         let mut rng = test_rng();
         let (nu, sigma) = (2, 2);
         let params = HyraxParams::new(sigma);
-        let mut evals_list = vec![vec![Fr::rand(&mut rng); 16], vec![Fr::rand(&mut rng); 16]];
+        let evals_list = vec![vec![Fr::rand(&mut rng); 16], vec![Fr::rand(&mut rng); 16]];
         let point = vec![Fr::rand(&mut rng); 4];
 
         let mut commitments: Vec<_> = evals_list

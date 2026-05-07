@@ -1280,10 +1280,6 @@ mod tests {
     const V: usize = 2;
     const M_BITS: usize = 4;
 
-    fn zero_mat(rows: usize, cols: usize) -> Vec<Vec<F>> {
-        vec![vec![F::ZERO; cols]; rows]
-    }
-
     fn zero_ternary_mat(rows: usize, cols: usize) -> Vec<Vec<TernaryValue>> {
         vec![vec![TernaryValue::ZERO; cols]; rows]
     }

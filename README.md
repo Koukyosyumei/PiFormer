@@ -2,7 +2,9 @@
 
 > **Succinct ZK proofs of transformer inference via structured lookup attention.**
 
-π-Former is a research prototype for proving transformer inference in a zero-knowledge SNARK. It replaces softmax attention and dense activations with ZK-friendly primitives — linear attention with a learnable kernel, structured lookup activations, and ternary projection weights — and proves the resulting computation with Hyrax PCS, the Spartan sumcheck IOP, and a Lasso-based lookup argument over BN254.
+π-Former is a research prototype for proving transformer inference with a succinct argument. It replaces softmax attention and dense activations with ZK-friendly primitives — linear attention with a learnable kernel, structured lookup activations, and ternary projection weights — and proves the resulting computation with Hyrax PCS, sumcheck IOPs, and Lasso-style lookup arguments over BN254.
+
+The current prover uses a model-level batching architecture: block-local LayerNorm/range checks are followed by cross-block batched sumchecks, global Q/K and FFN activation Lasso proofs with committed-output binding, and batched Hyrax openings for repeated matrix claims.
 
 See [DESIGN.md](DESIGN.md) for the full technical treatment.
 
@@ -63,11 +65,11 @@ DESIGN.md  Technical specification
 | `*.json`  | Weights or witness (field elements as hex strings) |
 | `*.pk`    | Proving key (Hyrax commitments + raw ternary weights) |
 | `*.vk`    | Verifying key (Hyrax commitments only) |
-| `*.bin`   | Proof bundle (binary, magic-prefixed, versioned) |
+| `*.bin`   | Proof bundle (binary, magic-prefixed, versioned; lookup outputs live inside committed Lasso proofs) |
 
 ## Status
 
-Research prototype. The Rust prover is currently single-head (`n_heads = 1`); training and export refuse other configurations. The cross-layer projection and stand-alone ternary-weight check exist as building blocks but are not yet wired into the end-to-end prover.
+Research prototype. The Rust prover is currently single-head (`n_heads = 1`); training and export refuse other configurations. The proof is not zero-knowledge yet: public commitments and some intermediate evaluations are revealed. The cross-layer projection and stand-alone ternary-weight check exist as building blocks but are not yet wired into the end-to-end prover.
 
 ## License
 

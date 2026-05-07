@@ -529,7 +529,6 @@ pub fn verify_qkv_projections(
 ) -> Result<(EvalClaim, EvalClaim, EvalClaim, EvalClaim), String> {
     let t_bits = vk_q.seq_len.next_power_of_two().trailing_zeros() as usize;
     let in_bits = vk_q.d_in.next_power_of_two().trailing_zeros() as usize;
-    let out_bits = vk_q.d_out.next_power_of_two().trailing_zeros() as usize;
 
     // 1. Absorb (mirrors prover)
     absorb_com(transcript, b"qkv_w_q_com", &vk_q.w_com);

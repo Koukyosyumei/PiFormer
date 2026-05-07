@@ -27,8 +27,7 @@ use crate::attention::layernorm::{
     verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey,
 };
 use crate::attention::projection::{
-    verify_projection, verify_qkv_projections, BatchedQKVProjectionIOCommitments,
-    ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
+    verify_projection, ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
 };
 use crate::ffn::ffn::{FFNInstance, FFNProvingKey, FFNVerifyingKey};
 use ark_ec::{AffineRepr, CurveGroup};
@@ -241,15 +240,15 @@ pub fn verify(
 
     let mut ln_acc_t = HyraxBatchAccumulator::new();
     let mut ln_acc_td = HyraxBatchAccumulator::new();
-    let mut proj_acc_w = HyraxBatchAccumulator::new();
-    let mut proj_acc_b = HyraxBatchAccumulator::new();
+    let proj_acc_w = HyraxBatchAccumulator::new();
+    let proj_acc_b = HyraxBatchAccumulator::new();
     let mut lmh_acc_w = HyraxBatchAccumulator::new();
     let mut lmh_acc_b = HyraxBatchAccumulator::new();
     let mut acc_range_sig = HyraxBatchAccumulator::new();
     let mut acc_range_y = HyraxBatchAccumulator::new();
     let mut acc_range_m = HyraxBatchAccumulator::new();
     // inter_acc: per-block v_attn opens (different eval point per block)
-    let mut inter_acc = HyraxBatchAccumulator::new();
+    let inter_acc = HyraxBatchAccumulator::new();
 
     // =========================================================================
     // 2. Phase 1: verify range proofs + LN1 + LN2 for all blocks

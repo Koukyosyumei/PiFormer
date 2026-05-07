@@ -846,7 +846,6 @@ mod tests {
     #[test]
     fn test_sumcheck_random_trials() {
         // 異なる変数個数で複数回のランダム試行を行い、一貫性を検証する
-        let mut rng = test_rng();
         for num_vars in 1..8 {
             for _ in 0..10 {
                 let (f, g) = random_polys(num_vars);
@@ -1048,7 +1047,6 @@ mod multi_sumcheck_tests {
     /// 異常系: 重み(weights)がプロverと検証者で異なる場合
     #[test]
     fn test_multi_sumcheck_weight_mismatch() {
-        let mut rng = test_rng();
         let n = 2;
         let fs = vec![
             DenseMLPoly::new(vec![F::one(); 4]),

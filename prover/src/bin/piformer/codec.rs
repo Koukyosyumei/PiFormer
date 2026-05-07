@@ -12,26 +12,22 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate
 
 use piformer_prover::{
     attention::{
-        attention::{
-            AttentionOpenings, AttentionProvingKey, AttentionSumcheckProof,
-            LinearAttentionInstance, LinearAttentionProof,
-        },
+        attention::{AttentionProvingKey, LinearAttentionInstance},
         layernorm::{
             LayerNormInternalCommitments, LayerNormOpenings, LayerNormProof, LayerNormVerifyingKey,
         },
         projection::{
-            BatchedQKVProjectionOpenings, BatchedQKVProjectionProof, ProjectionOpenings,
-            ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey,
+            ProjectionOpenings, ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey,
         },
     },
-    ffn::ffn::{FFNInstance, FFNOpenings, FFNProof, FFNProvingKey, FFNVerifyingKey},
+    ffn::ffn::{FFNInstance, FFNProvingKey, FFNVerifyingKey},
     lookup::{
         lasso::{
             HighDegreeRoundPoly, LassoIndexProof, LassoInstance, LassoMultiProof,
-            LassoMultiProvingKey, LassoMultiVerifyingKey, LassoProof, LassoProvingKey,
-            LassoVerifyingKey, SelectorBindingProof, SelectorSumcheckProof,
+            LassoMultiProvingKey, LassoProof, LassoProvingKey, LassoVerifyingKey,
+            SelectorBindingProof, SelectorSumcheckProof,
         },
-        range::{GlobalRangeM, LogUpWitnessProof, RangeProof, RangeWitnessProof},
+        range::{GlobalRangeM, LogUpWitnessProof, RangeWitnessProof},
     },
     pcs::{HyraxCommitment, HyraxProof},
     poly::utils::TernaryValue,
@@ -167,9 +163,6 @@ fn write_vec_g1<W: Write>(w: &mut W, v: &[G1Affine]) -> io::Result<()> {
 fn read_vec_g1<R: Read>(r: &mut R) -> io::Result<Vec<G1Affine>> {
     read_vec(r, read_g1)
 }
-fn write_vec_vec_f<W: Write>(w: &mut W, v: &[Vec<F>]) -> io::Result<()> {
-    write_vec(w, v, |w2, row| write_vec_f(w2, row))
-}
 fn write_vec_vec_t<W: Write>(w: &mut W, v: &[Vec<TernaryValue>]) -> io::Result<()> {
     write_vec(w, v, |w2, row| write_vec_t(w2, row))
 }
@@ -178,9 +171,6 @@ fn read_vec_t<R: Read>(r: &mut R) -> io::Result<Vec<TernaryValue>> {
 }
 fn read_vec_vec_t<R: Read>(r: &mut R) -> io::Result<Vec<Vec<TernaryValue>>> {
     read_vec(r, read_vec_t)
-}
-fn read_vec_vec_f<R: Read>(r: &mut R) -> io::Result<Vec<Vec<F>>> {
-    read_vec(r, read_vec_f)
 }
 fn write_vec_usize<W: Write>(w: &mut W, v: &[usize]) -> io::Result<()> {
     write_vec(w, v, |w2, x| write_usize(w2, *x))
@@ -502,29 +492,6 @@ fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
     })
 }
 
-fn write_range_proof<W: Write>(w: &mut W, p: &RangeProof) -> io::Result<()> {
-    write_sumcheck_proof(w, &p.sumcheck)?;
-    write_f(w, &p.claim_v)?;
-    write_vec(w, &p.chunk_coms, write_hyrax_commitment)?;
-    write_vec_f(w, &p.chunk_evals)?;
-    write_hyrax_proof(w, &p.chunk_batch_proof)?;
-    write_hyrax_commitment(w, &p.m_com)?;
-    write_f(w, &p.m_eval)?;
-    write_hyrax_proof(w, &p.m_open)
-}
-fn read_range_proof<R: Read>(r: &mut R) -> io::Result<RangeProof> {
-    Ok(RangeProof {
-        sumcheck: read_sumcheck_proof(r)?,
-        claim_v: read_f(r)?,
-        chunk_coms: read_vec(r, read_hyrax_commitment)?,
-        chunk_evals: read_vec_f(r)?,
-        chunk_batch_proof: read_hyrax_proof(r)?,
-        m_com: read_hyrax_commitment(r)?,
-        m_eval: read_f(r)?,
-        m_open: read_hyrax_proof(r)?,
-    })
-}
-
 fn write_logup_witness_proof<W: Write>(w: &mut W, p: &LogUpWitnessProof) -> io::Result<()> {
     write_vec(w, &p.h_coms, write_hyrax_commitment)?;
     write_vec(w, &p.combined_sumchecks, write_sumcheck_proof)?;
@@ -826,185 +793,6 @@ fn read_proj_proof<R: Read>(r: &mut R) -> io::Result<ProjectionProof> {
     Ok(ProjectionProof {
         sumcheck: read_sumcheck_proof(r)?,
         openings: read_proj_openings(r)?,
-    })
-}
-
-fn write_batched_qkv_openings<W: Write>(
-    w: &mut W,
-    o: &BatchedQKVProjectionOpenings,
-) -> io::Result<()> {
-    write_f(w, &o.q_eval)?;
-    write_f(w, &o.k_eval)?;
-    write_f(w, &o.v_eval)?;
-    write_f(w, &o.x_eval)?;
-    write_ep!(w, &o.w_q_eval, &o.w_q_open);
-    write_ep!(w, &o.w_k_eval, &o.w_k_open);
-    write_ep!(w, &o.w_v_eval, &o.w_v_open);
-    write_ep!(w, &o.bias_q_eval, &o.bias_q_open);
-    write_ep!(w, &o.bias_k_eval, &o.bias_k_open);
-    write_ep!(w, &o.bias_v_eval, &o.bias_v_open);
-    Ok(())
-}
-fn read_batched_qkv_openings<R: Read>(r: &mut R) -> io::Result<BatchedQKVProjectionOpenings> {
-    let q_eval = read_f(r)?;
-    let k_eval = read_f(r)?;
-    let v_eval = read_f(r)?;
-    let x_eval = read_f(r)?;
-    let (w_q_eval, w_q_open) = read_ep!(r);
-    let (w_k_eval, w_k_open) = read_ep!(r);
-    let (w_v_eval, w_v_open) = read_ep!(r);
-    let (bias_q_eval, bias_q_open) = read_ep!(r);
-    let (bias_k_eval, bias_k_open) = read_ep!(r);
-    let (bias_v_eval, bias_v_open) = read_ep!(r);
-    Ok(BatchedQKVProjectionOpenings {
-        q_eval,
-        k_eval,
-        v_eval,
-        x_eval,
-        w_q_eval,
-        w_k_eval,
-        w_v_eval,
-        bias_q_eval,
-        bias_k_eval,
-        bias_v_eval,
-        w_q_open,
-        w_k_open,
-        w_v_open,
-        bias_q_open,
-        bias_k_open,
-        bias_v_open,
-    })
-}
-fn write_batched_qkv_proof<W: Write>(w: &mut W, p: &BatchedQKVProjectionProof) -> io::Result<()> {
-    write_sumcheck_proof(w, &p.sumcheck)?;
-    write_batched_qkv_openings(w, &p.openings)
-}
-fn read_batched_qkv_proof<R: Read>(r: &mut R) -> io::Result<BatchedQKVProjectionProof> {
-    Ok(BatchedQKVProjectionProof {
-        sumcheck: read_sumcheck_proof(r)?,
-        openings: read_batched_qkv_openings(r)?,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Attention proof
-// ---------------------------------------------------------------------------
-
-fn write_attn_openings<W: Write>(w: &mut W, o: &AttentionOpenings) -> io::Result<()> {
-    write_f(w, &o.out_eval)?;
-    write_f(w, &o.phi_q_eval)?;
-    write_f(w, &o.phi_k_eval)?;
-    write_f(w, &o.v_eval)?;
-    Ok(())
-}
-fn read_attn_openings<R: Read>(r: &mut R) -> io::Result<AttentionOpenings> {
-    Ok(AttentionOpenings {
-        out_eval: read_f(r)?,
-        phi_q_eval: read_f(r)?,
-        phi_k_eval: read_f(r)?,
-        v_eval: read_f(r)?,
-    })
-}
-
-fn write_attn_proof<W: Write>(w: &mut W, p: &LinearAttentionProof) -> io::Result<()> {
-    match &p.sumcheck {
-        AttentionSumcheckProof::Batched { proof, ctx_eval } => {
-            w.write_all(&[0u8])?; // tag: Batched
-            write_sumcheck_proof_multi(w, proof)?;
-            write_f(w, ctx_eval)?;
-        }
-        AttentionSumcheckProof::Sequential {
-            out_sumcheck,
-            context_sumcheck,
-        } => {
-            w.write_all(&[1u8])?; // tag: Sequential
-            write_sumcheck_proof(w, out_sumcheck)?;
-            write_sumcheck_proof(w, context_sumcheck)?;
-        }
-    }
-    write_attn_openings(w, &p.openings)?;
-    write_hyrax_commitment(w, &p.phi_q_com)?;
-    write_hyrax_commitment(w, &p.phi_k_com)?;
-    write_hyrax_proof(w, &p.phi_q_open)?;
-    write_hyrax_proof(w, &p.phi_k_open)
-}
-fn read_attn_proof<R: Read>(r: &mut R) -> io::Result<LinearAttentionProof> {
-    let mut tag = [0u8; 1];
-    r.read_exact(&mut tag)?;
-    let sumcheck = match tag[0] {
-        0 => AttentionSumcheckProof::Batched {
-            proof: read_sumcheck_proof_multi(r)?,
-            ctx_eval: read_f(r)?,
-        },
-        1 => AttentionSumcheckProof::Sequential {
-            out_sumcheck: read_sumcheck_proof(r)?,
-            context_sumcheck: read_sumcheck_proof(r)?,
-        },
-        t => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown AttentionSumcheckProof tag: {}", t),
-            ))
-        }
-    };
-    Ok(LinearAttentionProof {
-        sumcheck,
-        openings: read_attn_openings(r)?,
-        phi_q_com: read_hyrax_commitment(r)?,
-        phi_k_com: read_hyrax_commitment(r)?,
-        phi_q_open: read_hyrax_proof(r)?,
-        phi_k_open: read_hyrax_proof(r)?,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// FFN proof
-// ---------------------------------------------------------------------------
-
-fn write_ffn_openings<W: Write>(w: &mut W, o: &FFNOpenings) -> io::Result<()> {
-    write_f(w, &o.y_eval)?;
-    write_f(w, &o.x_eval)?;
-    write_f(w, &o.a_eval)?;
-    write_ep!(w, &o.w2_eval, &o.w2_open);
-    write_f(w, &o.m_eval)?;
-    write_ep!(w, &o.w1_eval, &o.w1_open);
-    Ok(())
-}
-fn read_ffn_openings<R: Read>(r: &mut R) -> io::Result<FFNOpenings> {
-    let y_eval = read_f(r)?;
-    let x_eval = read_f(r)?;
-    let a_eval = read_f(r)?;
-    let (w2_eval, w2_open) = read_ep!(r);
-    let m_eval = read_f(r)?;
-    let (w1_eval, w1_open) = read_ep!(r);
-    Ok(FFNOpenings {
-        y_eval,
-        x_eval,
-        a_eval,
-        w2_eval,
-        w2_open,
-        m_eval,
-        w1_eval,
-        w1_open,
-    })
-}
-
-fn write_ffn_proof<W: Write>(w: &mut W, p: &FFNProof) -> io::Result<()> {
-    write_lasso_proof(w, &p.activation_lasso_proof)?;
-    write_hyrax_commitment(w, &p.m_com)?;
-    write_sumcheck_proof(w, &p.y_sumcheck)?;
-    write_sumcheck_proof(w, &p.m_sumcheck)?;
-    write_ffn_openings(w, &p.openings)?;
-    write_hyrax_proof(w, &p.m_open)
-}
-fn read_ffn_proof<R: Read>(r: &mut R) -> io::Result<FFNProof> {
-    Ok(FFNProof {
-        activation_lasso_proof: read_lasso_proof(r)?,
-        m_com: read_hyrax_commitment(r)?,
-        y_sumcheck: read_sumcheck_proof(r)?,
-        m_sumcheck: read_sumcheck_proof(r)?,
-        openings: read_ffn_openings(r)?,
-        m_open: read_hyrax_proof(r)?,
     })
 }
 
@@ -1325,17 +1113,6 @@ fn read_lasso_pk<R: Read>(r: &mut R) -> io::Result<LassoProvingKey> {
     Ok(LassoProvingKey {
         nu,
         table_coms: read_vec(r, read_hyrax_commitment)?,
-    })
-}
-
-fn write_lasso_multi_vk<W: Write>(w: &mut W, vk: &LassoMultiVerifyingKey) -> io::Result<()> {
-    write_vec(w, &vk.instance_table_coms, |w, v: &Vec<HyraxCommitment>| {
-        write_vec(w, v, write_hyrax_commitment)
-    })
-}
-fn read_lasso_multi_vk<R: Read>(r: &mut R) -> io::Result<LassoMultiVerifyingKey> {
-    Ok(LassoMultiVerifyingKey {
-        instance_table_coms: read_vec(r, |r| read_vec(r, read_hyrax_commitment))?,
     })
 }
 
