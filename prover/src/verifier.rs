@@ -25,7 +25,7 @@ use crate::transcript::{challenge_vec, Transcript};
 
 use crate::attention::attention::{AttentionProvingKey, LinearAttentionInstance};
 use crate::attention::layernorm::{
-    verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey,
+    verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey, LAYERNORM_RANGE_BITS,
 };
 use crate::attention::projection::{
     verify_projection, ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
@@ -317,7 +317,7 @@ pub fn verify(
             ],
             &bp.block_range_m,
             &[ln_sigma_n, ln_y_n, ln_sigma_n, ln_y_n],
-            32,
+            LAYERNORM_RANGE_BITS,
             transcript,
             &mut acc_range_sig,
             &mut acc_range_y,
@@ -795,7 +795,7 @@ pub fn verify(
         ],
         &proof.final_range_m,
         &[final_sigma_n, final_y_n],
-        32,
+        LAYERNORM_RANGE_BITS,
         transcript,
         &mut acc_range_sig,
         &mut acc_range_y,

@@ -22,7 +22,7 @@ use ark_ff::{Field, PrimeField};
 use crate::attention::attention::{LinearAttentionInstance, LinearAttentionWitness};
 use crate::attention::layernorm::{
     compute_range_witnesses, prove_layernorm, LayerNormIOCommitments, LayerNormProof,
-    LayerNormVerifyingKey, LayerNormWitness,
+    LayerNormVerifyingKey, LayerNormWitness, LAYERNORM_RANGE_BITS,
 };
 use crate::attention::projection::{
     prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionProvingKey,
@@ -171,7 +171,7 @@ fn commit_block_phase1(
             &ln2_rw.sigma_witness,
             &ln2_rw.y_witness,
         ],
-        32,
+        LAYERNORM_RANGE_BITS,
         transcript,
     )?;
     let ln2_y_rp = block_range_proofs.remove(3);
@@ -1135,7 +1135,7 @@ pub fn prove(
     let final_rw = compute_range_witnesses(&witness.final_ln_wit, &pk.vk.final_ln_vk);
     let (mut final_range_proofs, final_range_m, final_r_vs) = prove_range_batched(
         &[&final_rw.sigma_witness, &final_rw.y_witness],
-        32,
+        LAYERNORM_RANGE_BITS,
         transcript,
     )?;
     let final_y_rp = final_range_proofs.remove(1);

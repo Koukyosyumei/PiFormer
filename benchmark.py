@@ -57,9 +57,10 @@ CONFIGS: dict[str, dict] = {
         "seq_len": 8,
         "num_bits": 8,
         "c": 2,
-        "scale": 0.1,
+        "scale": 1.0,
+        "lookup_table_scale": 0.01,
         "max_exp": 4,
-        "description": "Tiny (demo-scale)",
+        "description": "Tiny",
     },
     "small": {
         "d_model": 64,
@@ -70,7 +71,8 @@ CONFIGS: dict[str, dict] = {
         "seq_len": 16,
         "num_bits": 8,
         "c": 2,
-        "scale": 0.1,
+        "scale": 1.0,
+        "lookup_table_scale": 0.01,
         "max_exp": 4,
         "description": "Small",
     },
@@ -83,7 +85,8 @@ CONFIGS: dict[str, dict] = {
         "seq_len": 32,
         "num_bits": 8,
         "c": 2,
-        "scale": 0.1,
+        "scale": 1.0,
+        "lookup_table_scale": 0.01,
         "max_exp": 4,
         "description": "Medium",
     },
@@ -96,7 +99,8 @@ CONFIGS: dict[str, dict] = {
         "seq_len": 32,
         "num_bits": 8,
         "c": 2,
-        "scale": 0.1,
+        "scale": 1.0,
+        "lookup_table_scale": 0.01,
         "max_exp": 4,
         "description": "Large",
     },
@@ -111,7 +115,8 @@ CONFIGS: dict[str, dict] = {
         "seq_len": 32,
         "num_bits": 8,
         "c": 2,
-        "scale": 0.1,
+        "scale": 1.0,
+        "lookup_table_scale": 0.01,
         "max_exp": 4,
         "description": "GPT-2 Small (power-of-2 approximation, n_heads=1)",
     },
@@ -252,20 +257,15 @@ model = PiFormerModel(
 )
 model.eval()
 
-# The Rust proof binds centered lookup keys to committed Q/K/M tensors by
-# proving index = round(raw / S) + zero_point with no saturation. For benchmark
-# timing, keep configured dimensions but zero dense projection/FFN/head weights
-# and lookup tables.
-# Embeddings and LayerNorm parameters stay nonzero to avoid degenerate all-zero
-# range witnesses.
+# Keep dense projections, FFN layers, heads, and lookup tables nonzero.  The
+# LayerNorm proof ranges are finite, so benchmark-time lookup table
+# amplitudes are scaled down deterministically to avoid proving only a
+# saturation/overflow failure for randomly initialized, untrained weights.
 with torch.no_grad():
+    lookup_table_scale = float(cfg.get("lookup_table_scale", 1.0))
     for name, param in model.named_parameters():
-        if any(part in name for part in ("q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2", "head")):
-            param.zero_()
         if ".tables." in name:
-            param.zero_()
-        if name.endswith("alpha"):
-            param.fill_(1.0)
+            param.mul_(lookup_table_scale)
 
 token_ids = {token_ids!r}
 export_all(

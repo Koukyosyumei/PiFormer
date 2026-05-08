@@ -183,7 +183,10 @@ pub fn vec_to_bits(n: usize, num_bits: usize) -> Vec<F> {
 // Range-witness extraction (call before the global range batch)
 // ---------------------------------------------------------------------------
 
-/// Intermediate values that need 32-bit range proofs in a LayerNorm.
+/// Range width used for LayerNorm residual range proofs.
+pub const LAYERNORM_RANGE_BITS: usize = 64;
+
+/// Intermediate values that need range proofs in a LayerNorm.
 pub struct LayerNormRangeWitnesses {
     /// Residual pairs for σ (size 2*T): each pair enforces σ ≥ 0.
     pub sigma_witness: RangeProofWitness,
