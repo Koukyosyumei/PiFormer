@@ -402,8 +402,19 @@ pub struct TransformerModelProof {
     pub batch_oproj: SumcheckProofMulti,
     pub batch_ffn_y: SumcheckProofMulti,
     pub batch_ffn_m: SumcheckProofMulti,
-    pub batch_attn_out: SumcheckProofMulti,
-    pub batch_attn_ctx: SumcheckProofMulti,
+    /// Non-causal: degree-2 sumcheck over k axis.
+    /// Causal: None (replaced by batch_attn_out_causal).
+    pub batch_attn_out: Option<SumcheckProofMulti>,
+    /// Causal: degree-3 sumcheck over (t, k) with eq(r_t, ·) folded in as the
+    /// third multiplicand so the claim equals the actual attn_out MLE eval.
+    pub batch_attn_out_causal: Option<SumcheckCubicProofMulti>,
+    /// Non-causal: degree-2 sumcheck over t axis.
+    /// Causal: None (replaced by batch_attn_ctx_causal).
+    pub batch_attn_ctx: Option<SumcheckProofMulti>,
+    /// Causal: degree-3 sumcheck over (s, a, b) with the suffix·eq_a·eq_b
+    /// factor folded into the third multiplicand so f and g remain plain phi_k
+    /// and v MLEs respectively.
+    pub batch_attn_ctx_causal: Option<SumcheckCubicProofMulti>,
     pub attn_norm_sumcheck: Option<SumcheckCubicProofMulti>,
     pub attn_z_sumcheck: Option<SumcheckProofMulti>,
     pub attn_z_ksum_sumcheck: Option<SumcheckProofMulti>,
@@ -482,23 +493,14 @@ fn suffix_eq_evals_msb(r: &[F], len: usize) -> Vec<F> {
     suffix
 }
 
-fn eval_causal_context_features_direct(
-    causal_context: &[Vec<F>],
-    r_t: &[F],
-    r_out: &[F],
-    t: usize,
-    d: usize,
-) -> Vec<F> {
-    let d_p2 = d.next_power_of_two();
-    let mut out = vec![F::ZERO; d_p2];
-    let point = combine(r_t, r_out);
-    for a in 0..d {
-        let mat: Vec<Vec<F>> = (0..t).map(|i| causal_context[i * d + a].clone()).collect();
-        out[a] = mat_to_mle(&mat, t, d).evaluate(&point);
-    }
-    out
-}
-
+/// Build (f, g, h) polynomials for the causal prefix-context cubic sumcheck:
+///   ctx_eval = Σ_{s,a,b} suffix(s) · eq_a(a) · eq_b(b) · phi_k[s][a] · v[s][b]
+/// with
+///   f[s,a,b] = phi_k[s][a]  (constant in b)
+///   g[s,a,b] = v[s][b]      (constant in a)
+///   h[s,a,b] = suffix(s) · eq_a(a) · eq_b(b)  (verifier-computable factor)
+/// so that f_mle, g_mle, h_mle factor cleanly without MLE-of-pointwise-product
+/// pitfalls. (When d is a power of two, the constant-axis MLE summand is 1.)
 fn causal_prefix_polys(
     phi_k: &[Vec<F>],
     v: &[Vec<F>],
@@ -507,23 +509,35 @@ fn causal_prefix_polys(
     eq_b_evals: &[F],
     t: usize,
     d: usize,
-) -> (DenseMLPoly, DenseMLPoly) {
+) -> (DenseMLPoly, DenseMLPoly, DenseMLPoly) {
     let t_p2 = t.next_power_of_two();
     let d_p2 = d.next_power_of_two();
     let total = t_p2 * d_p2 * d_p2;
     let mut f = vec![F::ZERO; total];
     let mut g = vec![F::ZERO; total];
+    let mut h = vec![F::ZERO; total];
+    // h is multilinear over (s, a, b) and verifier-reproducible at any point;
+    // populate every cell, including indices outside [0, t)×[0, d)×[0, d), so
+    // that the MLE factors as suffix_mle(X_s)·eq_a_mle(X_a)·eq_b_mle(X_b).
+    for s in 0..t_p2 {
+        for a in 0..d_p2 {
+            for b in 0..d_p2 {
+                let idx = (s * d_p2 + a) * d_p2 + b;
+                h[idx] = suffix_evals[s] * eq_a_evals[a] * eq_b_evals[b];
+            }
+        }
+    }
     for s in 0..t {
         for a in 0..d {
             let f_val = phi_k[s][a];
             for b in 0..d {
                 let idx = (s * d_p2 + a) * d_p2 + b;
                 f[idx] = f_val;
-                g[idx] = suffix_evals[s] * eq_a_evals[a] * eq_b_evals[b] * v[s][b];
+                g[idx] = v[s][b];
             }
         }
     }
-    (DenseMLPoly::new(f), DenseMLPoly::new(g))
+    (DenseMLPoly::new(f), DenseMLPoly::new(g), DenseMLPoly::new(h))
 }
 
 fn causal_denominator_polys(
@@ -1068,12 +1082,56 @@ pub fn prove(
         attn_out_evals.push(out_eval_i);
     }
 
-    // 6b. Batch out sumcheck: out_i(r_t, r_k_o) = Σ_k phi_q_i(r_t,k) · ctx_i(k, r_k_o)
+    // 6b. Batch out sumcheck.
+    //   Non-causal: prove out_i(r_t, r_k_o) = Σ_k phi_q_i(r_t, k) · ctx_i(k, r_k_o)
+    //               via a degree-2 sumcheck over k (d_bits rounds).
+    //   Causal: handled separately below as a degree-3 sumcheck over (t, k)
+    //               with three multiplicands (eq(r_t, ·), phi_q, c_partial).
     let mut fs_attn_out: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut gs_attn_out: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
-    for i in 0..num_blocks {
-        let f_out_vals = eval_rows(&phi_q_mles[i], t_bits, &r_t);
-        let g_out = if inst_attn.causal {
+    if !inst_attn.causal {
+        for i in 0..num_blocks {
+            let f_out_vals = eval_rows(&phi_q_mles[i], t_bits, &r_t);
+            let g_out = eval_cols(&ctx_mles[i], d_bits, &r_k_o);
+            transcript.append_field(b"attn_out_eval", &attn_out_evals[i]);
+            fs_attn_out.push(DenseMLPoly::from_vec_padded(f_out_vals));
+            gs_attn_out.push(DenseMLPoly::from_vec_padded(g_out));
+        }
+    } else {
+        for i in 0..num_blocks {
+            transcript.append_field(b"attn_out_eval", &attn_out_evals[i]);
+        }
+    }
+    let eta_attn_out: F = transcript.challenge_field(b"batch_eta_attn_out");
+    let weights_attn_out = powers_of(eta_attn_out, num_blocks);
+    let claim_attn_out: F = weights_attn_out
+        .iter()
+        .zip(attn_out_evals.iter())
+        .map(|(w, e)| *w * *e)
+        .sum();
+    let (batch_attn_out, batch_attn_out_causal, batch_r_attn_out) = if !inst_attn.causal {
+        let (sc, r) = prove_sumcheck_multi_batched(
+            &fs_attn_out,
+            &gs_attn_out,
+            &weights_attn_out,
+            claim_attn_out,
+            transcript,
+        );
+        (Some(sc), None, r)
+    } else {
+        // Causal: degree-3 sumcheck Σ_{t,k} eq(r_t, t)·phi_q[t][k]·c_partial[t][k]
+        // where c_partial[t][k] = Σ_b eq(r_k_o, b)·causal_context[t][k][b].
+        // The (t_bits + d_bits)-variable polynomial layout uses MSB-first bits:
+        // index t·d_p2 + k for t in [0, t_p2), k in [0, d_p2). h is constant in
+        // the k axis, so Σ_k eq(X_k, k) = 1 makes h_mle(X_t, X_k) = eq(r_t, X_t).
+        let eq_t_evals = eq_evals_msb(&r_t, t);
+        let eq_k_o_evals = eq_evals_msb(&r_k_o, d);
+        let t_p2 = t.next_power_of_two();
+        let d_p2 = d.next_power_of_two();
+        let mut fs_cubic: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+        let mut gs_cubic: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+        let mut hs_cubic: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+        for i in 0..num_blocks {
             let bw = &witness.block_witnesses[i];
             let computed;
             let causal_context = match bw.attn_wit.causal_context.as_ref() {
@@ -1083,42 +1141,47 @@ pub fn prove(
                     &computed
                 }
             };
-            eval_causal_context_features_direct(causal_context, &r_t, &r_k_o, t, d)
-        } else {
-            eval_cols(&ctx_mles[i], d_bits, &r_k_o)
-        };
-        if inst_attn.causal {
-            attn_out_evals[i] = f_out_vals
-                .iter()
-                .zip(g_out.iter())
-                .map(|(a, b)| *a * *b)
-                .sum();
+            let mut f_evals = vec![F::ZERO; t_p2 * d_p2];
+            let mut g_evals = vec![F::ZERO; t_p2 * d_p2];
+            let mut h_evals = vec![F::ZERO; t_p2 * d_p2];
+            // h is the constant-in-k extension of eq(r_t, ·); fill all
+            // (t_p2 × d_p2) entries with eq_t_evals[t] regardless of k.
+            for tt in 0..t_p2 {
+                let eq_t = eq_t_evals[tt];
+                for k in 0..d_p2 {
+                    h_evals[tt * d_p2 + k] = eq_t;
+                }
+            }
+            for tt in 0..t {
+                for k in 0..d {
+                    f_evals[tt * d_p2 + k] = bw.attn_wit.phi_q[tt][k];
+                    let mut c_partial = F::ZERO;
+                    for b in 0..d {
+                        c_partial += eq_k_o_evals[b] * causal_context[tt * d + k][b];
+                    }
+                    g_evals[tt * d_p2 + k] = c_partial;
+                }
+            }
+            fs_cubic.push(DenseMLPoly::new(f_evals));
+            gs_cubic.push(DenseMLPoly::new(g_evals));
+            hs_cubic.push(DenseMLPoly::new(h_evals));
         }
-        transcript.append_field(b"attn_out_eval", &attn_out_evals[i]);
-        let f_out = DenseMLPoly::from_vec_padded(f_out_vals);
-        let g_out = DenseMLPoly::from_vec_padded(g_out);
-        fs_attn_out.push(f_out);
-        gs_attn_out.push(g_out);
-    }
-    let eta_attn_out: F = transcript.challenge_field(b"batch_eta_attn_out");
-    let weights_attn_out = powers_of(eta_attn_out, num_blocks);
-    let claim_attn_out: F = weights_attn_out
-        .iter()
-        .zip(attn_out_evals.iter())
-        .map(|(w, e)| *w * *e)
-        .sum();
-    let (batch_attn_out, batch_r_attn_out) = prove_sumcheck_multi_batched(
-        &fs_attn_out,
-        &gs_attn_out,
-        &weights_attn_out,
-        claim_attn_out,
-        transcript,
-    );
+        let (sc, r) = prove_sumcheck_cubic_multi_batched(
+            &fs_cubic,
+            &gs_cubic,
+            &hs_cubic,
+            &weights_attn_out,
+            claim_attn_out,
+            transcript,
+        );
+        (None, Some(sc), r)
+    };
     // 6c. Non-causal: ctx(batch_r_attn_out, r_k_o) = Σ_t phi_k(t, batch_r_attn_out) · v(t, r_k_o).
     //     Causal: prove a random linear combination of prefix-context equations
     //     C_i[a,b] = Σ_{s<=i} phi_k[s,a] · v[s,b].
     let mut fs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut gs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut hs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut causal_prefix_point: Option<Vec<F>> = None;
     let mut causal_ctx_prefix_evals: Vec<F> = Vec::new();
     let attn_ctx_evals: Vec<F> = if inst_attn.causal {
@@ -1134,7 +1197,7 @@ pub fn prove(
             let bw = &witness.block_witnesses[i];
             let ctx_eval = ctx_mles[i].evaluate(&prefix_point);
             transcript.append_field(b"attn_ctx_eval", &ctx_eval);
-            let (f_ctx, g_v) = causal_prefix_polys(
+            let (f_ctx, g_v, h_ctx) = causal_prefix_polys(
                 &bw.attn_wit.phi_k,
                 &bw.attn_wit.v,
                 &suffix_evals,
@@ -1145,13 +1208,18 @@ pub fn prove(
             );
             fs_attn_ctx.push(f_ctx);
             gs_attn_ctx.push(g_v);
+            hs_attn_ctx.push(h_ctx);
             claims.push(ctx_eval);
         }
         causal_prefix_point = Some(prefix_point);
         causal_ctx_prefix_evals = claims.clone();
         claims
     } else {
-        let claims = batch_attn_out.final_evals_g.clone();
+        let claims = batch_attn_out
+            .as_ref()
+            .expect("non-causal mode always produces batch_attn_out")
+            .final_evals_g
+            .clone();
         for i in 0..num_blocks {
             transcript.append_field(b"attn_ctx_eval", &claims[i]);
             let f_ctx =
@@ -1169,13 +1237,26 @@ pub fn prove(
         .zip(attn_ctx_evals.iter())
         .map(|(w, e)| *w * *e)
         .sum();
-    let (batch_attn_ctx, batch_r_attn_ctx) = prove_sumcheck_multi_batched(
-        &fs_attn_ctx,
-        &gs_attn_ctx,
-        &weights_attn_ctx,
-        claim_attn_ctx,
-        transcript,
-    );
+    let (batch_attn_ctx, batch_attn_ctx_causal, batch_r_attn_ctx) = if !inst_attn.causal {
+        let (sc, r) = prove_sumcheck_multi_batched(
+            &fs_attn_ctx,
+            &gs_attn_ctx,
+            &weights_attn_ctx,
+            claim_attn_ctx,
+            transcript,
+        );
+        (Some(sc), None, r)
+    } else {
+        let (sc, r) = prove_sumcheck_cubic_multi_batched(
+            &fs_attn_ctx,
+            &gs_attn_ctx,
+            &hs_attn_ctx,
+            &weights_attn_ctx,
+            claim_attn_ctx,
+            transcript,
+        );
+        (None, Some(sc), r)
+    };
 
     let (attn_norm_sumcheck, attn_norm_r) = if has_attn_norm {
         let r = challenge_vec(transcript, td_num_vars, b"attn_norm_r");
@@ -1781,8 +1862,15 @@ pub fn prove(
     let ffn_m_com_batch_open =
         hyrax_open_batch(&ffn_m_refs, &ffn_m_point, nu_mff, sigma_mff, transcript);
 
-    // phi_q_batch: L phi_q_i at combine(r_t, batch_r_attn_out) [td_num_vars]
-    let phi_q_attn_point = combine(&r_t, &batch_r_attn_out);
+    // phi_q_batch: open phi_q at the (t, k) point implied by the attention-out
+    // sumcheck. In causal mode the sumcheck folds in r_t internally, so
+    // batch_r_attn_out is already (t_bits + d_bits) long; in non-causal mode
+    // batch_r_attn_out has only d_bits and r_t prefixes the t-axis.
+    let phi_q_attn_point = if inst_attn.causal {
+        batch_r_attn_out.clone()
+    } else {
+        combine(&r_t, &batch_r_attn_out)
+    };
     let phi_q_refs: Vec<&[F]> = phi_q_mles
         .iter()
         .map(|m| m.evaluations.as_slice())
@@ -1859,7 +1947,9 @@ pub fn prove(
     };
 
     let causal_ctx_out_batch_open = if inst_attn.causal {
-        let ctx_out_point = combine(&combine(&r_t, &batch_r_attn_out), &r_k_o);
+        // Causal sumcheck has already folded r_t into batch_r_attn_out, so the
+        // causal-context open point is just (batch_r_attn_out, r_k_o).
+        let ctx_out_point = combine(&batch_r_attn_out, &r_k_o);
         let ctx_refs: Vec<&[F]> = ctx_mles.iter().map(|m| m.evaluations.as_slice()).collect();
         let (nu_tdd, sigma_tdd, _) = params_from_vars(t_bits + 2 * d_bits);
         Some(hyrax_open_batch(
@@ -2086,7 +2176,9 @@ pub fn prove(
         batch_ffn_y,
         batch_ffn_m,
         batch_attn_out,
+        batch_attn_out_causal,
         batch_attn_ctx,
+        batch_attn_ctx_causal,
         attn_norm_sumcheck,
         attn_z_sumcheck,
         attn_z_ksum_sumcheck,

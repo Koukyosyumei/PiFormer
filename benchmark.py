@@ -254,7 +254,11 @@ model = PiFormerModel(
     scale=cfg["scale"],
     max_exp=cfg["max_exp"],
     causal=cfg.get("causal", False),
-    attention_mode="normalized_fixed",
+    # Causal export does not yet support normalized_fixed (witness.py rejects
+    # the combination because the prefix-context proof needs a binding for the
+    # scaled V leaf). The Rust prover supports causal+unnormalized via the
+    # cubic batch_attn_out sumcheck.
+    attention_mode="prover" if cfg.get("causal", False) else "normalized_fixed",
     attention_scale=64,
 )
 model.eval()

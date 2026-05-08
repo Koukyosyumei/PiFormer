@@ -616,14 +616,55 @@ pub fn verify(
     let claim_attn_out: F = (0..num_blocks)
         .map(|i| weights_attn_out[i] * proof.block_proofs[i].attn_out_eval)
         .sum();
-    let (batch_r_attn_out, _) = verify_sumcheck_multi_batched(
-        &proof.batch_attn_out,
-        &weights_attn_out,
-        claim_attn_out,
-        d_bits,
-        transcript,
-    )
-    .map_err(|e| format!("batch_attn_out: {e}"))?;
+    // Causal mode runs a degree-3 sumcheck (eq(r_t, ·) folded as the third
+    // multiplicand) over (t, k); non-causal runs a degree-2 sumcheck over k only.
+    let (batch_r_attn_out, attn_out_final_evals_f, attn_out_final_evals_g) = if inst_attn.causal {
+        if proof.batch_attn_out.is_some() {
+            return Err("unexpected batch_attn_out in causal proof".to_string());
+        }
+        let sc = proof
+            .batch_attn_out_causal
+            .as_ref()
+            .ok_or_else(|| "missing batch_attn_out_causal".to_string())?;
+        let (r, _) = verify_sumcheck_cubic_multi_batched(
+            sc,
+            &weights_attn_out,
+            claim_attn_out,
+            t_bits + d_bits,
+            transcript,
+        )
+        .map_err(|e| format!("batch_attn_out_causal: {e}"))?;
+        // Verifier-computable check: h(r_final) must equal the MLE of
+        // eq(r_t, ·) padded constantly along k, evaluated at r_final, which is
+        // simply eq(r_t, r_final[..t_bits]).
+        let r_final_t = &r[..t_bits];
+        let expected_eq = eq_poly_eval(&r_t, r_final_t);
+        for (i, &h_val) in sc.final_evals_h.iter().enumerate() {
+            if h_val != expected_eq {
+                return Err(format!(
+                    "Block {i}: causal batch_attn_out final_evals_h does not match eq(r_t, r_final_t)"
+                ));
+            }
+        }
+        (r, sc.final_evals_f.clone(), sc.final_evals_g.clone())
+    } else {
+        if proof.batch_attn_out_causal.is_some() {
+            return Err("unexpected batch_attn_out_causal in non-causal proof".to_string());
+        }
+        let sc = proof
+            .batch_attn_out
+            .as_ref()
+            .ok_or_else(|| "missing batch_attn_out".to_string())?;
+        let (r, _) = verify_sumcheck_multi_batched(
+            sc,
+            &weights_attn_out,
+            claim_attn_out,
+            d_bits,
+            transcript,
+        )
+        .map_err(|e| format!("batch_attn_out: {e}"))?;
+        (r, sc.final_evals_f.clone(), sc.final_evals_g.clone())
+    };
 
     // Algebraic check: in legacy unnormalized mode the attention claim is
     // derived from the O-proj leaf. Normalized mode is checked by the
@@ -673,7 +714,7 @@ pub fn verify(
         if !proof.causal_ctx_prefix_evals.is_empty() {
             return Err("unexpected causal_ctx_prefix_evals in non-causal proof".to_string());
         }
-        proof.batch_attn_out.final_evals_g.clone()
+        attn_out_final_evals_g.clone()
     };
     for claim in &attn_ctx_claims {
         transcript.append_field(b"attn_ctx_eval", claim);
@@ -683,19 +724,64 @@ pub fn verify(
     let claim_attn_ctx: F = (0..num_blocks)
         .map(|i| weights_attn_ctx[i] * attn_ctx_claims[i])
         .sum();
-    let attn_ctx_num_vars = if inst_attn.causal {
-        t_bits + 2 * d_bits
+    let (batch_r_attn_ctx, attn_ctx_final_evals_f, attn_ctx_final_evals_g) = if inst_attn.causal {
+        if proof.batch_attn_ctx.is_some() {
+            return Err("unexpected batch_attn_ctx in causal proof".to_string());
+        }
+        let sc = proof
+            .batch_attn_ctx_causal
+            .as_ref()
+            .ok_or_else(|| "missing batch_attn_ctx_causal".to_string())?;
+        let (r, _) = verify_sumcheck_cubic_multi_batched(
+            sc,
+            &weights_attn_ctx,
+            claim_attn_ctx,
+            t_bits + 2 * d_bits,
+            transcript,
+        )
+        .map_err(|e| format!("batch_attn_ctx_causal: {e}"))?;
+        // Verifier computes h_mle locally: suffix_eq(prefix_t, ·) ⊗
+        // eq(prefix_a, ·) ⊗ eq(prefix_b, ·) factor cleanly across (s, a, b).
+        let prefix_point = causal_prefix_point
+            .as_ref()
+            .ok_or_else(|| "missing causal prefix point".to_string())?;
+        let prefix_t = &prefix_point[..t_bits];
+        let prefix_a = &prefix_point[t_bits..t_bits + d_bits];
+        let prefix_b = &prefix_point[t_bits + d_bits..];
+        let r_s = &r[..t_bits];
+        let r_a = &r[t_bits..t_bits + d_bits];
+        let r_b = &r[t_bits + d_bits..];
+        let suffix_at_rs =
+            DenseMLPoly::from_vec_padded(suffix_eq_evals_msb(prefix_t, t)).evaluate(r_s);
+        let eq_a_at_ra = DenseMLPoly::from_vec_padded(eq_evals_msb(prefix_a, d)).evaluate(r_a);
+        let eq_b_at_rb = DenseMLPoly::from_vec_padded(eq_evals_msb(prefix_b, d)).evaluate(r_b);
+        let expected_h = suffix_at_rs * eq_a_at_ra * eq_b_at_rb;
+        for (i, &h_val) in sc.final_evals_h.iter().enumerate() {
+            if h_val != expected_h {
+                return Err(format!(
+                    "Block {i}: causal batch_attn_ctx h leaf does not match suffix·eq_a·eq_b"
+                ));
+            }
+        }
+        (r, sc.final_evals_f.clone(), sc.final_evals_g.clone())
     } else {
-        t_bits
+        if proof.batch_attn_ctx_causal.is_some() {
+            return Err("unexpected batch_attn_ctx_causal in non-causal proof".to_string());
+        }
+        let sc = proof
+            .batch_attn_ctx
+            .as_ref()
+            .ok_or_else(|| "missing batch_attn_ctx".to_string())?;
+        let (r, _) = verify_sumcheck_multi_batched(
+            sc,
+            &weights_attn_ctx,
+            claim_attn_ctx,
+            t_bits,
+            transcript,
+        )
+        .map_err(|e| format!("batch_attn_ctx: {e}"))?;
+        (r, sc.final_evals_f.clone(), sc.final_evals_g.clone())
     };
-    let (batch_r_attn_ctx, _) = verify_sumcheck_multi_batched(
-        &proof.batch_attn_ctx,
-        &weights_attn_ctx,
-        claim_attn_ctx,
-        attn_ctx_num_vars,
-        transcript,
-    )
-    .map_err(|e| format!("batch_attn_ctx: {e}"))?;
 
     eprintln!(
         "[model] batch_attn:{:>8.3}ms",
@@ -1562,8 +1648,14 @@ pub fn verify(
     rxn2?;
     rffn_m?;
 
-    // phi_q at combine(r_t, batch_r_attn_out)
-    let phi_q_attn_point = combine(&r_t, &batch_r_attn_out);
+    // phi_q at the (t, k) point implied by the attention-out sumcheck.
+    // Causal mode folds r_t into the sumcheck so batch_r_attn_out covers both
+    // axes; non-causal mode prefixes r_t externally.
+    let phi_q_attn_point = if inst_attn.causal {
+        batch_r_attn_out.clone()
+    } else {
+        combine(&r_t, &batch_r_attn_out)
+    };
     let phi_q_coms: Vec<HyraxCommitment> = proof
         .block_proofs
         .iter()
@@ -1571,7 +1663,7 @@ pub fn verify(
         .collect();
     hyrax_verify_batch(
         &phi_q_coms,
-        &proof.batch_attn_out.final_evals_f,
+        &attn_out_final_evals_f,
         &phi_q_attn_point,
         &proof.phi_q_batch_open,
         &params_td,
@@ -1618,26 +1710,16 @@ pub fn verify(
         let r_s = &batch_r_attn_ctx[..t_bits];
         let r_a = &batch_r_attn_ctx[t_bits..t_bits + d_bits];
         let r_b = &batch_r_attn_ctx[t_bits + d_bits..];
-        let prefix_point = causal_prefix_point
-            .as_ref()
-            .ok_or_else(|| "missing causal prefix point".to_string())?;
-        let prefix_t = &prefix_point[..t_bits];
-        let prefix_a = &prefix_point[t_bits..t_bits + d_bits];
-        let prefix_b = &prefix_point[t_bits + d_bits..];
-        let suffix_at_rs =
-            DenseMLPoly::from_vec_padded(suffix_eq_evals_msb(prefix_t, t)).evaluate(r_s);
-        let eq_a_at_ra = DenseMLPoly::from_vec_padded(eq_evals_msb(prefix_a, d)).evaluate(r_a);
-        let eq_b_at_rb = DenseMLPoly::from_vec_padded(eq_evals_msb(prefix_b, d)).evaluate(r_b);
-        let v_denom = suffix_at_rs * eq_a_at_ra * eq_b_at_rb;
-        if v_denom == F::ZERO {
-            return Err("causal attention opening denominator is zero".to_string());
-        }
+        // The cubic batch_attn_ctx_causal sumcheck factors suffix·eq_a·eq_b
+        // into the h multiplicand (already checked above), so f and g leaves
+        // are plain phi_k_mle(r_s, r_a) and v_mle(r_s, r_b) — no v_denom
+        // scaling needed.
         for i in 0..num_blocks {
-            if proof.batch_attn_ctx.final_evals_f[i] != proof.causal_phi_k_prefix_evals[i] {
-                return Err(format!("Block {i}: causal phi_k scaled leaf mismatch"));
+            if attn_ctx_final_evals_f[i] != proof.causal_phi_k_prefix_evals[i] {
+                return Err(format!("Block {i}: causal phi_k leaf mismatch"));
             }
-            if proof.batch_attn_ctx.final_evals_g[i] != v_denom * proof.causal_v_prefix_evals[i] {
-                return Err(format!("Block {i}: causal v scaled leaf mismatch"));
+            if attn_ctx_final_evals_g[i] != proof.causal_v_prefix_evals[i] {
+                return Err(format!("Block {i}: causal v leaf mismatch"));
             }
         }
         (
@@ -1652,9 +1734,9 @@ pub fn verify(
         }
         (
             combine(&batch_r_attn_ctx, &batch_r_attn_out),
-            proof.batch_attn_ctx.final_evals_f.clone(),
+            attn_ctx_final_evals_f.clone(),
             combine(&batch_r_attn_ctx, &r_k_o),
-            proof.batch_attn_ctx.final_evals_g.clone(),
+            attn_ctx_final_evals_g.clone(),
         )
     };
 
@@ -1727,11 +1809,13 @@ pub fn verify(
         let ctx_coms = causal_ctx_coms
             .as_ref()
             .ok_or_else(|| "missing causal context commitments".to_string())?;
-        let ctx_out_point = combine(&combine(&r_t, &batch_r_attn_out), &r_k_o);
+        // Causal sumcheck folded r_t into batch_r_attn_out, so the
+        // causal-context open point is just (batch_r_attn_out, r_k_o).
+        let ctx_out_point = combine(&batch_r_attn_out, &r_k_o);
         let (_, _, params_tdd) = params_from_vars(t_bits + 2 * d_bits);
         hyrax_verify_batch(
             ctx_coms,
-            &proof.batch_attn_out.final_evals_g,
+            &attn_out_final_evals_g,
             &ctx_out_point,
             proof
                 .causal_ctx_out_batch_open

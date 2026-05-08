@@ -1042,8 +1042,22 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_sumcheck_proof_multi(w, &p.batch_oproj)?;
     write_sumcheck_proof_multi(w, &p.batch_ffn_y)?;
     write_sumcheck_proof_multi(w, &p.batch_ffn_m)?;
-    write_sumcheck_proof_multi(w, &p.batch_attn_out)?;
-    write_sumcheck_proof_multi(w, &p.batch_attn_ctx)?;
+    write_bool(w, p.batch_attn_out.is_some())?;
+    if let Some(ref sc) = p.batch_attn_out {
+        write_sumcheck_proof_multi(w, sc)?;
+    }
+    write_bool(w, p.batch_attn_out_causal.is_some())?;
+    if let Some(ref sc) = p.batch_attn_out_causal {
+        write_sumcheck_cubic_proof_multi(w, sc)?;
+    }
+    write_bool(w, p.batch_attn_ctx.is_some())?;
+    if let Some(ref sc) = p.batch_attn_ctx {
+        write_sumcheck_proof_multi(w, sc)?;
+    }
+    write_bool(w, p.batch_attn_ctx_causal.is_some())?;
+    if let Some(ref sc) = p.batch_attn_ctx_causal {
+        write_sumcheck_cubic_proof_multi(w, sc)?;
+    }
     write_bool(w, p.attn_norm_sumcheck.is_some())?;
     if let Some(ref sc) = p.attn_norm_sumcheck {
         write_sumcheck_cubic_proof_multi(w, sc)?;
@@ -1119,8 +1133,26 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         batch_oproj: read_sumcheck_proof_multi(r)?,
         batch_ffn_y: read_sumcheck_proof_multi(r)?,
         batch_ffn_m: read_sumcheck_proof_multi(r)?,
-        batch_attn_out: read_sumcheck_proof_multi(r)?,
-        batch_attn_ctx: read_sumcheck_proof_multi(r)?,
+        batch_attn_out: if read_bool(r)? {
+            Some(read_sumcheck_proof_multi(r)?)
+        } else {
+            None
+        },
+        batch_attn_out_causal: if read_bool(r)? {
+            Some(read_sumcheck_cubic_proof_multi(r)?)
+        } else {
+            None
+        },
+        batch_attn_ctx: if read_bool(r)? {
+            Some(read_sumcheck_proof_multi(r)?)
+        } else {
+            None
+        },
+        batch_attn_ctx_causal: if read_bool(r)? {
+            Some(read_sumcheck_cubic_proof_multi(r)?)
+        } else {
+            None
+        },
         attn_norm_sumcheck: if read_bool(r)? {
             Some(read_sumcheck_cubic_proof_multi(r)?)
         } else {
