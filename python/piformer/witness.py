@@ -149,6 +149,21 @@ def _attention_denominator(phi_q: List[List[int]], phi_k: List[List[int]]) -> Li
     return [sum(phi_q[i][a] * k_sum[a] for a in range(d)) for i in range(t)]
 
 
+def _causal_attention_denominator(
+    phi_q: List[List[int]], phi_k: List[List[int]]
+) -> List[int]:
+    """z_i = φ(Q_i) · Σ_{s<=i} φ(K_s)."""
+    t = len(phi_q)
+    d = len(phi_q[0]) if t else 0
+    prefix = [0 for _ in range(d)]
+    out: List[int] = []
+    for i in range(t):
+        for a in range(d):
+            prefix[a] += phi_k[i][a]
+        out.append(sum(phi_q[i][a] * prefix[a] for a in range(d)))
+    return out
+
+
 def _normalize_attention_floor(
     numerator: List[List[int]], z: List[int], scale: int
 ) -> Tuple[List[List[int]], List[List[int]], List[List[int]]]:
@@ -354,6 +369,7 @@ def _gen_block_witness(
     if causal:
         causal_context = _causal_context_matrix(phi_k, v_raw)
         attn_out = _causal_attn_out(phi_q, causal_context)  # (T, d_head)
+        norm_z = _causal_attention_denominator(phi_q, phi_k)
     else:
         attn_out = _attn_out(phi_q, context)  # (T, d_head)
         norm_z = _attention_denominator(phi_q, phi_k)
@@ -369,8 +385,9 @@ def _gen_block_witness(
     if attention_mode == "normalized_fixed":
         if causal:
             raise ValueError(
-                "attention_mode='normalized_fixed' is currently supported for "
-                "non-causal attention only"
+                "attention_mode='normalized_fixed' is not enabled for causal "
+                "proof export yet: the causal prefix-context proof needs a "
+                "cubic binding of the scaled V leaf to keep normalization sound"
             )
         attn_proj_in, norm_rem, norm_diff = _normalize_attention_floor(
             attn_out, norm_z or [], attention_scale

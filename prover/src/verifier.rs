@@ -622,7 +622,8 @@ pub fn verify(
         claim_attn_out,
         d_bits,
         transcript,
-    )?;
+    )
+    .map_err(|e| format!("batch_attn_out: {e}"))?;
 
     // Algebraic check: in legacy unnormalized mode the attention claim is
     // derived from the O-proj leaf. Normalized mode is checked by the
@@ -693,7 +694,8 @@ pub fn verify(
         claim_attn_ctx,
         attn_ctx_num_vars,
         transcript,
-    )?;
+    )
+    .map_err(|e| format!("batch_attn_ctx: {e}"))?;
 
     eprintln!(
         "[model] batch_attn:{:>8.3}ms",
@@ -734,6 +736,87 @@ pub fn verify(
         }
         None
     };
+
+    let (attn_z_phi_q_point, attn_z_phi_k_point, attn_z_phi_q_evals, attn_z_phi_k_evals) =
+        if let (true, Some(ref r_norm), Some(ref norm_sc)) = (
+            has_attn_norm,
+            attn_norm_r.as_ref(),
+            proof.attn_norm_sumcheck.as_ref(),
+        ) {
+            let r_norm_t = r_norm[..t_bits].to_vec();
+            let z_claims: Vec<F> = (0..num_blocks)
+                .map(|i| norm_sc.final_evals_g[7 * i + 2])
+                .collect();
+            let eta_z = transcript.challenge_field::<F>(b"attn_z_eta");
+            let weights_z = powers_of(eta_z, num_blocks);
+            let claim_z: F = weights_z
+                .iter()
+                .zip(z_claims.iter())
+                .map(|(w, z)| *w * *z)
+                .sum();
+            if inst_attn.causal {
+                if proof.attn_z_sumcheck.is_some() || proof.attn_z_ksum_sumcheck.is_some() {
+                    return Err("unexpected non-causal denominator proof in causal mode".into());
+                }
+                let sc = proof
+                    .attn_z_causal_sumcheck
+                    .as_ref()
+                    .ok_or_else(|| "missing causal attention denominator proof".to_string())?;
+                let (r_z, _) = verify_sumcheck_cubic_multi_batched(
+                    sc,
+                    &weights_z,
+                    claim_z,
+                    2 * t_bits + d_bits,
+                    transcript,
+                )?;
+                let r_i = r_z[..t_bits].to_vec();
+                let r_s = r_z[t_bits..2 * t_bits].to_vec();
+                let r_a = r_z[2 * t_bits..].to_vec();
+                (
+                    Some(combine(&r_i, &r_a)),
+                    Some(combine(&r_s, &r_a)),
+                    sc.final_evals_g.clone(),
+                    sc.final_evals_h.clone(),
+                )
+            } else {
+                if proof.attn_z_causal_sumcheck.is_some() {
+                    return Err("unexpected causal denominator proof in non-causal mode".into());
+                }
+                let sc = proof
+                    .attn_z_sumcheck
+                    .as_ref()
+                    .ok_or_else(|| "missing attention denominator proof".to_string())?;
+                let (r_a, _) =
+                    verify_sumcheck_multi_batched(sc, &weights_z, claim_z, d_bits, transcript)?;
+                let ksum_claims = sc.final_evals_g.clone();
+                let claim_ksum: F = weights_z
+                    .iter()
+                    .zip(ksum_claims.iter())
+                    .map(|(w, v)| *w * *v)
+                    .sum();
+                let sc_k = proof
+                    .attn_z_ksum_sumcheck
+                    .as_ref()
+                    .ok_or_else(|| "missing attention k-sum denominator proof".to_string())?;
+                let (r_s, _) = verify_sumcheck_multi_batched(
+                    sc_k, &weights_z, claim_ksum, t_bits, transcript,
+                )?;
+                (
+                    Some(combine(&r_norm_t, &r_a)),
+                    Some(combine(&r_s, &r_a)),
+                    sc.final_evals_f.clone(),
+                    sc_k.final_evals_g.clone(),
+                )
+            }
+        } else {
+            if proof.attn_z_sumcheck.is_some()
+                || proof.attn_z_ksum_sumcheck.is_some()
+                || proof.attn_z_causal_sumcheck.is_some()
+            {
+                return Err("unexpected attention denominator proof".into());
+            }
+            (None, None, Vec::new(), Vec::new())
+        };
 
     // =========================================================================
     // 7. Per-block FFN: Lasso + M absorb
@@ -1602,6 +1685,39 @@ pub fn verify(
         transcript,
     )
     .map_err(|e| format!("v_attn_batch: {e}"))?;
+
+    if let Some(ref p) = attn_z_phi_q_point {
+        hyrax_verify_batch(
+            &phi_q_coms,
+            &attn_z_phi_q_evals,
+            p,
+            proof
+                .attn_z_phi_q_open
+                .as_ref()
+                .ok_or_else(|| "missing attention denominator phi_q opening".to_string())?,
+            &params_td,
+            transcript,
+        )
+        .map_err(|e| format!("attn_z_phi_q_batch: {e}"))?;
+    } else if proof.attn_z_phi_q_open.is_some() {
+        return Err("unexpected attention denominator phi_q opening".into());
+    }
+    if let Some(ref p) = attn_z_phi_k_point {
+        hyrax_verify_batch(
+            &phi_k_coms,
+            &attn_z_phi_k_evals,
+            p,
+            proof
+                .attn_z_phi_k_open
+                .as_ref()
+                .ok_or_else(|| "missing attention denominator phi_k opening".to_string())?,
+            &params_td,
+            transcript,
+        )
+        .map_err(|e| format!("attn_z_phi_k_batch: {e}"))?;
+    } else if proof.attn_z_phi_k_open.is_some() {
+        return Err("unexpected attention denominator phi_k opening".into());
+    }
 
     if inst_attn.causal {
         let ctx_coms = causal_ctx_coms

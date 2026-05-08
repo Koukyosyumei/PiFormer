@@ -366,6 +366,9 @@ pub struct TransformerModelProof {
     pub batch_attn_out: SumcheckProofMulti,
     pub batch_attn_ctx: SumcheckProofMulti,
     pub attn_norm_sumcheck: Option<SumcheckCubicProofMulti>,
+    pub attn_z_sumcheck: Option<SumcheckProofMulti>,
+    pub attn_z_ksum_sumcheck: Option<SumcheckProofMulti>,
+    pub attn_z_causal_sumcheck: Option<SumcheckCubicProofMulti>,
     pub attn_norm_range_m: Option<GlobalRangeM>,
     pub attn_norm_rem_range_proofs: Vec<RangeWitnessProof>,
     pub attn_norm_diff_range_proofs: Vec<RangeWitnessProof>,
@@ -401,6 +404,8 @@ pub struct TransformerModelProof {
     pub attn_z_open: Option<HyraxProof>,
     pub attn_rem_open: Option<HyraxProof>,
     pub attn_diff_open: Option<HyraxProof>,
+    pub attn_z_phi_q_open: Option<HyraxProof>,
+    pub attn_z_phi_k_open: Option<HyraxProof>,
     pub causal_ctx_prefix_evals: Vec<F>,
     pub causal_phi_k_prefix_evals: Vec<F>,
     pub causal_v_prefix_evals: Vec<F>,
@@ -440,18 +445,21 @@ fn suffix_eq_evals_msb(r: &[F], len: usize) -> Vec<F> {
     suffix
 }
 
-fn eval_causal_context_features(
-    ctx_mle: &DenseMLPoly,
-    _t_bits: usize,
-    d_bits: usize,
+fn eval_causal_context_features_direct(
+    causal_context: &[Vec<F>],
     r_t: &[F],
     r_out: &[F],
+    t: usize,
+    d: usize,
 ) -> Vec<F> {
-    let mut p = ctx_mle.clone();
-    for &r in r_t {
-        p = p.fix_first_variable(r);
+    let d_p2 = d.next_power_of_two();
+    let mut out = vec![F::ZERO; d_p2];
+    let point = combine(r_t, r_out);
+    for a in 0..d {
+        let mat: Vec<Vec<F>> = (0..t).map(|i| causal_context[i * d + a].clone()).collect();
+        out[a] = mat_to_mle(&mat, t, d).evaluate(&point);
     }
-    eval_cols(&p, d_bits, r_out)
+    out
 }
 
 fn causal_prefix_polys(
@@ -479,6 +487,36 @@ fn causal_prefix_polys(
         }
     }
     (DenseMLPoly::new(f), DenseMLPoly::new(g))
+}
+
+fn causal_denominator_polys(
+    phi_q: &[Vec<F>],
+    phi_k: &[Vec<F>],
+    eq_t_evals: &[F],
+    t: usize,
+    d: usize,
+) -> (DenseMLPoly, DenseMLPoly, DenseMLPoly) {
+    let t_p2 = t.next_power_of_two();
+    let d_p2 = d.next_power_of_two();
+    let total = t_p2 * t_p2 * d_p2;
+    let mut f = vec![F::ZERO; total];
+    let mut g = vec![F::ZERO; total];
+    let mut h = vec![F::ZERO; total];
+    for i in 0..t {
+        for s in 0..=i {
+            for a in 0..d {
+                let idx = (i * t_p2 + s) * d_p2 + a;
+                f[idx] = eq_t_evals[i];
+                g[idx] = phi_q[i][a];
+                h[idx] = phi_k[s][a];
+            }
+        }
+    }
+    (
+        DenseMLPoly::new(f),
+        DenseMLPoly::new(g),
+        DenseMLPoly::new(h),
+    )
 }
 
 fn build_causal_context(phi_k: &[Vec<F>], v: &[Vec<F>], t: usize, d: usize) -> Vec<Vec<F>> {
@@ -987,13 +1025,30 @@ pub fn prove(
     let mut fs_attn_out: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut gs_attn_out: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     for i in 0..num_blocks {
-        transcript.append_field(b"attn_out_eval", &attn_out_evals[i]);
-        let f_out = DenseMLPoly::from_vec_padded(eval_rows(&phi_q_mles[i], t_bits, &r_t));
+        let f_out_vals = eval_rows(&phi_q_mles[i], t_bits, &r_t);
         let g_out = if inst_attn.causal {
-            eval_causal_context_features(&ctx_mles[i], t_bits, d_bits, &r_t, &r_k_o)
+            let bw = &witness.block_witnesses[i];
+            let computed;
+            let causal_context = match bw.attn_wit.causal_context.as_ref() {
+                Some(c) => c,
+                None => {
+                    computed = build_causal_context(&bw.attn_wit.phi_k, &bw.attn_wit.v, t, d);
+                    &computed
+                }
+            };
+            eval_causal_context_features_direct(causal_context, &r_t, &r_k_o, t, d)
         } else {
             eval_cols(&ctx_mles[i], d_bits, &r_k_o)
         };
+        if inst_attn.causal {
+            attn_out_evals[i] = f_out_vals
+                .iter()
+                .zip(g_out.iter())
+                .map(|(a, b)| *a * *b)
+                .sum();
+        }
+        transcript.append_field(b"attn_out_eval", &attn_out_evals[i]);
+        let f_out = DenseMLPoly::from_vec_padded(f_out_vals);
         let g_out = DenseMLPoly::from_vec_padded(g_out);
         fs_attn_out.push(f_out);
         gs_attn_out.push(g_out);
@@ -1147,6 +1202,116 @@ pub fn prove(
         (Some(proof), Some(r_sc))
     } else {
         (None, None)
+    };
+
+    let (
+        attn_z_sumcheck,
+        attn_z_ksum_sumcheck,
+        attn_z_causal_sumcheck,
+        attn_z_phi_q_point,
+        attn_z_phi_k_point,
+        _attn_z_phi_q_evals,
+        _attn_z_phi_k_evals,
+    ) = if let (true, Some(ref r_norm), Some(ref norm_sc)) = (
+        has_attn_norm,
+        attn_norm_r.as_ref(),
+        attn_norm_sumcheck.as_ref(),
+    ) {
+        let r_norm_t = r_norm[..t_bits].to_vec();
+        let z_claims: Vec<F> = (0..num_blocks)
+            .map(|i| norm_sc.final_evals_g[7 * i + 2])
+            .collect();
+        let eta_z = transcript.challenge_field::<F>(b"attn_z_eta");
+        let weights_z = powers_of(eta_z, num_blocks);
+        let claim_z: F = weights_z
+            .iter()
+            .zip(z_claims.iter())
+            .map(|(w, z)| *w * *z)
+            .sum();
+        if inst_attn.causal {
+            let eq_t = eq_evals_msb(&r_norm_t, t);
+            let mut fs = Vec::with_capacity(num_blocks);
+            let mut gs = Vec::with_capacity(num_blocks);
+            let mut hs = Vec::with_capacity(num_blocks);
+            for i in 0..num_blocks {
+                let bw = &witness.block_witnesses[i];
+                let (f, g, h) =
+                    causal_denominator_polys(&bw.attn_wit.phi_q, &bw.attn_wit.phi_k, &eq_t, t, d);
+                fs.push(f);
+                gs.push(g);
+                hs.push(h);
+            }
+            let (sc, r_z) =
+                prove_sumcheck_cubic_multi_batched(&fs, &gs, &hs, &weights_z, claim_z, transcript);
+            let r_i = r_z[..t_bits].to_vec();
+            let r_s = r_z[t_bits..2 * t_bits].to_vec();
+            let r_a = r_z[2 * t_bits..].to_vec();
+            let phi_q_point = combine(&r_i, &r_a);
+            let phi_k_point = combine(&r_s, &r_a);
+            let phi_q_evals = sc.final_evals_g.clone();
+            let phi_k_evals = sc.final_evals_h.clone();
+            (
+                None,
+                None,
+                Some(sc),
+                Some(phi_q_point),
+                Some(phi_k_point),
+                phi_q_evals,
+                phi_k_evals,
+            )
+        } else {
+            let mut fs = Vec::with_capacity(num_blocks);
+            let mut gs = Vec::with_capacity(num_blocks);
+            let mut ksum_mles = Vec::with_capacity(num_blocks);
+            for i in 0..num_blocks {
+                let bw = &witness.block_witnesses[i];
+                fs.push(DenseMLPoly::from_vec_padded(eval_rows(
+                    &phi_q_mles[i],
+                    t_bits,
+                    &r_norm_t,
+                )));
+                let ksum: Vec<F> = (0..d)
+                    .map(|a| (0..t).map(|s| bw.attn_wit.phi_k[s][a]).sum())
+                    .collect();
+                let ksum_mle = vec_to_mle(&ksum, d);
+                gs.push(ksum_mle.clone());
+                ksum_mles.push(ksum_mle);
+            }
+            let (sc, r_a) = prove_sumcheck_multi_batched(&fs, &gs, &weights_z, claim_z, transcript);
+            let ksum_claims = sc.final_evals_g.clone();
+            let claim_ksum: F = weights_z
+                .iter()
+                .zip(ksum_claims.iter())
+                .map(|(w, v)| *w * *v)
+                .sum();
+            let mut fs_k = Vec::with_capacity(num_blocks);
+            let mut gs_k = Vec::with_capacity(num_blocks);
+            for i in 0..num_blocks {
+                fs_k.push(DenseMLPoly::new(vec![F::ONE; 1 << t_bits]));
+                gs_k.push(DenseMLPoly::from_vec_padded(eval_cols(
+                    &phi_k_mles[i],
+                    t_bits,
+                    &r_a,
+                )));
+            }
+            let (sc_k, r_s) =
+                prove_sumcheck_multi_batched(&fs_k, &gs_k, &weights_z, claim_ksum, transcript);
+            let phi_q_point = combine(&r_norm_t, &r_a);
+            let phi_k_point = combine(&r_s, &r_a);
+            let phi_q_evals = sc.final_evals_f.clone();
+            let phi_k_evals = sc_k.final_evals_g.clone();
+            (
+                Some(sc),
+                Some(sc_k),
+                None,
+                Some(phi_q_point),
+                Some(phi_k_point),
+                phi_q_evals,
+                phi_k_evals,
+            )
+        }
+    } else {
+        (None, None, None, None, None, Vec::new(), Vec::new())
     };
     // =========================================================================
     // 7. Per-block FFN: Lasso + M commit + absorb coms
@@ -1624,6 +1789,25 @@ pub fn prove(
         transcript,
     );
 
+    let attn_z_phi_q_open = if let Some(ref p) = attn_z_phi_q_point {
+        let refs: Vec<&[F]> = phi_q_mles
+            .iter()
+            .map(|m| m.evaluations.as_slice())
+            .collect();
+        Some(hyrax_open_batch(&refs, p, nu_td, sigma_td, transcript))
+    } else {
+        None
+    };
+    let attn_z_phi_k_open = if let Some(ref p) = attn_z_phi_k_point {
+        let refs: Vec<&[F]> = phi_k_mles
+            .iter()
+            .map(|m| m.evaluations.as_slice())
+            .collect();
+        Some(hyrax_open_batch(&refs, p, nu_td, sigma_td, transcript))
+    } else {
+        None
+    };
+
     let causal_ctx_out_batch_open = if inst_attn.causal {
         let ctx_out_point = combine(&combine(&r_t, &batch_r_attn_out), &r_k_o);
         let ctx_refs: Vec<&[F]> = ctx_mles.iter().map(|m| m.evaluations.as_slice()).collect();
@@ -1856,6 +2040,9 @@ pub fn prove(
         batch_attn_out,
         batch_attn_ctx,
         attn_norm_sumcheck,
+        attn_z_sumcheck,
+        attn_z_ksum_sumcheck,
+        attn_z_causal_sumcheck,
         attn_norm_range_m,
         attn_norm_rem_range_proofs,
         attn_norm_diff_range_proofs,
@@ -1885,6 +2072,8 @@ pub fn prove(
         attn_z_open,
         attn_rem_open,
         attn_diff_open,
+        attn_z_phi_q_open,
+        attn_z_phi_k_open,
         causal_ctx_prefix_evals,
         causal_phi_k_prefix_evals,
         causal_v_prefix_evals,
