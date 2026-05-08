@@ -89,7 +89,7 @@ pub struct LayerNormOpenings {
 
     pub sq_sum_x_at_rsig: F,
     pub sigma_at_rsig: F,
-    pub sigma_sq_at_rsig: F, // bound by sigma_sq_sumcheck
+    pub sigma_sq_at_rsig: F, // bound by sigma_residual_sumcheck
     pub sum_x_sq_at_rsig: F,
     pub rsig_batch_proof: HyraxProof, // opens [sigma_com, sq_sum_x_com] at r_sig_t
 
@@ -137,9 +137,10 @@ pub struct LayerNormProof {
     pub internal_coms: LayerNormInternalCommitments,
     pub mean_sumcheck: SumcheckProof,
     pub sq_sum_sumcheck: SumcheckCubicProof,
-    pub sum_x_sq_sumcheck: SumcheckCubicProof,
-    /// Proves Σ_i eq(r_sig_t, i) * (d*sigma[i])^2 = sigma_sq_at_rsig, binding sigma_sq to sigma_com.
-    pub sigma_sq_sumcheck: SumcheckCubicProof,
+    /// Batched cubic sumcheck for sigma-side residual ingredients:
+    ///   Σ_i eq(r_sig_t, i) * sum_x[i]^2
+    ///   Σ_i eq(r_sig_t, i) * (d*sigma[i])^2
+    pub sigma_residual_sumcheck: SumcheckCubicProofMulti,
     /// Batched cubic sumcheck for gamma*X and sigma*Y (shared eq_y, same challenge vector)
     pub gamma_sigma_sumcheck: SumcheckCubicProofMulti,
     pub sigma_range_proof: RangeWitnessProof,
@@ -183,7 +184,10 @@ pub fn vec_to_bits(n: usize, num_bits: usize) -> Vec<F> {
 // Range-witness extraction (call before the global range batch)
 // ---------------------------------------------------------------------------
 
-/// Intermediate values that need 32-bit range proofs in a LayerNorm.
+/// Range width used for LayerNorm residual range proofs.
+pub const LAYERNORM_RANGE_BITS: usize = 64;
+
+/// Intermediate values that need range proofs in a LayerNorm.
 pub struct LayerNormRangeWitnesses {
     /// Residual pairs for σ (size 2*T): each pair enforces σ ≥ 0.
     pub sigma_witness: RangeProofWitness,
@@ -261,7 +265,7 @@ pub fn prove_layernorm(
     let sq_sum_x_mle = vec_to_mle(&witness.sq_sum_x, t);
     let sum_x_sq_mle = vec_to_mle(&witness.sum_x_sq, t);
     let sigma_mle = vec_to_mle(&witness.sigma, t);
-    // d_sigma_mle[i] = d * sigma[i]; used for sigma_sq_sumcheck
+    // d_sigma_mle[i] = d * sigma[i]; used for sigma_residual_sumcheck
     let d_sigma_evals: Vec<F> = witness.sigma.iter().map(|&s| d_f * s).collect();
     let d_sigma_mle = vec_to_mle(&d_sigma_evals, t);
     // sigma_sq_mle[i] = (d * sigma[i])^2; MLE for correct sumcheck claim
@@ -309,19 +313,23 @@ pub fn prove_layernorm(
     // r_sig and r_y come from the pre-computed global range batch (already in transcript)
     let r_sig_t = r_sig[0..t_bits].to_vec();
 
-    // Binding: sum_x_sq(r_sig_t) -> (sum_x)^2
+    // Binding: sigma-side residual ingredients at r_sig_t:
+    //   sum_x_sq(r_sig_t) = Σ_i eq(r_sig_t,i) * sum_x[i]^2
+    //   sigma_sq(r_sig_t) = Σ_i eq(r_sig_t,i) * (d*sigma[i])^2
+    // They share eq_sig, so batch them into one GKR-style cubic sumcheck.
     let eq_sig = gen_eq_poly(&r_sig_t);
     let claim_x_sq = sum_x_sq_mle.evaluate(&r_sig_t);
-    let (sum_x_sq_sumcheck, r_f_sig) =
-        prove_sumcheck_cubic(&eq_sig, &sum_x_mle, &sum_x_mle, claim_x_sq, transcript);
-
-    // Binding: sigma_sq(r_sig_t) = Σ_i eq(r_sig_t,i)*(d*sigma[i])^2  [binds to sigma_com]
     let claim_sigma_sq = sigma_sq_mle.evaluate(&r_sig_t);
-    let (sigma_sq_sumcheck, r_f_sigma_sq) = prove_sumcheck_cubic(
-        &eq_sig,
-        &d_sigma_mle,
-        &d_sigma_mle,
-        claim_sigma_sq,
+    transcript.append_field(b"claim_sum_x_sq", &claim_x_sq);
+    transcript.append_field(b"claim_sigma_sq", &claim_sigma_sq);
+    let sigma_batch_lambda = transcript.challenge_field::<F>(b"sigma_residual_batch_lambda");
+    let sigma_residual_claim = claim_x_sq + sigma_batch_lambda * claim_sigma_sq;
+    let (sigma_residual_sumcheck, r_f_sig) = prove_sumcheck_cubic_multi_batched(
+        &[eq_sig.clone(), eq_sig],
+        &[sum_x_mle.clone(), d_sigma_mle.clone()],
+        &[sum_x_mle.clone(), d_sigma_mle],
+        &[F::one(), sigma_batch_lambda],
+        sigma_residual_claim,
         transcript,
     );
 
@@ -444,8 +452,7 @@ pub fn prove_layernorm(
         },
         mean_sumcheck,
         sq_sum_sumcheck,
-        sum_x_sq_sumcheck,
-        sigma_sq_sumcheck,
+        sigma_residual_sumcheck,
         gamma_sigma_sumcheck,
         sigma_range_proof,
         y_range_proof,
@@ -515,14 +522,9 @@ pub fn prove_layernorm(
             sigma_at_rf_sy_t_proof,
             sum_x_at_rf_sig: sum_x_mle.evaluate(&r_f_sig),
             sum_x_at_rf_sig_proof: hyrax_open(&sum_x_mle.evaluations, &r_f_sig, nu_t, sigma_t),
-            // sigma_sq binding: open sigma_com at r_f_sigma_sq
-            sigma_at_rf_sigma_sq: sigma_mle.evaluate(&r_f_sigma_sq),
-            sigma_at_rf_sigma_sq_proof: hyrax_open(
-                &sigma_mle.evaluations,
-                &r_f_sigma_sq,
-                nu_t,
-                sigma_t,
-            ),
+            // sigma_sq binding uses the same batched residual challenge as sum_x_sq.
+            sigma_at_rf_sigma_sq: sigma_mle.evaluate(&r_f_sig),
+            sigma_at_rf_sigma_sq_proof: hyrax_open(&sigma_mle.evaluations, &r_f_sig, nu_t, sigma_t),
         },
     })
 }
@@ -611,27 +613,32 @@ pub fn verify_layernorm(
     };
     let r_sig_t = r_sig[0..t_bits].to_vec();
 
-    let (r_f_sig, f_sq) = verify_sumcheck_cubic(
-        &proof.sum_x_sq_sumcheck,
-        proof.openings.sum_x_sq_at_rsig,
+    transcript.append_field(b"claim_sum_x_sq", &proof.openings.sum_x_sq_at_rsig);
+    transcript.append_field(b"claim_sigma_sq", &proof.openings.sigma_sq_at_rsig);
+    let sigma_batch_lambda = transcript.challenge_field::<F>(b"sigma_residual_batch_lambda");
+    let sigma_residual_claim =
+        proof.openings.sum_x_sq_at_rsig + sigma_batch_lambda * proof.openings.sigma_sq_at_rsig;
+    let (r_f_sig, _) = verify_sumcheck_cubic_multi_batched(
+        &proof.sigma_residual_sumcheck,
+        &[F::one(), sigma_batch_lambda],
+        sigma_residual_claim,
         t_bits,
         transcript,
     )?;
     let eq_sig_eval = eq_poly_eval(&r_f_sig, &r_sig_t);
-    if f_sq != eq_sig_eval * proof.openings.sum_x_at_rf_sig * proof.openings.sum_x_at_rf_sig {
+    if proof.sigma_residual_sumcheck.final_evals_f[0]
+        * proof.sigma_residual_sumcheck.final_evals_g[0]
+        * proof.sigma_residual_sumcheck.final_evals_h[0]
+        != eq_sig_eval * proof.openings.sum_x_at_rf_sig * proof.openings.sum_x_at_rf_sig
+    {
         return Err("sum_x_sq binding failed".into());
     }
-
-    // sigma_sq_sumcheck: proves Σ eq(r_sig_t, i) * (d*sigma[i])^2 = sigma_sq_at_rsig
-    let (r_f_sigma_sq, f_sigma_sq) = verify_sumcheck_cubic(
-        &proof.sigma_sq_sumcheck,
-        proof.openings.sigma_sq_at_rsig,
-        t_bits,
-        transcript,
-    )?;
-    let eq_sigma_sq_eval = eq_poly_eval(&r_f_sigma_sq, &r_sig_t);
     let d_sigma_rf = d_f * proof.openings.sigma_at_rf_sigma_sq;
-    if f_sigma_sq != eq_sigma_sq_eval * d_sigma_rf * d_sigma_rf {
+    if proof.sigma_residual_sumcheck.final_evals_f[1]
+        * proof.sigma_residual_sumcheck.final_evals_g[1]
+        * proof.sigma_residual_sumcheck.final_evals_h[1]
+        != eq_sig_eval * d_sigma_rf * d_sigma_rf
+    {
         return Err("sigma_sq sumcheck binding failed".into());
     }
 
@@ -715,7 +722,7 @@ pub fn verify_layernorm(
 
     // --- Sigma Fusion Check ---
     let v_ev = d_f * (d_f * proof.openings.sq_sum_x_at_rsig - proof.openings.sum_x_sq_at_rsig);
-    // sigma_sq_at_rsig is bound by sigma_sq_sumcheck above
+    // sigma_sq_at_rsig is bound by sigma_residual_sumcheck above
     let z_ev = proof.openings.sigma_sq_at_rsig;
     let dsi = d_f * proof.openings.sigma_at_rsig;
 
@@ -758,10 +765,7 @@ pub fn verify_layernorm(
             proof.internal_coms.sum_x_com.clone(),
             proof.internal_coms.sq_sum_x_com.clone(),
         ],
-        &[
-            proof.openings.sum_x_at_rt,
-            proof.openings.sq_sum_x_at_rt,
-        ],
+        &[proof.openings.sum_x_at_rt, proof.openings.sq_sum_x_at_rt],
         &r_t,
         &proof.openings.rt_batch_proof,
         transcript,
@@ -876,11 +880,11 @@ pub fn verify_layernorm(
         &proof.openings.sum_x_at_rf_sig_proof,
     )?;
 
-    // sigma_sq_sumcheck final binding: open sigma_com at r_f_sigma_sq
+    // sigma_sq binding uses the same batched residual point r_f_sig.
     acc_t.add_verify(
         &proof.internal_coms.sigma_com,
         proof.openings.sigma_at_rf_sigma_sq,
-        &r_f_sigma_sq,
+        &r_f_sig,
         &proof.openings.sigma_at_rf_sigma_sq_proof,
     )?;
 

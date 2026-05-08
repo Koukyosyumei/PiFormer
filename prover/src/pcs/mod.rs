@@ -317,17 +317,32 @@ pub fn hyrax_open_batch(
     let l_vec = lagrange_basis(&r_l_rev);
 
     // 3. 統合された w' ベクトルを計算: w'_batch = Σ_k η^k * (Σ_i L_i * Row_{k,i})
-    let mut w_prime_batched = vec![F::ZERO; num_cols];
-    for (k, evals) in evals_list.iter().enumerate() {
-        let eta_k = eta_pows[k];
-        for (i, &l_i) in l_vec.iter().enumerate() {
-            let row = &evals[i * num_cols..(i + 1) * num_cols];
-            let coeff = eta_k * l_i;
-            for (j, &m_ij) in row.iter().enumerate() {
-                w_prime_batched[j] += coeff * m_ij;
+    // Parallelize over the polynomial axis k. Each task computes its η^k-scaled
+    // contribution into a local accumulator, then a reduce sums them.
+    let w_prime_batched: Vec<F> = evals_list
+        .par_iter()
+        .enumerate()
+        .map(|(k, evals)| {
+            let eta_k = eta_pows[k];
+            let mut local = vec![F::ZERO; num_cols];
+            for (i, &l_i) in l_vec.iter().enumerate() {
+                let coeff = eta_k * l_i;
+                let row = &evals[i * num_cols..(i + 1) * num_cols];
+                for (j, &m_ij) in row.iter().enumerate() {
+                    local[j] += coeff * m_ij;
+                }
             }
-        }
-    }
+            local
+        })
+        .reduce(
+            || vec![F::ZERO; num_cols],
+            |mut a, b| {
+                for (a_j, b_j) in a.iter_mut().zip(b.iter()) {
+                    *a_j += *b_j;
+                }
+                a
+            },
+        );
 
     HyraxProof {
         w_prime: w_prime_batched,
@@ -380,6 +395,63 @@ pub fn hyrax_verify_batch(
 
     // 4. 内積の検証 (統合された評価値との比較)
     // Check 2: <R, w'_batch> == Σ_k η^k * eval_k
+    let inner: F = r_vec
+        .iter()
+        .zip(proof.w_prime.iter())
+        .map(|(&r, &w)| r * w)
+        .sum();
+    let expected_inner: F = evals
+        .iter()
+        .zip(eta_pows.iter())
+        .map(|(&v, &e)| v * e)
+        .sum();
+
+    if inner != expected_inner {
+        return Err(format!(
+            "Hyrax Batch: inner product check failed: got {inner:?}, expected {expected_inner:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Same as `hyrax_verify_batch`, but the caller supplies the Fiat-Shamir
+/// batching challenge. This is useful when a verifier derives several `eta`s
+/// sequentially to preserve transcript order, then verifies the independent
+/// batch openings in parallel.
+pub fn hyrax_verify_batch_with_eta(
+    commitments: &[HyraxCommitment],
+    evals: &[F],
+    point: &[F],
+    proof: &HyraxProof,
+    params: &HyraxParams,
+    eta: F,
+) -> Result<(), String> {
+    let count = commitments.len();
+    assert_eq!(evals.len(), count);
+    let nu = commitments[0].nu;
+    let eta_pows = powers_of(eta, count);
+
+    let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
+    let r_r_rev: Vec<F> = point[nu..].iter().rev().copied().collect();
+    let l_vec = lagrange_basis(&r_l_rev);
+    let r_vec = lagrange_basis(&r_r_rev);
+
+    let num_rows = 1usize << nu;
+    let mut all_row_points: Vec<G1Affine> = Vec::with_capacity(count * num_rows);
+    let mut all_row_scalars: Vec<F> = Vec::with_capacity(count * num_rows);
+    for (k, com) in commitments.iter().enumerate() {
+        for (i, &row_com) in com.row_coms.iter().enumerate() {
+            all_row_points.push(row_com);
+            all_row_scalars.push(eta_pows[k] * l_vec[i]);
+        }
+    }
+    let lhs = msm(&all_row_points, &all_row_scalars);
+    let rhs = msm(&params.gens, &proof.w_prime);
+    if lhs != rhs {
+        return Err("Hyrax Batch: commitment check failed".to_string());
+    }
+
     let inner: F = r_vec
         .iter()
         .zip(proof.w_prime.iter())
@@ -647,6 +719,56 @@ impl HyraxBatchAccumulator {
 
         if lhs != rhs {
             return Err("HyraxBatchAccumulator finalize: commitment check failed".to_string());
+        }
+        Ok(())
+    }
+
+    /// Fuse several accumulators that use identical Hyrax parameters into one
+    /// randomized commitment check. Each group keeps its own `mu` challenge;
+    /// `rho` randomizes across groups so invalid groups cannot cancel except
+    /// with negligible probability.
+    pub fn finalize_many_with_mus(
+        params: &HyraxParams,
+        groups: Vec<(HyraxBatchAccumulator, F)>,
+        rho: F,
+    ) -> Result<(), String> {
+        let num_cols = params.gens.len();
+        let rho_pows = powers_of(rho, groups.len());
+        let mut w_prime_combined = vec![F::ZERO; num_cols];
+        let mut all_points: Vec<G1Affine> = Vec::new();
+        let mut all_scalars: Vec<F> = Vec::new();
+
+        for ((acc, mu), rho_g) in groups.into_iter().zip(rho_pows.into_iter()) {
+            if acc.slots.is_empty() {
+                continue;
+            }
+            let mu_pows = powers_of(mu, acc.slots.len());
+            let total: usize = acc.slots.iter().map(|s| s.row_coms.len()).sum();
+            all_points.reserve(total);
+            all_scalars.reserve(total);
+
+            for (k, slot) in acc.slots.into_iter().enumerate() {
+                let group_weight = rho_g * mu_pows[k];
+                for (j, &w) in slot.w_prime.iter().enumerate() {
+                    w_prime_combined[j] += group_weight * w;
+                }
+                for (com, scalar) in slot.row_coms.into_iter().zip(slot.row_scalars.into_iter()) {
+                    all_points.push(com);
+                    all_scalars.push(group_weight * scalar);
+                }
+            }
+        }
+
+        if all_points.is_empty() {
+            return Ok(());
+        }
+
+        let lhs = msm(&all_points, &all_scalars);
+        let rhs = msm(&params.gens, &w_prime_combined);
+        if lhs != rhs {
+            return Err(
+                "HyraxBatchAccumulator fused finalize: commitment check failed".to_string(),
+            );
         }
         Ok(())
     }

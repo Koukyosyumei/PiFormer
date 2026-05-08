@@ -16,6 +16,7 @@ Protocol invariants matched to layernorm.rs / lasso.rs / range.rs:
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 from typing import List, Tuple
 
 # ---------------------------------------------------------------------------
@@ -86,11 +87,42 @@ def vec_to_json(v: List[int]) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+def round_half_up_fraction(x: Fraction) -> int:
+    """Round a rational as floor(x + 1/2), including for negative values."""
+    return (2 * x.numerator + x.denominator) // (2 * x.denominator)
+
+
+def effective_activation_scale(scale: float, quant_scale: int) -> tuple[int, int]:
+    """Return numerator/denominator for raw_int divisor `quant_scale * scale`."""
+    frac = Fraction(str(scale)) * int(quant_scale)
+    frac = frac.limit_denominator()
+    if frac.numerator <= 0 or frac.denominator <= 0:
+        raise ValueError("activation scale must be positive")
+    return frac.numerator, frac.denominator
+
+
 def quantize_to_int(x: float, scale: float, num_bits: int) -> int:
-    """Centered clamp-round quantize: returns integer in [0, 2^num_bits - 1]."""
+    """Centered no-saturation quantize; raises if the index is out of range."""
     max_val = (1 << num_bits) - 1
     zero_point = 1 << (num_bits - 1)
-    return max(0, min(max_val, round(x / scale) + zero_point))
+    idx = round_half_up_fraction(Fraction(str(x)) / Fraction(str(scale))) + zero_point
+    if idx < 0 or idx > max_val:
+        raise ValueError(f"quantized activation index {idx} outside [0, {max_val}]")
+    return idx
+
+
+def quantize_raw_to_index(
+    raw: int, scale_num: int, scale_den: int, num_bits: int, zero_point: int | None = None
+) -> int:
+    """Quantize integer-domain raw value using raw / (scale_num / scale_den)."""
+    max_val = (1 << num_bits) - 1
+    if zero_point is None:
+        zero_point = 1 << (num_bits - 1)
+    q = round_half_up_fraction(Fraction(raw * scale_den, scale_num))
+    idx = q + zero_point
+    if idx < 0 or idx > max_val:
+        raise ValueError(f"quantized activation index {idx} outside [0, {max_val}]")
+    return idx
 
 
 def apply_phi_int(

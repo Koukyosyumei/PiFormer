@@ -41,6 +41,12 @@ Optional Python training pipeline:
 cd python && pip install -r requirements.txt && python train_demo.py
 ```
 
+The current end-to-end proof path uses no-saturation centered lookup
+quantization: Python computes `index = round(raw / S) + zero_point` and rejects
+out-of-range activations, while Rust verifies that relation against committed
+Q/K/M tensors before the Lasso lookup. The benchmark and demo use zero
+dense/lookup layers for fast proof timing and CLI smoke tests.
+
 Tests and benchmarks:
 
 ```bash
@@ -54,7 +60,6 @@ python benchmark.py --all
 python/    PyTorch training pipeline + JSON exporter
 prover/    Rust SNARK prover/verifier (library + `piformer` CLI)
 paper/     Reference papers (zkGPT, zkLLM)
-ref/       Reference implementations
 DESIGN.md  Technical specification
 ```
 
@@ -69,7 +74,7 @@ DESIGN.md  Technical specification
 
 ## Status
 
-Research prototype. The Rust prover is currently single-head (`n_heads = 1`); training and export refuse other configurations. The proof is not zero-knowledge yet: public commitments and some intermediate evaluations are revealed. The cross-layer projection and stand-alone ternary-weight check exist as building blocks but are not yet wired into the end-to-end prover.
+Research prototype. The Rust prover is currently single-head (`n_heads = 1`); training and export refuse other configurations. The proof is not fully zero-knowledge yet: public commitments and some intermediate evaluations are revealed, while lookup quantization is now proved with committed remainders/range proofs instead of public raw Q/K/M vectors. The cross-layer projection and stand-alone ternary-weight check exist as building blocks but are not yet wired into the end-to-end prover.
 
 ## License
 

@@ -57,9 +57,10 @@ CONFIGS: dict[str, dict] = {
         "seq_len": 8,
         "num_bits": 8,
         "c": 2,
-        "scale": 0.1,
+        "scale": 1.0,
+        "lookup_table_scale": 0.01,
         "max_exp": 4,
-        "description": "Tiny (demo-scale)",
+        "description": "Tiny",
     },
     "small": {
         "d_model": 64,
@@ -70,7 +71,8 @@ CONFIGS: dict[str, dict] = {
         "seq_len": 16,
         "num_bits": 8,
         "c": 2,
-        "scale": 0.1,
+        "scale": 1.0,
+        "lookup_table_scale": 0.01,
         "max_exp": 4,
         "description": "Small",
     },
@@ -83,7 +85,8 @@ CONFIGS: dict[str, dict] = {
         "seq_len": 32,
         "num_bits": 8,
         "c": 2,
-        "scale": 0.1,
+        "scale": 1.0,
+        "lookup_table_scale": 0.01,
         "max_exp": 4,
         "description": "Medium",
     },
@@ -96,7 +99,8 @@ CONFIGS: dict[str, dict] = {
         "seq_len": 32,
         "num_bits": 8,
         "c": 2,
-        "scale": 0.1,
+        "scale": 1.0,
+        "lookup_table_scale": 0.01,
         "max_exp": 4,
         "description": "Large",
     },
@@ -111,7 +115,8 @@ CONFIGS: dict[str, dict] = {
         "seq_len": 32,
         "num_bits": 8,
         "c": 2,
-        "scale": 0.1,
+        "scale": 1.0,
+        "lookup_table_scale": 0.01,
         "max_exp": 4,
         "description": "GPT-2 Small (power-of-2 approximation, n_heads=1)",
     },
@@ -223,7 +228,7 @@ def _export(cfg: dict, out_dir: Path) -> float:
 
     # Build the Python inline script so we don't need the repo on PYTHONPATH
     seq_len = cfg["seq_len"]
-    token_ids = list(range(seq_len % cfg["vocab_size"]))  # deterministic dummy input
+    token_ids = list(range(min(seq_len, cfg["vocab_size"])))  # deterministic dummy input
     # Make sure token_ids have the right length
     token_ids = (token_ids * (seq_len // len(token_ids) + 1))[:seq_len]
 
@@ -249,21 +254,24 @@ model = PiFormerModel(
     scale=cfg["scale"],
     max_exp=cfg["max_exp"],
     causal=cfg.get("causal", False),
+    # Causal export does not yet support normalized_fixed (witness.py rejects
+    # the combination because the prefix-context proof needs a binding for the
+    # scaled V leaf). The Rust prover supports causal+unnormalized via the
+    # cubic batch_attn_out sumcheck.
+    attention_mode="prover" if cfg.get("causal", False) else "normalized_fixed",
+    attention_scale=64,
 )
 model.eval()
 
-# The current Rust proof binds lookup keys directly to the committed Q/K/M
-# tensors. Random Python weights use clamp/round quantized lookup keys, which
-# require an additional quantization proof not present in this protocol path.
-# For benchmark timing, keep the configured dimensions but zero only the
-# projection/FFN/head weights so lookup inputs are raw zero. Embeddings and
-# LayerNorm parameters stay nonzero to avoid degenerate all-zero range witnesses.
+# Keep dense projections, FFN layers, heads, and lookup tables nonzero.  The
+# LayerNorm proof ranges are finite, so benchmark-time lookup table
+# amplitudes are scaled down deterministically to avoid proving only a
+# saturation/overflow failure for randomly initialized, untrained weights.
 with torch.no_grad():
+    lookup_table_scale = float(cfg.get("lookup_table_scale", 1.0))
     for name, param in model.named_parameters():
-        if any(part in name for part in ("q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2", "head")):
-            param.zero_()
-        if name.endswith("alpha"):
-            param.fill_(1.0)
+        if ".tables." in name:
+            param.mul_(lookup_table_scale)
 
 token_ids = {token_ids!r}
 export_all(
@@ -274,6 +282,7 @@ export_all(
     ln_scale=4,
     extra_beta_floor=8,
     lasso_sigma=4,
+    lookup_index_mode="centered",
 )
 """
 

@@ -13,7 +13,7 @@ use piformer_prover::{
         projection::ProjectionWitness,
     },
     ffn::ffn::{FFNInstance, FFNWitness},
-    lookup::lasso::LassoInstance,
+    lookup::{lasso::LassoInstance, quantization::QuantizationParams},
     poly::utils::TernaryValue,
     prover::{TransformerBlockWitness, TransformerModelWitness},
     setup::{TransformerBlockWeights, TransformerModelWeights},
@@ -154,16 +154,15 @@ pub struct JsonBlockWeights {
     pub ffn_w1: Vec<Vec<i8>>,
     pub ffn_w2: Vec<Vec<i8>>,
     // Activation tables for Lasso precommitment at setup time
-    #[serde(default)]
     pub ffn_activation_tables: Vec<Vec<String>>,
-    #[serde(default)]
     pub ffn_activation_bits_per_chunk: usize,
-    #[serde(default)]
+    pub ffn_activation_scale_num: u64,
+    pub ffn_activation_scale_den: u64,
     pub q_activation_tables: Vec<Vec<String>>,
-    #[serde(default)]
     pub k_activation_tables: Vec<Vec<String>>,
-    #[serde(default)]
     pub qk_activation_bits_per_chunk: usize,
+    pub qk_activation_scale_num: u64,
+    pub qk_activation_scale_den: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -225,9 +224,13 @@ pub fn weights_to_json(w: &TransformerModelWeights) -> JsonWeights {
             ffn_w2: ternary_mat_to_json(&b.ffn_w2),
             ffn_activation_tables: mat_to_json(&b.ffn_activation_tables),
             ffn_activation_bits_per_chunk: b.ffn_activation_bits_per_chunk,
+            ffn_activation_scale_num: b.ffn_activation_quant.scale_num,
+            ffn_activation_scale_den: b.ffn_activation_quant.scale_den,
             q_activation_tables: mat_to_json(&b.q_activation_tables),
             k_activation_tables: mat_to_json(&b.k_activation_tables),
             qk_activation_bits_per_chunk: b.qk_activation_bits_per_chunk,
+            qk_activation_scale_num: b.qk_activation_quant.scale_num,
+            qk_activation_scale_den: b.qk_activation_quant.scale_den,
         })
         .collect();
     JsonWeights {
@@ -271,9 +274,17 @@ pub fn weights_from_json(j: JsonWeights) -> Result<TransformerModelWeights, Stri
                 ffn_w2: ternary_mat_from_json(b.ffn_w2)?,
                 ffn_activation_tables: mat_from_json(b.ffn_activation_tables)?,
                 ffn_activation_bits_per_chunk: b.ffn_activation_bits_per_chunk,
+                ffn_activation_quant: QuantizationParams {
+                    scale_num: b.ffn_activation_scale_num,
+                    scale_den: b.ffn_activation_scale_den,
+                },
                 q_activation_tables: mat_from_json(b.q_activation_tables)?,
                 k_activation_tables: mat_from_json(b.k_activation_tables)?,
                 qk_activation_bits_per_chunk: b.qk_activation_bits_per_chunk,
+                qk_activation_quant: QuantizationParams {
+                    scale_num: b.qk_activation_scale_num,
+                    scale_den: b.qk_activation_scale_den,
+                },
             })
         })
         .collect();
@@ -351,6 +362,14 @@ pub struct JsonAttnWitness {
     pub context: Vec<Vec<String>>,
     #[serde(default)]
     pub causal_context: Option<Vec<Vec<String>>>,
+    #[serde(default)]
+    pub normalized_out: Option<Vec<Vec<String>>>,
+    #[serde(default)]
+    pub norm_z: Option<Vec<String>>,
+    #[serde(default)]
+    pub norm_rem: Option<Vec<Vec<String>>>,
+    #[serde(default)]
+    pub norm_diff: Option<Vec<Vec<String>>>,
     pub out: Vec<Vec<String>>,
 }
 
@@ -475,6 +494,10 @@ fn attn_wit_to_json(w: &LinearAttentionWitness) -> JsonAttnWitness {
         k_query_indices: w.k_query_indices.clone(),
         context: mat_to_json(&w.context),
         causal_context: w.causal_context.as_ref().map(|m| mat_to_json(m)),
+        normalized_out: w.normalized_out.as_ref().map(|m| mat_to_json(m)),
+        norm_z: w.norm_z.as_ref().map(|v| vec_to_json(v)),
+        norm_rem: w.norm_rem.as_ref().map(|m| mat_to_json(m)),
+        norm_diff: w.norm_diff.as_ref().map(|m| mat_to_json(m)),
         out: mat_to_json(&w.out),
     }
 }
@@ -494,6 +517,26 @@ fn attn_wit_from_json(j: JsonAttnWitness) -> Result<LinearAttentionWitness, Stri
             .map(mat_from_json)
             .transpose()
             .map_err(|e| format!("causal_context: {e}"))?,
+        normalized_out: j
+            .normalized_out
+            .map(mat_from_json)
+            .transpose()
+            .map_err(|e| format!("normalized_out: {e}"))?,
+        norm_z: j
+            .norm_z
+            .map(vec_from_json)
+            .transpose()
+            .map_err(|e| format!("norm_z: {e}"))?,
+        norm_rem: j
+            .norm_rem
+            .map(mat_from_json)
+            .transpose()
+            .map_err(|e| format!("norm_rem: {e}"))?,
+        norm_diff: j
+            .norm_diff
+            .map(mat_from_json)
+            .transpose()
+            .map_err(|e| format!("norm_diff: {e}"))?,
         out: mat_from_json(j.out)?,
     })
 }

@@ -41,6 +41,7 @@ import torch.nn as nn
 
 from .model import PiFormerModel
 from .quant import (
+    effective_activation_scale,
     extract_phi_tables_int,
     extract_ternary_weight_matrix,
     int_to_field_hex,
@@ -102,7 +103,7 @@ def _proj_weight_int(
 
 def _proj_alpha_int(linear: "TernaryLinear") -> int:  # noqa: F821
     """Return the integer alpha for a TernaryLinear (matches witness computation)."""
-    return max(1, round(float(linear.alpha)))
+    return max(1, round(float(linear.alpha.detach())))
 
 
 def _proj_bias_ints(linear: "TernaryLinear") -> List[int]:  # noqa: F821
@@ -152,6 +153,14 @@ def export_weights_rust(
             f"Got n_heads={model.blocks[0].attn.n_heads}. "
             "Either use n_heads=1 or extend the Rust prover."
         )
+    for i, blk in enumerate(model.blocks):
+        mode = getattr(blk.attn, "attention_mode", "normalized_float")
+        if mode == "normalized_float":
+            raise ValueError(
+                f"block {i}: Rust export cannot prove "
+                "attention_mode='normalized_float'. Use "
+                "attention_mode='normalized_fixed' or 'prover'."
+            )
 
     n_layers = len(model.blocks)
     vocab_size = model.embedding.num_embeddings
@@ -185,6 +194,13 @@ def export_weights_rust(
         )
         attn_bits = attn.phi.bits_per_chunk
         ffn_bits = blk.ffn.act.bits_per_chunk
+        qk_scale_num, qk_scale_den = effective_activation_scale(attn.phi.scale, quant_scale)
+        ffn_scale_num, ffn_scale_den = effective_activation_scale(blk.ffn.act.scale, quant_scale)
+        if qk_scale_num & (qk_scale_num - 1) or ffn_scale_num & (ffn_scale_num - 1):
+            raise ValueError(
+                "activation scale numerator must be a power of two for the Rust "
+                "quantization range proof; adjust scale or quant_scale"
+            )
 
         blocks_json.append({
             "ln1_gamma": vec_to_json(ln1_gamma),
@@ -207,9 +223,13 @@ def export_weights_rust(
             # Activation tables for Lasso precommitment at setup time
             "ffn_activation_tables": [[int_to_field_hex(v) for v in tbl] for tbl in ffn_tables_int],
             "ffn_activation_bits_per_chunk": ffn_bits,
+            "ffn_activation_scale_num": ffn_scale_num,
+            "ffn_activation_scale_den": ffn_scale_den,
             "q_activation_tables":  [[int_to_field_hex(v) for v in tbl] for tbl in attn_tables_int],
             "k_activation_tables":  [[int_to_field_hex(v) for v in tbl] for tbl in attn_tables_int],
             "qk_activation_bits_per_chunk": attn_bits,
+            "qk_activation_scale_num": qk_scale_num,
+            "qk_activation_scale_den": qk_scale_den,
         })
 
     if final_ln_weights is not None:
@@ -251,6 +271,7 @@ def export_witness_rust(
     ln_scale: int = 4,
     extra_beta_floor: int = 8,
     lasso_sigma: int = 4,
+    lookup_index_mode: str = "centered",
 ) -> None:
     """Run the integer forward pass and write ``witness.json``.
 
@@ -263,12 +284,16 @@ def export_witness_rust(
         extra_beta_floor:  Extra safety margin added to auto beta_floor.
         lasso_sigma:       Hyrax sigma parameter used by the Lasso prover
                            (must match the value passed to ``piformer prove``).
+        lookup_index_mode: ``"centered"`` binds lookup keys to committed Q/K/M
+                           tensors plus the activation zero-point. ``"field"``
+                           uses Q/K/M as direct lookup keys.
     """
     gen = WitnessGenerator(
         quant_scale=quant_scale,
         ln_scale=ln_scale,
         extra_beta_floor=extra_beta_floor,
         lasso_sigma=lasso_sigma,
+        lookup_index_mode=lookup_index_mode,
     )
     witness_dict = gen.generate(model, token_ids)
     Path(out_path).write_text(json.dumps(witness_dict, indent=2))
@@ -291,6 +316,7 @@ def export_all(
     ln_scale: int = 4,
     extra_beta_floor: int = 8,
     lasso_sigma: int = 4,
+    lookup_index_mode: str = "centered",
 ) -> None:
     """Export both weights and witness in a single call.
 
@@ -308,6 +334,7 @@ def export_all(
         ln_scale=ln_scale,
         extra_beta_floor=extra_beta_floor,
         lasso_sigma=lasso_sigma,
+        lookup_index_mode=lookup_index_mode,
     )
     witness_dict = gen.generate(model, token_ids)
     Path(witness_path).write_text(json.dumps(witness_dict, indent=2))

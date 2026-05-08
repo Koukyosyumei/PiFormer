@@ -13,7 +13,7 @@ use piformer_prover::{
         projection::ProjectionWitness,
     },
     ffn::ffn::{FFNInstance, FFNWitness},
-    lookup::lasso::LassoInstance,
+    lookup::{lasso::LassoInstance, quantization::QuantizationParams},
     poly::utils::TernaryValue,
     prover::{TransformerBlockWitness, TransformerModelWitness},
     setup::{TransformerBlockWeights, TransformerModelWeights},
@@ -52,9 +52,17 @@ fn make_block(d_model: usize, d_ff: usize, m_bits: usize) -> TransformerBlockWei
         ffn_w2: zero_ternary_mat(d_ff, d_model),
         ffn_activation_tables: dummy_table.clone(),
         ffn_activation_bits_per_chunk: m_bits,
+        ffn_activation_quant: QuantizationParams {
+            scale_num: 2,
+            scale_den: 2,
+        },
         q_activation_tables: dummy_table.clone(),
         k_activation_tables: dummy_table.clone(),
         qk_activation_bits_per_chunk: m_bits,
+        qk_activation_quant: QuantizationParams {
+            scale_num: 2,
+            scale_den: 2,
+        },
     }
 }
 
@@ -88,7 +96,6 @@ pub fn build_zero_weights(
 /// LayerNorm witness values are pre-validated for this specific input with
 /// gamma=[2,2], beta=[5,5]: y=[[4,6],[4,6]], var_x=[200,200], sigma=[7,7].
 ///
-/// For other sizes, zero fill is used (placeholder; NOT valid for real proving).
 pub fn build_zero_witness(
     seq_len: usize,
     d_model: usize,
@@ -100,20 +107,12 @@ pub fn build_zero_witness(
     LinearAttentionInstance,
     FFNInstance,
 ) {
-    let x_in: Vec<Vec<F>> = if seq_len == 2 && d_model == 2 {
-        vec![
-            vec![F::from(10u64), F::from(20u64)],
-            vec![F::from(30u64), F::from(40u64)],
-        ]
-    } else {
-        (0..seq_len)
-            .map(|i| {
-                (0..d_model)
-                    .map(|j| F::from(((i + 1) * 10 + j) as u64))
-                    .collect()
-            })
-            .collect()
-    };
+    assert_eq!(seq_len, 2, "sample witness is defined only for seq_len=2");
+    assert_eq!(d_model, 2, "sample witness is defined only for d_model=2");
+    let x_in: Vec<Vec<F>> = vec![
+        vec![F::from(10u64), F::from(20u64)],
+        vec![F::from(30u64), F::from(40u64)],
+    ];
 
     let zero_td = zero_mat(seq_len, d_model);
     let zero_tff = zero_mat(seq_len, d_ff);
@@ -122,6 +121,8 @@ pub fn build_zero_witness(
 
     let make_ln_wit = || build_ln_witness(&x_in, d_model);
     let ln_y = make_ln_wit().y.clone();
+    let qk_zp = 0usize;
+    let ffn_zp = 0usize;
 
     let block_wit = TransformerBlockWitness {
         x_in: x_in.clone(),
@@ -144,10 +145,14 @@ pub fn build_zero_witness(
             v: zero_td.clone(),
             phi_q: zero_td.clone(),
             phi_k: zero_td.clone(),
-            q_query_indices: vec![0; seq_len * d_model],
-            k_query_indices: vec![0; seq_len * d_model],
+            q_query_indices: vec![qk_zp; seq_len * d_model],
+            k_query_indices: vec![qk_zp; seq_len * d_model],
             context: zero_dd,
             causal_context: None,
+            normalized_out: None,
+            norm_z: None,
+            norm_rem: None,
+            norm_diff: None,
             out: zero_td.clone(),
         },
         o_proj_wit: ProjectionWitness {
@@ -161,7 +166,7 @@ pub fn build_zero_witness(
             m: zero_tff.clone(),
             a: zero_tff.clone(),
             y: zero_td.clone(),
-            activation_query_indices: vec![0usize; seq_len * d_ff],
+            activation_query_indices: vec![ffn_zp; seq_len * d_ff],
         },
         x_out: x_in.clone(),
     };
@@ -183,8 +188,8 @@ pub fn build_zero_witness(
         causal: false,
         q_lasso: make_lasso(num_queries_td),
         k_lasso: make_lasso(num_queries_td),
-        q_query_indices: vec![0usize; num_queries_td],
-        k_query_indices: vec![0usize; num_queries_td],
+        q_query_indices: vec![qk_zp; num_queries_td],
+        k_query_indices: vec![qk_zp; num_queries_td],
     };
     let inst_ffn = FFNInstance {
         activation_lasso: make_lasso(num_queries_tff),
@@ -233,22 +238,5 @@ fn build_ln_witness(x: &[Vec<F>], d_model: usize) -> LayerNormWitness {
             };
         }
     }
-    // Generic fallback: sigma=0, sum_x=0 (placeholder, not valid for real proving)
-    let d_f = F::from(d_model as u64);
-    let sq_sum_x: Vec<F> = x
-        .iter()
-        .map(|row: &Vec<F>| row.iter().copied().map(|v| v * v).sum())
-        .collect();
-    let sum_x_sq = vec![F::ZERO; t];
-    let sigma_sq_scaled = vec![F::ZERO; t];
-    let _ = d_f; // d_f not needed when sigma=0
-    LayerNormWitness {
-        x: x.to_vec(),
-        y: vec![vec![F::ZERO; d_model]; t],
-        sum_x: vec![F::ZERO; t],
-        sigma: vec![F::ZERO; t],
-        sq_sum_x,
-        sum_x_sq,
-        sigma_sq_scaled,
-    }
+    panic!("sample LayerNorm witness is defined only for the built-in 2x2 input")
 }

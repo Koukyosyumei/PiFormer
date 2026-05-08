@@ -10,6 +10,7 @@ use crate::attention::projection::preprocess_projection;
 use crate::ffn::ffn::preprocess_ffn;
 use crate::field::F;
 use crate::lookup::lasso::LassoInstance;
+use crate::lookup::quantization::QuantizationParams;
 use crate::pcs::HyraxParams;
 use crate::poly::utils::TernaryValue;
 use crate::prover::{TransformerModelProvingKey, TransformerModelVerifyingKey};
@@ -46,10 +47,12 @@ pub struct TransformerBlockWeights {
     // FFN activation function table
     pub ffn_activation_tables: Vec<Vec<F>>,
     pub ffn_activation_bits_per_chunk: usize,
+    pub ffn_activation_quant: QuantizationParams,
     // Q and K activation tables
     pub q_activation_tables: Vec<Vec<F>>,
     pub k_activation_tables: Vec<Vec<F>>,
     pub qk_activation_bits_per_chunk: usize,
+    pub qk_activation_quant: QuantizationParams,
 }
 
 /// モデル全体の生の重み
@@ -154,6 +157,8 @@ pub fn preprocess_transformer_model(
             v_vk: v_pk.vk.clone(),
             o_vk: o_pk.vk.clone(),
             ffn_vk: ffn_pk.vk.clone(),
+            ffn_activation_quant: bw.ffn_activation_quant.clone(),
+            qk_activation_quant: bw.qk_activation_quant.clone(),
             // Prover用にPKも保持
             q_pk,
             k_pk,

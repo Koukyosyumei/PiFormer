@@ -1,7 +1,8 @@
 """
 ZK-friendly linear attention layer.
 
-Attention(Q, K, V) = φ(Q) (φ(K)^T V) / Z
+Default training attention uses φ(Q) (φ(K)^T V) / Z.  Proof export uses the
+fixed-point ``normalized_fixed`` mode, whose integer witness is proved by Rust.
 
 - φ is StructuredLookupActivation (proved via Lasso in the SNARK)
 - Projections use TernaryLinear (no general multiplications in circuit)
@@ -39,6 +40,8 @@ class LinearAttentionLayer(nn.Module):
         max_exp: int = 4,
         eps: float = 1e-6,
         causal: bool = False,
+        attention_mode: str = "normalized_float",
+        attention_scale: int = 64,
     ):
         super().__init__()
         assert d_model % n_heads == 0
@@ -46,6 +49,15 @@ class LinearAttentionLayer(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.eps = eps
+        if attention_mode not in {"normalized_float", "normalized_fixed", "prover"}:
+            raise ValueError(
+                "attention_mode must be 'normalized_float', "
+                "'normalized_fixed', or 'prover'"
+            )
+        if attention_scale <= 0:
+            raise ValueError("attention_scale must be positive")
+        self.attention_mode = attention_mode
+        self.attention_scale = int(attention_scale)
         # Causal mode uses cumulative sums and is for training/eval comparison
         # only. The non-causal path is what the prover circuit and witness
         # currently mirror; do not enable causal=True for proof generation.
@@ -106,7 +118,12 @@ class LinearAttentionLayer(nn.Module):
             # Normalizer Z_t = φ(Q_t) · Σ_s φ(K_s)
             k_sum = phiK.sum(dim=2, keepdim=True)            # (B, h, 1, d)
             Z = (phiQ * k_sum).sum(dim=-1, keepdim=True).clamp(min=self.eps)
-        out = out / Z
+        if self.attention_mode == "prover":
+            pass
+        elif self.attention_mode == "normalized_fixed":
+            out = torch.floor(out * float(self.attention_scale) / Z)
+        else:
+            out = out / Z
 
         # Merge heads and final projection
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)

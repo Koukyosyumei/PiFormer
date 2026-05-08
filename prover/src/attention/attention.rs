@@ -55,15 +55,41 @@ pub struct AttentionVerifyingKey {
 }
 
 /// Precommit Q and K activation tables at setup time.
+///
+/// When Q and K share identical sub-tables (the common case — Python's
+/// exporter always writes them from the same source), we commit them once
+/// and reuse the row commitments for the K instance instead of running a
+/// duplicate `hyrax_commit` per sub-table. The downstream Lasso protocol
+/// still treats Q and K as separate instances (different outputs / queries),
+/// so soundness is unchanged.
 pub fn precommit_attention_tables(
     q_lasso: &LassoInstance,
     k_lasso: &LassoInstance,
     params: &HyraxParams,
 ) -> AttentionProvingKey {
-    let multi_inst = LassoMultiInstance {
-        instances: vec![q_lasso.clone(), k_lasso.clone()],
+    assert_eq!(
+        q_lasso.bits_per_chunk, k_lasso.bits_per_chunk,
+        "Q and K Lasso instances must agree on bits_per_chunk",
+    );
+    let qk_lasso_pk = if q_lasso.tables == k_lasso.tables {
+        let nu = q_lasso.bits_per_chunk / 2;
+        let q_coms: Vec<HyraxCommitment> = q_lasso
+            .tables
+            .iter()
+            .map(|t| hyrax_commit(t, nu, params))
+            .collect();
+        let k_coms = q_coms.clone();
+        LassoMultiProvingKey {
+            instance_table_coms: vec![q_coms, k_coms],
+            instance_to_group: vec![0, 0],
+            nu,
+        }
+    } else {
+        let multi_inst = LassoMultiInstance {
+            instances: vec![q_lasso.clone(), k_lasso.clone()],
+        };
+        precommit_lasso_multi_tables(&multi_inst, q_lasso.bits_per_chunk, params)
     };
-    let qk_lasso_pk = precommit_lasso_multi_tables(&multi_inst, q_lasso.bits_per_chunk, params);
     AttentionProvingKey { qk_lasso_pk }
 }
 
@@ -100,6 +126,17 @@ pub struct LinearAttentionWitness {
     /// For row `i * d_head + a`, value `[b]` is
     /// `sum_{s <= i} phi_k[s][a] * v[s][b]`.
     pub causal_context: Option<Vec<Vec<F>>>,
+    /// Optional normalized attention output used as the input to W_O.
+    /// When present, the model proof enforces
+    /// `out * ATTN_NORM_SCALE = z * normalized_out + rem` and
+    /// `0 <= rem < z` entrywise.
+    pub normalized_out: Option<Vec<Vec<F>>>,
+    /// Per-row attention denominator `z[t] = phi_q[t] · sum_s phi_k[s]`.
+    pub norm_z: Option<Vec<F>>,
+    /// Euclidean division remainder for normalized attention.
+    pub norm_rem: Option<Vec<Vec<F>>>,
+    /// `z[t] - 1 - rem[t][j]`, range-proved to enforce `rem < z`.
+    pub norm_diff: Option<Vec<Vec<F>>>,
     pub out: Vec<Vec<F>>,
 }
 
@@ -591,6 +628,10 @@ mod linear_attention_tests {
             k_query_indices: k_query_indices_wit,
             context,
             causal_context: None,
+            normalized_out: None,
+            norm_z: None,
+            norm_rem: None,
+            norm_diff: None,
             out: out.clone(),
         };
 

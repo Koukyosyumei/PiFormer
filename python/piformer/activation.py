@@ -20,8 +20,8 @@ class StructuredLookupActivation(nn.Module):
     Args:
         num_bits: Total quantization bits for the input (e.g. 8 or 16).
         c: Number of sub-tables (decomposition depth). Must divide num_bits.
-        scale: Quantization scale; x_int = clamp(round(x / scale) + zero_point,
-            0, 2^num_bits - 1).
+        scale: Quantization scale; x_int = round(x / scale) + zero_point.
+            Values outside [0, 2^num_bits - 1] are rejected rather than clamped.
         init: Initial table shape. ``"positive"`` is intended for attention
             kernels; ``"gelu"`` is intended for feed-forward activations.
 
@@ -71,16 +71,23 @@ class StructuredLookupActivation(nn.Module):
             self.tables.append(nn.Parameter(init_values))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1. Quantize to non-negative integer index.
+        # 1. Quantize to non-negative integer index. This intentionally does
+        # not clamp: the proof system verifies no-saturation quantization, so
+        # Python training/inference must fail if the table range is exceeded.
         # The integer index path is non-differentiable today, so avoid building
-        # a throwaway autograd graph for division/rounding/clamping.
+        # a throwaway autograd graph for division/range-checking.
         with torch.no_grad():
-            x_int = (
-                (x / self.scale).round()
-                .add_(self.zero_point)
-                .clamp_(0, 2 ** self.num_bits - 1)
-                .long()
-            )
+            scaled = x / self.scale
+            rounded = torch.floor(scaled + 0.5)
+            x_int = rounded.add_(self.zero_point)
+            max_idx = 2 ** self.num_bits - 1
+            if torch.any((x_int < 0) | (x_int > max_idx)):
+                bad = x_int[(x_int < 0) | (x_int > max_idx)][0].item()
+                raise RuntimeError(
+                    f"activation lookup index {bad} outside [0, {max_idx}]; "
+                    "increase activation scale or retrain with a wider range"
+                )
+            x_int = x_int.long()
 
         # 2. Decompose and sum sub-table lookups.
         # chunk_size is a power of two, so use bit-and / bit-shift instead of

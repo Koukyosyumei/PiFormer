@@ -11,9 +11,9 @@ Design contract
   arbitrary signed Python ints converted to BN254 field elements on output.
   Field arithmetic in the Rust prover reproduces the same arithmetic mod p.
 
-* The phi activation uses centered clamp-round quantization into
-  [0, 2^num_bits − 1], so Lasso query_indices are always small
-  non-negative integers while preserving negative inputs.
+* The phi activation uses centered no-saturation quantization:
+  query_index = round(raw / S) + zero_point. Out-of-range indices are rejected
+  instead of clamped, matching the Rust verifier.
 
 * LayerNorm witnesses (sum_x, var_x, sigma, y) are small non-negative Python
   ints computed with the exact formula from ``layernorm.rs``.
@@ -41,6 +41,8 @@ from .quant import (
     mat_to_json,
     mat_transpose,
     min_beta_floor,
+    effective_activation_scale,
+    quantize_raw_to_index,
     quantize_to_int,
     vec_to_json,
 )
@@ -71,6 +73,7 @@ def _phi_mat(
     c: int,
     phi_scale: float,
     quant_scale: int,
+    lookup_index_mode: str,
 ) -> Tuple[List[List[int]], List[int], List[int]]:
     """
     Apply the decomposed lookup activation φ to every element of a matrix.
@@ -86,13 +89,34 @@ def _phi_mat(
     bits_per_chunk = num_bits // c
     t, d = len(m_int), len(m_int[0])
 
-    # Compute query indices: clamp-round quantize each element.
-    # m_int is in "integer units"; effective float is m_int / quant_scale.
+    # Compute query indices.
+    #
+    # "centered" mode is the sound exported-circuit mode for decomposed lookup
+    # tables: the verifier proves idx = round(raw / S) + zero_point with no
+    # saturation, where S = quant_scale * phi_scale.
+    #
+    # "field" mode is kept for experiments with direct lookup keys.
     q_indices_flat: List[int] = []
+    max_val = (1 << num_bits) - 1
+    scale_num, scale_den = effective_activation_scale(phi_scale, quant_scale)
     for row in m_int:
         for v in row:
-            x_float_approx = v / quant_scale if quant_scale != 0 else float(v)
-            q_indices_flat.append(quantize_to_int(x_float_approx, phi_scale, num_bits))
+            if lookup_index_mode == "field":
+                if v < 0 or v > max_val:
+                    raise ValueError(
+                        "lookup_index_mode='field' requires Q/K/M values to be "
+                        f"lookup keys in [0, {max_val}], got {v}"
+                    )
+                q_indices_flat.append(v)
+            elif lookup_index_mode == "centered":
+                zero_point = 0 if c <= 1 else 1 << (num_bits - 1)
+                idx = quantize_raw_to_index(v, scale_num, scale_den, num_bits, zero_point)
+                q_indices_flat.append(idx)
+            else:
+                raise ValueError(
+                    "lookup_index_mode must be 'field' or 'centered', "
+                    f"got {lookup_index_mode!r}"
+                )
 
     outputs_flat, _ = apply_phi_int(q_indices_flat, tables_int, bits_per_chunk)
 
@@ -115,6 +139,64 @@ def _attn_out(
 ) -> List[List[int]]:
     """out = φ(Q) · context : (T, d_head)."""
     return mat_mul_int(phi_q, context)
+
+
+def _attention_denominator(phi_q: List[List[int]], phi_k: List[List[int]]) -> List[int]:
+    """z_i = φ(Q_i) · Σ_s φ(K_s)."""
+    t = len(phi_q)
+    d = len(phi_q[0]) if t else 0
+    k_sum = [sum(phi_k[s][a] for s in range(t)) for a in range(d)]
+    return [sum(phi_q[i][a] * k_sum[a] for a in range(d)) for i in range(t)]
+
+
+def _causal_attention_denominator(
+    phi_q: List[List[int]], phi_k: List[List[int]]
+) -> List[int]:
+    """z_i = φ(Q_i) · Σ_{s<=i} φ(K_s)."""
+    t = len(phi_q)
+    d = len(phi_q[0]) if t else 0
+    prefix = [0 for _ in range(d)]
+    out: List[int] = []
+    for i in range(t):
+        for a in range(d):
+            prefix[a] += phi_k[i][a]
+        out.append(sum(phi_q[i][a] * prefix[a] for a in range(d)))
+    return out
+
+
+def _normalize_attention_floor(
+    numerator: List[List[int]], z: List[int], scale: int
+) -> Tuple[List[List[int]], List[List[int]], List[List[int]]]:
+    """Return floor-normalized output plus remainder and z-1-remainder witnesses."""
+    if scale <= 0:
+        raise ValueError("attention_scale must be positive")
+    y: List[List[int]] = []
+    rem: List[List[int]] = []
+    diff: List[List[int]] = []
+    for i, row in enumerate(numerator):
+        zi = z[i]
+        if zi <= 0:
+            raise ValueError(
+                f"attention normalizer z[{i}]={zi} is not positive; "
+                "the normalization proof requires z > 0"
+            )
+        y_row: List[int] = []
+        rem_row: List[int] = []
+        diff_row: List[int] = []
+        for n in row:
+            num = n * scale
+            q = num // zi
+            r = num - zi * q
+            d = zi - 1 - r
+            if r < 0 or d < 0:
+                raise ValueError("internal attention normalization remainder error")
+            y_row.append(q)
+            rem_row.append(r)
+            diff_row.append(d)
+        y.append(y_row)
+        rem.append(rem_row)
+        diff.append(diff_row)
+    return y, rem, diff
 
 
 def _causal_context_matrix(
@@ -192,6 +274,7 @@ def _gen_block_witness(
     quant_scale: int,
     ln_scale: int,
     extra_beta_floor: int,
+    lookup_index_mode: str,
 ) -> Tuple[Dict[str, Any], List[List[int]]]:
     """
     Generate the integer witness for one transformer block.
@@ -270,21 +353,49 @@ def _gen_block_witness(
 
     # ---- φ activation on Q and K ----
     phi_q, q_indices, q_outputs = _phi_mat(
-        q_raw, attn_tables_int, phi_num_bits, phi_c, phi_scale, quant_scale
+        q_raw, attn_tables_int, phi_num_bits, phi_c, phi_scale, quant_scale,
+        lookup_index_mode,
     )
     phi_k, k_indices, k_outputs = _phi_mat(
-        k_raw, attn_tables_int, phi_num_bits, phi_c, phi_scale, quant_scale
+        k_raw, attn_tables_int, phi_num_bits, phi_c, phi_scale, quant_scale,
+        lookup_index_mode,
     )
 
     # ---- Linear attention ----
     causal = bool(getattr(attn, "causal", False))
     context = _context_matrix(phi_k, v_raw)  # (d_head, d_head)
     causal_context = None
+    norm_z = None
     if causal:
         causal_context = _causal_context_matrix(phi_k, v_raw)
         attn_out = _causal_attn_out(phi_q, causal_context)  # (T, d_head)
+        norm_z = _causal_attention_denominator(phi_q, phi_k)
     else:
         attn_out = _attn_out(phi_q, context)  # (T, d_head)
+        norm_z = _attention_denominator(phi_q, phi_k)
+
+    attention_mode = getattr(attn, "attention_mode", "normalized_float")
+    attention_scale = int(getattr(attn, "attention_scale", 64))
+    if attention_mode == "normalized_float":
+        raise ValueError(
+            "Rust proof export cannot prove attention_mode='normalized_float'. "
+            "Use attention_mode='normalized_fixed' for fixed-point normalization "
+            "or attention_mode='prover' for unnormalized legacy math."
+        )
+    if attention_mode == "normalized_fixed":
+        if causal:
+            raise ValueError(
+                "attention_mode='normalized_fixed' is not enabled for causal "
+                "proof export yet: the causal prefix-context proof needs a "
+                "cubic binding of the scaled V leaf to keep normalization sound"
+            )
+        attn_proj_in, norm_rem, norm_diff = _normalize_attention_floor(
+            attn_out, norm_z or [], attention_scale
+        )
+    else:
+        attn_proj_in = attn_out
+        norm_rem = None
+        norm_diff = None
 
     # ---- Output projection ----
     w_o = extract_ternary_weight_matrix(
@@ -298,7 +409,7 @@ def _gen_block_witness(
         if attn.out_proj.bias is not None
         else None
     )
-    out_attn = _add_bias_int(_project(attn_out, w_o_T), o_bias)
+    out_attn = _add_bias_int(_project(attn_proj_in, w_o_T), o_bias)
 
     # ---- Residual 1 ----
     x_mid = mat_add_int(x_in, out_attn)
@@ -328,7 +439,8 @@ def _gen_block_witness(
     ffn_m = _project(ln2_y, w1_T)
 
     ffn_a, ffn_q_indices, ffn_q_outputs = _phi_mat(
-        ffn_m, ffn_tables_int, ffn_num_bits, ffn_c, ffn_phi_scale, quant_scale
+        ffn_m, ffn_tables_int, ffn_num_bits, ffn_c, ffn_phi_scale, quant_scale,
+        lookup_index_mode,
     )
 
     w2 = extract_ternary_weight_matrix(
@@ -383,9 +495,21 @@ def _gen_block_witness(
             "q_query_indices": q_indices,
             "k_query_indices": k_indices,
             "context": mat_to_json(context),
+            "normalized_out": (
+                mat_to_json(attn_proj_in)
+                if attention_mode == "normalized_fixed"
+                else None
+            ),
+            "norm_z": (
+                vec_to_json(norm_z)
+                if norm_z is not None and attention_mode == "normalized_fixed"
+                else None
+            ),
+            "norm_rem": mat_to_json(norm_rem) if norm_rem is not None else None,
+            "norm_diff": mat_to_json(norm_diff) if norm_diff is not None else None,
             "out": mat_to_json(attn_out),
         },
-        "o_proj": {"x": mat_to_json(attn_out), "y": mat_to_json(out_attn)},
+        "o_proj": {"x": mat_to_json(attn_proj_in), "y": mat_to_json(out_attn)},
         "x_mid": mat_to_json(x_mid),
         "ln2": {
             "x": mat_to_json(x_mid),
@@ -438,6 +562,10 @@ class WitnessGenerator:
     lasso_sigma : int
         Hyrax PCS sigma parameter used for Lasso commitments in the Rust prover.
         Must match the value used in ``HyraxParams::new(lasso_sigma)``.
+    lookup_index_mode : str
+        ``"centered"`` means lookup keys are Q/K/M plus the activation
+        zero-point and is soundly bound by the current Rust verifier.
+        ``"field"`` means Q/K/M are already lookup keys.
     """
 
     def __init__(
@@ -446,11 +574,13 @@ class WitnessGenerator:
         ln_scale: int = 4,
         extra_beta_floor: int = 8,
         lasso_sigma: int = 4,
+        lookup_index_mode: str = "centered",
     ):
         self.quant_scale = quant_scale
         self.ln_scale = ln_scale
         self.extra_beta_floor = extra_beta_floor
         self.lasso_sigma = lasso_sigma
+        self.lookup_index_mode = lookup_index_mode
 
     def generate(self, model, token_ids: List[int]) -> Dict[str, Any]:
         """
@@ -497,7 +627,8 @@ class WitnessGenerator:
         block_ln_weights = []
         for blk in model.blocks:
             bwit, x_cur = _gen_block_witness(
-                x_cur, blk, self.quant_scale, self.ln_scale, self.extra_beta_floor
+                x_cur, blk, self.quant_scale, self.ln_scale, self.extra_beta_floor,
+                self.lookup_index_mode,
             )
             q_lasso_last, k_lasso_last = bwit.pop("_attn_lasso")
             ffn_lasso_last = bwit.pop("_ffn_lasso")

@@ -22,7 +22,7 @@ use ark_ff::{Field, PrimeField};
 use crate::attention::attention::{LinearAttentionInstance, LinearAttentionWitness};
 use crate::attention::layernorm::{
     compute_range_witnesses, prove_layernorm, LayerNormIOCommitments, LayerNormProof,
-    LayerNormVerifyingKey, LayerNormWitness,
+    LayerNormRangeWitnesses, LayerNormVerifyingKey, LayerNormWitness, LAYERNORM_RANGE_BITS,
 };
 use crate::attention::projection::{
     prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionProvingKey,
@@ -33,9 +33,14 @@ use crate::lookup::lasso::{
     prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
     LassoOutputBinding, LassoProof,
 };
-use crate::lookup::range::{prove_range_batched, GlobalRangeM};
+use crate::lookup::quantization::{prove_quantization_batch, QuantizationProof};
+use crate::lookup::range::{
+    prove_range_batched, GlobalRangeM, RangeProofWitness, RangeWitnessProof,
+};
+use crate::subprotocols::{prove_sumcheck_cubic_multi_batched, SumcheckCubicProofMulti};
 use crate::subprotocols::{prove_sumcheck_multi_batched, SumcheckProofMulti};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey};
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Proof Structures
@@ -47,7 +52,6 @@ use crate::verifier::{add_commitments, TransformerBlockVerifyingKey};
 pub struct TransformerBlockProof {
     pub ln1_proof: LayerNormProof,
     pub ln2_proof: LayerNormProof,
-    pub block_range_m: GlobalRangeM,
 
     // FFN per-block: Lasso for activation + A/M commitments
     pub ffn_lasso_proof: LassoProof,
@@ -59,6 +63,11 @@ pub struct TransformerBlockProof {
     pub q_com: HyraxCommitment,
     pub k_com: HyraxCommitment,
     pub v_com: HyraxCommitment,
+    pub attn_norm_com: Option<HyraxCommitment>,
+    pub attn_num_com: Option<HyraxCommitment>,
+    pub attn_z_com: Option<HyraxCommitment>,
+    pub attn_rem_com: Option<HyraxCommitment>,
+    pub attn_diff_com: Option<HyraxCommitment>,
     pub out_attn_com: HyraxCommitment,
     pub x_norm2_com: HyraxCommitment,
     pub out_ffn_com: HyraxCommitment,
@@ -94,6 +103,9 @@ pub struct TransformerBlockProof {
     pub attn_out_eval: F, // x_inner_i(r_t, r_k_o) = claim for out sumcheck
 }
 
+pub const ATTN_NORM_SCALE: u64 = 64;
+pub const ATTN_NORM_RANGE_BITS: usize = 64;
+
 // ---------------------------------------------------------------------------
 // Witness Structures
 // ---------------------------------------------------------------------------
@@ -119,27 +131,62 @@ pub struct TransformerBlockWitness {
 struct BlockPhase1Data {
     ln1_proof: LayerNormProof,
     ln2_proof: LayerNormProof,
-    block_range_m: GlobalRangeM,
     x_norm1_com: HyraxCommitment,
     q_com: HyraxCommitment,
     k_com: HyraxCommitment,
     v_com: HyraxCommitment,
+    attn_norm_com: Option<HyraxCommitment>,
+    attn_num_com: Option<HyraxCommitment>,
+    attn_z_com: Option<HyraxCommitment>,
+    attn_rem_com: Option<HyraxCommitment>,
+    attn_diff_com: Option<HyraxCommitment>,
+    out_attn_com: HyraxCommitment,
+    x_norm2_com: HyraxCommitment,
+    out_ffn_com: HyraxCommitment,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: commit block intermediates, then prove LNs after global range batch
+// ---------------------------------------------------------------------------
+
+struct BlockCommitData {
+    x_norm1_com: HyraxCommitment,
+    q_com: HyraxCommitment,
+    k_com: HyraxCommitment,
+    v_com: HyraxCommitment,
+    attn_norm_com: Option<HyraxCommitment>,
+    attn_num_com: Option<HyraxCommitment>,
+    attn_z_com: Option<HyraxCommitment>,
+    attn_rem_com: Option<HyraxCommitment>,
+    attn_diff_com: Option<HyraxCommitment>,
     out_attn_com: HyraxCommitment,
     x_norm2_com: HyraxCommitment,
     out_ffn_com: HyraxCommitment,
     x_mid_com: HyraxCommitment,
 }
 
-// ---------------------------------------------------------------------------
-// Phase 1: commit + LN proofs + absorb into transcript
-// ---------------------------------------------------------------------------
+/// Per-block commits that depend only on this block's witness — no residual
+/// chain dependency. Computed in parallel across blocks; the residual
+/// `x_mid_com` is finalized later in a sequential pass.
+struct BlockCommitDataNoResidual {
+    x_norm1_com: HyraxCommitment,
+    q_com: HyraxCommitment,
+    k_com: HyraxCommitment,
+    v_com: HyraxCommitment,
+    attn_norm_com: Option<HyraxCommitment>,
+    attn_num_com: Option<HyraxCommitment>,
+    attn_z_com: Option<HyraxCommitment>,
+    attn_rem_com: Option<HyraxCommitment>,
+    attn_diff_com: Option<HyraxCommitment>,
+    out_attn_com: HyraxCommitment,
+    x_norm2_com: HyraxCommitment,
+    out_ffn_com: HyraxCommitment,
+}
 
-fn commit_block_phase1(
+fn commit_block_intermediates_no_residual(
     witness: &TransformerBlockWitness,
-    x_in_com: &HyraxCommitment,
     pk: &TransformerBlockVerifyingKey,
-    transcript: &mut Transcript,
-) -> Result<BlockPhase1Data, String> {
+) -> BlockCommitDataNoResidual {
     let t = pk.seq_len;
     let d = pk.d_model;
 
@@ -151,41 +198,95 @@ fn commit_block_phase1(
         hyrax_commit(&mle.evaluations, nu, &params)
     };
 
-    // Commit all 7 intermediate matrices
     let x_norm1_com = commit_mat(&witness.ln1_wit.y, t, d);
     let q_com = commit_mat(&witness.attn_wit.q, t, d);
     let k_com = commit_mat(&witness.attn_wit.k, t, d);
     let v_com = commit_mat(&witness.attn_wit.v, t, d);
+    let attn_norm_com = witness
+        .attn_wit
+        .normalized_out
+        .as_ref()
+        .map(|m| commit_mat(m, t, d));
+    let attn_num_com = witness
+        .attn_wit
+        .normalized_out
+        .as_ref()
+        .map(|_| commit_mat(&witness.attn_wit.out, t, d));
+    let attn_z_com = witness.attn_wit.norm_z.as_ref().map(|v| {
+        let mle = vec_to_mle(v, t);
+        let vars = t.next_power_of_two().trailing_zeros() as usize;
+        let (nu, _, params) = params_from_vars(vars);
+        hyrax_commit(&mle.evaluations, nu, &params)
+    });
+    let attn_rem_com = witness
+        .attn_wit
+        .norm_rem
+        .as_ref()
+        .map(|m| commit_mat(m, t, d));
+    let attn_diff_com = witness
+        .attn_wit
+        .norm_diff
+        .as_ref()
+        .map(|m| commit_mat(m, t, d));
     let out_attn_com = commit_mat(&witness.o_proj_wit.y, t, d);
     let x_norm2_com = commit_mat(&witness.ln2_wit.y, t, d);
     let out_ffn_com = commit_mat(&witness.ffn_wit.y, t, d);
 
-    // Range proofs for LN1 and LN2
-    let ln1_rw = compute_range_witnesses(&witness.ln1_wit, &pk.ln1_vk);
-    let ln2_rw = compute_range_witnesses(&witness.ln2_wit, &pk.ln2_vk);
-    let (mut block_range_proofs, block_range_m, block_r_vs) = prove_range_batched(
-        &[
-            &ln1_rw.sigma_witness,
-            &ln1_rw.y_witness,
-            &ln2_rw.sigma_witness,
-            &ln2_rw.y_witness,
-        ],
-        32,
-        transcript,
-    )?;
-    let ln2_y_rp = block_range_proofs.remove(3);
-    let ln2_sig_rp = block_range_proofs.remove(2);
-    let ln1_y_rp = block_range_proofs.remove(1);
-    let ln1_sig_rp = block_range_proofs.remove(0);
-    let ln2_y_rv = block_r_vs[3].clone();
-    let ln2_sig_rv = block_r_vs[2].clone();
-    let ln1_y_rv = block_r_vs[1].clone();
-    let ln1_sig_rv = block_r_vs[0].clone();
+    BlockCommitDataNoResidual {
+        x_norm1_com,
+        q_com,
+        k_com,
+        v_com,
+        attn_norm_com,
+        attn_num_com,
+        attn_z_com,
+        attn_rem_com,
+        attn_diff_com,
+        out_attn_com,
+        x_norm2_com,
+        out_ffn_com,
+    }
+}
 
+/// Finalize the residual chain for one block: produce x_mid_com from the
+/// block's `out_attn_com` and the running input commitment.
+fn finalize_block_commits(
+    partial: BlockCommitDataNoResidual,
+    x_in_com: &HyraxCommitment,
+) -> BlockCommitData {
+    let x_mid_com = add_commitments(x_in_com, &partial.out_attn_com);
+    BlockCommitData {
+        x_norm1_com: partial.x_norm1_com,
+        q_com: partial.q_com,
+        k_com: partial.k_com,
+        v_com: partial.v_com,
+        attn_norm_com: partial.attn_norm_com,
+        attn_num_com: partial.attn_num_com,
+        attn_z_com: partial.attn_z_com,
+        attn_rem_com: partial.attn_rem_com,
+        attn_diff_com: partial.attn_diff_com,
+        out_attn_com: partial.out_attn_com,
+        x_norm2_com: partial.x_norm2_com,
+        out_ffn_com: partial.out_ffn_com,
+        x_mid_com,
+    }
+}
+
+fn prove_block_layernorms(
+    witness: &TransformerBlockWitness,
+    x_in_com: &HyraxCommitment,
+    pk: &TransformerBlockVerifyingKey,
+    commits: &BlockCommitData,
+    range_proofs: [RangeWitnessProof; 4],
+    range_rvs: [Vec<F>; 4],
+    transcript: &mut Transcript,
+) -> Result<BlockPhase1Data, String> {
+    let [ln1_sig_rp, ln1_y_rp, ln2_sig_rp, ln2_y_rp] = range_proofs;
+    let [ln1_sig_rv, ln1_y_rv, ln2_sig_rv, ln2_y_rv] = range_rvs;
     // LN1 sub-prover: absorbs x_norm1_com as y_com
     let ln1_io = LayerNormIOCommitments {
         x_com: x_in_com.clone(),
-        y_com: Some(x_norm1_com.clone()),
+        y_com: Some(commits.x_norm1_com.clone()),
     };
     let ln1_proof = prove_layernorm(
         &witness.ln1_wit,
@@ -197,19 +298,31 @@ fn commit_block_phase1(
     )?;
 
     // Explicitly absorb q/k/v_com with the same labels attention uses.
-    absorb_com(transcript, b"q_com", &q_com);
-    absorb_com(transcript, b"k_com", &k_com);
-    absorb_com(transcript, b"v_com", &v_com);
+    absorb_com(transcript, b"q_com", &commits.q_com);
+    absorb_com(transcript, b"k_com", &commits.k_com);
+    absorb_com(transcript, b"v_com", &commits.v_com);
+    if let Some(ref c) = commits.attn_norm_com {
+        absorb_com(transcript, b"attn_norm_com", c);
+    }
+    if let Some(ref c) = commits.attn_num_com {
+        absorb_com(transcript, b"attn_num_com", c);
+    }
+    if let Some(ref c) = commits.attn_z_com {
+        absorb_com(transcript, b"attn_z_com", c);
+    }
+    if let Some(ref c) = commits.attn_rem_com {
+        absorb_com(transcript, b"attn_rem_com", c);
+    }
+    if let Some(ref c) = commits.attn_diff_com {
+        absorb_com(transcript, b"attn_diff_com", c);
+    }
     // out_attn_com not absorbed by any sub-prover; absorb explicitly here.
-    absorb_com(transcript, b"out_attn_com", &out_attn_com);
-
-    // Residual 1 (homomorphic)
-    let x_mid_com = add_commitments(x_in_com, &out_attn_com);
+    absorb_com(transcript, b"out_attn_com", &commits.out_attn_com);
 
     // LN2 sub-prover: absorbs x_norm2_com as y_com
     let ln2_io = LayerNormIOCommitments {
-        x_com: x_mid_com.clone(),
-        y_com: Some(x_norm2_com.clone()),
+        x_com: commits.x_mid_com.clone(),
+        y_com: Some(commits.x_norm2_com.clone()),
     };
     let ln2_proof = prove_layernorm(
         &witness.ln2_wit,
@@ -221,20 +334,23 @@ fn commit_block_phase1(
     )?;
 
     // Absorb out_ffn_com so transcript stays consistent with Phase 1.
-    absorb_com(transcript, b"y_com", &out_ffn_com);
+    absorb_com(transcript, b"y_com", &commits.out_ffn_com);
 
     Ok(BlockPhase1Data {
         ln1_proof,
         ln2_proof,
-        block_range_m,
-        x_norm1_com,
-        q_com,
-        k_com,
-        v_com,
-        out_attn_com,
-        x_norm2_com,
-        out_ffn_com,
-        x_mid_com,
+        x_norm1_com: commits.x_norm1_com.clone(),
+        q_com: commits.q_com.clone(),
+        k_com: commits.k_com.clone(),
+        v_com: commits.v_com.clone(),
+        attn_norm_com: commits.attn_norm_com.clone(),
+        attn_num_com: commits.attn_num_com.clone(),
+        attn_z_com: commits.attn_z_com.clone(),
+        attn_rem_com: commits.attn_rem_com.clone(),
+        attn_diff_com: commits.attn_diff_com.clone(),
+        out_attn_com: commits.out_attn_com.clone(),
+        x_norm2_com: commits.x_norm2_com.clone(),
+        out_ffn_com: commits.out_ffn_com.clone(),
     })
 }
 
@@ -277,15 +393,35 @@ pub struct TransformerModelProof {
     pub lm_head_logits_open: HyraxProof,
     pub ffn_lasso_proof: LassoMultiProof,
     pub all_lasso_proof: LassoMultiProof,
-    pub final_range_m: GlobalRangeM,
+    pub ffn_quant_proof: QuantizationProof,
+    pub qk_quant_proof: QuantizationProof,
+    pub ln_range_m: GlobalRangeM,
 
     // Cross-block batch sumchecks (one per projection type + attention)
     pub batch_qkv: SumcheckProofMulti,
     pub batch_oproj: SumcheckProofMulti,
     pub batch_ffn_y: SumcheckProofMulti,
     pub batch_ffn_m: SumcheckProofMulti,
-    pub batch_attn_out: SumcheckProofMulti,
-    pub batch_attn_ctx: SumcheckProofMulti,
+    /// Non-causal: degree-2 sumcheck over k axis.
+    /// Causal: None (replaced by batch_attn_out_causal).
+    pub batch_attn_out: Option<SumcheckProofMulti>,
+    /// Causal: degree-3 sumcheck over (t, k) with eq(r_t, ·) folded in as the
+    /// third multiplicand so the claim equals the actual attn_out MLE eval.
+    pub batch_attn_out_causal: Option<SumcheckCubicProofMulti>,
+    /// Non-causal: degree-2 sumcheck over t axis.
+    /// Causal: None (replaced by batch_attn_ctx_causal).
+    pub batch_attn_ctx: Option<SumcheckProofMulti>,
+    /// Causal: degree-3 sumcheck over (s, a, b) with the suffix·eq_a·eq_b
+    /// factor folded into the third multiplicand so f and g remain plain phi_k
+    /// and v MLEs respectively.
+    pub batch_attn_ctx_causal: Option<SumcheckCubicProofMulti>,
+    pub attn_norm_sumcheck: Option<SumcheckCubicProofMulti>,
+    pub attn_z_sumcheck: Option<SumcheckProofMulti>,
+    pub attn_z_ksum_sumcheck: Option<SumcheckProofMulti>,
+    pub attn_z_causal_sumcheck: Option<SumcheckCubicProofMulti>,
+    pub attn_norm_range_m: Option<GlobalRangeM>,
+    pub attn_norm_rem_range_proofs: Vec<RangeWitnessProof>,
+    pub attn_norm_diff_range_proofs: Vec<RangeWitnessProof>,
 
     // Global batch open for 5L intermediate matrices at shared r_td
     pub inter_batch_open: HyraxProof,
@@ -311,6 +447,13 @@ pub struct TransformerModelProof {
     pub phi_q_batch_open: HyraxProof,
     pub phi_k_batch_open: HyraxProof,
     pub v_attn_batch_open: HyraxProof,
+    /// Merged open at r_norm covering, in order: num_coms, norm_coms, rem_coms, diff_coms (4L commits total).
+    pub attn_norm_r_batch_open: Option<HyraxProof>,
+    /// Merged open at attn_point=combine(r_t,r_k_o) covering num_coms then norm_coms (2L commits).
+    pub attn_norm_attn_point_open: Option<HyraxProof>,
+    pub attn_z_open: Option<HyraxProof>,
+    pub attn_z_phi_q_open: Option<HyraxProof>,
+    pub attn_z_phi_k_open: Option<HyraxProof>,
     pub causal_ctx_prefix_evals: Vec<F>,
     pub causal_phi_k_prefix_evals: Vec<F>,
     pub causal_v_prefix_evals: Vec<F>,
@@ -350,20 +493,14 @@ fn suffix_eq_evals_msb(r: &[F], len: usize) -> Vec<F> {
     suffix
 }
 
-fn eval_causal_context_features(
-    ctx_mle: &DenseMLPoly,
-    _t_bits: usize,
-    d_bits: usize,
-    r_t: &[F],
-    r_out: &[F],
-) -> Vec<F> {
-    let mut p = ctx_mle.clone();
-    for &r in r_t {
-        p = p.fix_first_variable(r);
-    }
-    eval_cols(&p, d_bits, r_out)
-}
-
+/// Build (f, g, h) polynomials for the causal prefix-context cubic sumcheck:
+///   ctx_eval = Σ_{s,a,b} suffix(s) · eq_a(a) · eq_b(b) · phi_k[s][a] · v[s][b]
+/// with
+///   f[s,a,b] = phi_k[s][a]  (constant in b)
+///   g[s,a,b] = v[s][b]      (constant in a)
+///   h[s,a,b] = suffix(s) · eq_a(a) · eq_b(b)  (verifier-computable factor)
+/// so that f_mle, g_mle, h_mle factor cleanly without MLE-of-pointwise-product
+/// pitfalls. (When d is a power of two, the constant-axis MLE summand is 1.)
 fn causal_prefix_polys(
     phi_k: &[Vec<F>],
     v: &[Vec<F>],
@@ -372,23 +509,65 @@ fn causal_prefix_polys(
     eq_b_evals: &[F],
     t: usize,
     d: usize,
-) -> (DenseMLPoly, DenseMLPoly) {
+) -> (DenseMLPoly, DenseMLPoly, DenseMLPoly) {
     let t_p2 = t.next_power_of_two();
     let d_p2 = d.next_power_of_two();
     let total = t_p2 * d_p2 * d_p2;
     let mut f = vec![F::ZERO; total];
     let mut g = vec![F::ZERO; total];
+    let mut h = vec![F::ZERO; total];
+    // h is multilinear over (s, a, b) and verifier-reproducible at any point;
+    // populate every cell, including indices outside [0, t)×[0, d)×[0, d), so
+    // that the MLE factors as suffix_mle(X_s)·eq_a_mle(X_a)·eq_b_mle(X_b).
+    for s in 0..t_p2 {
+        for a in 0..d_p2 {
+            for b in 0..d_p2 {
+                let idx = (s * d_p2 + a) * d_p2 + b;
+                h[idx] = suffix_evals[s] * eq_a_evals[a] * eq_b_evals[b];
+            }
+        }
+    }
     for s in 0..t {
         for a in 0..d {
             let f_val = phi_k[s][a];
             for b in 0..d {
                 let idx = (s * d_p2 + a) * d_p2 + b;
                 f[idx] = f_val;
-                g[idx] = suffix_evals[s] * eq_a_evals[a] * eq_b_evals[b] * v[s][b];
+                g[idx] = v[s][b];
             }
         }
     }
-    (DenseMLPoly::new(f), DenseMLPoly::new(g))
+    (DenseMLPoly::new(f), DenseMLPoly::new(g), DenseMLPoly::new(h))
+}
+
+fn causal_denominator_polys(
+    phi_q: &[Vec<F>],
+    phi_k: &[Vec<F>],
+    eq_t_evals: &[F],
+    t: usize,
+    d: usize,
+) -> (DenseMLPoly, DenseMLPoly, DenseMLPoly) {
+    let t_p2 = t.next_power_of_two();
+    let d_p2 = d.next_power_of_two();
+    let total = t_p2 * t_p2 * d_p2;
+    let mut f = vec![F::ZERO; total];
+    let mut g = vec![F::ZERO; total];
+    let mut h = vec![F::ZERO; total];
+    for i in 0..t {
+        for s in 0..=i {
+            for a in 0..d {
+                let idx = (i * t_p2 + s) * d_p2 + a;
+                f[idx] = eq_t_evals[i];
+                g[idx] = phi_q[i][a];
+                h[idx] = phi_k[s][a];
+            }
+        }
+    }
+    (
+        DenseMLPoly::new(f),
+        DenseMLPoly::new(g),
+        DenseMLPoly::new(h),
+    )
 }
 
 fn build_causal_context(phi_k: &[Vec<F>], v: &[Vec<F>], t: usize, d: usize) -> Vec<Vec<F>> {
@@ -460,6 +639,11 @@ fn flatten_mat_indices(mat: &[Vec<F>]) -> Vec<usize> {
         .collect()
 }
 
+fn indices_to_mle_evals(indices: &[usize]) -> Vec<F> {
+    DenseMLPoly::from_vec_padded(indices.iter().map(|&idx| F::from(idx as u64)).collect())
+        .evaluations
+}
+
 // ---------------------------------------------------------------------------
 // Model Prover (E2E) — cross-block batch sumcheck Phase 2
 // ---------------------------------------------------------------------------
@@ -508,23 +692,133 @@ pub fn prove(
     absorb_com(transcript, b"x_in_com", &x_in_com);
 
     // =========================================================================
-    // 2. Phase 1: commit all blocks' intermediates + run LN proofs
+    // 2. Phase 1: commit all block intermediates, prove one global LN range batch,
+    // then run the per-LN algebraic proofs against those range challenges.
     // =========================================================================
+    let mut block_commits: Vec<BlockCommitData> = Vec::with_capacity(num_blocks);
+    let mut block_input_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
+    let mut ln_range_witnesses: Vec<RangeProofWitness> = Vec::with_capacity(4 * num_blocks + 2);
     let mut phase1_data: Vec<BlockPhase1Data> = Vec::with_capacity(num_blocks);
     let mut current_x_com = x_in_com.clone();
 
+    // Phase 1a (PARALLEL): Per-block witness commits and LN range witnesses are
+    // independent across blocks — neither depends on the residual chain or the
+    // transcript. Compute them concurrently across L blocks.
+    let parallel_per_block: Vec<(BlockCommitDataNoResidual, LayerNormRangeWitnesses, LayerNormRangeWitnesses)> =
+        (0..num_blocks)
+            .into_par_iter()
+            .map(|i| {
+                let bw = &witness.block_witnesses[i];
+                let bpk = &pk.block_pks[i];
+                let partial = commit_block_intermediates_no_residual(bw, bpk);
+                let ln1_rw = compute_range_witnesses(&bw.ln1_wit, &bpk.ln1_vk);
+                let ln2_rw = compute_range_witnesses(&bw.ln2_wit, &bpk.ln2_vk);
+                (partial, ln1_rw, ln2_rw)
+            })
+            .collect();
+
+    // Phase 1b (SEQUENTIAL): finalize the residual-chain x_mid_com per block
+    // (homomorphic adds, cheap) and accumulate ln_range_witnesses in deterministic order.
+    for (partial, ln1_rw, ln2_rw) in parallel_per_block {
+        block_input_coms.push(current_x_com.clone());
+        let commits = finalize_block_commits(partial, &current_x_com);
+        ln_range_witnesses.push(ln1_rw.sigma_witness);
+        ln_range_witnesses.push(ln1_rw.y_witness);
+        ln_range_witnesses.push(ln2_rw.sigma_witness);
+        ln_range_witnesses.push(ln2_rw.y_witness);
+        let next_x_com = add_commitments(&commits.x_mid_com, &commits.out_ffn_com);
+        current_x_com = next_x_com;
+        block_commits.push(commits);
+    }
+
+    let final_rw = compute_range_witnesses(&witness.final_ln_wit, &pk.vk.final_ln_vk);
+    ln_range_witnesses.push(final_rw.sigma_witness);
+    ln_range_witnesses.push(final_rw.y_witness);
+
+    let ln_range_refs: Vec<&RangeProofWitness> = ln_range_witnesses.iter().collect();
+    let (ln_range_proofs, ln_range_m, ln_range_rvs) =
+        prove_range_batched(&ln_range_refs, LAYERNORM_RANGE_BITS, transcript)?;
+    let mut ln_range_proofs = ln_range_proofs.into_iter();
+    let mut ln_range_rvs = ln_range_rvs.into_iter();
+
+    let mut norm_range_witnesses: Vec<RangeProofWitness> = Vec::new();
+    let has_attn_norm = witness
+        .block_witnesses
+        .iter()
+        .any(|b| b.attn_wit.normalized_out.is_some());
+    if has_attn_norm {
+        for (i, b) in witness.block_witnesses.iter().enumerate() {
+            let rem =
+                b.attn_wit.norm_rem.as_ref().ok_or_else(|| {
+                    format!("block {i}: missing attention normalization remainder")
+                })?;
+            let diff = b
+                .attn_wit
+                .norm_diff
+                .as_ref()
+                .ok_or_else(|| format!("block {i}: missing attention normalization diff"))?;
+            norm_range_witnesses.push(RangeProofWitness {
+                values: flatten_mat_values(rem),
+            });
+            norm_range_witnesses.push(RangeProofWitness {
+                values: flatten_mat_values(diff),
+            });
+        }
+    }
+    let (attn_norm_rem_range_proofs, attn_norm_diff_range_proofs, attn_norm_range_m) =
+        if has_attn_norm {
+            let refs: Vec<&RangeProofWitness> = norm_range_witnesses.iter().collect();
+            let (proofs, m, _) = prove_range_batched(&refs, ATTN_NORM_RANGE_BITS, transcript)?;
+            let mut rem = Vec::with_capacity(num_blocks);
+            let mut diff = Vec::with_capacity(num_blocks);
+            let mut it = proofs.into_iter();
+            for _ in 0..num_blocks {
+                rem.push(it.next().expect("missing attention rem range proof"));
+                diff.push(it.next().expect("missing attention diff range proof"));
+            }
+            (rem, diff, Some(m))
+        } else {
+            (Vec::new(), Vec::new(), None)
+        };
+
     for i in 0..num_blocks {
-        let p1 = commit_block_phase1(
+        let range_proofs = [
+            ln_range_proofs
+                .next()
+                .expect("missing ln1 sigma range proof"),
+            ln_range_proofs.next().expect("missing ln1 y range proof"),
+            ln_range_proofs
+                .next()
+                .expect("missing ln2 sigma range proof"),
+            ln_range_proofs.next().expect("missing ln2 y range proof"),
+        ];
+        let range_rvs = [
+            ln_range_rvs.next().expect("missing ln1 sigma range point"),
+            ln_range_rvs.next().expect("missing ln1 y range point"),
+            ln_range_rvs.next().expect("missing ln2 sigma range point"),
+            ln_range_rvs.next().expect("missing ln2 y range point"),
+        ];
+        let p1 = prove_block_layernorms(
             &witness.block_witnesses[i],
-            &current_x_com,
+            &block_input_coms[i],
             &pk.block_pks[i],
+            &block_commits[i],
+            range_proofs,
+            range_rvs,
             transcript,
         )?;
-        let x_mid_com = p1.x_mid_com.clone();
-        let next_x_com = add_commitments(&x_mid_com, &p1.out_ffn_com);
-        current_x_com = next_x_com;
         phase1_data.push(p1);
     }
+    let final_sig_rp = ln_range_proofs
+        .next()
+        .expect("missing final LN sigma range proof");
+    let final_y_rp = ln_range_proofs
+        .next()
+        .expect("missing final LN y range proof");
+    let final_sig_rv = ln_range_rvs
+        .next()
+        .expect("missing final LN sigma range point");
+    let final_y_rv = ln_range_rvs.next().expect("missing final LN y range point");
 
     // =========================================================================
     // 3. Derive global r_td after ALL blocks' Phase 1 commitments
@@ -739,40 +1033,38 @@ pub fn prove(
 
         let phi_q_mle = mat_to_mle(&bw.attn_wit.phi_q, t, d);
         let phi_k_mle = mat_to_mle(&bw.attn_wit.phi_k, t, d);
-        let (ctx_mle, causal_context_com) = if inst_attn.causal {
-            let computed_causal_context;
-            let causal_context = match bw.attn_wit.causal_context.as_ref() {
-                Some(context) => {
-                    validate_causal_context_shape(context, t, d)?;
-                    context
-                }
-                None => {
-                    computed_causal_context =
-                        build_causal_context(&bw.attn_wit.phi_k, &bw.attn_wit.v, t, d);
-                    &computed_causal_context
-                }
-            };
-            let ctx_mle = mat_to_mle(causal_context, t * d, d);
-            let ctx_com = commit_mat(causal_context, t * d, d);
-            (ctx_mle, Some(ctx_com))
+        // GKR chain: in causal mode, causal_context is no longer committed; the
+        // CTX cubic sumcheck binds it algebraically via phi_k and v. In
+        // non-causal mode we still need the per-block ctx_mle for the OUT
+        // sumcheck's degree-2 dot product over k.
+        let ctx_mle = if inst_attn.causal {
+            // Validate the witness shape if provided, but otherwise we don't
+            // need a committed MLE — the CTX cubic sumcheck rebuilds the
+            // (s, a, b) tensor from phi_k and v directly.
+            if let Some(context) = bw.attn_wit.causal_context.as_ref() {
+                validate_causal_context_shape(context, t, d)?;
+            }
+            DenseMLPoly::new(vec![F::ZERO; 1])
         } else {
-            (mat_to_mle(&bw.attn_wit.context, d, d), None)
+            mat_to_mle(&bw.attn_wit.context, d, d)
         };
+        let causal_context_com: Option<HyraxCommitment> = None;
 
         let phi_q_com = commit_mat(&bw.attn_wit.phi_q, t, d);
         let phi_k_com = commit_mat(&bw.attn_wit.phi_k, t, d);
         absorb_com(transcript, b"phi_q_com", &phi_q_com);
         absorb_com(transcript, b"phi_k_com", &phi_k_com);
-        if let Some(ref ctx_com) = causal_context_com {
-            absorb_com(transcript, b"causal_ctx_com", ctx_com);
-        }
 
-        // out_i(r_t, r_k_o) = x_inner_i = batch_oproj.final_evals_f[i] / alpha_o
-        let alpha_o = bpk.o_pk.vk.alpha;
-        let out_eval_i = if alpha_o == F::from(0u64) {
-            F::from(0u64)
+        let out_eval_i = if bw.attn_wit.normalized_out.is_some() {
+            mat_to_mle(&bw.attn_wit.out, t, d).evaluate(&combine(&r_t, &r_k_o))
         } else {
-            batch_oproj.final_evals_f[i] * alpha_o.inverse().unwrap()
+            // Legacy unnormalized mode: attention output is the O-proj input.
+            let alpha_o = bpk.o_pk.vk.alpha;
+            if alpha_o == F::from(0u64) {
+                F::from(0u64)
+            } else {
+                batch_oproj.final_evals_f[i] * alpha_o.inverse().unwrap()
+            }
         };
 
         phi_q_mles.push(phi_q_mle);
@@ -784,20 +1076,25 @@ pub fn prove(
         attn_out_evals.push(out_eval_i);
     }
 
-    // 6b. Batch out sumcheck: out_i(r_t, r_k_o) = Σ_k phi_q_i(r_t,k) · ctx_i(k, r_k_o)
+    // 6b. Batch out sumcheck.
+    //   Non-causal: prove out_i(r_t, r_k_o) = Σ_k phi_q_i(r_t, k) · ctx_i(k, r_k_o)
+    //               via a degree-2 sumcheck over k (d_bits rounds).
+    //   Causal: handled separately below as a degree-3 sumcheck over (t, k)
+    //               with three multiplicands (eq(r_t, ·), phi_q, c_partial).
     let mut fs_attn_out: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut gs_attn_out: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
-    for i in 0..num_blocks {
-        transcript.append_field(b"attn_out_eval", &attn_out_evals[i]);
-        let f_out = DenseMLPoly::from_vec_padded(eval_rows(&phi_q_mles[i], t_bits, &r_t));
-        let g_out = if inst_attn.causal {
-            eval_causal_context_features(&ctx_mles[i], t_bits, d_bits, &r_t, &r_k_o)
-        } else {
-            eval_cols(&ctx_mles[i], d_bits, &r_k_o)
-        };
-        let g_out = DenseMLPoly::from_vec_padded(g_out);
-        fs_attn_out.push(f_out);
-        gs_attn_out.push(g_out);
+    if !inst_attn.causal {
+        for i in 0..num_blocks {
+            let f_out_vals = eval_rows(&phi_q_mles[i], t_bits, &r_t);
+            let g_out = eval_cols(&ctx_mles[i], d_bits, &r_k_o);
+            transcript.append_field(b"attn_out_eval", &attn_out_evals[i]);
+            fs_attn_out.push(DenseMLPoly::from_vec_padded(f_out_vals));
+            gs_attn_out.push(DenseMLPoly::from_vec_padded(g_out));
+        }
+    } else {
+        for i in 0..num_blocks {
+            transcript.append_field(b"attn_out_eval", &attn_out_evals[i]);
+        }
     }
     let eta_attn_out: F = transcript.challenge_field(b"batch_eta_attn_out");
     let weights_attn_out = powers_of(eta_attn_out, num_blocks);
@@ -806,34 +1103,101 @@ pub fn prove(
         .zip(attn_out_evals.iter())
         .map(|(w, e)| *w * *e)
         .sum();
-    let (batch_attn_out, batch_r_attn_out) = prove_sumcheck_multi_batched(
-        &fs_attn_out,
-        &gs_attn_out,
-        &weights_attn_out,
-        claim_attn_out,
-        transcript,
-    );
+    let (batch_attn_out, batch_attn_out_causal, batch_r_attn_out) = if !inst_attn.causal {
+        let (sc, r) = prove_sumcheck_multi_batched(
+            &fs_attn_out,
+            &gs_attn_out,
+            &weights_attn_out,
+            claim_attn_out,
+            transcript,
+        );
+        (Some(sc), None, r)
+    } else {
+        // Causal: degree-3 sumcheck Σ_{t,k} eq(r_t, t)·phi_q[t][k]·c_partial[t][k]
+        // where c_partial[t][k] = Σ_b eq(r_k_o, b)·causal_context[t][k][b].
+        // The (t_bits + d_bits)-variable polynomial layout uses MSB-first bits:
+        // index t·d_p2 + k for t in [0, t_p2), k in [0, d_p2). h is constant in
+        // the k axis, so Σ_k eq(X_k, k) = 1 makes h_mle(X_t, X_k) = eq(r_t, X_t).
+        let eq_t_evals = eq_evals_msb(&r_t, t);
+        let eq_k_o_evals = eq_evals_msb(&r_k_o, d);
+        let t_p2 = t.next_power_of_two();
+        let d_p2 = d.next_power_of_two();
+        let mut fs_cubic: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+        let mut gs_cubic: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+        let mut hs_cubic: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+        for i in 0..num_blocks {
+            let bw = &witness.block_witnesses[i];
+            let computed;
+            let causal_context = match bw.attn_wit.causal_context.as_ref() {
+                Some(c) => c,
+                None => {
+                    computed = build_causal_context(&bw.attn_wit.phi_k, &bw.attn_wit.v, t, d);
+                    &computed
+                }
+            };
+            let mut f_evals = vec![F::ZERO; t_p2 * d_p2];
+            let mut g_evals = vec![F::ZERO; t_p2 * d_p2];
+            let mut h_evals = vec![F::ZERO; t_p2 * d_p2];
+            // h is the constant-in-k extension of eq(r_t, ·); fill all
+            // (t_p2 × d_p2) entries with eq_t_evals[t] regardless of k.
+            for tt in 0..t_p2 {
+                let eq_t = eq_t_evals[tt];
+                for k in 0..d_p2 {
+                    h_evals[tt * d_p2 + k] = eq_t;
+                }
+            }
+            for tt in 0..t {
+                for k in 0..d {
+                    f_evals[tt * d_p2 + k] = bw.attn_wit.phi_q[tt][k];
+                    let mut c_partial = F::ZERO;
+                    for b in 0..d {
+                        c_partial += eq_k_o_evals[b] * causal_context[tt * d + k][b];
+                    }
+                    g_evals[tt * d_p2 + k] = c_partial;
+                }
+            }
+            fs_cubic.push(DenseMLPoly::new(f_evals));
+            gs_cubic.push(DenseMLPoly::new(g_evals));
+            hs_cubic.push(DenseMLPoly::new(h_evals));
+        }
+        let (sc, r) = prove_sumcheck_cubic_multi_batched(
+            &fs_cubic,
+            &gs_cubic,
+            &hs_cubic,
+            &weights_attn_out,
+            claim_attn_out,
+            transcript,
+        );
+        (None, Some(sc), r)
+    };
     // 6c. Non-causal: ctx(batch_r_attn_out, r_k_o) = Σ_t phi_k(t, batch_r_attn_out) · v(t, r_k_o).
     //     Causal: prove a random linear combination of prefix-context equations
     //     C_i[a,b] = Σ_{s<=i} phi_k[s,a] · v[s,b].
     let mut fs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut gs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
-    let mut causal_prefix_point: Option<Vec<F>> = None;
-    let mut causal_ctx_prefix_evals: Vec<F> = Vec::new();
+    let mut hs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    // GKR chain: in causal mode the CTX-relation is proved at the prefix point
+    // implied by the OUT sumcheck terminal — (r_final_t, r_final_k) for the
+    // (t, a) axes from batch_r_attn_out, plus r_k_o for the b-axis. The CTX
+    // claim per block is OUT's final_evals_g[i] (= causal_context_mle at that
+    // point), so we don't sample fresh prefix challenges and don't need to
+    // separately bind the prefix-point opening of causal_context.
+    let causal_ctx_prefix_evals: Vec<F> = Vec::new();
     let attn_ctx_evals: Vec<F> = if inst_attn.causal {
-        let prefix_t = challenge_vec(transcript, t_bits, b"causal_prefix_t");
-        let prefix_a = challenge_vec(transcript, d_bits, b"causal_prefix_a");
-        let prefix_b = challenge_vec(transcript, d_bits, b"causal_prefix_b");
-        let prefix_point = combine(&combine(&prefix_t, &prefix_a), &prefix_b);
+        let prefix_t = batch_r_attn_out[..t_bits].to_vec();
+        let prefix_a = batch_r_attn_out[t_bits..t_bits + d_bits].to_vec();
+        let prefix_b = r_k_o.clone();
         let suffix_evals = suffix_eq_evals_msb(&prefix_t, t);
         let eq_a_evals = eq_evals_msb(&prefix_a, d);
         let eq_b_evals = eq_evals_msb(&prefix_b, d);
-        let mut claims = Vec::with_capacity(num_blocks);
+        let claims = batch_attn_out_causal
+            .as_ref()
+            .expect("causal mode always produces batch_attn_out_causal")
+            .final_evals_g
+            .clone();
         for i in 0..num_blocks {
             let bw = &witness.block_witnesses[i];
-            let ctx_eval = ctx_mles[i].evaluate(&prefix_point);
-            transcript.append_field(b"attn_ctx_eval", &ctx_eval);
-            let (f_ctx, g_v) = causal_prefix_polys(
+            let (f_ctx, g_v, h_ctx) = causal_prefix_polys(
                 &bw.attn_wit.phi_k,
                 &bw.attn_wit.v,
                 &suffix_evals,
@@ -844,13 +1208,15 @@ pub fn prove(
             );
             fs_attn_ctx.push(f_ctx);
             gs_attn_ctx.push(g_v);
-            claims.push(ctx_eval);
+            hs_attn_ctx.push(h_ctx);
         }
-        causal_prefix_point = Some(prefix_point);
-        causal_ctx_prefix_evals = claims.clone();
         claims
     } else {
-        let claims = batch_attn_out.final_evals_g.clone();
+        let claims = batch_attn_out
+            .as_ref()
+            .expect("non-causal mode always produces batch_attn_out")
+            .final_evals_g
+            .clone();
         for i in 0..num_blocks {
             transcript.append_field(b"attn_ctx_eval", &claims[i]);
             let f_ctx =
@@ -868,13 +1234,210 @@ pub fn prove(
         .zip(attn_ctx_evals.iter())
         .map(|(w, e)| *w * *e)
         .sum();
-    let (batch_attn_ctx, batch_r_attn_ctx) = prove_sumcheck_multi_batched(
-        &fs_attn_ctx,
-        &gs_attn_ctx,
-        &weights_attn_ctx,
-        claim_attn_ctx,
-        transcript,
-    );
+    let (batch_attn_ctx, batch_attn_ctx_causal, batch_r_attn_ctx) = if !inst_attn.causal {
+        let (sc, r) = prove_sumcheck_multi_batched(
+            &fs_attn_ctx,
+            &gs_attn_ctx,
+            &weights_attn_ctx,
+            claim_attn_ctx,
+            transcript,
+        );
+        (Some(sc), None, r)
+    } else {
+        let (sc, r) = prove_sumcheck_cubic_multi_batched(
+            &fs_attn_ctx,
+            &gs_attn_ctx,
+            &hs_attn_ctx,
+            &weights_attn_ctx,
+            claim_attn_ctx,
+            transcript,
+        );
+        (None, Some(sc), r)
+    };
+
+    let (attn_norm_sumcheck, attn_norm_r) = if has_attn_norm {
+        let r = challenge_vec(transcript, td_num_vars, b"attn_norm_r");
+        let lambda = transcript.challenge_field::<F>(b"attn_norm_lambda");
+        let eq = DenseMLPoly::new(eq_evals_msb(&r, 1usize << td_num_vars));
+        let one = DenseMLPoly::new(vec![F::ONE; 1 << td_num_vars]);
+        let scale_f = F::from(ATTN_NORM_SCALE);
+        let mut fs = Vec::with_capacity(7 * num_blocks);
+        let mut gs = Vec::with_capacity(7 * num_blocks);
+        let mut hs = Vec::with_capacity(7 * num_blocks);
+        let mut ws = Vec::with_capacity(7 * num_blocks);
+        for (i, bw) in witness.block_witnesses.iter().enumerate() {
+            let y = bw
+                .attn_wit
+                .normalized_out
+                .as_ref()
+                .ok_or_else(|| format!("block {i}: missing normalized attention output"))?;
+            let z = bw
+                .attn_wit
+                .norm_z
+                .as_ref()
+                .ok_or_else(|| format!("block {i}: missing attention z"))?;
+            let rem = bw
+                .attn_wit
+                .norm_rem
+                .as_ref()
+                .ok_or_else(|| format!("block {i}: missing attention rem"))?;
+            let diff = bw
+                .attn_wit
+                .norm_diff
+                .as_ref()
+                .ok_or_else(|| format!("block {i}: missing attention diff"))?;
+            let n_mle = mat_to_mle(&bw.attn_wit.out, t, d);
+            let y_mle = mat_to_mle(y, t, d);
+            let r_mle = mat_to_mle(rem, t, d);
+            let d_mle = mat_to_mle(diff, t, d);
+            let z_ext: Vec<Vec<F>> = (0..t).map(|row| vec![z[row]; d]).collect();
+            let z_mle = mat_to_mle(&z_ext, t, d);
+
+            fs.extend(vec![eq.clone(); 7]);
+            gs.extend(vec![
+                n_mle.clone(),
+                r_mle.clone(),
+                z_mle.clone(),
+                z_mle.clone(),
+                one.clone(),
+                r_mle.clone(),
+                d_mle.clone(),
+            ]);
+            hs.extend(vec![
+                one.clone(),
+                one.clone(),
+                y_mle,
+                one.clone(),
+                one.clone(),
+                one.clone(),
+                one.clone(),
+            ]);
+            ws.extend(vec![
+                scale_f,
+                -F::ONE,
+                -F::ONE,
+                lambda,
+                -lambda,
+                -lambda,
+                -lambda,
+            ]);
+        }
+        let (proof, r_sc) =
+            prove_sumcheck_cubic_multi_batched(&fs, &gs, &hs, &ws, F::ZERO, transcript);
+        (Some(proof), Some(r_sc))
+    } else {
+        (None, None)
+    };
+
+    let (
+        attn_z_sumcheck,
+        attn_z_ksum_sumcheck,
+        attn_z_causal_sumcheck,
+        attn_z_phi_q_point,
+        attn_z_phi_k_point,
+        _attn_z_phi_q_evals,
+        _attn_z_phi_k_evals,
+    ) = if let (true, Some(ref r_norm), Some(ref norm_sc)) = (
+        has_attn_norm,
+        attn_norm_r.as_ref(),
+        attn_norm_sumcheck.as_ref(),
+    ) {
+        let r_norm_t = r_norm[..t_bits].to_vec();
+        let z_claims: Vec<F> = (0..num_blocks)
+            .map(|i| norm_sc.final_evals_g[7 * i + 2])
+            .collect();
+        let eta_z = transcript.challenge_field::<F>(b"attn_z_eta");
+        let weights_z = powers_of(eta_z, num_blocks);
+        let claim_z: F = weights_z
+            .iter()
+            .zip(z_claims.iter())
+            .map(|(w, z)| *w * *z)
+            .sum();
+        if inst_attn.causal {
+            let eq_t = eq_evals_msb(&r_norm_t, t);
+            let mut fs = Vec::with_capacity(num_blocks);
+            let mut gs = Vec::with_capacity(num_blocks);
+            let mut hs = Vec::with_capacity(num_blocks);
+            for i in 0..num_blocks {
+                let bw = &witness.block_witnesses[i];
+                let (f, g, h) =
+                    causal_denominator_polys(&bw.attn_wit.phi_q, &bw.attn_wit.phi_k, &eq_t, t, d);
+                fs.push(f);
+                gs.push(g);
+                hs.push(h);
+            }
+            let (sc, r_z) =
+                prove_sumcheck_cubic_multi_batched(&fs, &gs, &hs, &weights_z, claim_z, transcript);
+            let r_i = r_z[..t_bits].to_vec();
+            let r_s = r_z[t_bits..2 * t_bits].to_vec();
+            let r_a = r_z[2 * t_bits..].to_vec();
+            let phi_q_point = combine(&r_i, &r_a);
+            let phi_k_point = combine(&r_s, &r_a);
+            let phi_q_evals = sc.final_evals_g.clone();
+            let phi_k_evals = sc.final_evals_h.clone();
+            (
+                None,
+                None,
+                Some(sc),
+                Some(phi_q_point),
+                Some(phi_k_point),
+                phi_q_evals,
+                phi_k_evals,
+            )
+        } else {
+            let mut fs = Vec::with_capacity(num_blocks);
+            let mut gs = Vec::with_capacity(num_blocks);
+            let mut ksum_mles = Vec::with_capacity(num_blocks);
+            for i in 0..num_blocks {
+                let bw = &witness.block_witnesses[i];
+                fs.push(DenseMLPoly::from_vec_padded(eval_rows(
+                    &phi_q_mles[i],
+                    t_bits,
+                    &r_norm_t,
+                )));
+                let ksum: Vec<F> = (0..d)
+                    .map(|a| (0..t).map(|s| bw.attn_wit.phi_k[s][a]).sum())
+                    .collect();
+                let ksum_mle = vec_to_mle(&ksum, d);
+                gs.push(ksum_mle.clone());
+                ksum_mles.push(ksum_mle);
+            }
+            let (sc, r_a) = prove_sumcheck_multi_batched(&fs, &gs, &weights_z, claim_z, transcript);
+            let ksum_claims = sc.final_evals_g.clone();
+            let claim_ksum: F = weights_z
+                .iter()
+                .zip(ksum_claims.iter())
+                .map(|(w, v)| *w * *v)
+                .sum();
+            let mut fs_k = Vec::with_capacity(num_blocks);
+            let mut gs_k = Vec::with_capacity(num_blocks);
+            for i in 0..num_blocks {
+                fs_k.push(DenseMLPoly::new(vec![F::ONE; 1 << t_bits]));
+                gs_k.push(DenseMLPoly::from_vec_padded(eval_cols(
+                    &phi_k_mles[i],
+                    t_bits,
+                    &r_a,
+                )));
+            }
+            let (sc_k, r_s) =
+                prove_sumcheck_multi_batched(&fs_k, &gs_k, &weights_z, claim_ksum, transcript);
+            let phi_q_point = combine(&r_norm_t, &r_a);
+            let phi_k_point = combine(&r_s, &r_a);
+            let phi_q_evals = sc.final_evals_f.clone();
+            let phi_k_evals = sc_k.final_evals_g.clone();
+            (
+                Some(sc),
+                Some(sc_k),
+                None,
+                Some(phi_q_point),
+                Some(phi_k_point),
+                phi_q_evals,
+                phi_k_evals,
+            )
+        }
+    } else {
+        (None, None, None, None, None, Vec::new(), Vec::new())
+    };
     // =========================================================================
     // 7. Per-block FFN: Lasso + M commit + absorb coms
     // =========================================================================
@@ -934,8 +1497,11 @@ pub fn prove(
     let global_ffn_lasso_inst = LassoMultiInstance {
         instances: ffn_lasso_instances,
     };
+    let ffn_instance_to_group =
+        crate::lookup::lasso::derive_instance_groups(&ffn_instance_coms);
     let global_ffn_lasso_pk = LassoMultiProvingKey {
         instance_table_coms: ffn_instance_coms,
+        instance_to_group: ffn_instance_to_group,
         nu: ffn_lasso_nu,
     };
     let ffn_lasso_proof = prove_lasso_multi(
@@ -953,11 +1519,25 @@ pub fn prove(
         .map(|v| v.as_slice())
         .collect();
     absorb_index_vectors(transcript, b"ffn_lasso_indices", &ffn_index_refs);
+    let ffn_quant_proof = prove_quantization_batch(
+        b"ffn_quant_rem_com",
+        &ffn_m_mles,
+        &ffn_m_coms,
+        &ffn_lasso_proof.all_query_indices,
+        inst_ffn.activation_lasso.tables.len(),
+        inst_ffn.activation_lasso.bits_per_chunk,
+        t,
+        d_ff,
+        &pk.vk.block_vks[0].ffn_activation_quant,
+        transcript,
+    )?;
     let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
-    let ffn_bind_refs: Vec<&[F]> = ffn_m_mles
+    let ffn_bind_evals_vecs: Vec<Vec<F>> = ffn_lasso_proof
+        .all_query_indices
         .iter()
-        .map(|m| m.evaluations.as_slice())
+        .map(|indices| indices_to_mle_evals(indices))
         .collect();
+    let ffn_bind_refs: Vec<&[F]> = ffn_bind_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let (nu_mff_bind, sigma_mff_bind, _) = params_from_vars(t_bits + f_bits);
     let ffn_lasso_bind_open = hyrax_open_batch(
         &ffn_bind_refs,
@@ -1075,7 +1655,6 @@ pub fn prove(
         block_proofs.push(TransformerBlockProof {
             ln1_proof: p1.ln1_proof.clone(),
             ln2_proof: p1.ln2_proof.clone(),
-            block_range_m: p1.block_range_m.clone(),
             ffn_lasso_proof: empty_lasso_proof(),
             ffn_a_com: ffn_a_coms[i].clone(),
             ffn_m_com: ffn_m_coms[i].clone(),
@@ -1083,6 +1662,11 @@ pub fn prove(
             q_com: p1.q_com.clone(),
             k_com: p1.k_com.clone(),
             v_com: p1.v_com.clone(),
+            attn_norm_com: p1.attn_norm_com.clone(),
+            attn_num_com: p1.attn_num_com.clone(),
+            attn_z_com: p1.attn_z_com.clone(),
+            attn_rem_com: p1.attn_rem_com.clone(),
+            attn_diff_com: p1.attn_diff_com.clone(),
             out_attn_com: p1.out_attn_com.clone(),
             x_norm2_com: p1.x_norm2_com.clone(),
             out_ffn_com: p1.out_ffn_com.clone(),
@@ -1110,14 +1694,6 @@ pub fn prove(
     // =========================================================================
     // 11. Final LayerNorm
     // =========================================================================
-    let final_rw = compute_range_witnesses(&witness.final_ln_wit, &pk.vk.final_ln_vk);
-    let (mut final_range_proofs, final_range_m, final_r_vs) = prove_range_batched(
-        &[&final_rw.sigma_witness, &final_rw.y_witness],
-        32,
-        transcript,
-    )?;
-    let final_y_rp = final_range_proofs.remove(1);
-    let final_sig_rp = final_range_proofs.remove(0);
     let final_ln_out_com = commit_mat(&witness.final_ln_wit.y, t, d);
     let ln_io = LayerNormIOCommitments {
         x_com: current_x_com.clone(),
@@ -1127,8 +1703,8 @@ pub fn prove(
         &witness.final_ln_wit,
         &ln_io,
         &pk.vk.final_ln_vk,
-        (final_sig_rp, final_r_vs[0].clone()),
-        (final_y_rp, final_r_vs[1].clone()),
+        (final_sig_rp, final_sig_rv),
+        (final_y_rp, final_y_rv),
         transcript,
     )?;
 
@@ -1154,9 +1730,9 @@ pub fn prove(
         hyrax_open(&logits_mle.evaluations, &lm_y_claim.point, lm_nu, lm_sigma);
 
     // =========================================================================
-    // 13. Advance transcript for accumulator mu challenges (10 accumulators)
+    // 13. Advance transcript for accumulator mu challenges
     // =========================================================================
-    for _ in 0..10 {
+    for _ in 0..15 {
         let _ = transcript.challenge_field::<F>(b"hyrax_group_mu");
     }
 
@@ -1283,8 +1859,15 @@ pub fn prove(
     let ffn_m_com_batch_open =
         hyrax_open_batch(&ffn_m_refs, &ffn_m_point, nu_mff, sigma_mff, transcript);
 
-    // phi_q_batch: L phi_q_i at combine(r_t, batch_r_attn_out) [td_num_vars]
-    let phi_q_attn_point = combine(&r_t, &batch_r_attn_out);
+    // phi_q_batch: open phi_q at the (t, k) point implied by the attention-out
+    // sumcheck. In causal mode the sumcheck folds in r_t internally, so
+    // batch_r_attn_out is already (t_bits + d_bits) long; in non-causal mode
+    // batch_r_attn_out has only d_bits and r_t prefixes the t-axis.
+    let phi_q_attn_point = if inst_attn.causal {
+        batch_r_attn_out.clone()
+    } else {
+        combine(&r_t, &batch_r_attn_out)
+    };
     let phi_q_refs: Vec<&[F]> = phi_q_mles
         .iter()
         .map(|m| m.evaluations.as_slice())
@@ -1298,13 +1881,6 @@ pub fn prove(
         let r_s = batch_r_attn_ctx[..t_bits].to_vec();
         let r_a = batch_r_attn_ctx[t_bits..t_bits + d_bits].to_vec();
         let r_b = batch_r_attn_ctx[t_bits + d_bits..].to_vec();
-        let prefix_point = causal_prefix_point
-            .clone()
-            .ok_or_else(|| "missing causal prefix point".to_string())?;
-        let ctx_refs: Vec<&[F]> = ctx_mles.iter().map(|m| m.evaluations.as_slice()).collect();
-        let (nu_tdd, sigma_tdd, _) = params_from_vars(t_bits + 2 * d_bits);
-        let ctx_prefix_open =
-            hyrax_open_batch(&ctx_refs, &prefix_point, nu_tdd, sigma_tdd, transcript);
         let phi_k_point = combine(&r_s, &r_a);
         let v_point = combine(&r_s, &r_b);
         causal_phi_k_prefix_evals = phi_k_mles
@@ -1312,7 +1888,10 @@ pub fn prove(
             .map(|m| m.evaluate(&phi_k_point))
             .collect();
         causal_v_prefix_evals = v_mles.iter().map(|m| m.evaluate(&v_point)).collect();
-        (phi_k_point, v_point, Some(ctx_prefix_open))
+        // GKR chain: the CTX-relation prefix point is implied by the OUT
+        // sumcheck terminal, so no separate prefix-point open of
+        // causal_context_com is needed.
+        (phi_k_point, v_point, None)
     } else {
         (
             combine(&batch_r_attn_ctx, &batch_r_attn_out),
@@ -1341,20 +1920,116 @@ pub fn prove(
         transcript,
     );
 
-    let causal_ctx_out_batch_open = if inst_attn.causal {
-        let ctx_out_point = combine(&combine(&r_t, &batch_r_attn_out), &r_k_o);
-        let ctx_refs: Vec<&[F]> = ctx_mles.iter().map(|m| m.evaluations.as_slice()).collect();
-        let (nu_tdd, sigma_tdd, _) = params_from_vars(t_bits + 2 * d_bits);
-        Some(hyrax_open_batch(
-            &ctx_refs,
-            &ctx_out_point,
-            nu_tdd,
-            sigma_tdd,
-            transcript,
-        ))
+    let attn_z_phi_q_open = if let Some(ref p) = attn_z_phi_q_point {
+        let refs: Vec<&[F]> = phi_q_mles
+            .iter()
+            .map(|m| m.evaluations.as_slice())
+            .collect();
+        Some(hyrax_open_batch(&refs, p, nu_td, sigma_td, transcript))
     } else {
         None
     };
+    let attn_z_phi_k_open = if let Some(ref p) = attn_z_phi_k_point {
+        let refs: Vec<&[F]> = phi_k_mles
+            .iter()
+            .map(|m| m.evaluations.as_slice())
+            .collect();
+        Some(hyrax_open_batch(&refs, p, nu_td, sigma_td, transcript))
+    } else {
+        None
+    };
+
+    // GKR chain (step 2): causal_context is not committed, so no Hyrax open
+    // is required at the OUT-sumcheck terminal point. The CTX cubic sumcheck
+    // binds the OUT final_evals_g[i] to phi_k and v algebraically.
+    let causal_ctx_out_batch_open: Option<HyraxProof> = None;
+
+    let (attn_norm_r_batch_open, attn_z_open, attn_norm_attn_point_open) =
+        if let Some(ref r_norm) = attn_norm_r {
+            let r_norm_t = r_norm[..t_bits].to_vec();
+            let num_evals: Vec<Vec<F>> = witness
+                .block_witnesses
+                .iter()
+                .map(|b| mat_to_mle(&b.attn_wit.out, t, d).evaluations)
+                .collect();
+            let norm_evals: Vec<Vec<F>> = witness
+                .block_witnesses
+                .iter()
+                .map(|b| {
+                    mat_to_mle(
+                        b.attn_wit
+                            .normalized_out
+                            .as_ref()
+                            .expect("missing normalized attention"),
+                        t,
+                        d,
+                    )
+                    .evaluations
+                })
+                .collect();
+            let z_evals: Vec<Vec<F>> = witness
+                .block_witnesses
+                .iter()
+                .map(|b| {
+                    vec_to_mle(b.attn_wit.norm_z.as_ref().expect("missing attention z"), t)
+                        .evaluations
+                })
+                .collect();
+            let rem_evals: Vec<Vec<F>> = witness
+                .block_witnesses
+                .iter()
+                .map(|b| {
+                    mat_to_mle(b.attn_wit.norm_rem.as_ref().expect("missing rem"), t, d).evaluations
+                })
+                .collect();
+            let diff_evals: Vec<Vec<F>> = witness
+                .block_witnesses
+                .iter()
+                .map(|b| {
+                    mat_to_mle(b.attn_wit.norm_diff.as_ref().expect("missing diff"), t, d)
+                        .evaluations
+                })
+                .collect();
+            let z_refs: Vec<&[F]> = z_evals.iter().map(|v| v.as_slice()).collect();
+            let (nu_t, sigma_t, _) = params_from_vars(t_bits);
+
+            // Merged open at r_norm: [num | norm | rem | diff], same size & params.
+            let r_norm_refs: Vec<&[F]> = num_evals
+                .iter()
+                .chain(norm_evals.iter())
+                .chain(rem_evals.iter())
+                .chain(diff_evals.iter())
+                .map(|v| v.as_slice())
+                .collect();
+            let attn_norm_r_batch_open =
+                hyrax_open_batch(&r_norm_refs, r_norm, nu_td, sigma_td, transcript);
+
+            // attn_z is at a different point (r_norm_t) and different params.
+            let attn_z_open = hyrax_open_batch(&z_refs, &r_norm_t, nu_t, sigma_t, transcript);
+
+            // Merged open at attn_point: [num | norm].
+            let attn_point = combine(&r_t, &r_k_o);
+            let attn_point_refs: Vec<&[F]> = num_evals
+                .iter()
+                .chain(norm_evals.iter())
+                .map(|v| v.as_slice())
+                .collect();
+            let attn_norm_attn_point_open = hyrax_open_batch(
+                &attn_point_refs,
+                &attn_point,
+                nu_td,
+                sigma_td,
+                transcript,
+            );
+
+            (
+                Some(attn_norm_r_batch_open),
+                Some(attn_z_open),
+                Some(attn_norm_attn_point_open),
+            )
+        } else {
+            (None, None, None)
+        };
 
     // =========================================================================
     // 16. Global batched Lasso (attention)
@@ -1405,18 +2080,48 @@ pub fn prove(
     let global_multi_inst = LassoMultiInstance {
         instances: all_lasso_instances,
     };
+    let global_instance_to_group =
+        crate::lookup::lasso::derive_instance_groups(&all_instance_coms);
     let global_lasso_pk = LassoMultiProvingKey {
         instance_table_coms: all_instance_coms,
+        instance_to_group: global_instance_to_group,
         nu: global_nu,
     };
     let qk_index_refs: Vec<&[usize]> = all_query_indices.iter().map(|v| v.as_slice()).collect();
     absorb_index_vectors(transcript, b"qk_lasso_indices", &qk_index_refs);
-    let qk_lasso_bind_point = challenge_vec(transcript, td_num_vars, b"qk_lasso_bind_r");
-    let mut qk_bind_evals_vecs: Vec<Vec<F>> = Vec::with_capacity(2 * num_blocks);
-    for bw in &witness.block_witnesses {
-        qk_bind_evals_vecs.push(mat_to_mle(&bw.attn_wit.q, t, d).evaluations);
-        qk_bind_evals_vecs.push(mat_to_mle(&bw.attn_wit.k, t, d).evaluations);
+    if inst_attn.q_lasso.tables.len() != inst_attn.k_lasso.tables.len()
+        || inst_attn.q_lasso.bits_per_chunk != inst_attn.k_lasso.bits_per_chunk
+    {
+        return Err("Q/K quantization lookup domains must match".to_string());
     }
+    let mut qk_raw_mles = Vec::with_capacity(2 * num_blocks);
+    let mut qk_raw_coms = Vec::with_capacity(2 * num_blocks);
+    for i in 0..num_blocks {
+        qk_raw_mles.push(q_mles[i].clone());
+        qk_raw_mles.push(k_mles[i].clone());
+        qk_raw_coms.push(block_proofs[i].q_com.clone());
+        qk_raw_coms.push(block_proofs[i].k_com.clone());
+    }
+    let qk_quant_proof = prove_quantization_batch(
+        b"qk_quant_rem_com",
+        &qk_raw_mles,
+        &qk_raw_coms,
+        &all_query_indices,
+        inst_attn.q_lasso.tables.len(),
+        inst_attn.q_lasso.bits_per_chunk,
+        t,
+        d,
+        &pk.vk.block_vks[0].qk_activation_quant,
+        transcript,
+    )?;
+    for _ in 0..2 {
+        let _ = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    }
+    let qk_lasso_bind_point = challenge_vec(transcript, td_num_vars, b"qk_lasso_bind_r");
+    let qk_bind_evals_vecs: Vec<Vec<F>> = all_query_indices
+        .iter()
+        .map(|indices| indices_to_mle_evals(indices))
+        .collect();
     let qk_bind_refs: Vec<&[F]> = qk_bind_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let qk_lasso_bind_open = hyrax_open_batch(
         &qk_bind_refs,
@@ -1444,13 +2149,24 @@ pub fn prove(
         lm_head_logits_open,
         ffn_lasso_proof,
         all_lasso_proof,
-        final_range_m,
+        ffn_quant_proof,
+        qk_quant_proof,
+        ln_range_m,
         batch_qkv,
         batch_oproj,
         batch_ffn_y,
         batch_ffn_m,
         batch_attn_out,
+        batch_attn_out_causal,
         batch_attn_ctx,
+        batch_attn_ctx_causal,
+        attn_norm_sumcheck,
+        attn_z_sumcheck,
+        attn_z_ksum_sumcheck,
+        attn_z_causal_sumcheck,
+        attn_norm_range_m,
+        attn_norm_rem_range_proofs,
+        attn_norm_diff_range_proofs,
         inter_batch_open,
         x_norm1_batch_open,
         w_q_batch_open,
@@ -1470,6 +2186,11 @@ pub fn prove(
         phi_q_batch_open,
         phi_k_batch_open,
         v_attn_batch_open,
+        attn_norm_r_batch_open,
+        attn_norm_attn_point_open,
+        attn_z_open,
+        attn_z_phi_q_open,
+        attn_z_phi_k_open,
         causal_ctx_prefix_evals,
         causal_phi_k_prefix_evals,
         causal_v_prefix_evals,
@@ -1493,6 +2214,8 @@ pub fn add_commitments_prover(a: &HyraxCommitment, b: &HyraxCommitment) -> Hyrax
 
 #[cfg(test)]
 mod tests {
+    use crate::lookup::quantization::QuantizationParams;
+
     use super::*;
     use crate::attention::attention::{LinearAttentionInstance, LinearAttentionWitness};
     use crate::attention::layernorm::LayerNormWitness;
@@ -1557,9 +2280,17 @@ mod tests {
             ffn_w2,
             ffn_activation_tables: vec![identity_table.clone()],
             ffn_activation_bits_per_chunk: M_BITS,
+            ffn_activation_quant: QuantizationParams {
+                scale_num: 2,
+                scale_den: 2,
+            },
             q_activation_tables: vec![identity_table.clone()],
             k_activation_tables: vec![identity_table.clone()],
             qk_activation_bits_per_chunk: M_BITS,
+            qk_activation_quant: QuantizationParams {
+                scale_num: 2,
+                scale_den: 2,
+            },
         };
 
         TransformerModelWeights {
@@ -1696,6 +2427,10 @@ mod tests {
             k_query_indices: vec![7, 0, 7, 0],
             context: zero_out.clone(),
             causal_context: None,
+            normalized_out: None,
+            norm_z: None,
+            norm_rem: None,
+            norm_diff: None,
             out: zero_out.clone(),
         };
         let o_proj_wit = ProjectionWitness {
@@ -1772,6 +2507,34 @@ mod tests {
         }
     }
 
+    fn assert_tampered_model_rejected(
+        label: &'static [u8],
+        tamper: impl FnOnce(&mut TransformerModelProof, &mut TransformerModelVerifyingKey),
+    ) {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(label);
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        let mut vk = pk.vk.clone();
+        tamper(&mut proof, &mut vk);
+
+        let mut vt = Transcript::new(label);
+        let result = verify(
+            &proof,
+            &vk,
+            &inst_attn,
+            &inst_ffn,
+            &model_wit.x_in,
+            &model_wit.lm_head_wit.y,
+            &mut vt,
+            &lp,
+        );
+        assert!(result.is_err(), "tampered proof should be rejected");
+    }
+
     // -----------------------------------------------------------------------
     // Model-level tests (single block L=1)
     // -----------------------------------------------------------------------
@@ -1817,9 +2580,12 @@ mod tests {
 
         let mut pt = Transcript::new(b"model_causal_e2e");
         let proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
-        assert!(proof.block_proofs[0].causal_context_com.is_some());
-        assert!(proof.causal_ctx_out_batch_open.is_some());
-        assert!(proof.causal_ctx_prefix_batch_open.is_some());
+        // GKR chain (step 2): causal_context_com and both causal_ctx opens are
+        // dropped — the CTX cubic sumcheck binds the OUT terminal claim
+        // algebraically through phi_k and v.
+        assert!(proof.block_proofs[0].causal_context_com.is_none());
+        assert!(proof.causal_ctx_out_batch_open.is_none());
+        assert!(proof.causal_ctx_prefix_batch_open.is_none());
 
         let mut vt = Transcript::new(b"model_causal_e2e");
         let result = verify(
@@ -2043,6 +2809,76 @@ mod tests {
             result.is_err(),
             "Should reject tampered attention Lasso query indices"
         );
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_ffn_quant_remainder_eval() {
+        assert_tampered_model_rejected(b"model_tamper_ffn_quant_rem_eval", |proof, _| {
+            proof.ffn_quant_proof.rem_evals[0] += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_ffn_quant_raw_eval() {
+        assert_tampered_model_rejected(b"model_tamper_ffn_quant_raw_eval", |proof, _| {
+            proof.ffn_quant_proof.raw_evals[0] += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_ffn_quant_range_claim() {
+        assert_tampered_model_rejected(b"model_tamper_ffn_quant_range_claim", |proof, _| {
+            proof.ffn_quant_proof.rem_range_proofs[0].claim_v += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_ffn_quant_remainder_commitment() {
+        assert_tampered_model_rejected(b"model_tamper_ffn_quant_rem_com", |proof, _| {
+            proof.ffn_quant_proof.rem_coms[0] = proof.block_proofs[0].ffn_m_com.clone();
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_qk_quant_remainder_eval() {
+        assert_tampered_model_rejected(b"model_tamper_qk_quant_rem_eval", |proof, _| {
+            proof.qk_quant_proof.rem_evals[0] += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_qk_quant_raw_eval() {
+        assert_tampered_model_rejected(b"model_tamper_qk_quant_raw_eval", |proof, _| {
+            proof.qk_quant_proof.raw_evals[0] += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_qk_quant_range_claim() {
+        assert_tampered_model_rejected(b"model_tamper_qk_quant_range_claim", |proof, _| {
+            proof.qk_quant_proof.rem_range_proofs[0].claim_v += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_qk_quant_remainder_commitment() {
+        assert_tampered_model_rejected(b"model_tamper_qk_quant_rem_com", |proof, _| {
+            proof.qk_quant_proof.rem_coms[0] = proof.block_proofs[0].q_com.clone();
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_ffn_quant_scale_mismatch() {
+        assert_tampered_model_rejected(b"model_tamper_ffn_quant_scale", |_, vk| {
+            vk.block_vks[0].ffn_activation_quant.scale_den += 1;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_qk_quant_scale_mismatch() {
+        assert_tampered_model_rejected(b"model_tamper_qk_quant_scale", |_, vk| {
+            vk.block_vks[0].qk_activation_quant.scale_den += 1;
+        });
     }
 
     #[test]
