@@ -18,11 +18,13 @@ Options
     --out-dir DIR      Scratch directory (default: benchmark_out/<model>)
     --no-build         Skip `cargo build` (assumes binary already built)
     --all              Run all predefined model sizes sequentially
+    --causal           Benchmark autoregressive / causal attention
 
 Examples
 --------
     python benchmark.py tiny
     python benchmark.py gpt2-small --seq-len 32
+    python benchmark.py large --causal
     python benchmark.py --all
 """
 
@@ -208,6 +210,10 @@ def _model_params(cfg: dict) -> int:
     return L * per_block + lm_head + embedding
 
 
+def _mode_suffix(cfg: dict) -> str:
+    return "causal" if cfg.get("causal", False) else "bidirectional"
+
+
 # ---------------------------------------------------------------------------
 # Python model creation + export
 # ---------------------------------------------------------------------------
@@ -242,6 +248,7 @@ model = PiFormerModel(
     c=cfg["c"],
     scale=cfg["scale"],
     max_exp=cfg["max_exp"],
+    causal=cfg.get("causal", False),
 )
 model.eval()
 
@@ -273,6 +280,7 @@ export_all(
     print(f"\n[export] building model: {cfg['description']}")
     print(f"         d_model={cfg['d_model']}, n_layers={cfg['n_layers']}, "
           f"d_ff={cfg['d_ff']}, seq_len={cfg['seq_len']}, vocab={cfg['vocab_size']}")
+    print(f"         attention={_mode_suffix(cfg)}")
     t0 = time.perf_counter()
     result = subprocess.run([sys.executable, "-c", py_code], text=True)
     elapsed = time.perf_counter() - t0
@@ -315,6 +323,7 @@ def benchmark_one(name: str, cfg: dict, out_dir: Path) -> dict:
 
     _section(f"Benchmark: {name}  ({cfg['description']})")
     print(f"  Approx parameters : ~{_model_params(cfg):,}")
+    print(f"  Attention mode    : {_mode_suffix(cfg)}")
     print(f"  Output directory  : {out_dir}")
 
     t_export = _export(cfg, out_dir)
@@ -360,6 +369,7 @@ def benchmark_one(name: str, cfg: dict, out_dir: Path) -> dict:
         "d_ff":       cfg["d_ff"],
         "seq_len":    cfg["seq_len"],
         "vocab_size": cfg["vocab_size"],
+        "causal":     bool(cfg.get("causal", False)),
         "approx_params": _model_params(cfg),
         "t_export_s":  round(t_export,  3),
         # Wall-clock includes JSON parse + file IO; "inner" is the pure
@@ -480,6 +490,11 @@ def main() -> None:
         help="Run all predefined model sizes sequentially",
     )
     parser.add_argument(
+        "--causal",
+        action="store_true",
+        help="Use autoregressive / causal attention in exported weights and witness",
+    )
+    parser.add_argument(
         "--json",
         type=Path,
         default=None,
@@ -521,7 +536,9 @@ def main() -> None:
         cfg = dict(CONFIGS[name])
         if args.seq_len is not None:
             cfg["seq_len"] = args.seq_len
-        out_dir = base_out / name
+        cfg["causal"] = args.causal
+        out_name = f"{name}-causal" if args.causal else name
+        out_dir = base_out / out_name
         r = benchmark_one(name, cfg, out_dir)
         results.append(r)
 

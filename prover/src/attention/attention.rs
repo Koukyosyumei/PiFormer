@@ -96,6 +96,10 @@ pub struct LinearAttentionWitness {
     pub q_query_indices: Vec<usize>,
     pub k_query_indices: Vec<usize>,
     pub context: Vec<Vec<F>>,
+    /// Causal prefix context flattened as rows `(time, feature)` and columns `out`.
+    /// For row `i * d_head + a`, value `[b]` is
+    /// `sum_{s <= i} phi_k[s][a] * v[s][b]`.
+    pub causal_context: Option<Vec<Vec<F>>>,
     pub out: Vec<Vec<F>>,
 }
 
@@ -103,6 +107,7 @@ pub struct LinearAttentionWitness {
 pub struct LinearAttentionInstance {
     pub seq_len: usize,
     pub d_head: usize,
+    pub causal: bool,
     pub q_lasso: LassoInstance,
     pub k_lasso: LassoInstance,
     /// Private witness: table lookup indices for Q/K activations (not sent to verifier).
@@ -585,6 +590,7 @@ mod linear_attention_tests {
             q_query_indices: q_query_indices_wit,
             k_query_indices: k_query_indices_wit,
             context,
+            causal_context: None,
             out: out.clone(),
         };
 
@@ -595,6 +601,7 @@ mod linear_attention_tests {
         let inst = LinearAttentionInstance {
             seq_len,
             d_head,
+            causal: false,
             q_lasso,
             k_lasso,
             q_query_indices,

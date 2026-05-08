@@ -17,7 +17,7 @@ use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_verify, hyrax_verify_batch, params_from_vars,
     HyraxBatchAccumulator, HyraxCommitment, HyraxParams,
 };
-use crate::poly::utils::{combine, mat_to_mle};
+use crate::poly::utils::{combine, compute_eq_evals, mat_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::verify_sumcheck_multi_batched;
 use crate::transcript::{challenge_vec, Transcript};
@@ -90,6 +90,23 @@ fn powers_of(base: F, n: usize) -> Vec<F> {
         cur *= base;
     }
     v
+}
+
+fn eq_evals_msb(r: &[F], n: usize) -> Vec<F> {
+    let r_rev: Vec<F> = r.iter().rev().copied().collect();
+    compute_eq_evals(&r_rev, n)
+}
+
+fn suffix_eq_evals_msb(r: &[F], len: usize) -> Vec<F> {
+    let padded = len.next_power_of_two();
+    let eq = eq_evals_msb(r, len);
+    let mut suffix = vec![F::ZERO; padded];
+    let mut running = F::ZERO;
+    for i in (0..len).rev() {
+        running += eq[i];
+        suffix[i] = running;
+    }
+    suffix
 }
 
 fn commit_public_mat(mat: &[Vec<F>], rows: usize, cols: usize) -> Result<HyraxCommitment, String> {
@@ -199,6 +216,12 @@ pub fn verify(
     let t = vk.seq_len;
     let d = vk.d_model;
     let v_vocab = vk.vocab_size;
+    if vk.causal != inst_attn.causal {
+        return Err(format!(
+            "attention mode mismatch: key causal={}, instance causal={}",
+            vk.causal, inst_attn.causal
+        ));
+    }
     let t_bits = t.next_power_of_two().trailing_zeros() as usize;
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
     let td_num_vars = t_bits + d_bits;
@@ -478,6 +501,17 @@ pub fn verify(
         let bp = &proof.block_proofs[i];
         absorb_com(transcript, b"phi_q_com", &bp.attn_phi_q_com);
         absorb_com(transcript, b"phi_k_com", &bp.attn_phi_k_com);
+        if inst_attn.causal {
+            let ctx_com = bp
+                .causal_context_com
+                .as_ref()
+                .ok_or_else(|| format!("Block {i}: missing causal context commitment"))?;
+            absorb_com(transcript, b"causal_ctx_com", ctx_com);
+        } else if bp.causal_context_com.is_some() {
+            return Err(format!(
+                "Block {i}: unexpected causal context commitment in non-causal proof"
+            ));
+        }
     }
 
     // 6b. Verify batch out sumcheck
@@ -513,20 +547,53 @@ pub fn verify(
         }
     }
 
-    // 6c. Verify batch ctx sumcheck
-    for i in 0..num_blocks {
-        transcript.append_field(b"attn_ctx_eval", &proof.batch_attn_out.final_evals_g[i]);
+    // 6c. Verify context relation. In causal mode this proves the committed
+    // prefix context by a random linear combination of all prefix equations.
+    let causal_prefix_point = if inst_attn.causal {
+        let prefix_t = challenge_vec(transcript, t_bits, b"causal_prefix_t");
+        let prefix_a = challenge_vec(transcript, d_bits, b"causal_prefix_a");
+        let prefix_b = challenge_vec(transcript, d_bits, b"causal_prefix_b");
+        Some(combine(&combine(&prefix_t, &prefix_a), &prefix_b))
+    } else {
+        None
+    };
+    let attn_ctx_claims = if inst_attn.causal {
+        if proof.causal_ctx_prefix_evals.len() != num_blocks {
+            return Err(format!(
+                "causal prefix eval count mismatch: got {}, expected {}",
+                proof.causal_ctx_prefix_evals.len(),
+                num_blocks
+            ));
+        }
+        proof
+            .causal_ctx_prefix_batch_open
+            .as_ref()
+            .ok_or_else(|| "missing causal_ctx_prefix_batch_open".to_string())?;
+        proof.causal_ctx_prefix_evals.clone()
+    } else {
+        if !proof.causal_ctx_prefix_evals.is_empty() {
+            return Err("unexpected causal_ctx_prefix_evals in non-causal proof".to_string());
+        }
+        proof.batch_attn_out.final_evals_g.clone()
+    };
+    for claim in &attn_ctx_claims {
+        transcript.append_field(b"attn_ctx_eval", claim);
     }
     let eta_attn_ctx: F = transcript.challenge_field(b"batch_eta_attn_ctx");
     let weights_attn_ctx = powers_of(eta_attn_ctx, num_blocks);
     let claim_attn_ctx: F = (0..num_blocks)
-        .map(|i| weights_attn_ctx[i] * proof.batch_attn_out.final_evals_g[i])
+        .map(|i| weights_attn_ctx[i] * attn_ctx_claims[i])
         .sum();
+    let attn_ctx_num_vars = if inst_attn.causal {
+        t_bits + 2 * d_bits
+    } else {
+        t_bits
+    };
     let (batch_r_attn_ctx, _) = verify_sumcheck_multi_batched(
         &proof.batch_attn_ctx,
         &weights_attn_ctx,
         claim_attn_ctx,
-        t_bits,
+        attn_ctx_num_vars,
         transcript,
     )?;
 
@@ -1176,8 +1243,86 @@ pub fn verify(
     )
     .map_err(|e| format!("phi_q_batch: {e}"))?;
 
-    // phi_k at combine(batch_r_attn_ctx, batch_r_attn_out)
-    let phi_k_attn_point = combine(&batch_r_attn_ctx, &batch_r_attn_out);
+    let causal_ctx_coms: Option<Vec<HyraxCommitment>> = if inst_attn.causal {
+        let ctx_coms: Vec<HyraxCommitment> = proof
+            .block_proofs
+            .iter()
+            .map(|bp| {
+                bp.causal_context_com
+                    .clone()
+                    .ok_or_else(|| "missing causal context commitment".to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        let (_, _, params_tdd) = params_from_vars(t_bits + 2 * d_bits);
+        hyrax_verify_batch(
+            &ctx_coms,
+            &proof.causal_ctx_prefix_evals,
+            causal_prefix_point
+                .as_ref()
+                .ok_or_else(|| "missing causal prefix point".to_string())?,
+            proof
+                .causal_ctx_prefix_batch_open
+                .as_ref()
+                .ok_or_else(|| "missing causal_ctx_prefix_batch_open".to_string())?,
+            &params_tdd,
+            transcript,
+        )
+        .map_err(|e| format!("causal_ctx_prefix_batch: {e}"))?;
+        Some(ctx_coms)
+    } else {
+        None
+    };
+
+    let (phi_k_attn_point, phi_k_evals, v_attn_batch_point, v_evals) = if inst_attn.causal {
+        if proof.causal_phi_k_prefix_evals.len() != num_blocks
+            || proof.causal_v_prefix_evals.len() != num_blocks
+        {
+            return Err("causal prefix leaf eval count mismatch".to_string());
+        }
+        let r_s = &batch_r_attn_ctx[..t_bits];
+        let r_a = &batch_r_attn_ctx[t_bits..t_bits + d_bits];
+        let r_b = &batch_r_attn_ctx[t_bits + d_bits..];
+        let prefix_point = causal_prefix_point
+            .as_ref()
+            .ok_or_else(|| "missing causal prefix point".to_string())?;
+        let prefix_t = &prefix_point[..t_bits];
+        let prefix_a = &prefix_point[t_bits..t_bits + d_bits];
+        let prefix_b = &prefix_point[t_bits + d_bits..];
+        let suffix_at_rs =
+            DenseMLPoly::from_vec_padded(suffix_eq_evals_msb(prefix_t, t)).evaluate(r_s);
+        let eq_a_at_ra = DenseMLPoly::from_vec_padded(eq_evals_msb(prefix_a, d)).evaluate(r_a);
+        let eq_b_at_rb = DenseMLPoly::from_vec_padded(eq_evals_msb(prefix_b, d)).evaluate(r_b);
+        let v_denom = suffix_at_rs * eq_a_at_ra * eq_b_at_rb;
+        if v_denom == F::ZERO {
+            return Err("causal attention opening denominator is zero".to_string());
+        }
+        for i in 0..num_blocks {
+            if proof.batch_attn_ctx.final_evals_f[i] != proof.causal_phi_k_prefix_evals[i] {
+                return Err(format!("Block {i}: causal phi_k scaled leaf mismatch"));
+            }
+            if proof.batch_attn_ctx.final_evals_g[i] != v_denom * proof.causal_v_prefix_evals[i] {
+                return Err(format!("Block {i}: causal v scaled leaf mismatch"));
+            }
+        }
+        (
+            combine(r_s, r_a),
+            proof.causal_phi_k_prefix_evals.clone(),
+            combine(r_s, r_b),
+            proof.causal_v_prefix_evals.clone(),
+        )
+    } else {
+        if !proof.causal_phi_k_prefix_evals.is_empty() || !proof.causal_v_prefix_evals.is_empty() {
+            return Err("unexpected causal prefix leaf evals in non-causal proof".to_string());
+        }
+        (
+            combine(&batch_r_attn_ctx, &batch_r_attn_out),
+            proof.batch_attn_ctx.final_evals_f.clone(),
+            combine(&batch_r_attn_ctx, &r_k_o),
+            proof.batch_attn_ctx.final_evals_g.clone(),
+        )
+    };
+
+    // phi_k opening for the context/prefix-context sumcheck leaf.
     let phi_k_coms: Vec<HyraxCommitment> = proof
         .block_proofs
         .iter()
@@ -1185,7 +1330,7 @@ pub fn verify(
         .collect();
     hyrax_verify_batch(
         &phi_k_coms,
-        &proof.batch_attn_ctx.final_evals_f,
+        &phi_k_evals,
         &phi_k_attn_point,
         &proof.phi_k_batch_open,
         &params_td,
@@ -1193,8 +1338,7 @@ pub fn verify(
     )
     .map_err(|e| format!("phi_k_batch: {e}"))?;
 
-    // v_attn at combine(batch_r_attn_ctx, r_k_o)
-    let v_attn_batch_point = combine(&batch_r_attn_ctx, &r_k_o);
+    // v_attn opening for the context/prefix-context sumcheck leaf.
     let v_attn_coms: Vec<HyraxCommitment> = proof
         .block_proofs
         .iter()
@@ -1202,13 +1346,37 @@ pub fn verify(
         .collect();
     hyrax_verify_batch(
         &v_attn_coms,
-        &proof.batch_attn_ctx.final_evals_g,
+        &v_evals,
         &v_attn_batch_point,
         &proof.v_attn_batch_open,
         &params_td,
         transcript,
     )
     .map_err(|e| format!("v_attn_batch: {e}"))?;
+
+    if inst_attn.causal {
+        let ctx_coms = causal_ctx_coms
+            .as_ref()
+            .ok_or_else(|| "missing causal context commitments".to_string())?;
+        let ctx_out_point = combine(&combine(&r_t, &batch_r_attn_out), &r_k_o);
+        let (_, _, params_tdd) = params_from_vars(t_bits + 2 * d_bits);
+        hyrax_verify_batch(
+            ctx_coms,
+            &proof.batch_attn_out.final_evals_g,
+            &ctx_out_point,
+            proof
+                .causal_ctx_out_batch_open
+                .as_ref()
+                .ok_or_else(|| "missing causal_ctx_out_batch_open".to_string())?,
+            &params_tdd,
+            transcript,
+        )
+        .map_err(|e| format!("causal_ctx_out_batch: {e}"))?;
+    } else if proof.causal_ctx_out_batch_open.is_some()
+        || proof.causal_ctx_prefix_batch_open.is_some()
+    {
+        return Err("unexpected causal context openings in non-causal proof".to_string());
+    }
 
     eprintln!(
         "[model] cross_batch_opens:{:>8.3}ms",

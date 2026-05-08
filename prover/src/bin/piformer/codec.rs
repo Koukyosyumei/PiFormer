@@ -49,8 +49,8 @@ use piformer_prover::{
 const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
-const VERSION: u8 = 2;
-const PROOF_VERSION: u8 = 8;
+const VERSION: u8 = 3;
+const PROOF_VERSION: u8 = 9;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -256,6 +256,34 @@ fn read_bool<R: Read>(r: &mut R) -> io::Result<bool> {
     let mut buf = [0u8; 1];
     r.read_exact(&mut buf)?;
     Ok(buf[0] != 0)
+}
+fn write_opt_hyrax_commitment<W: Write>(w: &mut W, c: &Option<HyraxCommitment>) -> io::Result<()> {
+    write_bool(w, c.is_some())?;
+    if let Some(c) = c {
+        write_hyrax_commitment(w, c)?;
+    }
+    Ok(())
+}
+fn read_opt_hyrax_commitment<R: Read>(r: &mut R) -> io::Result<Option<HyraxCommitment>> {
+    if read_bool(r)? {
+        Ok(Some(read_hyrax_commitment(r)?))
+    } else {
+        Ok(None)
+    }
+}
+fn write_opt_hyrax_proof<W: Write>(w: &mut W, p: &Option<HyraxProof>) -> io::Result<()> {
+    write_bool(w, p.is_some())?;
+    if let Some(p) = p {
+        write_hyrax_proof(w, p)?;
+    }
+    Ok(())
+}
+fn read_opt_hyrax_proof<R: Read>(r: &mut R) -> io::Result<Option<HyraxProof>> {
+    if read_bool(r)? {
+        Ok(Some(read_hyrax_proof(r)?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn read_version<R: Read>(r: &mut R) -> io::Result<u8> {
@@ -911,6 +939,7 @@ fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Resu
     // Attention phi_q/phi_k commitments + scalars
     write_hyrax_commitment(w, &p.attn_phi_q_com)?;
     write_hyrax_commitment(w, &p.attn_phi_k_com)?;
+    write_opt_hyrax_commitment(w, &p.causal_context_com)?;
     write_f(w, &p.attn_out_eval)
 }
 fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
@@ -951,6 +980,7 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
         // Attention phi_q/phi_k commitments + scalars
         attn_phi_q_com: read_hyrax_commitment(r)?,
         attn_phi_k_com: read_hyrax_commitment(r)?,
+        causal_context_com: read_opt_hyrax_commitment(r)?,
         attn_out_eval: read_f(r)?,
     })
 }
@@ -995,6 +1025,11 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_hyrax_proof(w, &p.phi_q_batch_open)?;
     write_hyrax_proof(w, &p.phi_k_batch_open)?;
     write_hyrax_proof(w, &p.v_attn_batch_open)?;
+    write_vec_f(w, &p.causal_ctx_prefix_evals)?;
+    write_vec_f(w, &p.causal_phi_k_prefix_evals)?;
+    write_vec_f(w, &p.causal_v_prefix_evals)?;
+    write_opt_hyrax_proof(w, &p.causal_ctx_out_batch_open)?;
+    write_opt_hyrax_proof(w, &p.causal_ctx_prefix_batch_open)?;
     write_hyrax_proof(w, &p.qk_lasso_bind_open)
 }
 fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
@@ -1038,6 +1073,11 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         phi_q_batch_open: read_hyrax_proof(r)?,
         phi_k_batch_open: read_hyrax_proof(r)?,
         v_attn_batch_open: read_hyrax_proof(r)?,
+        causal_ctx_prefix_evals: read_vec_f(r)?,
+        causal_phi_k_prefix_evals: read_vec_f(r)?,
+        causal_v_prefix_evals: read_vec_f(r)?,
+        causal_ctx_out_batch_open: read_opt_hyrax_proof(r)?,
+        causal_ctx_prefix_batch_open: read_opt_hyrax_proof(r)?,
         qk_lasso_bind_open: read_hyrax_proof(r)?,
     })
 }
@@ -1097,6 +1137,7 @@ fn instances_from_vk(
         LinearAttentionInstance {
             seq_len: vk.seq_len,
             d_head: vk.d_model,
+            causal: vk.causal,
             q_lasso,
             k_lasso,
             q_query_indices: Vec::new(),
@@ -1346,6 +1387,7 @@ pub fn encode_pk(pk: &TransformerModelProvingKey) -> io::Result<Vec<u8>> {
     write_usize(&mut buf, pk.vk.seq_len)?;
     write_usize(&mut buf, pk.vk.d_model)?;
     write_usize(&mut buf, pk.vk.vocab_size)?;
+    write_bool(&mut buf, pk.vk.causal)?;
     write_ln_vk(&mut buf, &pk.vk.final_ln_vk)?;
     write_proj_vk(&mut buf, &pk.vk.lm_head_vk)?;
     for bpk in &pk.block_pks {
@@ -1364,6 +1406,7 @@ pub fn decode_pk(bytes: &[u8]) -> io::Result<TransformerModelProvingKey> {
     let seq_len = read_usize(&mut r)?;
     let d_model = read_usize(&mut r)?;
     let vocab_size = read_usize(&mut r)?;
+    let causal = read_bool(&mut r)?;
     let final_ln_vk = read_ln_vk(&mut r)?;
     let lm_head_vk = read_proj_vk(&mut r)?;
     let mut block_pks = Vec::with_capacity(num_blocks);
@@ -1380,6 +1423,7 @@ pub fn decode_pk(bytes: &[u8]) -> io::Result<TransformerModelProvingKey> {
             seq_len,
             d_model,
             vocab_size,
+            causal,
             block_vks,
             final_ln_vk,
             lm_head_vk,
@@ -1398,6 +1442,7 @@ pub fn encode_vk(vk: &TransformerModelVerifyingKey) -> io::Result<Vec<u8>> {
     write_usize(&mut buf, vk.seq_len)?;
     write_usize(&mut buf, vk.d_model)?;
     write_usize(&mut buf, vk.vocab_size)?;
+    write_bool(&mut buf, vk.causal)?;
     write_ln_vk(&mut buf, &vk.final_ln_vk)?;
     write_proj_vk(&mut buf, &vk.lm_head_vk)?;
     for bvk in &vk.block_vks {
@@ -1415,6 +1460,7 @@ pub fn decode_vk(bytes: &[u8]) -> io::Result<TransformerModelVerifyingKey> {
     let seq_len = read_usize(&mut r)?;
     let d_model = read_usize(&mut r)?;
     let vocab_size = read_usize(&mut r)?;
+    let causal = read_bool(&mut r)?;
     let final_ln_vk = read_ln_vk(&mut r)?;
     let lm_head_vk = read_proj_vk(&mut r)?;
     let mut block_vks = Vec::with_capacity(num_blocks);
@@ -1426,6 +1472,7 @@ pub fn decode_vk(bytes: &[u8]) -> io::Result<TransformerModelVerifyingKey> {
         seq_len,
         d_model,
         vocab_size,
+        causal,
         block_vks,
         final_ln_vk,
         lm_head_vk,

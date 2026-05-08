@@ -88,6 +88,7 @@ pub struct TransformerBlockProof {
     // Attention: phi_q/phi_k commitments (for Lasso binding + cross-block batch opens)
     pub attn_phi_q_com: HyraxCommitment,
     pub attn_phi_k_com: HyraxCommitment,
+    pub causal_context_com: Option<HyraxCommitment>,
 
     // Per-block scalars for cross-block attention batch sumchecks
     pub attn_out_eval: F, // x_inner_i(r_t, r_k_o) = claim for out sumcheck
@@ -247,6 +248,7 @@ pub struct TransformerModelVerifyingKey {
     pub seq_len: usize,
     pub d_model: usize,
     pub vocab_size: usize,
+    pub causal: bool,
     pub block_vks: Vec<TransformerBlockVerifyingKey>,
     pub final_ln_vk: LayerNormVerifyingKey,
     pub lm_head_vk: ProjectionVerifyingKey,
@@ -309,6 +311,11 @@ pub struct TransformerModelProof {
     pub phi_q_batch_open: HyraxProof,
     pub phi_k_batch_open: HyraxProof,
     pub v_attn_batch_open: HyraxProof,
+    pub causal_ctx_prefix_evals: Vec<F>,
+    pub causal_phi_k_prefix_evals: Vec<F>,
+    pub causal_v_prefix_evals: Vec<F>,
+    pub causal_ctx_out_batch_open: Option<HyraxProof>,
+    pub causal_ctx_prefix_batch_open: Option<HyraxProof>,
     pub qk_lasso_bind_open: HyraxProof,
 }
 
@@ -324,6 +331,96 @@ fn powers_of(base: F, n: usize) -> Vec<F> {
         cur *= base;
     }
     v
+}
+
+fn eq_evals_msb(r: &[F], n: usize) -> Vec<F> {
+    let r_rev: Vec<F> = r.iter().rev().copied().collect();
+    crate::poly::utils::compute_eq_evals(&r_rev, n)
+}
+
+fn suffix_eq_evals_msb(r: &[F], len: usize) -> Vec<F> {
+    let padded = len.next_power_of_two();
+    let eq = eq_evals_msb(r, len);
+    let mut suffix = vec![F::ZERO; padded];
+    let mut running = F::ZERO;
+    for i in (0..len).rev() {
+        running += eq[i];
+        suffix[i] = running;
+    }
+    suffix
+}
+
+fn eval_causal_context_features(
+    ctx_mle: &DenseMLPoly,
+    _t_bits: usize,
+    d_bits: usize,
+    r_t: &[F],
+    r_out: &[F],
+) -> Vec<F> {
+    let mut p = ctx_mle.clone();
+    for &r in r_t {
+        p = p.fix_first_variable(r);
+    }
+    eval_cols(&p, d_bits, r_out)
+}
+
+fn causal_prefix_polys(
+    phi_k: &[Vec<F>],
+    v: &[Vec<F>],
+    suffix_evals: &[F],
+    eq_a_evals: &[F],
+    eq_b_evals: &[F],
+    t: usize,
+    d: usize,
+) -> (DenseMLPoly, DenseMLPoly) {
+    let t_p2 = t.next_power_of_two();
+    let d_p2 = d.next_power_of_two();
+    let total = t_p2 * d_p2 * d_p2;
+    let mut f = vec![F::ZERO; total];
+    let mut g = vec![F::ZERO; total];
+    for s in 0..t {
+        for a in 0..d {
+            let f_val = phi_k[s][a];
+            for b in 0..d {
+                let idx = (s * d_p2 + a) * d_p2 + b;
+                f[idx] = f_val;
+                g[idx] = suffix_evals[s] * eq_a_evals[a] * eq_b_evals[b] * v[s][b];
+            }
+        }
+    }
+    (DenseMLPoly::new(f), DenseMLPoly::new(g))
+}
+
+fn build_causal_context(phi_k: &[Vec<F>], v: &[Vec<F>], t: usize, d: usize) -> Vec<Vec<F>> {
+    let mut prefix = vec![vec![F::ZERO; d]; d];
+    let mut context = vec![vec![F::ZERO; d]; t * d];
+    for s in 0..t {
+        for a in 0..d {
+            let k_sa = phi_k[s][a];
+            for b in 0..d {
+                prefix[a][b] += k_sa * v[s][b];
+                context[s * d + a][b] = prefix[a][b];
+            }
+        }
+    }
+    context
+}
+
+fn validate_causal_context_shape(context: &[Vec<F>], t: usize, d: usize) -> Result<(), String> {
+    if context.len() != t * d {
+        return Err(format!(
+            "causal_context row count mismatch: got {}, expected {}",
+            context.len(),
+            t * d
+        ));
+    }
+    if context.iter().any(|row| row.len() != d) {
+        return Err(format!(
+            "causal_context column count mismatch: expected {} columns",
+            d
+        ));
+    }
+    Ok(())
 }
 
 fn empty_lasso_proof() -> LassoProof {
@@ -383,6 +480,12 @@ pub fn prove(
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
     let td_num_vars = t_bits + d_bits;
     let d_ff = pk.block_pks[0].ffn_pk.vk.d_ff;
+    if pk.vk.causal != inst_attn.causal {
+        return Err(format!(
+            "attention mode mismatch: key causal={}, instance causal={}",
+            pk.vk.causal, inst_attn.causal
+        ));
+    }
     let f_bits = d_ff.next_power_of_two().trailing_zeros() as usize;
     let (nu_td, sigma_td, _) = params_from_vars(td_num_vars);
     let (nu_w, sigma_w, _) = params_from_vars(d_bits + d_bits);
@@ -627,6 +730,7 @@ pub fn prove(
     let mut ctx_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut attn_phi_q_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
     let mut attn_phi_k_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
+    let mut causal_context_coms: Vec<Option<HyraxCommitment>> = Vec::with_capacity(num_blocks);
     let mut attn_out_evals: Vec<F> = Vec::with_capacity(num_blocks);
 
     for i in 0..num_blocks {
@@ -635,12 +739,33 @@ pub fn prove(
 
         let phi_q_mle = mat_to_mle(&bw.attn_wit.phi_q, t, d);
         let phi_k_mle = mat_to_mle(&bw.attn_wit.phi_k, t, d);
-        let ctx_mle = mat_to_mle(&bw.attn_wit.context, d, d);
+        let (ctx_mle, causal_context_com) = if inst_attn.causal {
+            let computed_causal_context;
+            let causal_context = match bw.attn_wit.causal_context.as_ref() {
+                Some(context) => {
+                    validate_causal_context_shape(context, t, d)?;
+                    context
+                }
+                None => {
+                    computed_causal_context =
+                        build_causal_context(&bw.attn_wit.phi_k, &bw.attn_wit.v, t, d);
+                    &computed_causal_context
+                }
+            };
+            let ctx_mle = mat_to_mle(causal_context, t * d, d);
+            let ctx_com = commit_mat(causal_context, t * d, d);
+            (ctx_mle, Some(ctx_com))
+        } else {
+            (mat_to_mle(&bw.attn_wit.context, d, d), None)
+        };
 
         let phi_q_com = commit_mat(&bw.attn_wit.phi_q, t, d);
         let phi_k_com = commit_mat(&bw.attn_wit.phi_k, t, d);
         absorb_com(transcript, b"phi_q_com", &phi_q_com);
         absorb_com(transcript, b"phi_k_com", &phi_k_com);
+        if let Some(ref ctx_com) = causal_context_com {
+            absorb_com(transcript, b"causal_ctx_com", ctx_com);
+        }
 
         // out_i(r_t, r_k_o) = x_inner_i = batch_oproj.final_evals_f[i] / alpha_o
         let alpha_o = bpk.o_pk.vk.alpha;
@@ -655,6 +780,7 @@ pub fn prove(
         ctx_mles.push(ctx_mle);
         attn_phi_q_coms.push(phi_q_com);
         attn_phi_k_coms.push(phi_k_com);
+        causal_context_coms.push(causal_context_com);
         attn_out_evals.push(out_eval_i);
     }
 
@@ -664,7 +790,12 @@ pub fn prove(
     for i in 0..num_blocks {
         transcript.append_field(b"attn_out_eval", &attn_out_evals[i]);
         let f_out = DenseMLPoly::from_vec_padded(eval_rows(&phi_q_mles[i], t_bits, &r_t));
-        let g_out = DenseMLPoly::from_vec_padded(eval_cols(&ctx_mles[i], d_bits, &r_k_o));
+        let g_out = if inst_attn.causal {
+            eval_causal_context_features(&ctx_mles[i], t_bits, d_bits, &r_t, &r_k_o)
+        } else {
+            eval_cols(&ctx_mles[i], d_bits, &r_k_o)
+        };
+        let g_out = DenseMLPoly::from_vec_padded(g_out);
         fs_attn_out.push(f_out);
         gs_attn_out.push(g_out);
     }
@@ -682,20 +813,54 @@ pub fn prove(
         claim_attn_out,
         transcript,
     );
-    // final_evals_g[i] = ctx_i(batch_r_attn_out, r_k_o) = claim for ctx sumcheck
-    let attn_ctx_evals: Vec<F> = batch_attn_out.final_evals_g.clone();
-
-    // 6c. Batch ctx sumcheck: ctx_i(batch_r_attn_out, r_k_o) = Σ_t phi_k_i(t, batch_r_attn_out) · v_i(t, r_k_o)
+    // 6c. Non-causal: ctx(batch_r_attn_out, r_k_o) = Σ_t phi_k(t, batch_r_attn_out) · v(t, r_k_o).
+    //     Causal: prove a random linear combination of prefix-context equations
+    //     C_i[a,b] = Σ_{s<=i} phi_k[s,a] · v[s,b].
     let mut fs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut gs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
-    for i in 0..num_blocks {
-        transcript.append_field(b"attn_ctx_eval", &attn_ctx_evals[i]);
-        let f_ctx =
-            DenseMLPoly::from_vec_padded(eval_cols(&phi_k_mles[i], t_bits, &batch_r_attn_out));
-        let g_v = DenseMLPoly::from_vec_padded(eval_cols(&v_mles[i], t_bits, &r_k_o));
-        fs_attn_ctx.push(f_ctx);
-        gs_attn_ctx.push(g_v);
-    }
+    let mut causal_prefix_point: Option<Vec<F>> = None;
+    let mut causal_ctx_prefix_evals: Vec<F> = Vec::new();
+    let attn_ctx_evals: Vec<F> = if inst_attn.causal {
+        let prefix_t = challenge_vec(transcript, t_bits, b"causal_prefix_t");
+        let prefix_a = challenge_vec(transcript, d_bits, b"causal_prefix_a");
+        let prefix_b = challenge_vec(transcript, d_bits, b"causal_prefix_b");
+        let prefix_point = combine(&combine(&prefix_t, &prefix_a), &prefix_b);
+        let suffix_evals = suffix_eq_evals_msb(&prefix_t, t);
+        let eq_a_evals = eq_evals_msb(&prefix_a, d);
+        let eq_b_evals = eq_evals_msb(&prefix_b, d);
+        let mut claims = Vec::with_capacity(num_blocks);
+        for i in 0..num_blocks {
+            let bw = &witness.block_witnesses[i];
+            let ctx_eval = ctx_mles[i].evaluate(&prefix_point);
+            transcript.append_field(b"attn_ctx_eval", &ctx_eval);
+            let (f_ctx, g_v) = causal_prefix_polys(
+                &bw.attn_wit.phi_k,
+                &bw.attn_wit.v,
+                &suffix_evals,
+                &eq_a_evals,
+                &eq_b_evals,
+                t,
+                d,
+            );
+            fs_attn_ctx.push(f_ctx);
+            gs_attn_ctx.push(g_v);
+            claims.push(ctx_eval);
+        }
+        causal_prefix_point = Some(prefix_point);
+        causal_ctx_prefix_evals = claims.clone();
+        claims
+    } else {
+        let claims = batch_attn_out.final_evals_g.clone();
+        for i in 0..num_blocks {
+            transcript.append_field(b"attn_ctx_eval", &claims[i]);
+            let f_ctx =
+                DenseMLPoly::from_vec_padded(eval_cols(&phi_k_mles[i], t_bits, &batch_r_attn_out));
+            let g_v = DenseMLPoly::from_vec_padded(eval_cols(&v_mles[i], t_bits, &r_k_o));
+            fs_attn_ctx.push(f_ctx);
+            gs_attn_ctx.push(g_v);
+        }
+        claims
+    };
     let eta_attn_ctx: F = transcript.challenge_field(b"batch_eta_attn_ctx");
     let weights_attn_ctx = powers_of(eta_attn_ctx, num_blocks);
     let claim_attn_ctx: F = weights_attn_ctx
@@ -937,6 +1102,7 @@ pub fn prove(
             ffn_m_eval: pb_ffn_m_eval[i],
             attn_phi_q_com: attn_phi_q_coms[i].clone(),
             attn_phi_k_com: attn_phi_k_coms[i].clone(),
+            causal_context_com: causal_context_coms[i].clone(),
             attn_out_eval: attn_out_evals[i],
         });
     }
@@ -1126,8 +1292,37 @@ pub fn prove(
     let phi_q_batch_open =
         hyrax_open_batch(&phi_q_refs, &phi_q_attn_point, nu_td, sigma_td, transcript);
 
-    // phi_k_batch: L phi_k_i at combine(batch_r_attn_ctx, batch_r_attn_out) [td_num_vars]
-    let phi_k_attn_point = combine(&batch_r_attn_ctx, &batch_r_attn_out);
+    let mut causal_phi_k_prefix_evals = Vec::new();
+    let mut causal_v_prefix_evals = Vec::new();
+    let (phi_k_attn_point, v_attn_batch_point, causal_ctx_prefix_batch_open) = if inst_attn.causal {
+        let r_s = batch_r_attn_ctx[..t_bits].to_vec();
+        let r_a = batch_r_attn_ctx[t_bits..t_bits + d_bits].to_vec();
+        let r_b = batch_r_attn_ctx[t_bits + d_bits..].to_vec();
+        let prefix_point = causal_prefix_point
+            .clone()
+            .ok_or_else(|| "missing causal prefix point".to_string())?;
+        let ctx_refs: Vec<&[F]> = ctx_mles.iter().map(|m| m.evaluations.as_slice()).collect();
+        let (nu_tdd, sigma_tdd, _) = params_from_vars(t_bits + 2 * d_bits);
+        let ctx_prefix_open =
+            hyrax_open_batch(&ctx_refs, &prefix_point, nu_tdd, sigma_tdd, transcript);
+        let phi_k_point = combine(&r_s, &r_a);
+        let v_point = combine(&r_s, &r_b);
+        causal_phi_k_prefix_evals = phi_k_mles
+            .iter()
+            .map(|m| m.evaluate(&phi_k_point))
+            .collect();
+        causal_v_prefix_evals = v_mles.iter().map(|m| m.evaluate(&v_point)).collect();
+        (phi_k_point, v_point, Some(ctx_prefix_open))
+    } else {
+        (
+            combine(&batch_r_attn_ctx, &batch_r_attn_out),
+            combine(&batch_r_attn_ctx, &r_k_o),
+            None,
+        )
+    };
+
+    // phi_k_batch: non-causal opens phi_k at (batch_r_attn_ctx, batch_r_attn_out);
+    // causal opens the unscaled phi_k leaf from the prefix-context sumcheck.
     let phi_k_refs: Vec<&[F]> = phi_k_mles
         .iter()
         .map(|m| m.evaluations.as_slice())
@@ -1135,8 +1330,8 @@ pub fn prove(
     let phi_k_batch_open =
         hyrax_open_batch(&phi_k_refs, &phi_k_attn_point, nu_td, sigma_td, transcript);
 
-    // v_attn_batch: L v_i at combine(batch_r_attn_ctx, r_k_o) [td_num_vars]
-    let v_attn_batch_point = combine(&batch_r_attn_ctx, &r_k_o);
+    // v_attn_batch: non-causal opens v at (batch_r_attn_ctx, r_k_o);
+    // causal opens the unscaled v leaf from the prefix-context sumcheck.
     let v_attn_refs: Vec<&[F]> = v_mles.iter().map(|m| m.evaluations.as_slice()).collect();
     let v_attn_batch_open = hyrax_open_batch(
         &v_attn_refs,
@@ -1145,6 +1340,21 @@ pub fn prove(
         sigma_td,
         transcript,
     );
+
+    let causal_ctx_out_batch_open = if inst_attn.causal {
+        let ctx_out_point = combine(&combine(&r_t, &batch_r_attn_out), &r_k_o);
+        let ctx_refs: Vec<&[F]> = ctx_mles.iter().map(|m| m.evaluations.as_slice()).collect();
+        let (nu_tdd, sigma_tdd, _) = params_from_vars(t_bits + 2 * d_bits);
+        Some(hyrax_open_batch(
+            &ctx_refs,
+            &ctx_out_point,
+            nu_tdd,
+            sigma_tdd,
+            transcript,
+        ))
+    } else {
+        None
+    };
 
     // =========================================================================
     // 16. Global batched Lasso (attention)
@@ -1260,6 +1470,11 @@ pub fn prove(
         phi_q_batch_open,
         phi_k_batch_open,
         v_attn_batch_open,
+        causal_ctx_prefix_evals,
+        causal_phi_k_prefix_evals,
+        causal_v_prefix_evals,
+        causal_ctx_out_batch_open,
+        causal_ctx_prefix_batch_open,
         qk_lasso_bind_open,
     })
 }
@@ -1352,6 +1567,7 @@ mod tests {
             d_model: D,
             d_ff: D_FF,
             vocab_size: V,
+            causal: false,
             blocks: vec![block],
             final_ln_gamma: vec![F::from(2u64); D],
             final_ln_beta: vec![F::from(5u64); D],
@@ -1479,6 +1695,7 @@ mod tests {
             q_query_indices: vec![7, 0, 7, 0],
             k_query_indices: vec![7, 0, 7, 0],
             context: zero_out.clone(),
+            causal_context: None,
             out: zero_out.clone(),
         };
         let o_proj_wit = ProjectionWitness {
@@ -1525,6 +1742,7 @@ mod tests {
         let inst_attn = LinearAttentionInstance {
             seq_len: T,
             d_head: D,
+            causal: false,
             q_lasso,
             k_lasso,
             q_query_indices,
@@ -1582,6 +1800,41 @@ mod tests {
         assert!(
             result.is_ok(),
             "Model verification failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_prove_verify_full_model_causal_e2e() {
+        let (mut block_wit, mut inst_attn, inst_ffn) = build_block_witness_and_instances();
+        inst_attn.causal = true;
+        block_wit.attn_wit.causal_context = None;
+        let model_wit = build_model_witness(block_wit);
+        let mut weights = build_test_weights();
+        weights.causal = true;
+        let pk = preprocess_transformer_model(weights, T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_causal_e2e");
+        let proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        assert!(proof.block_proofs[0].causal_context_com.is_some());
+        assert!(proof.causal_ctx_out_batch_open.is_some());
+        assert!(proof.causal_ctx_prefix_batch_open.is_some());
+
+        let mut vt = Transcript::new(b"model_causal_e2e");
+        let result = verify(
+            &proof,
+            &pk.vk,
+            &inst_attn,
+            &inst_ffn,
+            &model_wit.x_in,
+            &model_wit.lm_head_wit.y,
+            &mut vt,
+            &lp,
+        );
+        assert!(
+            result.is_ok(),
+            "Causal model verification failed: {:?}",
             result.err()
         );
     }

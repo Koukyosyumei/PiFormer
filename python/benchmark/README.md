@@ -9,7 +9,7 @@ This benchmark trains PiFormer and a standard pre-norm transformer side-by-side 
 
 The baseline differs from PiFormer in exactly three components — softmax attention, GELU FFN, dense `nn.Linear` — so the gap measures the cost of going ZK-friendly.
 
-> **Scope.** Both models are non-causal (PiFormer's `LinearAttentionLayer` has no causal mask), so this is an architecture comparison, not a state-of-the-art LM benchmark.
+> **Scope.** By default both models use bidirectional attention for architecture comparison. Pass `--causal` to benchmark autoregressive attention: the baseline uses a softmax causal mask, while PiFormer uses prefix linear attention.
 
 ## Google Colab
 
@@ -58,6 +58,7 @@ python -m benchmark.plot benchmark_results.json
 | `--steps` | `3000` | Training steps (per model). |
 | `--seq_len` / `--batch_size` | `128` / `64` | Training shape. |
 | `--d_model` / `--n_heads` / `--n_layers` / `--d_ff` | `128 / 4 / 4 / 512` | Model size. Both models share these. |
+| `--causal` / `--no-causal` | `--no-causal` | Use autoregressive attention in both models. |
 | `--num_bits` / `--c` / `--scale` / `--max_exp` | `8 / 2 / 0.1 / 4` | PiFormer quantization knobs (ignored by baseline). |
 | `--weight_decay` | `0.01` | Applied only to ordinary matrix weights; norm/bias/lookup-table/ternary-scale parameters are excluded. |
 | `--warmup_steps` / `--min_lr_ratio` | `100 / 0.1` | Linear warmup followed by cosine decay; set `--warmup_steps 0 --min_lr_ratio 1` for constant LR. |

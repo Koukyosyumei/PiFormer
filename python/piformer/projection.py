@@ -35,6 +35,11 @@ class TernaryLinear(nn.Module):
             alpha_init = 1.0 / math.sqrt(in_features)
         self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
 
+        # Gradual QAT knob: 0.0 → pure FP weights, 1.0 → pure ternary.
+        # Trainers can ramp this from 0 to 1 over the course of training so the
+        # FP weights first find a good basin, then are gently snapped to {-1,0,1}.
+        self.register_buffer("quant_strength", torch.tensor(1.0))
+
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
@@ -58,18 +63,18 @@ class TernaryLinear(nn.Module):
         return self._quantize_indices(w) * self.alpha
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 学習時は STE (Straight-Through Estimator)
-        if self.training:
-            # Build ternary indices without autograd bookkeeping, then let
-            # alpha learn normally and pass an identity STE to the real weight.
-            with torch.no_grad():
-                w_idx = self._quantize_indices(self.weight)
-            w_q = w_idx * self.alpha + (self.weight - self.weight.detach())
-        else:
-            w_q = self._quantize(self.weight)
-
-        # 行列演算 (ZKP側では加減算のみになる)
-        return F.linear(x, w_q, self.bias)
+        # Forward value:  alpha * ((1-q) * w + q * sign-mask(w))
+        # Backward:       identity STE into self.weight (the explicit
+        #                 self.weight term is the only path with a gradient).
+        # Both regimes are alpha-scaled so the effective weight magnitude is
+        # consistent across the q-schedule and alpha receives gradient
+        # throughout (including the q=0 warmup phase).
+        # All ops are tensor-valued (no .item() / float() conversion) and there
+        # is no data-dependent branching, so torch.compile captures one static
+        # graph regardless of training/eval mode or the current value of q.
+        w_idx = self._quantize_indices(self.weight.detach())
+        w_blend = self.weight + self.quant_strength * (w_idx - self.weight.detach())
+        return F.linear(x, w_blend * self.alpha, self.bias)
 
     @torch.no_grad()
     def export_weights(self) -> dict:

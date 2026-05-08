@@ -86,6 +86,7 @@ class BaselineTransformer(nn.Module):
         **_unused,
     ):
         super().__init__()
+        self.causal = causal
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
         self.register_buffer(

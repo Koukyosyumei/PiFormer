@@ -81,6 +81,44 @@ def peak_memory_mb(device) -> float:
     return torch.cuda.max_memory_allocated() / (1024 ** 2)
 
 
+# ---------------------------------------------------------------------------
+# Gradual ternary QAT schedule
+# ---------------------------------------------------------------------------
+#
+# Training a ternary network from scratch tends to underfit because the
+# {-1, 0, +1} constraint is too aggressive for the optimizer to find a good
+# basin. Instead we ramp every TernaryLinear's `quant_strength` from 0 → 1
+# across three phases:
+#
+#   phase 1: warmup    (q = 0)        full-precision pretrain
+#   phase 2: ramp      (q: 0 → 1)     gentle interpolation to ternary
+#   phase 3: finetune  (q = 1)        pure ternary, optionally lower LR
+#
+# Phase boundaries are expressed as fractions of args.steps. The default split
+# (0.4 / 0.4 / 0.2) gives the FP weights time to settle, then ramps long
+# enough that any single step's quantization shock is small.
+
+def _ternary_modules(model: nn.Module):
+    return [m for m in model.modules() if isinstance(m, TernaryLinear)]
+
+
+def _set_quant_strength(modules, q: float):
+    for m in modules:
+        m.quant_strength.fill_(q)
+
+
+def _qat_schedule(step: int, total_steps: int, warmup_frac: float, ramp_frac: float):
+    """Return (q, phase) for a given step. Phase ∈ {'warmup','ramp','finetune'}."""
+    warmup_end = int(round(total_steps * warmup_frac))
+    ramp_end = int(round(total_steps * (warmup_frac + ramp_frac)))
+    if step <= warmup_end:
+        return 0.0, "warmup"
+    if step <= ramp_end:
+        span = max(1, ramp_end - warmup_end)
+        return (step - warmup_end) / span, "ramp"
+    return 1.0, "finetune"
+
+
 def maybe_compile_model(name: str, model: nn.Module, args, device: torch.device) -> nn.Module:
     """Compile models for long CUDA runs, where PiFormer's small kernels benefit most."""
     if args.no_compile:
@@ -109,7 +147,17 @@ def copy_state_to_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
 
 @torch.no_grad()
 def init_ternary_from_dense(dst: TernaryLinear, weight: torch.Tensor, bias: torch.Tensor | None):
-    """Initialize a ternary layer from a dense layer using one scalar alpha."""
+    """Initialize a ternary layer from a dense layer using one scalar alpha.
+
+    TernaryLinear.forward computes ``w_eff = blend(w, sign-mask(w)) * alpha``,
+    so we store ``weight / alpha`` in ``dst.weight`` to make the q=0 forward
+    reproduce the original dense weight exactly:
+        q=0:  w_eff = (weight/alpha) * alpha   = weight
+        q=1:  w_eff = sign(weight/alpha) * alpha = sign(weight) * alpha
+    Positive rescaling preserves both the sign pattern and the 0.7-mean
+    threshold mask, so the inherited ternary structure is identical to the
+    one computed from ``weight`` directly.
+    """
     weight = weight.to(device=dst.weight.device, dtype=dst.weight.dtype)
     abs_w = weight.abs()
     selected = abs_w > (0.7 * abs_w.mean())
@@ -117,8 +165,9 @@ def init_ternary_from_dense(dst: TernaryLinear, weight: torch.Tensor, bias: torc
         alpha = abs_w[selected].mean()
     else:
         alpha = abs_w.mean().clamp_min(1e-6)
+    alpha = alpha.clamp_min(1e-6)
 
-    dst.weight.copy_(weight)
+    dst.weight.copy_(weight / alpha)
     dst.alpha.copy_(alpha.to(device=dst.alpha.device, dtype=dst.alpha.dtype))
     if dst.bias is not None and bias is not None:
         dst.bias.copy_(bias.to(device=dst.bias.device, dtype=dst.bias.dtype))
@@ -235,7 +284,24 @@ def train_one(
         "train_ppl": [],
         "val_loss": [],
         "val_ppl": [],
+        "quant_strength": [],
     }
+
+    # Identify ternary layers and decide whether to schedule quant_strength.
+    tern_modules = _ternary_modules(model)
+    use_qat = bool(tern_modules) and args.ternary_qat
+    if use_qat:
+        print(
+            f"  gradual QAT: warmup={args.ternary_warmup_frac:.2f} "
+            f"ramp={args.ternary_ramp_frac:.2f} "
+            f"finetune_lr_mult={args.ternary_finetune_lr_mult:g} "
+            f"({len(tern_modules)} TernaryLinear layers)"
+        )
+        # Start in the warmup phase (q=0) so weights train at full precision.
+        _set_quant_strength(tern_modules, 0.0)
+    elif tern_modules:
+        # QAT disabled: keep the original behavior (always fully ternary).
+        _set_quant_strength(tern_modules, 1.0)
 
     reset_peak_memory(device)
     model.train()
@@ -255,8 +321,19 @@ def train_one(
     t0 = time.perf_counter()
     running = 0.0
     log_start = 1
+    cur_q = 1.0
+    cur_phase = "finetune"
     for step in range(1, steps + 1):
+        if use_qat:
+            cur_q, new_phase = _qat_schedule(
+                step, steps,
+                args.ternary_warmup_frac, args.ternary_ramp_frac,
+            )
+            _set_quant_strength(tern_modules, cur_q)
+            cur_phase = new_phase
         lr = learning_rate_for_step(step, steps, args)
+        if use_qat and cur_phase == "finetune":
+            lr *= args.ternary_finetune_lr_mult
         for group in optim.param_groups:
             group["lr"] = lr
 
@@ -287,15 +364,22 @@ def train_one(
             history["train_ppl"].append(train_ppl)
             history["val_loss"].append(val)
             history["val_ppl"].append(val_ppl)
+            history["quant_strength"].append(cur_q)
+            qat_tag = f"  q={cur_q:.2f} [{cur_phase}]" if use_qat else ""
             print(
                 f"  step {step:5d}  "
                 f"train={avg:.4f} (ppl={train_ppl:.2f})  "
-                f"val={val:.4f} (ppl={val_ppl:.2f})"
+                f"val={val:.4f} (ppl={val_ppl:.2f}){qat_tag}"
             )
 
     if device.type == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
+
+    # Pin to fully ternary weights for final evaluation and downstream
+    # inference benchmarks — that's the model we'll actually ship.
+    if tern_modules:
+        _set_quant_strength(tern_modules, 1.0)
 
     final_val = eval_loss(model, val_ids, args.batch_size, args.seq_len, device, n_batches=50)
     return {
@@ -402,6 +486,10 @@ def parse_args():
     p.add_argument("--n_heads", type=int, default=4)
     p.add_argument("--n_layers", type=int, default=4)
     p.add_argument("--d_ff", type=int, default=512)
+    p.add_argument("--causal", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Use autoregressive attention. Use --no-causal for "
+                        "bidirectional architecture comparisons.")
 
     # PiFormer-only knobs
     p.add_argument("--num_bits", type=int, default=8)
@@ -445,6 +533,18 @@ def parse_args():
                    help="Run PiFormer in non-causal mode (matches the current "
                         "prover/witness math). Default is causal so the LM "
                         "comparison is fair; disable when reproducing proofs.")
+
+    # Gradual ternary QAT schedule (only affects models with TernaryLinear)
+    p.add_argument("--ternary_qat", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Enable warmup → ramp → finetune schedule for ternary weights. "
+                        "Use --no-ternary_qat to fall back to ternary-from-scratch.")
+    p.add_argument("--ternary_warmup_frac", type=float, default=0.4,
+                   help="Fraction of steps with full-precision weights (q=0).")
+    p.add_argument("--ternary_ramp_frac", type=float, default=0.4,
+                   help="Fraction of steps over which q ramps 0 → 1.")
+    p.add_argument("--ternary_finetune_lr_mult", type=float, default=0.1,
+                   help="LR multiplier applied once at the start of the q=1 finetune phase.")
 
     # Models to run
     p.add_argument("--models", default="baseline,piformer",
@@ -527,6 +627,9 @@ def main():
     train_ids, val_ids, vocab_size, decode = get_dataset(args.dataset, cache_dir)
     print(f"Dataset: {args.dataset}   vocab={vocab_size}   "
           f"train_tokens={len(train_ids):,}   val_tokens={len(val_ids):,}")
+    piformer_causal = args.causal and not args.piformer_no_causal
+    print(f"Baseline attention: {'causal' if args.causal else 'bidirectional'}")
+    print(f"PiFormer attention: {'causal' if piformer_causal else 'bidirectional'}")
 
     common = dict(
         vocab_size=vocab_size,
@@ -539,7 +642,7 @@ def main():
     )
     piformer_kwargs = dict(
         num_bits=args.num_bits, c=args.c, scale=args.scale, max_exp=args.max_exp,
-        causal=not args.piformer_no_causal,
+        causal=piformer_causal,
     )
 
     selected = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -594,7 +697,7 @@ def main():
 
     if "baseline" in selected:
         torch.manual_seed(args.seed)
-        model = BaselineTransformer(**common).to(device)
+        model = BaselineTransformer(**common, causal=args.causal).to(device)
         model = maybe_compile_model("baseline", model, args, device)
         results["models"]["baseline"] = train_one(
             "baseline", model, train_ids, val_ids, args, device, baseline_steps
@@ -619,6 +722,22 @@ def main():
         if args.piformer_init_from_baseline:
             print("  initializing PiFormer from trained baseline weights")
             init_piformer_from_baseline_state(model, baseline_state_for_init)
+            # The dense FP weights are already trained, so a long FP warmup
+            # phase wastes budget. If the user is still on the schedule
+            # defaults (0.4 / 0.4), shrink warmup and lengthen ramp.
+            if (
+                args.ternary_qat
+                and args.ternary_warmup_frac == 0.4
+                and args.ternary_ramp_frac == 0.4
+            ):
+                args.ternary_warmup_frac = 0.05
+                args.ternary_ramp_frac = 0.55
+                print(
+                    f"  init_from_baseline: shrinking QAT schedule to "
+                    f"warmup={args.ternary_warmup_frac:.2f} "
+                    f"ramp={args.ternary_ramp_frac:.2f} "
+                    f"(pass --ternary_warmup_frac/--ternary_ramp_frac to override)"
+                )
         model = maybe_compile_model("piformer", model, args, device)
         results["models"]["piformer"] = train_one(
             "piformer", model, train_ids, val_ids, args, device, piformer_steps

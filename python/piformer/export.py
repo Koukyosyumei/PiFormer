@@ -223,6 +223,7 @@ def export_weights_rust(
         "d_model":          d,
         "d_ff":             d_ff,
         "vocab_size":       vocab_size,
+        "causal":           bool(getattr(model, "causal", False)),
         "blocks":           blocks_json,
         "final_ln_gamma":   vec_to_json(final_ln_gamma),
         "final_ln_beta":    vec_to_json(final_ln_beta),
