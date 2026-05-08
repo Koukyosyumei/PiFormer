@@ -121,8 +121,10 @@ pub fn quantized_lookup_index(
 }
 
 fn validate_quant_params(params: &QuantizationParams) -> Result<(), String> {
-    if params.scale_num == 0 || params.scale_den == 0 {
-        return Err("quantization scale numerator/denominator must be nonzero".to_string());
+    if params.scale_num < 2 || params.scale_den == 0 {
+        return Err(
+            "quantization scale numerator must be at least 2 and denominator nonzero".to_string(),
+        );
     }
     if !params.scale_num.is_power_of_two() {
         return Err(format!(

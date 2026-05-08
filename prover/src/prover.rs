@@ -1433,6 +1433,11 @@ pub fn prove(
     };
     let qk_index_refs: Vec<&[usize]> = all_query_indices.iter().map(|v| v.as_slice()).collect();
     absorb_index_vectors(transcript, b"qk_lasso_indices", &qk_index_refs);
+    if inst_attn.q_lasso.tables.len() != inst_attn.k_lasso.tables.len()
+        || inst_attn.q_lasso.bits_per_chunk != inst_attn.k_lasso.bits_per_chunk
+    {
+        return Err("Q/K quantization lookup domains must match".to_string());
+    }
     let mut qk_raw_mles = Vec::with_capacity(2 * num_blocks);
     let mut qk_raw_coms = Vec::with_capacity(2 * num_blocks);
     for i in 0..num_blocks {
@@ -1828,6 +1833,34 @@ mod tests {
         }
     }
 
+    fn assert_tampered_model_rejected(
+        label: &'static [u8],
+        tamper: impl FnOnce(&mut TransformerModelProof, &mut TransformerModelVerifyingKey),
+    ) {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(label);
+        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        let mut vk = pk.vk.clone();
+        tamper(&mut proof, &mut vk);
+
+        let mut vt = Transcript::new(label);
+        let result = verify(
+            &proof,
+            &vk,
+            &inst_attn,
+            &inst_ffn,
+            &model_wit.x_in,
+            &model_wit.lm_head_wit.y,
+            &mut vt,
+            &lp,
+        );
+        assert!(result.is_err(), "tampered proof should be rejected");
+    }
+
     // -----------------------------------------------------------------------
     // Model-level tests (single block L=1)
     // -----------------------------------------------------------------------
@@ -2099,6 +2132,76 @@ mod tests {
             result.is_err(),
             "Should reject tampered attention Lasso query indices"
         );
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_ffn_quant_remainder_eval() {
+        assert_tampered_model_rejected(b"model_tamper_ffn_quant_rem_eval", |proof, _| {
+            proof.ffn_quant_proof.rem_evals[0] += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_ffn_quant_raw_eval() {
+        assert_tampered_model_rejected(b"model_tamper_ffn_quant_raw_eval", |proof, _| {
+            proof.ffn_quant_proof.raw_evals[0] += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_ffn_quant_range_claim() {
+        assert_tampered_model_rejected(b"model_tamper_ffn_quant_range_claim", |proof, _| {
+            proof.ffn_quant_proof.rem_range_proofs[0].claim_v += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_ffn_quant_remainder_commitment() {
+        assert_tampered_model_rejected(b"model_tamper_ffn_quant_rem_com", |proof, _| {
+            proof.ffn_quant_proof.rem_coms[0] = proof.block_proofs[0].ffn_m_com.clone();
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_qk_quant_remainder_eval() {
+        assert_tampered_model_rejected(b"model_tamper_qk_quant_rem_eval", |proof, _| {
+            proof.qk_quant_proof.rem_evals[0] += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_qk_quant_raw_eval() {
+        assert_tampered_model_rejected(b"model_tamper_qk_quant_raw_eval", |proof, _| {
+            proof.qk_quant_proof.raw_evals[0] += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_qk_quant_range_claim() {
+        assert_tampered_model_rejected(b"model_tamper_qk_quant_range_claim", |proof, _| {
+            proof.qk_quant_proof.rem_range_proofs[0].claim_v += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_qk_quant_remainder_commitment() {
+        assert_tampered_model_rejected(b"model_tamper_qk_quant_rem_com", |proof, _| {
+            proof.qk_quant_proof.rem_coms[0] = proof.block_proofs[0].q_com.clone();
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_ffn_quant_scale_mismatch() {
+        assert_tampered_model_rejected(b"model_tamper_ffn_quant_scale", |_, vk| {
+            vk.block_vks[0].ffn_activation_quant.scale_den += 1;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_qk_quant_scale_mismatch() {
+        assert_tampered_model_rejected(b"model_tamper_qk_quant_scale", |_, vk| {
+            vk.block_vks[0].qk_activation_quant.scale_den += 1;
+        });
     }
 
     #[test]

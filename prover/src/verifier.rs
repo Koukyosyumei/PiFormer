@@ -1479,6 +1479,11 @@ pub fn verify(
         .map(|v| v.as_slice())
         .collect();
     absorb_index_vectors(transcript, b"qk_lasso_indices", &qk_index_refs);
+    if inst_attn.q_lasso.tables.len() != inst_attn.k_lasso.tables.len()
+        || inst_attn.q_lasso.bits_per_chunk != inst_attn.k_lasso.bits_per_chunk
+    {
+        return Err("Q/K quantization lookup domains must match".to_string());
+    }
     let mut qk_raw_coms = Vec::with_capacity(2 * num_blocks);
     for bp in &proof.block_proofs {
         qk_raw_coms.push(bp.q_com.clone());
