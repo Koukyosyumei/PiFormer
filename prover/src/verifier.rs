@@ -15,8 +15,8 @@ use crate::lookup::lasso::{
 use crate::lookup::quantization::{verify_quantization_batch, QuantizationParams};
 use crate::lookup::range::verify_range_batched;
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_verify, hyrax_verify_batch, params_from_vars,
-    HyraxBatchAccumulator, HyraxCommitment, HyraxParams,
+    absorb_com, hyrax_commit, hyrax_verify, hyrax_verify_batch, hyrax_verify_batch_with_eta,
+    params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams,
 };
 use crate::poly::utils::{combine, compute_eq_evals, mat_to_mle};
 use crate::poly::DenseMLPoly;
@@ -1032,15 +1032,6 @@ pub fn verify(
         .iter()
         .map(|bp| bp.qkv_w_q_eval)
         .collect();
-    hyrax_verify_batch(
-        &wq_coms,
-        &wq_evals,
-        &wq_point,
-        &proof.w_q_batch_open,
-        &params_qkvo_w,
-        transcript,
-    )
-    .map_err(|e| format!("w_q_batch: {e}"))?;
 
     let wk_coms: Vec<HyraxCommitment> = vk
         .block_vks
@@ -1052,15 +1043,6 @@ pub fn verify(
         .iter()
         .map(|bp| bp.qkv_w_k_eval)
         .collect();
-    hyrax_verify_batch(
-        &wk_coms,
-        &wk_evals,
-        &wq_point,
-        &proof.w_k_batch_open,
-        &params_qkvo_w,
-        transcript,
-    )
-    .map_err(|e| format!("w_k_batch: {e}"))?;
 
     let wv_coms: Vec<HyraxCommitment> = vk
         .block_vks
@@ -1072,15 +1054,51 @@ pub fn verify(
         .iter()
         .map(|bp| bp.qkv_w_v_eval)
         .collect();
-    hyrax_verify_batch(
-        &wv_coms,
-        &wv_evals,
-        &wq_point,
-        &proof.w_v_batch_open,
-        &params_qkvo_w,
-        transcript,
-    )
-    .map_err(|e| format!("w_v_batch: {e}"))?;
+    let eta_wq = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let eta_wk = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let eta_wv = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let ((rwq, rwk), rwv) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    hyrax_verify_batch_with_eta(
+                        &wq_coms,
+                        &wq_evals,
+                        &wq_point,
+                        &proof.w_q_batch_open,
+                        &params_qkvo_w,
+                        eta_wq,
+                    )
+                    .map_err(|e| format!("w_q_batch: {e}"))
+                },
+                || {
+                    hyrax_verify_batch_with_eta(
+                        &wk_coms,
+                        &wk_evals,
+                        &wq_point,
+                        &proof.w_k_batch_open,
+                        &params_qkvo_w,
+                        eta_wk,
+                    )
+                    .map_err(|e| format!("w_k_batch: {e}"))
+                },
+            )
+        },
+        || {
+            hyrax_verify_batch_with_eta(
+                &wv_coms,
+                &wv_evals,
+                &wq_point,
+                &proof.w_v_batch_open,
+                &params_qkvo_w,
+                eta_wv,
+            )
+            .map_err(|e| format!("w_v_batch: {e}"))
+        },
+    );
+    rwq?;
+    rwk?;
+    rwv?;
 
     // bias_q/k/v at r_out
     let bq_coms: Vec<HyraxCommitment> = vk
@@ -1093,15 +1111,6 @@ pub fn verify(
         .iter()
         .map(|bp| bp.qkv_bias_q_eval)
         .collect();
-    hyrax_verify_batch(
-        &bq_coms,
-        &bq_evals,
-        &r_out,
-        &proof.bias_q_batch_open,
-        &params_qkvo_b,
-        transcript,
-    )
-    .map_err(|e| format!("bias_q_batch: {e}"))?;
 
     let bk_coms: Vec<HyraxCommitment> = vk
         .block_vks
@@ -1113,15 +1122,6 @@ pub fn verify(
         .iter()
         .map(|bp| bp.qkv_bias_k_eval)
         .collect();
-    hyrax_verify_batch(
-        &bk_coms,
-        &bk_evals,
-        &r_out,
-        &proof.bias_k_batch_open,
-        &params_qkvo_b,
-        transcript,
-    )
-    .map_err(|e| format!("bias_k_batch: {e}"))?;
 
     let bv_coms: Vec<HyraxCommitment> = vk
         .block_vks
@@ -1133,15 +1133,51 @@ pub fn verify(
         .iter()
         .map(|bp| bp.qkv_bias_v_eval)
         .collect();
-    hyrax_verify_batch(
-        &bv_coms,
-        &bv_evals,
-        &r_out,
-        &proof.bias_v_batch_open,
-        &params_qkvo_b,
-        transcript,
-    )
-    .map_err(|e| format!("bias_v_batch: {e}"))?;
+    let eta_bq = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let eta_bk = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let eta_bv = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let ((rbq, rbk), rbv) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    hyrax_verify_batch_with_eta(
+                        &bq_coms,
+                        &bq_evals,
+                        &r_out,
+                        &proof.bias_q_batch_open,
+                        &params_qkvo_b,
+                        eta_bq,
+                    )
+                    .map_err(|e| format!("bias_q_batch: {e}"))
+                },
+                || {
+                    hyrax_verify_batch_with_eta(
+                        &bk_coms,
+                        &bk_evals,
+                        &r_out,
+                        &proof.bias_k_batch_open,
+                        &params_qkvo_b,
+                        eta_bk,
+                    )
+                    .map_err(|e| format!("bias_k_batch: {e}"))
+                },
+            )
+        },
+        || {
+            hyrax_verify_batch_with_eta(
+                &bv_coms,
+                &bv_evals,
+                &r_out,
+                &proof.bias_v_batch_open,
+                &params_qkvo_b,
+                eta_bv,
+            )
+            .map_err(|e| format!("bias_v_batch: {e}"))
+        },
+    );
+    rbq?;
+    rbk?;
+    rbv?;
 
     // wo at combine(r_k_o, r_out)
     let wo_point = combine(&r_k_o, &r_out);
@@ -1155,15 +1191,6 @@ pub fn verify(
         .iter()
         .map(|bp| bp.oproj_w_o_eval)
         .collect();
-    hyrax_verify_batch(
-        &wo_coms,
-        &wo_evals,
-        &wo_point,
-        &proof.w_o_batch_open,
-        &params_qkvo_w,
-        transcript,
-    )
-    .map_err(|e| format!("w_o_batch: {e}"))?;
 
     // bias_o at r_out
     let bo_coms: Vec<HyraxCommitment> = vk
@@ -1176,15 +1203,34 @@ pub fn verify(
         .iter()
         .map(|bp| bp.oproj_bias_o_eval)
         .collect();
-    hyrax_verify_batch(
-        &bo_coms,
-        &bo_evals,
-        &r_out,
-        &proof.bias_o_batch_open,
-        &params_qkvo_b,
-        transcript,
-    )
-    .map_err(|e| format!("bias_o_batch: {e}"))?;
+    let eta_wo = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let eta_bo = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let (rwo, rbo) = rayon::join(
+        || {
+            hyrax_verify_batch_with_eta(
+                &wo_coms,
+                &wo_evals,
+                &wo_point,
+                &proof.w_o_batch_open,
+                &params_qkvo_w,
+                eta_wo,
+            )
+            .map_err(|e| format!("w_o_batch: {e}"))
+        },
+        || {
+            hyrax_verify_batch_with_eta(
+                &bo_coms,
+                &bo_evals,
+                &r_out,
+                &proof.bias_o_batch_open,
+                &params_qkvo_b,
+                eta_bo,
+            )
+            .map_err(|e| format!("bias_o_batch: {e}"))
+        },
+    );
+    rwo?;
+    rbo?;
 
     // w2 at combine(r_k_fy, r_out)
     let w2_point = combine(&r_k_fy, &r_out);
@@ -1193,15 +1239,6 @@ pub fn verify(
         .iter()
         .map(|bvk| bvk.ffn_vk.w2_com.clone())
         .collect();
-    hyrax_verify_batch(
-        &w2_coms,
-        &proof.batch_ffn_y.final_evals_g,
-        &w2_point,
-        &proof.w2_batch_open,
-        &params_wff,
-        transcript,
-    )
-    .map_err(|e| format!("w2_batch: {e}"))?;
 
     // A at combine(r_t, r_k_fy)
     let ffn_a_point = combine(&r_t, &r_k_fy);
@@ -1210,15 +1247,6 @@ pub fn verify(
         .iter()
         .map(|bp| bp.ffn_a_com.clone())
         .collect();
-    hyrax_verify_batch(
-        &ffn_a_coms,
-        &proof.batch_ffn_y.final_evals_f,
-        &ffn_a_point,
-        &proof.ffn_a_batch_open,
-        &params_mff,
-        transcript,
-    )
-    .map_err(|e| format!("ffn_a_batch: {e}"))?;
 
     // w1 at combine(r_k_m, ry_m) — uses same params as prover (params_qkvo_w)
     let w1_point = combine(&r_k_m, &ry_m);
@@ -1227,15 +1255,6 @@ pub fn verify(
         .iter()
         .map(|bvk| bvk.ffn_vk.w1_com.clone())
         .collect();
-    hyrax_verify_batch(
-        &w1_coms,
-        &proof.batch_ffn_m.final_evals_g,
-        &w1_point,
-        &proof.w1_batch_open,
-        &params_wff,
-        transcript,
-    )
-    .map_err(|e| format!("w1_batch: {e}"))?;
 
     // x_norm2 at combine(rx_m, r_k_m)
     let x_norm2_point = combine(&rx_m, &r_k_m);
@@ -1244,15 +1263,6 @@ pub fn verify(
         .iter()
         .map(|bp| bp.x_norm2_com.clone())
         .collect();
-    hyrax_verify_batch(
-        &x_norm2_coms,
-        &proof.batch_ffn_m.final_evals_f,
-        &x_norm2_point,
-        &proof.x_norm2_batch_open,
-        &params_td,
-        transcript,
-    )
-    .map_err(|e| format!("x_norm2_batch: {e}"))?;
 
     // ffn_m_com at combine(rx_m, ry_m)
     let ffn_m_point = combine(&rx_m, &ry_m);
@@ -1262,15 +1272,85 @@ pub fn verify(
         .map(|bp| bp.ffn_m_com.clone())
         .collect();
     let ffn_m_evals: Vec<F> = proof.block_proofs.iter().map(|bp| bp.ffn_m_eval).collect();
-    hyrax_verify_batch(
-        &ffn_m_coms,
-        &ffn_m_evals,
-        &ffn_m_point,
-        &proof.ffn_m_com_batch_open,
-        &params_mff,
-        transcript,
-    )
-    .map_err(|e| format!("ffn_m_com_batch: {e}"))?;
+    let eta_w2 = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let eta_ffn_a = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let eta_w1 = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let eta_x_norm2 = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let eta_ffn_m = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let ((rw2, rffn_a), (rw1, (rxn2, rffn_m))) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    hyrax_verify_batch_with_eta(
+                        &w2_coms,
+                        &proof.batch_ffn_y.final_evals_g,
+                        &w2_point,
+                        &proof.w2_batch_open,
+                        &params_wff,
+                        eta_w2,
+                    )
+                    .map_err(|e| format!("w2_batch: {e}"))
+                },
+                || {
+                    hyrax_verify_batch_with_eta(
+                        &ffn_a_coms,
+                        &proof.batch_ffn_y.final_evals_f,
+                        &ffn_a_point,
+                        &proof.ffn_a_batch_open,
+                        &params_mff,
+                        eta_ffn_a,
+                    )
+                    .map_err(|e| format!("ffn_a_batch: {e}"))
+                },
+            )
+        },
+        || {
+            rayon::join(
+                || {
+                    hyrax_verify_batch_with_eta(
+                        &w1_coms,
+                        &proof.batch_ffn_m.final_evals_g,
+                        &w1_point,
+                        &proof.w1_batch_open,
+                        &params_wff,
+                        eta_w1,
+                    )
+                    .map_err(|e| format!("w1_batch: {e}"))
+                },
+                || {
+                    rayon::join(
+                        || {
+                            hyrax_verify_batch_with_eta(
+                                &x_norm2_coms,
+                                &proof.batch_ffn_m.final_evals_f,
+                                &x_norm2_point,
+                                &proof.x_norm2_batch_open,
+                                &params_td,
+                                eta_x_norm2,
+                            )
+                            .map_err(|e| format!("x_norm2_batch: {e}"))
+                        },
+                        || {
+                            hyrax_verify_batch_with_eta(
+                                &ffn_m_coms,
+                                &ffn_m_evals,
+                                &ffn_m_point,
+                                &proof.ffn_m_com_batch_open,
+                                &params_mff,
+                                eta_ffn_m,
+                            )
+                            .map_err(|e| format!("ffn_m_com_batch: {e}"))
+                        },
+                    )
+                },
+            )
+        },
+    );
+    rw2?;
+    rffn_a?;
+    rw1?;
+    rxn2?;
+    rffn_m?;
 
     // phi_q at combine(r_t, batch_r_attn_out)
     let phi_q_attn_point = combine(&r_t, &batch_r_attn_out);

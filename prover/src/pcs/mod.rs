@@ -400,6 +400,63 @@ pub fn hyrax_verify_batch(
     Ok(())
 }
 
+/// Same as `hyrax_verify_batch`, but the caller supplies the Fiat-Shamir
+/// batching challenge. This is useful when a verifier derives several `eta`s
+/// sequentially to preserve transcript order, then verifies the independent
+/// batch openings in parallel.
+pub fn hyrax_verify_batch_with_eta(
+    commitments: &[HyraxCommitment],
+    evals: &[F],
+    point: &[F],
+    proof: &HyraxProof,
+    params: &HyraxParams,
+    eta: F,
+) -> Result<(), String> {
+    let count = commitments.len();
+    assert_eq!(evals.len(), count);
+    let nu = commitments[0].nu;
+    let eta_pows = powers_of(eta, count);
+
+    let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
+    let r_r_rev: Vec<F> = point[nu..].iter().rev().copied().collect();
+    let l_vec = lagrange_basis(&r_l_rev);
+    let r_vec = lagrange_basis(&r_r_rev);
+
+    let num_rows = 1usize << nu;
+    let mut all_row_points: Vec<G1Affine> = Vec::with_capacity(count * num_rows);
+    let mut all_row_scalars: Vec<F> = Vec::with_capacity(count * num_rows);
+    for (k, com) in commitments.iter().enumerate() {
+        for (i, &row_com) in com.row_coms.iter().enumerate() {
+            all_row_points.push(row_com);
+            all_row_scalars.push(eta_pows[k] * l_vec[i]);
+        }
+    }
+    let lhs = msm(&all_row_points, &all_row_scalars);
+    let rhs = msm(&params.gens, &proof.w_prime);
+    if lhs != rhs {
+        return Err("Hyrax Batch: commitment check failed".to_string());
+    }
+
+    let inner: F = r_vec
+        .iter()
+        .zip(proof.w_prime.iter())
+        .map(|(&r, &w)| r * w)
+        .sum();
+    let expected_inner: F = evals
+        .iter()
+        .zip(eta_pows.iter())
+        .map(|(&v, &e)| v * e)
+        .sum();
+
+    if inner != expected_inner {
+        return Err(format!(
+            "Hyrax Batch: inner product check failed: got {inner:?}, expected {expected_inner:?}"
+        ));
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Multi-point batched verification (K independent openings → 2 MSMs total)
 // ---------------------------------------------------------------------------
