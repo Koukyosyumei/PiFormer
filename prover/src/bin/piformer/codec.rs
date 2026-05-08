@@ -867,8 +867,7 @@ fn write_ln_proof<W: Write>(w: &mut W, p: &LayerNormProof) -> io::Result<()> {
     write_ln_internal_coms(w, &p.internal_coms)?;
     write_sumcheck_proof(w, &p.mean_sumcheck)?;
     write_sumcheck_cubic_proof(w, &p.sq_sum_sumcheck)?;
-    write_sumcheck_cubic_proof(w, &p.sum_x_sq_sumcheck)?;
-    write_sumcheck_cubic_proof(w, &p.sigma_sq_sumcheck)?;
+    write_sumcheck_cubic_proof_multi(w, &p.sigma_residual_sumcheck)?;
     write_sumcheck_cubic_proof_multi(w, &p.gamma_sigma_sumcheck)?;
     write_range_witness_proof(w, &p.sigma_range_proof)?;
     write_range_witness_proof(w, &p.y_range_proof)?;
@@ -879,8 +878,7 @@ fn read_ln_proof<R: Read>(r: &mut R) -> io::Result<LayerNormProof> {
         internal_coms: read_ln_internal_coms(r)?,
         mean_sumcheck: read_sumcheck_proof(r)?,
         sq_sum_sumcheck: read_sumcheck_cubic_proof(r)?,
-        sum_x_sq_sumcheck: read_sumcheck_cubic_proof(r)?,
-        sigma_sq_sumcheck: read_sumcheck_cubic_proof(r)?,
+        sigma_residual_sumcheck: read_sumcheck_cubic_proof_multi(r)?,
         gamma_sigma_sumcheck: read_sumcheck_cubic_proof_multi(r)?,
         sigma_range_proof: read_range_witness_proof(r)?,
         y_range_proof: read_range_witness_proof(r)?,
