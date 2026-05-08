@@ -655,10 +655,17 @@ pub struct LassoOutputBinding {
 }
 
 /// Precomputed table commitments for multi-instance Lasso (setup phase).
+///
+/// `instance_table_coms[t][k]` is the commitment to sub-table k of instance t.
+/// Some instances may share identical sub-tables (e.g., Q and K activation
+/// tables in attention); `instance_to_group[t]` returns the group id assigned
+/// to instance t, and instances within the same group are guaranteed to have
+/// element-wise equal commitments. The protocol uses this mapping to dedup
+/// per-proof work in transcript absorption and the final batched table open.
 #[derive(Clone)]
 pub struct LassoMultiProvingKey {
-    /// instance_table_coms[t][k] = commitment to sub-table k of instance t
     pub instance_table_coms: Vec<Vec<HyraxCommitment>>,
+    pub instance_to_group: Vec<usize>,
     pub nu: usize,
 }
 
@@ -666,6 +673,7 @@ impl LassoMultiProvingKey {
     pub fn vk(&self) -> LassoMultiVerifyingKey {
         LassoMultiVerifyingKey {
             instance_table_coms: self.instance_table_coms.clone(),
+            instance_to_group: self.instance_to_group.clone(),
         }
     }
 }
@@ -674,16 +682,21 @@ impl LassoMultiProvingKey {
 #[derive(Clone)]
 pub struct LassoMultiVerifyingKey {
     pub instance_table_coms: Vec<Vec<HyraxCommitment>>,
+    pub instance_to_group: Vec<usize>,
 }
 
 /// Precommit tables for all instances in a multi-Lasso (call at setup, once).
+///
+/// This is the no-sharing entry point: every instance gets its own group.
+/// Use `precommit_lasso_multi_tables_grouped` to share commitments across
+/// instances when their sub-tables are identical.
 pub fn precommit_lasso_multi_tables(
     multi_instance: &LassoMultiInstance,
     bits_per_chunk: usize,
     params: &HyraxParams,
 ) -> LassoMultiProvingKey {
     let nu = bits_per_chunk / 2;
-    let instance_table_coms = multi_instance
+    let instance_table_coms: Vec<Vec<HyraxCommitment>> = multi_instance
         .instances
         .iter()
         .map(|inst| {
@@ -693,10 +706,53 @@ pub fn precommit_lasso_multi_tables(
                 .collect()
         })
         .collect();
+    let instance_to_group: Vec<usize> = (0..multi_instance.instances.len()).collect();
     LassoMultiProvingKey {
         instance_table_coms,
+        instance_to_group,
         nu,
     }
+}
+
+/// Detect equal table-commitment sets across instances and return a
+/// canonical group assignment. Two instances are in the same group iff every
+/// sub-table commitment matches element-wise (same nu/sigma + same row_coms).
+///
+/// Group ids are assigned in instance order: the first instance gets group 0;
+/// each subsequent instance inherits the group of the first equal earlier
+/// instance, or starts a new group. This is O(L²) in the instance count but
+/// L is typically tiny (one instance per Lasso instance, at most a handful
+/// of groups in practice), so cost is negligible.
+pub fn derive_instance_groups(
+    instance_table_coms: &[Vec<HyraxCommitment>],
+) -> Vec<usize> {
+    fn coms_eq(a: &[HyraxCommitment], b: &[HyraxCommitment]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        a.iter().zip(b.iter()).all(|(x, y)| {
+            x.nu == y.nu && x.sigma == y.sigma && x.row_coms == y.row_coms
+        })
+    }
+    let mut groups: Vec<usize> = Vec::with_capacity(instance_table_coms.len());
+    let mut representatives: Vec<usize> = Vec::new();
+    for (idx, coms) in instance_table_coms.iter().enumerate() {
+        let mut found = None;
+        for &rep_idx in &representatives {
+            if coms_eq(coms, &instance_table_coms[rep_idx]) {
+                found = Some(groups[rep_idx]);
+                break;
+            }
+        }
+        match found {
+            Some(g) => groups.push(g),
+            None => {
+                groups.push(representatives.len());
+                representatives.push(idx);
+            }
+        }
+    }
+    groups
 }
 
 /// 複数のLassoルックアップ要求をまとめたもの
@@ -770,7 +826,15 @@ pub fn prove_lasso_multi(
     }
 
     // --- STEP 1: absorb precommitted table commitments (from setup phase) ---
-    for inst_coms in &pk.instance_table_coms {
+    // When several instances share the same table commitments (e.g., Q and K
+    // attention tables), we only absorb each unique group once.
+    let mut absorbed_groups: Vec<bool> = vec![false; pk.instance_table_coms.len()];
+    for (t, inst_coms) in pk.instance_table_coms.iter().enumerate() {
+        let g = pk.instance_to_group[t];
+        if absorbed_groups[g] {
+            continue;
+        }
+        absorbed_groups[g] = true;
         for com in inst_coms {
             absorb_com(transcript, b"hyrax_com", com);
         }
@@ -868,8 +932,27 @@ pub fn prove_lasso_multi(
         table_openings.push(inst_openings);
     }
 
-    let flatten_tables_slices: Vec<&[F]> = flatten_tables.iter().map(|v| v.as_slice()).collect();
-    let hyrax_proof = hyrax_open_batch(&flatten_tables_slices, &r_vec, nu, sigma, transcript);
+    // Dedup tables across instances that share the same group (e.g., Q and K
+    // attention tables): the underlying MLE is identical, so we only need to
+    // open one copy. The verifier mirrors this dedup by selecting the same
+    // representative-instance ordering before calling `hyrax_verify_batch`.
+    let unique_flatten_tables: Vec<&[F]> = {
+        let mut seen: Vec<bool> = vec![false; pk.instance_table_coms.len()];
+        let mut out: Vec<&[F]> = Vec::new();
+        let mut idx = 0usize;
+        for (t, instance) in multi_instance.instances.iter().enumerate() {
+            let g = pk.instance_to_group[t];
+            for _ in 0..instance.tables.len() {
+                if !seen[g] {
+                    out.push(flatten_tables[idx]);
+                }
+                idx += 1;
+            }
+            seen[g] = true;
+        }
+        out
+    };
+    let hyrax_proof = hyrax_open_batch(&unique_flatten_tables, &r_vec, nu, sigma, transcript);
 
     let mut l_k_evals_multi: Vec<Vec<F>> = Vec::new();
     for (t, instance) in multi_instance.instances.iter().enumerate() {
@@ -1046,7 +1129,14 @@ fn verify_lasso_multi_with_outputs(
     let m = multi_instance.instances[0].bits_per_chunk;
 
     // --- STEP 1: replay precommitted table absorptions (from verifying key) ---
-    for inst_coms in &vk.instance_table_coms {
+    // Mirror the prover's group-deduped absorption order.
+    let mut absorbed_groups: Vec<bool> = vec![false; vk.instance_table_coms.len()];
+    for (t, inst_coms) in vk.instance_table_coms.iter().enumerate() {
+        let g = vk.instance_to_group[t];
+        if absorbed_groups[g] {
+            continue;
+        }
+        absorbed_groups[g] = true;
         for com in inst_coms {
             absorb_com(transcript, b"hyrax_com", com);
         }
@@ -1199,10 +1289,41 @@ fn verify_lasso_multi_with_outputs(
         );
     }
 
-    let flatten_commitments: Vec<_> = vk.instance_table_coms.iter().flatten().cloned().collect();
-    let flatten_openings: Vec<_> = proof.table_openings.iter().flatten().copied().collect();
+    // Dedup tables across instances that share a group (mirror the prover).
+    // Before dropping duplicate openings, assert that the openings agreed
+    // within the group: every instance in a group is committed to the same
+    // sub-table MLE, so its opening at `r_vec` must match.
+    let mut group_representative: Vec<Option<usize>> =
+        vec![None; vk.instance_table_coms.len()];
+    let mut flatten_commitments: Vec<HyraxCommitment> = Vec::new();
+    let mut flatten_openings: Vec<F> = Vec::new();
+    for (t, inst_coms) in vk.instance_table_coms.iter().enumerate() {
+        let g = vk.instance_to_group[t];
+        match group_representative[g] {
+            None => {
+                group_representative[g] = Some(t);
+                for (k, com) in inst_coms.iter().enumerate() {
+                    flatten_commitments.push(com.clone());
+                    flatten_openings.push(proof.table_openings[t][k]);
+                }
+            }
+            Some(rep_t) => {
+                if proof.table_openings[t].len() != proof.table_openings[rep_t].len() {
+                    return Err(format!(
+                        "Multi-Lasso group consistency: instance {t} has different table count than representative {rep_t}"
+                    ));
+                }
+                for (k, &v) in proof.table_openings[t].iter().enumerate() {
+                    if v != proof.table_openings[rep_t][k] {
+                        return Err(format!(
+                            "Multi-Lasso group consistency: instance {t} table {k} opening differs from representative {rep_t}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
 
-    // 検証側も transcript を含めた引数構成に修正
     hyrax_verify_batch(
         &flatten_commitments,
         &flatten_openings,

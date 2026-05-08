@@ -1370,8 +1370,11 @@ pub fn prove(
     let global_ffn_lasso_inst = LassoMultiInstance {
         instances: ffn_lasso_instances,
     };
+    let ffn_instance_to_group =
+        crate::lookup::lasso::derive_instance_groups(&ffn_instance_coms);
     let global_ffn_lasso_pk = LassoMultiProvingKey {
         instance_table_coms: ffn_instance_coms,
+        instance_to_group: ffn_instance_to_group,
         nu: ffn_lasso_nu,
     };
     let ffn_lasso_proof = prove_lasso_multi(
@@ -1957,8 +1960,11 @@ pub fn prove(
     let global_multi_inst = LassoMultiInstance {
         instances: all_lasso_instances,
     };
+    let global_instance_to_group =
+        crate::lookup::lasso::derive_instance_groups(&all_instance_coms);
     let global_lasso_pk = LassoMultiProvingKey {
         instance_table_coms: all_instance_coms,
+        instance_to_group: global_instance_to_group,
         nu: global_nu,
     };
     let qk_index_refs: Vec<&[usize]> = all_query_indices.iter().map(|v| v.as_slice()).collect();

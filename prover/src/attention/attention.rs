@@ -81,6 +81,7 @@ pub fn precommit_attention_tables(
         let k_coms = q_coms.clone();
         LassoMultiProvingKey {
             instance_table_coms: vec![q_coms, k_coms],
+            instance_to_group: vec![0, 0],
             nu,
         }
     } else {

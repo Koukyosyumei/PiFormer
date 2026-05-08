@@ -843,12 +843,16 @@ pub fn verify(
             .map(|_| inst_ffn.activation_lasso.clone())
             .collect(),
     };
+    let ffn_instance_table_coms: Vec<Vec<HyraxCommitment>> = vk
+        .block_vks
+        .iter()
+        .map(|bvk| bvk.ffn_vk.activation_lasso_vk.table_coms.clone())
+        .collect();
+    let ffn_instance_to_group =
+        crate::lookup::lasso::derive_instance_groups(&ffn_instance_table_coms);
     let ffn_lasso_vk = LassoMultiVerifyingKey {
-        instance_table_coms: vk
-            .block_vks
-            .iter()
-            .map(|bvk| bvk.ffn_vk.activation_lasso_vk.table_coms.clone())
-            .collect(),
+        instance_table_coms: ffn_instance_table_coms,
+        instance_to_group: ffn_instance_to_group,
     };
     let ffn_output_coms: Vec<(HyraxCommitment, usize)> = proof
         .block_proofs
@@ -1926,8 +1930,11 @@ pub fn verify(
     let global_multi_inst = LassoMultiInstance {
         instances: all_lasso_instances,
     };
+    let global_instance_to_group =
+        crate::lookup::lasso::derive_instance_groups(&all_instance_coms);
     let global_lasso_vk = LassoMultiVerifyingKey {
         instance_table_coms: all_instance_coms,
+        instance_to_group: global_instance_to_group,
     };
     let qk_index_refs: Vec<&[usize]> = proof
         .all_lasso_proof

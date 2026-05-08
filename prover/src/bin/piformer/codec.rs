@@ -1331,13 +1331,17 @@ fn write_lasso_multi_pk<W: Write>(w: &mut W, pk: &LassoMultiProvingKey) -> io::R
     write_usize(w, pk.nu)?;
     write_vec(w, &pk.instance_table_coms, |w, v: &Vec<HyraxCommitment>| {
         write_vec(w, v, write_hyrax_commitment)
-    })
+    })?;
+    write_vec(w, &pk.instance_to_group, |w, &g| write_usize(w, g))
 }
 fn read_lasso_multi_pk<R: Read>(r: &mut R) -> io::Result<LassoMultiProvingKey> {
     let nu = read_usize(r)?;
+    let instance_table_coms = read_vec(r, |r| read_vec(r, read_hyrax_commitment))?;
+    let instance_to_group = read_vec(r, read_usize)?;
     Ok(LassoMultiProvingKey {
         nu,
-        instance_table_coms: read_vec(r, |r| read_vec(r, read_hyrax_commitment))?,
+        instance_table_coms,
+        instance_to_group,
     })
 }
 
