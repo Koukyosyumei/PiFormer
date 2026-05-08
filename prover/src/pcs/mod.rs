@@ -317,17 +317,32 @@ pub fn hyrax_open_batch(
     let l_vec = lagrange_basis(&r_l_rev);
 
     // 3. 統合された w' ベクトルを計算: w'_batch = Σ_k η^k * (Σ_i L_i * Row_{k,i})
-    let mut w_prime_batched = vec![F::ZERO; num_cols];
-    for (k, evals) in evals_list.iter().enumerate() {
-        let eta_k = eta_pows[k];
-        for (i, &l_i) in l_vec.iter().enumerate() {
-            let row = &evals[i * num_cols..(i + 1) * num_cols];
-            let coeff = eta_k * l_i;
-            for (j, &m_ij) in row.iter().enumerate() {
-                w_prime_batched[j] += coeff * m_ij;
+    // Parallelize over the polynomial axis k. Each task computes its η^k-scaled
+    // contribution into a local accumulator, then a reduce sums them.
+    let w_prime_batched: Vec<F> = evals_list
+        .par_iter()
+        .enumerate()
+        .map(|(k, evals)| {
+            let eta_k = eta_pows[k];
+            let mut local = vec![F::ZERO; num_cols];
+            for (i, &l_i) in l_vec.iter().enumerate() {
+                let coeff = eta_k * l_i;
+                let row = &evals[i * num_cols..(i + 1) * num_cols];
+                for (j, &m_ij) in row.iter().enumerate() {
+                    local[j] += coeff * m_ij;
+                }
             }
-        }
-    }
+            local
+        })
+        .reduce(
+            || vec![F::ZERO; num_cols],
+            |mut a, b| {
+                for (a_j, b_j) in a.iter_mut().zip(b.iter()) {
+                    *a_j += *b_j;
+                }
+                a
+            },
+        );
 
     HyraxProof {
         w_prime: w_prime_batched,

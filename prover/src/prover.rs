@@ -22,7 +22,7 @@ use ark_ff::{Field, PrimeField};
 use crate::attention::attention::{LinearAttentionInstance, LinearAttentionWitness};
 use crate::attention::layernorm::{
     compute_range_witnesses, prove_layernorm, LayerNormIOCommitments, LayerNormProof,
-    LayerNormVerifyingKey, LayerNormWitness, LAYERNORM_RANGE_BITS,
+    LayerNormRangeWitnesses, LayerNormVerifyingKey, LayerNormWitness, LAYERNORM_RANGE_BITS,
 };
 use crate::attention::projection::{
     prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionProvingKey,
@@ -40,6 +40,7 @@ use crate::lookup::range::{
 use crate::subprotocols::{prove_sumcheck_cubic_multi_batched, SumcheckCubicProofMulti};
 use crate::subprotocols::{prove_sumcheck_multi_batched, SumcheckProofMulti};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey};
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Proof Structures
@@ -164,11 +165,28 @@ struct BlockCommitData {
     x_mid_com: HyraxCommitment,
 }
 
-fn commit_block_intermediates(
+/// Per-block commits that depend only on this block's witness — no residual
+/// chain dependency. Computed in parallel across blocks; the residual
+/// `x_mid_com` is finalized later in a sequential pass.
+struct BlockCommitDataNoResidual {
+    x_norm1_com: HyraxCommitment,
+    q_com: HyraxCommitment,
+    k_com: HyraxCommitment,
+    v_com: HyraxCommitment,
+    attn_norm_com: Option<HyraxCommitment>,
+    attn_num_com: Option<HyraxCommitment>,
+    attn_z_com: Option<HyraxCommitment>,
+    attn_rem_com: Option<HyraxCommitment>,
+    attn_diff_com: Option<HyraxCommitment>,
+    out_attn_com: HyraxCommitment,
+    x_norm2_com: HyraxCommitment,
+    out_ffn_com: HyraxCommitment,
+}
+
+fn commit_block_intermediates_no_residual(
     witness: &TransformerBlockWitness,
-    x_in_com: &HyraxCommitment,
     pk: &TransformerBlockVerifyingKey,
-) -> BlockCommitData {
+) -> BlockCommitDataNoResidual {
     let t = pk.seq_len;
     let d = pk.d_model;
 
@@ -180,7 +198,6 @@ fn commit_block_intermediates(
         hyrax_commit(&mle.evaluations, nu, &params)
     };
 
-    // Commit all 7 intermediate matrices
     let x_norm1_com = commit_mat(&witness.ln1_wit.y, t, d);
     let q_com = commit_mat(&witness.attn_wit.q, t, d);
     let k_com = commit_mat(&witness.attn_wit.k, t, d);
@@ -214,9 +231,8 @@ fn commit_block_intermediates(
     let out_attn_com = commit_mat(&witness.o_proj_wit.y, t, d);
     let x_norm2_com = commit_mat(&witness.ln2_wit.y, t, d);
     let out_ffn_com = commit_mat(&witness.ffn_wit.y, t, d);
-    let x_mid_com = add_commitments(x_in_com, &out_attn_com);
 
-    BlockCommitData {
+    BlockCommitDataNoResidual {
         x_norm1_com,
         q_com,
         k_com,
@@ -229,6 +245,29 @@ fn commit_block_intermediates(
         out_attn_com,
         x_norm2_com,
         out_ffn_com,
+    }
+}
+
+/// Finalize the residual chain for one block: produce x_mid_com from the
+/// block's `out_attn_com` and the running input commitment.
+fn finalize_block_commits(
+    partial: BlockCommitDataNoResidual,
+    x_in_com: &HyraxCommitment,
+) -> BlockCommitData {
+    let x_mid_com = add_commitments(x_in_com, &partial.out_attn_com);
+    BlockCommitData {
+        x_norm1_com: partial.x_norm1_com,
+        q_com: partial.q_com,
+        k_com: partial.k_com,
+        v_com: partial.v_com,
+        attn_norm_com: partial.attn_norm_com,
+        attn_num_com: partial.attn_num_com,
+        attn_z_com: partial.attn_z_com,
+        attn_rem_com: partial.attn_rem_com,
+        attn_diff_com: partial.attn_diff_com,
+        out_attn_com: partial.out_attn_com,
+        x_norm2_com: partial.x_norm2_com,
+        out_ffn_com: partial.out_ffn_com,
         x_mid_com,
     }
 }
@@ -648,17 +687,27 @@ pub fn prove(
     let mut phase1_data: Vec<BlockPhase1Data> = Vec::with_capacity(num_blocks);
     let mut current_x_com = x_in_com.clone();
 
-    for i in 0..num_blocks {
+    // Phase 1a (PARALLEL): Per-block witness commits and LN range witnesses are
+    // independent across blocks — neither depends on the residual chain or the
+    // transcript. Compute them concurrently across L blocks.
+    let parallel_per_block: Vec<(BlockCommitDataNoResidual, LayerNormRangeWitnesses, LayerNormRangeWitnesses)> =
+        (0..num_blocks)
+            .into_par_iter()
+            .map(|i| {
+                let bw = &witness.block_witnesses[i];
+                let bpk = &pk.block_pks[i];
+                let partial = commit_block_intermediates_no_residual(bw, bpk);
+                let ln1_rw = compute_range_witnesses(&bw.ln1_wit, &bpk.ln1_vk);
+                let ln2_rw = compute_range_witnesses(&bw.ln2_wit, &bpk.ln2_vk);
+                (partial, ln1_rw, ln2_rw)
+            })
+            .collect();
+
+    // Phase 1b (SEQUENTIAL): finalize the residual-chain x_mid_com per block
+    // (homomorphic adds, cheap) and accumulate ln_range_witnesses in deterministic order.
+    for (partial, ln1_rw, ln2_rw) in parallel_per_block {
         block_input_coms.push(current_x_com.clone());
-        let commits = commit_block_intermediates(
-            &witness.block_witnesses[i],
-            &current_x_com,
-            &pk.block_pks[i],
-        );
-        let ln1_rw =
-            compute_range_witnesses(&witness.block_witnesses[i].ln1_wit, &pk.block_pks[i].ln1_vk);
-        let ln2_rw =
-            compute_range_witnesses(&witness.block_witnesses[i].ln2_wit, &pk.block_pks[i].ln2_vk);
+        let commits = finalize_block_commits(partial, &current_x_com);
         ln_range_witnesses.push(ln1_rw.sigma_witness);
         ln_range_witnesses.push(ln1_rw.y_witness);
         ln_range_witnesses.push(ln2_rw.sigma_witness);
