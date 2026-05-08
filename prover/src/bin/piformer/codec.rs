@@ -1088,13 +1088,9 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_hyrax_proof(w, &p.phi_q_batch_open)?;
     write_hyrax_proof(w, &p.phi_k_batch_open)?;
     write_hyrax_proof(w, &p.v_attn_batch_open)?;
-    write_opt_hyrax_proof(w, &p.attn_num_batch_open)?;
-    write_opt_hyrax_proof(w, &p.attn_norm_batch_open)?;
-    write_opt_hyrax_proof(w, &p.attn_num_attn_open)?;
-    write_opt_hyrax_proof(w, &p.attn_norm_oproj_open)?;
+    write_opt_hyrax_proof(w, &p.attn_norm_r_batch_open)?;
+    write_opt_hyrax_proof(w, &p.attn_norm_attn_point_open)?;
     write_opt_hyrax_proof(w, &p.attn_z_open)?;
-    write_opt_hyrax_proof(w, &p.attn_rem_open)?;
-    write_opt_hyrax_proof(w, &p.attn_diff_open)?;
     write_opt_hyrax_proof(w, &p.attn_z_phi_q_open)?;
     write_opt_hyrax_proof(w, &p.attn_z_phi_k_open)?;
     write_vec_f(w, &p.causal_ctx_prefix_evals)?;
@@ -1174,13 +1170,9 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         phi_q_batch_open: read_hyrax_proof(r)?,
         phi_k_batch_open: read_hyrax_proof(r)?,
         v_attn_batch_open: read_hyrax_proof(r)?,
-        attn_num_batch_open: read_opt_hyrax_proof(r)?,
-        attn_norm_batch_open: read_opt_hyrax_proof(r)?,
-        attn_num_attn_open: read_opt_hyrax_proof(r)?,
-        attn_norm_oproj_open: read_opt_hyrax_proof(r)?,
+        attn_norm_r_batch_open: read_opt_hyrax_proof(r)?,
+        attn_norm_attn_point_open: read_opt_hyrax_proof(r)?,
         attn_z_open: read_opt_hyrax_proof(r)?,
-        attn_rem_open: read_opt_hyrax_proof(r)?,
-        attn_diff_open: read_opt_hyrax_proof(r)?,
         attn_z_phi_q_open: read_opt_hyrax_proof(r)?,
         attn_z_phi_k_open: read_opt_hyrax_proof(r)?,
         causal_ctx_prefix_evals: read_vec_f(r)?,

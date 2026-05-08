@@ -397,13 +397,11 @@ pub struct TransformerModelProof {
     pub phi_q_batch_open: HyraxProof,
     pub phi_k_batch_open: HyraxProof,
     pub v_attn_batch_open: HyraxProof,
-    pub attn_num_batch_open: Option<HyraxProof>,
-    pub attn_norm_batch_open: Option<HyraxProof>,
-    pub attn_num_attn_open: Option<HyraxProof>,
-    pub attn_norm_oproj_open: Option<HyraxProof>,
+    /// Merged open at r_norm covering, in order: num_coms, norm_coms, rem_coms, diff_coms (4L commits total).
+    pub attn_norm_r_batch_open: Option<HyraxProof>,
+    /// Merged open at attn_point=combine(r_t,r_k_o) covering num_coms then norm_coms (2L commits).
+    pub attn_norm_attn_point_open: Option<HyraxProof>,
     pub attn_z_open: Option<HyraxProof>,
-    pub attn_rem_open: Option<HyraxProof>,
-    pub attn_diff_open: Option<HyraxProof>,
     pub attn_z_phi_q_open: Option<HyraxProof>,
     pub attn_z_phi_k_open: Option<HyraxProof>,
     pub causal_ctx_prefix_evals: Vec<F>,
@@ -1823,97 +1821,92 @@ pub fn prove(
         None
     };
 
-    let (
-        attn_num_batch_open,
-        attn_norm_batch_open,
-        attn_z_open,
-        attn_rem_open,
-        attn_diff_open,
-        attn_num_attn_open,
-        attn_norm_oproj_open,
-    ) = if let Some(ref r_norm) = attn_norm_r {
-        let r_norm_t = r_norm[..t_bits].to_vec();
-        let num_evals: Vec<Vec<F>> = witness
-            .block_witnesses
-            .iter()
-            .map(|b| mat_to_mle(&b.attn_wit.out, t, d).evaluations)
-            .collect();
-        let norm_evals: Vec<Vec<F>> = witness
-            .block_witnesses
-            .iter()
-            .map(|b| {
-                mat_to_mle(
-                    b.attn_wit
-                        .normalized_out
-                        .as_ref()
-                        .expect("missing normalized attention"),
-                    t,
-                    d,
-                )
-                .evaluations
-            })
-            .collect();
-        let z_evals: Vec<Vec<F>> = witness
-            .block_witnesses
-            .iter()
-            .map(|b| {
-                vec_to_mle(b.attn_wit.norm_z.as_ref().expect("missing attention z"), t).evaluations
-            })
-            .collect();
-        let rem_evals: Vec<Vec<F>> = witness
-            .block_witnesses
-            .iter()
-            .map(|b| {
-                mat_to_mle(b.attn_wit.norm_rem.as_ref().expect("missing rem"), t, d).evaluations
-            })
-            .collect();
-        let diff_evals: Vec<Vec<F>> = witness
-            .block_witnesses
-            .iter()
-            .map(|b| {
-                mat_to_mle(b.attn_wit.norm_diff.as_ref().expect("missing diff"), t, d).evaluations
-            })
-            .collect();
-        let num_refs: Vec<&[F]> = num_evals.iter().map(|v| v.as_slice()).collect();
-        let norm_refs: Vec<&[F]> = norm_evals.iter().map(|v| v.as_slice()).collect();
-        let z_refs: Vec<&[F]> = z_evals.iter().map(|v| v.as_slice()).collect();
-        let rem_refs: Vec<&[F]> = rem_evals.iter().map(|v| v.as_slice()).collect();
-        let diff_refs: Vec<&[F]> = diff_evals.iter().map(|v| v.as_slice()).collect();
-        let (nu_t, sigma_t, _) = params_from_vars(t_bits);
-        (
-            Some(hyrax_open_batch(
-                &num_refs, r_norm, nu_td, sigma_td, transcript,
-            )),
-            Some(hyrax_open_batch(
-                &norm_refs, r_norm, nu_td, sigma_td, transcript,
-            )),
-            Some(hyrax_open_batch(
-                &z_refs, &r_norm_t, nu_t, sigma_t, transcript,
-            )),
-            Some(hyrax_open_batch(
-                &rem_refs, r_norm, nu_td, sigma_td, transcript,
-            )),
-            Some(hyrax_open_batch(
-                &diff_refs, r_norm, nu_td, sigma_td, transcript,
-            )),
-            Some(hyrax_open_batch(
-                &num_refs,
-                &combine(&r_t, &r_k_o),
+    let (attn_norm_r_batch_open, attn_z_open, attn_norm_attn_point_open) =
+        if let Some(ref r_norm) = attn_norm_r {
+            let r_norm_t = r_norm[..t_bits].to_vec();
+            let num_evals: Vec<Vec<F>> = witness
+                .block_witnesses
+                .iter()
+                .map(|b| mat_to_mle(&b.attn_wit.out, t, d).evaluations)
+                .collect();
+            let norm_evals: Vec<Vec<F>> = witness
+                .block_witnesses
+                .iter()
+                .map(|b| {
+                    mat_to_mle(
+                        b.attn_wit
+                            .normalized_out
+                            .as_ref()
+                            .expect("missing normalized attention"),
+                        t,
+                        d,
+                    )
+                    .evaluations
+                })
+                .collect();
+            let z_evals: Vec<Vec<F>> = witness
+                .block_witnesses
+                .iter()
+                .map(|b| {
+                    vec_to_mle(b.attn_wit.norm_z.as_ref().expect("missing attention z"), t)
+                        .evaluations
+                })
+                .collect();
+            let rem_evals: Vec<Vec<F>> = witness
+                .block_witnesses
+                .iter()
+                .map(|b| {
+                    mat_to_mle(b.attn_wit.norm_rem.as_ref().expect("missing rem"), t, d).evaluations
+                })
+                .collect();
+            let diff_evals: Vec<Vec<F>> = witness
+                .block_witnesses
+                .iter()
+                .map(|b| {
+                    mat_to_mle(b.attn_wit.norm_diff.as_ref().expect("missing diff"), t, d)
+                        .evaluations
+                })
+                .collect();
+            let z_refs: Vec<&[F]> = z_evals.iter().map(|v| v.as_slice()).collect();
+            let (nu_t, sigma_t, _) = params_from_vars(t_bits);
+
+            // Merged open at r_norm: [num | norm | rem | diff], same size & params.
+            let r_norm_refs: Vec<&[F]> = num_evals
+                .iter()
+                .chain(norm_evals.iter())
+                .chain(rem_evals.iter())
+                .chain(diff_evals.iter())
+                .map(|v| v.as_slice())
+                .collect();
+            let attn_norm_r_batch_open =
+                hyrax_open_batch(&r_norm_refs, r_norm, nu_td, sigma_td, transcript);
+
+            // attn_z is at a different point (r_norm_t) and different params.
+            let attn_z_open = hyrax_open_batch(&z_refs, &r_norm_t, nu_t, sigma_t, transcript);
+
+            // Merged open at attn_point: [num | norm].
+            let attn_point = combine(&r_t, &r_k_o);
+            let attn_point_refs: Vec<&[F]> = num_evals
+                .iter()
+                .chain(norm_evals.iter())
+                .map(|v| v.as_slice())
+                .collect();
+            let attn_norm_attn_point_open = hyrax_open_batch(
+                &attn_point_refs,
+                &attn_point,
                 nu_td,
                 sigma_td,
                 transcript,
-            )),
-            Some(hyrax_open_batch(
-                &norm_refs,
-                &combine(&r_t, &r_k_o),
-                nu_td,
-                sigma_td,
-                transcript,
-            )),
-        )
-    } else {
-        (None, None, None, None, None, None, None)
-    };
+            );
+
+            (
+                Some(attn_norm_r_batch_open),
+                Some(attn_z_open),
+                Some(attn_norm_attn_point_open),
+            )
+        } else {
+            (None, None, None)
+        };
 
     // =========================================================================
     // 16. Global batched Lasso (attention)
@@ -2065,13 +2058,9 @@ pub fn prove(
         phi_q_batch_open,
         phi_k_batch_open,
         v_attn_batch_open,
-        attn_num_batch_open,
-        attn_norm_batch_open,
-        attn_num_attn_open,
-        attn_norm_oproj_open,
+        attn_norm_r_batch_open,
+        attn_norm_attn_point_open,
         attn_z_open,
-        attn_rem_open,
-        attn_diff_open,
         attn_z_phi_q_open,
         attn_z_phi_k_open,
         causal_ctx_prefix_evals,

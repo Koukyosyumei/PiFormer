@@ -1809,30 +1809,34 @@ pub fn verify(
                     .ok_or_else(|| "missing attn_diff_com".to_string())
             })
             .collect::<Result<_, _>>()?;
+        // Merged open at r_norm: num_coms | norm_coms | rem_coms | diff_coms.
+        let r_norm_coms: Vec<HyraxCommitment> = num_coms
+            .iter()
+            .chain(norm_coms.iter())
+            .chain(rem_coms.iter())
+            .chain(diff_coms.iter())
+            .cloned()
+            .collect();
+        let r_norm_evals: Vec<F> = eval_num
+            .iter()
+            .chain(eval_norm.iter())
+            .chain(eval_rem.iter())
+            .chain(eval_diff.iter())
+            .copied()
+            .collect();
         hyrax_verify_batch(
-            &num_coms,
-            &eval_num,
+            &r_norm_coms,
+            &r_norm_evals,
             r_norm,
             proof
-                .attn_num_batch_open
+                .attn_norm_r_batch_open
                 .as_ref()
-                .ok_or_else(|| "missing attn_num open".to_string())?,
+                .ok_or_else(|| "missing attn_norm_r batch open".to_string())?,
             &params_td,
             transcript,
         )
-        .map_err(|e| format!("attn_num_batch: {e}"))?;
-        hyrax_verify_batch(
-            &norm_coms,
-            &eval_norm,
-            r_norm,
-            proof
-                .attn_norm_batch_open
-                .as_ref()
-                .ok_or_else(|| "missing attn_norm open".to_string())?,
-            &params_td,
-            transcript,
-        )
-        .map_err(|e| format!("attn_norm_batch: {e}"))?;
+        .map_err(|e| format!("attn_norm_r_batch: {e}"))?;
+
         let r_norm_t = r_norm[..t_bits].to_vec();
         let (_, _, params_t) = params_from_vars(t_bits);
         hyrax_verify_batch(
@@ -1847,48 +1851,13 @@ pub fn verify(
             transcript,
         )
         .map_err(|e| format!("attn_z_batch: {e}"))?;
-        hyrax_verify_batch(
-            &rem_coms,
-            &eval_rem,
-            r_norm,
-            proof
-                .attn_rem_open
-                .as_ref()
-                .ok_or_else(|| "missing attn_rem open".to_string())?,
-            &params_td,
-            transcript,
-        )
-        .map_err(|e| format!("attn_rem_batch: {e}"))?;
-        hyrax_verify_batch(
-            &diff_coms,
-            &eval_diff,
-            r_norm,
-            proof
-                .attn_diff_open
-                .as_ref()
-                .ok_or_else(|| "missing attn_diff open".to_string())?,
-            &params_td,
-            transcript,
-        )
-        .map_err(|e| format!("attn_diff_batch: {e}"))?;
+
         let attn_point = combine(&r_t, &r_k_o);
         let attn_num_evals: Vec<F> = proof
             .block_proofs
             .iter()
             .map(|bp| bp.attn_out_eval)
             .collect();
-        hyrax_verify_batch(
-            &num_coms,
-            &attn_num_evals,
-            &attn_point,
-            proof
-                .attn_num_attn_open
-                .as_ref()
-                .ok_or_else(|| "missing attn_num_attn open".to_string())?,
-            &params_td,
-            transcript,
-        )
-        .map_err(|e| format!("attn_num_attn_batch: {e}"))?;
         let norm_oproj_evals: Vec<F> = (0..num_blocks)
             .map(|i| {
                 let alpha_o = vk.block_vks[i].o_vk.alpha;
@@ -1899,25 +1868,29 @@ pub fn verify(
                 }
             })
             .collect();
+        // Merged open at attn_point: num_coms | norm_coms.
+        let attn_point_coms: Vec<HyraxCommitment> =
+            num_coms.iter().chain(norm_coms.iter()).cloned().collect();
+        let attn_point_evals: Vec<F> = attn_num_evals
+            .iter()
+            .chain(norm_oproj_evals.iter())
+            .copied()
+            .collect();
         hyrax_verify_batch(
-            &norm_coms,
-            &norm_oproj_evals,
+            &attn_point_coms,
+            &attn_point_evals,
             &attn_point,
             proof
-                .attn_norm_oproj_open
+                .attn_norm_attn_point_open
                 .as_ref()
-                .ok_or_else(|| "missing attn_norm_oproj open".to_string())?,
+                .ok_or_else(|| "missing attn_norm_attn_point open".to_string())?,
             &params_td,
             transcript,
         )
-        .map_err(|e| format!("attn_norm_oproj_batch: {e}"))?;
-    } else if proof.attn_num_batch_open.is_some()
-        || proof.attn_norm_batch_open.is_some()
-        || proof.attn_num_attn_open.is_some()
-        || proof.attn_norm_oproj_open.is_some()
+        .map_err(|e| format!("attn_norm_attn_point_batch: {e}"))?;
+    } else if proof.attn_norm_r_batch_open.is_some()
+        || proof.attn_norm_attn_point_open.is_some()
         || proof.attn_z_open.is_some()
-        || proof.attn_rem_open.is_some()
-        || proof.attn_diff_open.is_some()
     {
         return Err("unexpected attention normalization openings".to_string());
     }
