@@ -55,13 +55,16 @@ class PiFormerBlock(nn.Module):
         scale: float = 0.1,
         max_exp: int = 4,
         causal: bool = False,
+        attention_mode: str = "normalized_float",
+        attention_scale: int = 64,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
         self.attn = LinearAttentionLayer(
             d_model, n_heads,
             num_bits=num_bits, c=c, scale=scale, max_exp=max_exp,
-            causal=causal,
+            causal=causal, attention_mode=attention_mode,
+            attention_scale=attention_scale,
         )
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = PiFormerFFN(
@@ -105,10 +108,14 @@ class PiFormerModel(nn.Module):
         scale: float = 0.1,
         max_exp: int = 4,
         causal: bool = False,
+        attention_mode: str = "normalized_float",
+        attention_scale: int = 64,
     ):
         super().__init__()
         self.d_model = d_model
         self.causal = causal
+        self.attention_mode = attention_mode
+        self.attention_scale = int(attention_scale)
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
         self.register_buffer(
@@ -121,7 +128,8 @@ class PiFormerModel(nn.Module):
                 PiFormerBlock(
                     d_model, n_heads, d_ff,
                     num_bits=num_bits, c=c, scale=scale, max_exp=max_exp,
-                    causal=causal,
+                    causal=causal, attention_mode=attention_mode,
+                    attention_scale=attention_scale,
                 )
                 for _ in range(n_layers)
             ]

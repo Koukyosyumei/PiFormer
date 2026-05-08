@@ -254,6 +254,8 @@ model = PiFormerModel(
     scale=cfg["scale"],
     max_exp=cfg["max_exp"],
     causal=cfg.get("causal", False),
+    attention_mode="normalized_fixed",
+    attention_scale=64,
 )
 model.eval()
 

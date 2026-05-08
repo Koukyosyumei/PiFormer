@@ -149,6 +149,10 @@ pub fn build_zero_witness(
             k_query_indices: vec![qk_zp; seq_len * d_model],
             context: zero_dd,
             causal_context: None,
+            normalized_out: None,
+            norm_z: None,
+            norm_rem: None,
+            norm_diff: None,
             out: zero_td.clone(),
         },
         o_proj_wit: ProjectionWitness {

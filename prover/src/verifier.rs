@@ -20,7 +20,9 @@ use crate::pcs::{
 };
 use crate::poly::utils::{combine, compute_eq_evals, mat_to_mle};
 use crate::poly::DenseMLPoly;
-use crate::subprotocols::verify_sumcheck_multi_batched;
+use crate::subprotocols::{
+    eq_poly_eval, verify_sumcheck_cubic_multi_batched, verify_sumcheck_multi_batched,
+};
 use crate::transcript::{challenge_vec, Transcript};
 
 use crate::attention::attention::{AttentionProvingKey, LinearAttentionInstance};
@@ -290,6 +292,9 @@ pub fn verify(
     let mut acc_range_sig = HyraxBatchAccumulator::new();
     let mut acc_range_y = HyraxBatchAccumulator::new();
     let mut acc_range_m = HyraxBatchAccumulator::new();
+    let mut acc_attn_norm_rem = HyraxBatchAccumulator::new();
+    let mut acc_attn_norm_diff = HyraxBatchAccumulator::new();
+    let mut acc_attn_norm_m = HyraxBatchAccumulator::new();
     let mut acc_quant_ffn = HyraxBatchAccumulator::new();
     let mut acc_quant_unused = HyraxBatchAccumulator::new();
     let mut acc_quant_m = HyraxBatchAccumulator::new();
@@ -335,6 +340,46 @@ pub fn verify(
         _t0.elapsed().as_secs_f64() * 1000.0
     );
 
+    let has_attn_norm = proof
+        .block_proofs
+        .iter()
+        .any(|bp| bp.attn_norm_com.is_some());
+    if has_attn_norm {
+        let m = proof
+            .attn_norm_range_m
+            .as_ref()
+            .ok_or_else(|| "missing attention normalization range proof".to_string())?;
+        if proof.attn_norm_rem_range_proofs.len() != num_blocks
+            || proof.attn_norm_diff_range_proofs.len() != num_blocks
+        {
+            return Err("attention normalization range proof count mismatch".into());
+        }
+        let mut proofs = Vec::with_capacity(2 * num_blocks);
+        let mut num_vars = Vec::with_capacity(2 * num_blocks);
+        let n = (t * d).next_power_of_two().trailing_zeros() as usize;
+        for i in 0..num_blocks {
+            proofs.push(&proof.attn_norm_rem_range_proofs[i]);
+            num_vars.push(n);
+            proofs.push(&proof.attn_norm_diff_range_proofs[i]);
+            num_vars.push(n);
+        }
+        verify_range_batched(
+            &proofs,
+            m,
+            &num_vars,
+            crate::prover::ATTN_NORM_RANGE_BITS,
+            transcript,
+            &mut acc_attn_norm_rem,
+            &mut acc_attn_norm_diff,
+            &mut acc_attn_norm_m,
+        )?;
+    } else if proof.attn_norm_range_m.is_some()
+        || !proof.attn_norm_rem_range_proofs.is_empty()
+        || !proof.attn_norm_diff_range_proofs.is_empty()
+    {
+        return Err("unexpected attention normalization range proof".into());
+    }
+
     for i in 0..num_blocks {
         let bp = &proof.block_proofs[i];
         let bvk = &vk.block_vks[i];
@@ -369,6 +414,21 @@ pub fn verify(
         absorb_com(transcript, b"q_com", &bp.q_com);
         absorb_com(transcript, b"k_com", &bp.k_com);
         absorb_com(transcript, b"v_com", &bp.v_com);
+        if let Some(ref c) = bp.attn_norm_com {
+            absorb_com(transcript, b"attn_norm_com", c);
+        }
+        if let Some(ref c) = bp.attn_num_com {
+            absorb_com(transcript, b"attn_num_com", c);
+        }
+        if let Some(ref c) = bp.attn_z_com {
+            absorb_com(transcript, b"attn_z_com", c);
+        }
+        if let Some(ref c) = bp.attn_rem_com {
+            absorb_com(transcript, b"attn_rem_com", c);
+        }
+        if let Some(ref c) = bp.attn_diff_com {
+            absorb_com(transcript, b"attn_diff_com", c);
+        }
         absorb_com(transcript, b"out_attn_com", &bp.out_attn_com);
 
         let x_mid_com = add_commitments(&current_x_com, &bp.out_attn_com);
@@ -564,9 +624,14 @@ pub fn verify(
         transcript,
     )?;
 
-    // Algebraic check: the attention claim is derived from the O-proj leaf.
+    // Algebraic check: in legacy unnormalized mode the attention claim is
+    // derived from the O-proj leaf. Normalized mode is checked by the
+    // attention normalization proof below.
     for i in 0..num_blocks {
         let bp = &proof.block_proofs[i];
+        if bp.attn_norm_com.is_some() {
+            continue;
+        }
         let alpha_o = vk.block_vks[i].o_vk.alpha;
         let expected_out = if alpha_o == F::from(0u64) {
             F::from(0u64)
@@ -634,6 +699,41 @@ pub fn verify(
         "[model] batch_attn:{:>8.3}ms",
         _tattn.elapsed().as_secs_f64() * 1000.0
     );
+
+    let attn_norm_r = if has_attn_norm {
+        let r_eq = challenge_vec(transcript, td_num_vars, b"attn_norm_r");
+        let lambda = transcript.challenge_field::<F>(b"attn_norm_lambda");
+        let mut weights = Vec::with_capacity(7 * num_blocks);
+        for _ in 0..num_blocks {
+            weights.extend(vec![
+                F::from(crate::prover::ATTN_NORM_SCALE),
+                -F::ONE,
+                -F::ONE,
+                lambda,
+                -lambda,
+                -lambda,
+                -lambda,
+            ]);
+        }
+        let sc = proof
+            .attn_norm_sumcheck
+            .as_ref()
+            .ok_or_else(|| "missing attention normalization sumcheck".to_string())?;
+        let (r_sc, _) =
+            verify_sumcheck_cubic_multi_batched(sc, &weights, F::ZERO, td_num_vars, transcript)?;
+        let eq_eval = eq_poly_eval(&r_sc, &r_eq);
+        for f in &sc.final_evals_f {
+            if *f != eq_eval {
+                return Err("attention normalization eq leaf mismatch".into());
+            }
+        }
+        Some(r_sc)
+    } else {
+        if proof.attn_norm_sumcheck.is_some() {
+            return Err("unexpected attention normalization sumcheck".into());
+        }
+        None
+    };
 
     // =========================================================================
     // 7. Per-block FFN: Lasso + M absorb
@@ -850,7 +950,7 @@ pub fn verify(
     .map_err(|e| format!("Logits commit: {e}"))?;
 
     // =========================================================================
-    // 12. Finalize 12 accumulators (same order as prover's mu challenge loop)
+    // 12. Finalize accumulators (same order as prover's mu challenge loop)
     // =========================================================================
     let _tacc = Instant::now();
     let mu_inter = transcript.challenge_field::<F>(b"hyrax_group_mu");
@@ -865,6 +965,9 @@ pub fn verify(
     let mu_rng_m = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_quant_ffn = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_quant_m = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_attn_norm_rem = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_attn_norm_diff = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_attn_norm_m = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let rho_td = transcript.challenge_field_readonly::<F>(b"hyrax_fuse_td");
     let rho_range_m = transcript.challenge_field_readonly::<F>(b"hyrax_fuse_range_m");
 
@@ -946,8 +1049,27 @@ pub fn verify(
             .map_err(|e| format!("range_m fused acc: {e}"))
         },
     );
-    let r10: Result<(), String> = Ok(());
-    let r11: Result<(), String> = Ok(());
+    let ((r10, r11), r12) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    acc_attn_norm_rem
+                        .finalize_with_mu(&params_td, mu_attn_norm_rem)
+                        .map_err(|e| format!("acc_attn_norm_rem: {e}"))
+                },
+                || {
+                    acc_attn_norm_diff
+                        .finalize_with_mu(&params_td, mu_attn_norm_diff)
+                        .map_err(|e| format!("acc_attn_norm_diff: {e}"))
+                },
+            )
+        },
+        || {
+            acc_attn_norm_m
+                .finalize_with_mu(&params_range_m, mu_attn_norm_m)
+                .map_err(|e| format!("acc_attn_norm_m: {e}"))
+        },
+    );
     eprintln!(
         "[model] acc_finalize:{:>8.3}ms",
         _tacc.elapsed().as_secs_f64() * 1000.0
@@ -964,6 +1086,7 @@ pub fn verify(
     r9?;
     r10?;
     r11?;
+    r12?;
 
     // =========================================================================
     // 13. Global batch open for 5L intermediate matrices at r_td (inter_batch_open)
@@ -1502,6 +1625,185 @@ pub fn verify(
         || proof.causal_ctx_prefix_batch_open.is_some()
     {
         return Err("unexpected causal context openings in non-causal proof".to_string());
+    }
+
+    if let Some(ref r_norm) = attn_norm_r {
+        let sc = proof.attn_norm_sumcheck.as_ref().unwrap();
+        let mut eval_num = Vec::with_capacity(num_blocks);
+        let mut eval_norm = Vec::with_capacity(num_blocks);
+        let mut eval_z = Vec::with_capacity(num_blocks);
+        let mut eval_rem = Vec::with_capacity(num_blocks);
+        let mut eval_diff = Vec::with_capacity(num_blocks);
+        for i in 0..num_blocks {
+            let base = 7 * i;
+            eval_num.push(sc.final_evals_g[base]);
+            eval_rem.push(sc.final_evals_g[base + 1]);
+            if sc.final_evals_g[base + 2] != sc.final_evals_g[base + 3] {
+                return Err(format!("Block {i}: attention z leaf mismatch"));
+            }
+            if sc.final_evals_g[base + 1] != sc.final_evals_g[base + 5] {
+                return Err(format!("Block {i}: attention rem leaf mismatch"));
+            }
+            eval_z.push(sc.final_evals_g[base + 2]);
+            eval_norm.push(sc.final_evals_h[base + 2]);
+            eval_diff.push(sc.final_evals_g[base + 6]);
+        }
+        let num_coms: Vec<HyraxCommitment> = proof
+            .block_proofs
+            .iter()
+            .map(|bp| {
+                bp.attn_num_com
+                    .clone()
+                    .ok_or_else(|| "missing attn_num_com".to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        let norm_coms: Vec<HyraxCommitment> = proof
+            .block_proofs
+            .iter()
+            .map(|bp| {
+                bp.attn_norm_com
+                    .clone()
+                    .ok_or_else(|| "missing attn_norm_com".to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        let z_coms: Vec<HyraxCommitment> = proof
+            .block_proofs
+            .iter()
+            .map(|bp| {
+                bp.attn_z_com
+                    .clone()
+                    .ok_or_else(|| "missing attn_z_com".to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        let rem_coms: Vec<HyraxCommitment> = proof
+            .block_proofs
+            .iter()
+            .map(|bp| {
+                bp.attn_rem_com
+                    .clone()
+                    .ok_or_else(|| "missing attn_rem_com".to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        let diff_coms: Vec<HyraxCommitment> = proof
+            .block_proofs
+            .iter()
+            .map(|bp| {
+                bp.attn_diff_com
+                    .clone()
+                    .ok_or_else(|| "missing attn_diff_com".to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        hyrax_verify_batch(
+            &num_coms,
+            &eval_num,
+            r_norm,
+            proof
+                .attn_num_batch_open
+                .as_ref()
+                .ok_or_else(|| "missing attn_num open".to_string())?,
+            &params_td,
+            transcript,
+        )
+        .map_err(|e| format!("attn_num_batch: {e}"))?;
+        hyrax_verify_batch(
+            &norm_coms,
+            &eval_norm,
+            r_norm,
+            proof
+                .attn_norm_batch_open
+                .as_ref()
+                .ok_or_else(|| "missing attn_norm open".to_string())?,
+            &params_td,
+            transcript,
+        )
+        .map_err(|e| format!("attn_norm_batch: {e}"))?;
+        let r_norm_t = r_norm[..t_bits].to_vec();
+        let (_, _, params_t) = params_from_vars(t_bits);
+        hyrax_verify_batch(
+            &z_coms,
+            &eval_z,
+            &r_norm_t,
+            proof
+                .attn_z_open
+                .as_ref()
+                .ok_or_else(|| "missing attn_z open".to_string())?,
+            &params_t,
+            transcript,
+        )
+        .map_err(|e| format!("attn_z_batch: {e}"))?;
+        hyrax_verify_batch(
+            &rem_coms,
+            &eval_rem,
+            r_norm,
+            proof
+                .attn_rem_open
+                .as_ref()
+                .ok_or_else(|| "missing attn_rem open".to_string())?,
+            &params_td,
+            transcript,
+        )
+        .map_err(|e| format!("attn_rem_batch: {e}"))?;
+        hyrax_verify_batch(
+            &diff_coms,
+            &eval_diff,
+            r_norm,
+            proof
+                .attn_diff_open
+                .as_ref()
+                .ok_or_else(|| "missing attn_diff open".to_string())?,
+            &params_td,
+            transcript,
+        )
+        .map_err(|e| format!("attn_diff_batch: {e}"))?;
+        let attn_point = combine(&r_t, &r_k_o);
+        let attn_num_evals: Vec<F> = proof
+            .block_proofs
+            .iter()
+            .map(|bp| bp.attn_out_eval)
+            .collect();
+        hyrax_verify_batch(
+            &num_coms,
+            &attn_num_evals,
+            &attn_point,
+            proof
+                .attn_num_attn_open
+                .as_ref()
+                .ok_or_else(|| "missing attn_num_attn open".to_string())?,
+            &params_td,
+            transcript,
+        )
+        .map_err(|e| format!("attn_num_attn_batch: {e}"))?;
+        let norm_oproj_evals: Vec<F> = (0..num_blocks)
+            .map(|i| {
+                let alpha_o = vk.block_vks[i].o_vk.alpha;
+                if alpha_o == F::ZERO {
+                    F::ZERO
+                } else {
+                    proof.batch_oproj.final_evals_f[i] * alpha_o.inverse().unwrap()
+                }
+            })
+            .collect();
+        hyrax_verify_batch(
+            &norm_coms,
+            &norm_oproj_evals,
+            &attn_point,
+            proof
+                .attn_norm_oproj_open
+                .as_ref()
+                .ok_or_else(|| "missing attn_norm_oproj open".to_string())?,
+            &params_td,
+            transcript,
+        )
+        .map_err(|e| format!("attn_norm_oproj_batch: {e}"))?;
+    } else if proof.attn_num_batch_open.is_some()
+        || proof.attn_norm_batch_open.is_some()
+        || proof.attn_num_attn_open.is_some()
+        || proof.attn_norm_oproj_open.is_some()
+        || proof.attn_z_open.is_some()
+        || proof.attn_rem_open.is_some()
+        || proof.attn_diff_open.is_some()
+    {
+        return Err("unexpected attention normalization openings".to_string());
     }
 
     eprintln!(

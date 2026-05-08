@@ -153,6 +153,14 @@ def export_weights_rust(
             f"Got n_heads={model.blocks[0].attn.n_heads}. "
             "Either use n_heads=1 or extend the Rust prover."
         )
+    for i, blk in enumerate(model.blocks):
+        mode = getattr(blk.attn, "attention_mode", "normalized_float")
+        if mode == "normalized_float":
+            raise ValueError(
+                f"block {i}: Rust export cannot prove "
+                "attention_mode='normalized_float'. Use "
+                "attention_mode='normalized_fixed' or 'prover'."
+            )
 
     n_layers = len(model.blocks)
     vocab_size = model.embedding.num_embeddings

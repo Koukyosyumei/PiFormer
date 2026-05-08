@@ -149,6 +149,11 @@ with torch.no_grad():
             param.zero_()
         if name.endswith("alpha"):
             param.fill_(1.0)
+for blk in model.blocks:
+    blk.attn.attention_mode = "normalized_fixed"
+    blk.attn.attention_scale = 64
+model.attention_mode = "normalized_fixed"
+model.attention_scale = 64
 
 export_all(
     model,

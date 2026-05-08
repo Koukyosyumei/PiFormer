@@ -37,6 +37,7 @@ use crate::lookup::quantization::{prove_quantization_batch, QuantizationProof};
 use crate::lookup::range::{
     prove_range_batched, GlobalRangeM, RangeProofWitness, RangeWitnessProof,
 };
+use crate::subprotocols::{prove_sumcheck_cubic_multi_batched, SumcheckCubicProofMulti};
 use crate::subprotocols::{prove_sumcheck_multi_batched, SumcheckProofMulti};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey};
 
@@ -61,6 +62,11 @@ pub struct TransformerBlockProof {
     pub q_com: HyraxCommitment,
     pub k_com: HyraxCommitment,
     pub v_com: HyraxCommitment,
+    pub attn_norm_com: Option<HyraxCommitment>,
+    pub attn_num_com: Option<HyraxCommitment>,
+    pub attn_z_com: Option<HyraxCommitment>,
+    pub attn_rem_com: Option<HyraxCommitment>,
+    pub attn_diff_com: Option<HyraxCommitment>,
     pub out_attn_com: HyraxCommitment,
     pub x_norm2_com: HyraxCommitment,
     pub out_ffn_com: HyraxCommitment,
@@ -96,6 +102,9 @@ pub struct TransformerBlockProof {
     pub attn_out_eval: F, // x_inner_i(r_t, r_k_o) = claim for out sumcheck
 }
 
+pub const ATTN_NORM_SCALE: u64 = 64;
+pub const ATTN_NORM_RANGE_BITS: usize = 64;
+
 // ---------------------------------------------------------------------------
 // Witness Structures
 // ---------------------------------------------------------------------------
@@ -125,6 +134,11 @@ struct BlockPhase1Data {
     q_com: HyraxCommitment,
     k_com: HyraxCommitment,
     v_com: HyraxCommitment,
+    attn_norm_com: Option<HyraxCommitment>,
+    attn_num_com: Option<HyraxCommitment>,
+    attn_z_com: Option<HyraxCommitment>,
+    attn_rem_com: Option<HyraxCommitment>,
+    attn_diff_com: Option<HyraxCommitment>,
     out_attn_com: HyraxCommitment,
     x_norm2_com: HyraxCommitment,
     out_ffn_com: HyraxCommitment,
@@ -139,6 +153,11 @@ struct BlockCommitData {
     q_com: HyraxCommitment,
     k_com: HyraxCommitment,
     v_com: HyraxCommitment,
+    attn_norm_com: Option<HyraxCommitment>,
+    attn_num_com: Option<HyraxCommitment>,
+    attn_z_com: Option<HyraxCommitment>,
+    attn_rem_com: Option<HyraxCommitment>,
+    attn_diff_com: Option<HyraxCommitment>,
     out_attn_com: HyraxCommitment,
     x_norm2_com: HyraxCommitment,
     out_ffn_com: HyraxCommitment,
@@ -166,6 +185,32 @@ fn commit_block_intermediates(
     let q_com = commit_mat(&witness.attn_wit.q, t, d);
     let k_com = commit_mat(&witness.attn_wit.k, t, d);
     let v_com = commit_mat(&witness.attn_wit.v, t, d);
+    let attn_norm_com = witness
+        .attn_wit
+        .normalized_out
+        .as_ref()
+        .map(|m| commit_mat(m, t, d));
+    let attn_num_com = witness
+        .attn_wit
+        .normalized_out
+        .as_ref()
+        .map(|_| commit_mat(&witness.attn_wit.out, t, d));
+    let attn_z_com = witness.attn_wit.norm_z.as_ref().map(|v| {
+        let mle = vec_to_mle(v, t);
+        let vars = t.next_power_of_two().trailing_zeros() as usize;
+        let (nu, _, params) = params_from_vars(vars);
+        hyrax_commit(&mle.evaluations, nu, &params)
+    });
+    let attn_rem_com = witness
+        .attn_wit
+        .norm_rem
+        .as_ref()
+        .map(|m| commit_mat(m, t, d));
+    let attn_diff_com = witness
+        .attn_wit
+        .norm_diff
+        .as_ref()
+        .map(|m| commit_mat(m, t, d));
     let out_attn_com = commit_mat(&witness.o_proj_wit.y, t, d);
     let x_norm2_com = commit_mat(&witness.ln2_wit.y, t, d);
     let out_ffn_com = commit_mat(&witness.ffn_wit.y, t, d);
@@ -176,6 +221,11 @@ fn commit_block_intermediates(
         q_com,
         k_com,
         v_com,
+        attn_norm_com,
+        attn_num_com,
+        attn_z_com,
+        attn_rem_com,
+        attn_diff_com,
         out_attn_com,
         x_norm2_com,
         out_ffn_com,
@@ -212,6 +262,21 @@ fn prove_block_layernorms(
     absorb_com(transcript, b"q_com", &commits.q_com);
     absorb_com(transcript, b"k_com", &commits.k_com);
     absorb_com(transcript, b"v_com", &commits.v_com);
+    if let Some(ref c) = commits.attn_norm_com {
+        absorb_com(transcript, b"attn_norm_com", c);
+    }
+    if let Some(ref c) = commits.attn_num_com {
+        absorb_com(transcript, b"attn_num_com", c);
+    }
+    if let Some(ref c) = commits.attn_z_com {
+        absorb_com(transcript, b"attn_z_com", c);
+    }
+    if let Some(ref c) = commits.attn_rem_com {
+        absorb_com(transcript, b"attn_rem_com", c);
+    }
+    if let Some(ref c) = commits.attn_diff_com {
+        absorb_com(transcript, b"attn_diff_com", c);
+    }
     // out_attn_com not absorbed by any sub-prover; absorb explicitly here.
     absorb_com(transcript, b"out_attn_com", &commits.out_attn_com);
 
@@ -239,6 +304,11 @@ fn prove_block_layernorms(
         q_com: commits.q_com.clone(),
         k_com: commits.k_com.clone(),
         v_com: commits.v_com.clone(),
+        attn_norm_com: commits.attn_norm_com.clone(),
+        attn_num_com: commits.attn_num_com.clone(),
+        attn_z_com: commits.attn_z_com.clone(),
+        attn_rem_com: commits.attn_rem_com.clone(),
+        attn_diff_com: commits.attn_diff_com.clone(),
         out_attn_com: commits.out_attn_com.clone(),
         x_norm2_com: commits.x_norm2_com.clone(),
         out_ffn_com: commits.out_ffn_com.clone(),
@@ -295,6 +365,10 @@ pub struct TransformerModelProof {
     pub batch_ffn_m: SumcheckProofMulti,
     pub batch_attn_out: SumcheckProofMulti,
     pub batch_attn_ctx: SumcheckProofMulti,
+    pub attn_norm_sumcheck: Option<SumcheckCubicProofMulti>,
+    pub attn_norm_range_m: Option<GlobalRangeM>,
+    pub attn_norm_rem_range_proofs: Vec<RangeWitnessProof>,
+    pub attn_norm_diff_range_proofs: Vec<RangeWitnessProof>,
 
     // Global batch open for 5L intermediate matrices at shared r_td
     pub inter_batch_open: HyraxProof,
@@ -320,6 +394,13 @@ pub struct TransformerModelProof {
     pub phi_q_batch_open: HyraxProof,
     pub phi_k_batch_open: HyraxProof,
     pub v_attn_batch_open: HyraxProof,
+    pub attn_num_batch_open: Option<HyraxProof>,
+    pub attn_norm_batch_open: Option<HyraxProof>,
+    pub attn_num_attn_open: Option<HyraxProof>,
+    pub attn_norm_oproj_open: Option<HyraxProof>,
+    pub attn_z_open: Option<HyraxProof>,
+    pub attn_rem_open: Option<HyraxProof>,
+    pub attn_diff_open: Option<HyraxProof>,
     pub causal_ctx_prefix_evals: Vec<F>,
     pub causal_phi_k_prefix_evals: Vec<F>,
     pub causal_v_prefix_evals: Vec<F>,
@@ -560,6 +641,46 @@ pub fn prove(
         prove_range_batched(&ln_range_refs, LAYERNORM_RANGE_BITS, transcript)?;
     let mut ln_range_proofs = ln_range_proofs.into_iter();
     let mut ln_range_rvs = ln_range_rvs.into_iter();
+
+    let mut norm_range_witnesses: Vec<RangeProofWitness> = Vec::new();
+    let has_attn_norm = witness
+        .block_witnesses
+        .iter()
+        .any(|b| b.attn_wit.normalized_out.is_some());
+    if has_attn_norm {
+        for (i, b) in witness.block_witnesses.iter().enumerate() {
+            let rem =
+                b.attn_wit.norm_rem.as_ref().ok_or_else(|| {
+                    format!("block {i}: missing attention normalization remainder")
+                })?;
+            let diff = b
+                .attn_wit
+                .norm_diff
+                .as_ref()
+                .ok_or_else(|| format!("block {i}: missing attention normalization diff"))?;
+            norm_range_witnesses.push(RangeProofWitness {
+                values: flatten_mat_values(rem),
+            });
+            norm_range_witnesses.push(RangeProofWitness {
+                values: flatten_mat_values(diff),
+            });
+        }
+    }
+    let (attn_norm_rem_range_proofs, attn_norm_diff_range_proofs, attn_norm_range_m) =
+        if has_attn_norm {
+            let refs: Vec<&RangeProofWitness> = norm_range_witnesses.iter().collect();
+            let (proofs, m, _) = prove_range_batched(&refs, ATTN_NORM_RANGE_BITS, transcript)?;
+            let mut rem = Vec::with_capacity(num_blocks);
+            let mut diff = Vec::with_capacity(num_blocks);
+            let mut it = proofs.into_iter();
+            for _ in 0..num_blocks {
+                rem.push(it.next().expect("missing attention rem range proof"));
+                diff.push(it.next().expect("missing attention diff range proof"));
+            }
+            (rem, diff, Some(m))
+        } else {
+            (Vec::new(), Vec::new(), None)
+        };
 
     for i in 0..num_blocks {
         let range_proofs = [
@@ -841,12 +962,16 @@ pub fn prove(
             absorb_com(transcript, b"causal_ctx_com", ctx_com);
         }
 
-        // out_i(r_t, r_k_o) = x_inner_i = batch_oproj.final_evals_f[i] / alpha_o
-        let alpha_o = bpk.o_pk.vk.alpha;
-        let out_eval_i = if alpha_o == F::from(0u64) {
-            F::from(0u64)
+        let out_eval_i = if bw.attn_wit.normalized_out.is_some() {
+            mat_to_mle(&bw.attn_wit.out, t, d).evaluate(&combine(&r_t, &r_k_o))
         } else {
-            batch_oproj.final_evals_f[i] * alpha_o.inverse().unwrap()
+            // Legacy unnormalized mode: attention output is the O-proj input.
+            let alpha_o = bpk.o_pk.vk.alpha;
+            if alpha_o == F::from(0u64) {
+                F::from(0u64)
+            } else {
+                batch_oproj.final_evals_f[i] * alpha_o.inverse().unwrap()
+            }
         };
 
         phi_q_mles.push(phi_q_mle);
@@ -949,6 +1074,80 @@ pub fn prove(
         claim_attn_ctx,
         transcript,
     );
+
+    let (attn_norm_sumcheck, attn_norm_r) = if has_attn_norm {
+        let r = challenge_vec(transcript, td_num_vars, b"attn_norm_r");
+        let lambda = transcript.challenge_field::<F>(b"attn_norm_lambda");
+        let eq = DenseMLPoly::new(eq_evals_msb(&r, 1usize << td_num_vars));
+        let one = DenseMLPoly::new(vec![F::ONE; 1 << td_num_vars]);
+        let scale_f = F::from(ATTN_NORM_SCALE);
+        let mut fs = Vec::with_capacity(7 * num_blocks);
+        let mut gs = Vec::with_capacity(7 * num_blocks);
+        let mut hs = Vec::with_capacity(7 * num_blocks);
+        let mut ws = Vec::with_capacity(7 * num_blocks);
+        for (i, bw) in witness.block_witnesses.iter().enumerate() {
+            let y = bw
+                .attn_wit
+                .normalized_out
+                .as_ref()
+                .ok_or_else(|| format!("block {i}: missing normalized attention output"))?;
+            let z = bw
+                .attn_wit
+                .norm_z
+                .as_ref()
+                .ok_or_else(|| format!("block {i}: missing attention z"))?;
+            let rem = bw
+                .attn_wit
+                .norm_rem
+                .as_ref()
+                .ok_or_else(|| format!("block {i}: missing attention rem"))?;
+            let diff = bw
+                .attn_wit
+                .norm_diff
+                .as_ref()
+                .ok_or_else(|| format!("block {i}: missing attention diff"))?;
+            let n_mle = mat_to_mle(&bw.attn_wit.out, t, d);
+            let y_mle = mat_to_mle(y, t, d);
+            let r_mle = mat_to_mle(rem, t, d);
+            let d_mle = mat_to_mle(diff, t, d);
+            let z_ext: Vec<Vec<F>> = (0..t).map(|row| vec![z[row]; d]).collect();
+            let z_mle = mat_to_mle(&z_ext, t, d);
+
+            fs.extend(vec![eq.clone(); 7]);
+            gs.extend(vec![
+                n_mle.clone(),
+                r_mle.clone(),
+                z_mle.clone(),
+                z_mle.clone(),
+                one.clone(),
+                r_mle.clone(),
+                d_mle.clone(),
+            ]);
+            hs.extend(vec![
+                one.clone(),
+                one.clone(),
+                y_mle,
+                one.clone(),
+                one.clone(),
+                one.clone(),
+                one.clone(),
+            ]);
+            ws.extend(vec![
+                scale_f,
+                -F::ONE,
+                -F::ONE,
+                lambda,
+                -lambda,
+                -lambda,
+                -lambda,
+            ]);
+        }
+        let (proof, r_sc) =
+            prove_sumcheck_cubic_multi_batched(&fs, &gs, &hs, &ws, F::ZERO, transcript);
+        (Some(proof), Some(r_sc))
+    } else {
+        (None, None)
+    };
     // =========================================================================
     // 7. Per-block FFN: Lasso + M commit + absorb coms
     // =========================================================================
@@ -1170,6 +1369,11 @@ pub fn prove(
             q_com: p1.q_com.clone(),
             k_com: p1.k_com.clone(),
             v_com: p1.v_com.clone(),
+            attn_norm_com: p1.attn_norm_com.clone(),
+            attn_num_com: p1.attn_num_com.clone(),
+            attn_z_com: p1.attn_z_com.clone(),
+            attn_rem_com: p1.attn_rem_com.clone(),
+            attn_diff_com: p1.attn_diff_com.clone(),
             out_attn_com: p1.out_attn_com.clone(),
             x_norm2_com: p1.x_norm2_com.clone(),
             out_ffn_com: p1.out_ffn_com.clone(),
@@ -1233,9 +1437,9 @@ pub fn prove(
         hyrax_open(&logits_mle.evaluations, &lm_y_claim.point, lm_nu, lm_sigma);
 
     // =========================================================================
-    // 13. Advance transcript for accumulator mu challenges (12 accumulators)
+    // 13. Advance transcript for accumulator mu challenges
     // =========================================================================
-    for _ in 0..12 {
+    for _ in 0..15 {
         let _ = transcript.challenge_field::<F>(b"hyrax_group_mu");
     }
 
@@ -1435,6 +1639,98 @@ pub fn prove(
         None
     };
 
+    let (
+        attn_num_batch_open,
+        attn_norm_batch_open,
+        attn_z_open,
+        attn_rem_open,
+        attn_diff_open,
+        attn_num_attn_open,
+        attn_norm_oproj_open,
+    ) = if let Some(ref r_norm) = attn_norm_r {
+        let r_norm_t = r_norm[..t_bits].to_vec();
+        let num_evals: Vec<Vec<F>> = witness
+            .block_witnesses
+            .iter()
+            .map(|b| mat_to_mle(&b.attn_wit.out, t, d).evaluations)
+            .collect();
+        let norm_evals: Vec<Vec<F>> = witness
+            .block_witnesses
+            .iter()
+            .map(|b| {
+                mat_to_mle(
+                    b.attn_wit
+                        .normalized_out
+                        .as_ref()
+                        .expect("missing normalized attention"),
+                    t,
+                    d,
+                )
+                .evaluations
+            })
+            .collect();
+        let z_evals: Vec<Vec<F>> = witness
+            .block_witnesses
+            .iter()
+            .map(|b| {
+                vec_to_mle(b.attn_wit.norm_z.as_ref().expect("missing attention z"), t).evaluations
+            })
+            .collect();
+        let rem_evals: Vec<Vec<F>> = witness
+            .block_witnesses
+            .iter()
+            .map(|b| {
+                mat_to_mle(b.attn_wit.norm_rem.as_ref().expect("missing rem"), t, d).evaluations
+            })
+            .collect();
+        let diff_evals: Vec<Vec<F>> = witness
+            .block_witnesses
+            .iter()
+            .map(|b| {
+                mat_to_mle(b.attn_wit.norm_diff.as_ref().expect("missing diff"), t, d).evaluations
+            })
+            .collect();
+        let num_refs: Vec<&[F]> = num_evals.iter().map(|v| v.as_slice()).collect();
+        let norm_refs: Vec<&[F]> = norm_evals.iter().map(|v| v.as_slice()).collect();
+        let z_refs: Vec<&[F]> = z_evals.iter().map(|v| v.as_slice()).collect();
+        let rem_refs: Vec<&[F]> = rem_evals.iter().map(|v| v.as_slice()).collect();
+        let diff_refs: Vec<&[F]> = diff_evals.iter().map(|v| v.as_slice()).collect();
+        let (nu_t, sigma_t, _) = params_from_vars(t_bits);
+        (
+            Some(hyrax_open_batch(
+                &num_refs, r_norm, nu_td, sigma_td, transcript,
+            )),
+            Some(hyrax_open_batch(
+                &norm_refs, r_norm, nu_td, sigma_td, transcript,
+            )),
+            Some(hyrax_open_batch(
+                &z_refs, &r_norm_t, nu_t, sigma_t, transcript,
+            )),
+            Some(hyrax_open_batch(
+                &rem_refs, r_norm, nu_td, sigma_td, transcript,
+            )),
+            Some(hyrax_open_batch(
+                &diff_refs, r_norm, nu_td, sigma_td, transcript,
+            )),
+            Some(hyrax_open_batch(
+                &num_refs,
+                &combine(&r_t, &r_k_o),
+                nu_td,
+                sigma_td,
+                transcript,
+            )),
+            Some(hyrax_open_batch(
+                &norm_refs,
+                &combine(&r_t, &r_k_o),
+                nu_td,
+                sigma_td,
+                transcript,
+            )),
+        )
+    } else {
+        (None, None, None, None, None, None, None)
+    };
+
     // =========================================================================
     // 16. Global batched Lasso (attention)
     // =========================================================================
@@ -1559,6 +1855,10 @@ pub fn prove(
         batch_ffn_m,
         batch_attn_out,
         batch_attn_ctx,
+        attn_norm_sumcheck,
+        attn_norm_range_m,
+        attn_norm_rem_range_proofs,
+        attn_norm_diff_range_proofs,
         inter_batch_open,
         x_norm1_batch_open,
         w_q_batch_open,
@@ -1578,6 +1878,13 @@ pub fn prove(
         phi_q_batch_open,
         phi_k_batch_open,
         v_attn_batch_open,
+        attn_num_batch_open,
+        attn_norm_batch_open,
+        attn_num_attn_open,
+        attn_norm_oproj_open,
+        attn_z_open,
+        attn_rem_open,
+        attn_diff_open,
         causal_ctx_prefix_evals,
         causal_phi_k_prefix_evals,
         causal_v_prefix_evals,
@@ -1814,6 +2121,10 @@ mod tests {
             k_query_indices: vec![7, 0, 7, 0],
             context: zero_out.clone(),
             causal_context: None,
+            normalized_out: None,
+            norm_z: None,
+            norm_rem: None,
+            norm_diff: None,
             out: zero_out.clone(),
         };
         let o_proj_wit = ProjectionWitness {

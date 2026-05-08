@@ -100,6 +100,17 @@ pub struct LinearAttentionWitness {
     /// For row `i * d_head + a`, value `[b]` is
     /// `sum_{s <= i} phi_k[s][a] * v[s][b]`.
     pub causal_context: Option<Vec<Vec<F>>>,
+    /// Optional normalized attention output used as the input to W_O.
+    /// When present, the model proof enforces
+    /// `out * ATTN_NORM_SCALE = z * normalized_out + rem` and
+    /// `0 <= rem < z` entrywise.
+    pub normalized_out: Option<Vec<Vec<F>>>,
+    /// Per-row attention denominator `z[t] = phi_q[t] · sum_s phi_k[s]`.
+    pub norm_z: Option<Vec<F>>,
+    /// Euclidean division remainder for normalized attention.
+    pub norm_rem: Option<Vec<Vec<F>>>,
+    /// `z[t] - 1 - rem[t][j]`, range-proved to enforce `rem < z`.
+    pub norm_diff: Option<Vec<Vec<F>>>,
     pub out: Vec<Vec<F>>,
 }
 
@@ -591,6 +602,10 @@ mod linear_attention_tests {
             k_query_indices: k_query_indices_wit,
             context,
             causal_context: None,
+            normalized_out: None,
+            norm_z: None,
+            norm_rem: None,
+            norm_diff: None,
             out: out.clone(),
         };
 

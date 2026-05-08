@@ -141,6 +141,49 @@ def _attn_out(
     return mat_mul_int(phi_q, context)
 
 
+def _attention_denominator(phi_q: List[List[int]], phi_k: List[List[int]]) -> List[int]:
+    """z_i = φ(Q_i) · Σ_s φ(K_s)."""
+    t = len(phi_q)
+    d = len(phi_q[0]) if t else 0
+    k_sum = [sum(phi_k[s][a] for s in range(t)) for a in range(d)]
+    return [sum(phi_q[i][a] * k_sum[a] for a in range(d)) for i in range(t)]
+
+
+def _normalize_attention_floor(
+    numerator: List[List[int]], z: List[int], scale: int
+) -> Tuple[List[List[int]], List[List[int]], List[List[int]]]:
+    """Return floor-normalized output plus remainder and z-1-remainder witnesses."""
+    if scale <= 0:
+        raise ValueError("attention_scale must be positive")
+    y: List[List[int]] = []
+    rem: List[List[int]] = []
+    diff: List[List[int]] = []
+    for i, row in enumerate(numerator):
+        zi = z[i]
+        if zi <= 0:
+            raise ValueError(
+                f"attention normalizer z[{i}]={zi} is not positive; "
+                "the normalization proof requires z > 0"
+            )
+        y_row: List[int] = []
+        rem_row: List[int] = []
+        diff_row: List[int] = []
+        for n in row:
+            num = n * scale
+            q = num // zi
+            r = num - zi * q
+            d = zi - 1 - r
+            if r < 0 or d < 0:
+                raise ValueError("internal attention normalization remainder error")
+            y_row.append(q)
+            rem_row.append(r)
+            diff_row.append(d)
+        y.append(y_row)
+        rem.append(rem_row)
+        diff.append(diff_row)
+    return y, rem, diff
+
+
 def _causal_context_matrix(
     phi_k: List[List[int]], v: List[List[int]]
 ) -> List[List[int]]:
@@ -307,11 +350,35 @@ def _gen_block_witness(
     causal = bool(getattr(attn, "causal", False))
     context = _context_matrix(phi_k, v_raw)  # (d_head, d_head)
     causal_context = None
+    norm_z = None
     if causal:
         causal_context = _causal_context_matrix(phi_k, v_raw)
         attn_out = _causal_attn_out(phi_q, causal_context)  # (T, d_head)
     else:
         attn_out = _attn_out(phi_q, context)  # (T, d_head)
+        norm_z = _attention_denominator(phi_q, phi_k)
+
+    attention_mode = getattr(attn, "attention_mode", "normalized_float")
+    attention_scale = int(getattr(attn, "attention_scale", 64))
+    if attention_mode == "normalized_float":
+        raise ValueError(
+            "Rust proof export cannot prove attention_mode='normalized_float'. "
+            "Use attention_mode='normalized_fixed' for fixed-point normalization "
+            "or attention_mode='prover' for unnormalized legacy math."
+        )
+    if attention_mode == "normalized_fixed":
+        if causal:
+            raise ValueError(
+                "attention_mode='normalized_fixed' is currently supported for "
+                "non-causal attention only"
+            )
+        attn_proj_in, norm_rem, norm_diff = _normalize_attention_floor(
+            attn_out, norm_z or [], attention_scale
+        )
+    else:
+        attn_proj_in = attn_out
+        norm_rem = None
+        norm_diff = None
 
     # ---- Output projection ----
     w_o = extract_ternary_weight_matrix(
@@ -325,7 +392,7 @@ def _gen_block_witness(
         if attn.out_proj.bias is not None
         else None
     )
-    out_attn = _add_bias_int(_project(attn_out, w_o_T), o_bias)
+    out_attn = _add_bias_int(_project(attn_proj_in, w_o_T), o_bias)
 
     # ---- Residual 1 ----
     x_mid = mat_add_int(x_in, out_attn)
@@ -411,9 +478,21 @@ def _gen_block_witness(
             "q_query_indices": q_indices,
             "k_query_indices": k_indices,
             "context": mat_to_json(context),
+            "normalized_out": (
+                mat_to_json(attn_proj_in)
+                if attention_mode == "normalized_fixed"
+                else None
+            ),
+            "norm_z": (
+                vec_to_json(norm_z)
+                if norm_z is not None and attention_mode == "normalized_fixed"
+                else None
+            ),
+            "norm_rem": mat_to_json(norm_rem) if norm_rem is not None else None,
+            "norm_diff": mat_to_json(norm_diff) if norm_diff is not None else None,
             "out": mat_to_json(attn_out),
         },
-        "o_proj": {"x": mat_to_json(attn_out), "y": mat_to_json(out_attn)},
+        "o_proj": {"x": mat_to_json(attn_proj_in), "y": mat_to_json(out_attn)},
         "x_mid": mat_to_json(x_mid),
         "ln2": {
             "x": mat_to_json(x_mid),

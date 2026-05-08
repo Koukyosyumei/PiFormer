@@ -945,6 +945,11 @@ fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Resu
     write_hyrax_commitment(w, &p.q_com)?;
     write_hyrax_commitment(w, &p.k_com)?;
     write_hyrax_commitment(w, &p.v_com)?;
+    write_opt_hyrax_commitment(w, &p.attn_norm_com)?;
+    write_opt_hyrax_commitment(w, &p.attn_num_com)?;
+    write_opt_hyrax_commitment(w, &p.attn_z_com)?;
+    write_opt_hyrax_commitment(w, &p.attn_rem_com)?;
+    write_opt_hyrax_commitment(w, &p.attn_diff_com)?;
     write_hyrax_commitment(w, &p.out_attn_com)?;
     write_hyrax_commitment(w, &p.x_norm2_com)?;
     write_hyrax_commitment(w, &p.out_ffn_com)?;
@@ -985,6 +990,11 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
         q_com: read_hyrax_commitment(r)?,
         k_com: read_hyrax_commitment(r)?,
         v_com: read_hyrax_commitment(r)?,
+        attn_norm_com: read_opt_hyrax_commitment(r)?,
+        attn_num_com: read_opt_hyrax_commitment(r)?,
+        attn_z_com: read_opt_hyrax_commitment(r)?,
+        attn_rem_com: read_opt_hyrax_commitment(r)?,
+        attn_diff_com: read_opt_hyrax_commitment(r)?,
         out_attn_com: read_hyrax_commitment(r)?,
         x_norm2_com: read_hyrax_commitment(r)?,
         out_ffn_com: read_hyrax_commitment(r)?,
@@ -1034,6 +1044,16 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_sumcheck_proof_multi(w, &p.batch_ffn_m)?;
     write_sumcheck_proof_multi(w, &p.batch_attn_out)?;
     write_sumcheck_proof_multi(w, &p.batch_attn_ctx)?;
+    write_bool(w, p.attn_norm_sumcheck.is_some())?;
+    if let Some(ref sc) = p.attn_norm_sumcheck {
+        write_sumcheck_cubic_proof_multi(w, sc)?;
+    }
+    write_bool(w, p.attn_norm_range_m.is_some())?;
+    if let Some(ref m) = p.attn_norm_range_m {
+        write_global_range_m(w, m)?;
+    }
+    write_vec(w, &p.attn_norm_rem_range_proofs, write_range_witness_proof)?;
+    write_vec(w, &p.attn_norm_diff_range_proofs, write_range_witness_proof)?;
     // Global intermediate batch open
     write_hyrax_proof(w, &p.inter_batch_open)?;
     // 13 cross-block weight/activation batch opens
@@ -1056,6 +1076,13 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_hyrax_proof(w, &p.phi_q_batch_open)?;
     write_hyrax_proof(w, &p.phi_k_batch_open)?;
     write_hyrax_proof(w, &p.v_attn_batch_open)?;
+    write_opt_hyrax_proof(w, &p.attn_num_batch_open)?;
+    write_opt_hyrax_proof(w, &p.attn_norm_batch_open)?;
+    write_opt_hyrax_proof(w, &p.attn_num_attn_open)?;
+    write_opt_hyrax_proof(w, &p.attn_norm_oproj_open)?;
+    write_opt_hyrax_proof(w, &p.attn_z_open)?;
+    write_opt_hyrax_proof(w, &p.attn_rem_open)?;
+    write_opt_hyrax_proof(w, &p.attn_diff_open)?;
     write_vec_f(w, &p.causal_ctx_prefix_evals)?;
     write_vec_f(w, &p.causal_phi_k_prefix_evals)?;
     write_vec_f(w, &p.causal_v_prefix_evals)?;
@@ -1084,6 +1111,18 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         batch_ffn_m: read_sumcheck_proof_multi(r)?,
         batch_attn_out: read_sumcheck_proof_multi(r)?,
         batch_attn_ctx: read_sumcheck_proof_multi(r)?,
+        attn_norm_sumcheck: if read_bool(r)? {
+            Some(read_sumcheck_cubic_proof_multi(r)?)
+        } else {
+            None
+        },
+        attn_norm_range_m: if read_bool(r)? {
+            Some(read_global_range_m(r)?)
+        } else {
+            None
+        },
+        attn_norm_rem_range_proofs: read_vec(r, read_range_witness_proof)?,
+        attn_norm_diff_range_proofs: read_vec(r, read_range_witness_proof)?,
         // Global intermediate batch open
         inter_batch_open: read_hyrax_proof(r)?,
         // 13 cross-block weight/activation batch opens
@@ -1106,6 +1145,13 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         phi_q_batch_open: read_hyrax_proof(r)?,
         phi_k_batch_open: read_hyrax_proof(r)?,
         v_attn_batch_open: read_hyrax_proof(r)?,
+        attn_num_batch_open: read_opt_hyrax_proof(r)?,
+        attn_norm_batch_open: read_opt_hyrax_proof(r)?,
+        attn_num_attn_open: read_opt_hyrax_proof(r)?,
+        attn_norm_oproj_open: read_opt_hyrax_proof(r)?,
+        attn_z_open: read_opt_hyrax_proof(r)?,
+        attn_rem_open: read_opt_hyrax_proof(r)?,
+        attn_diff_open: read_opt_hyrax_proof(r)?,
         causal_ctx_prefix_evals: read_vec_f(r)?,
         causal_phi_k_prefix_evals: read_vec_f(r)?,
         causal_v_prefix_evals: read_vec_f(r)?,

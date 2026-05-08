@@ -362,6 +362,14 @@ pub struct JsonAttnWitness {
     pub context: Vec<Vec<String>>,
     #[serde(default)]
     pub causal_context: Option<Vec<Vec<String>>>,
+    #[serde(default)]
+    pub normalized_out: Option<Vec<Vec<String>>>,
+    #[serde(default)]
+    pub norm_z: Option<Vec<String>>,
+    #[serde(default)]
+    pub norm_rem: Option<Vec<Vec<String>>>,
+    #[serde(default)]
+    pub norm_diff: Option<Vec<Vec<String>>>,
     pub out: Vec<Vec<String>>,
 }
 
@@ -486,6 +494,10 @@ fn attn_wit_to_json(w: &LinearAttentionWitness) -> JsonAttnWitness {
         k_query_indices: w.k_query_indices.clone(),
         context: mat_to_json(&w.context),
         causal_context: w.causal_context.as_ref().map(|m| mat_to_json(m)),
+        normalized_out: w.normalized_out.as_ref().map(|m| mat_to_json(m)),
+        norm_z: w.norm_z.as_ref().map(|v| vec_to_json(v)),
+        norm_rem: w.norm_rem.as_ref().map(|m| mat_to_json(m)),
+        norm_diff: w.norm_diff.as_ref().map(|m| mat_to_json(m)),
         out: mat_to_json(&w.out),
     }
 }
@@ -505,6 +517,26 @@ fn attn_wit_from_json(j: JsonAttnWitness) -> Result<LinearAttentionWitness, Stri
             .map(mat_from_json)
             .transpose()
             .map_err(|e| format!("causal_context: {e}"))?,
+        normalized_out: j
+            .normalized_out
+            .map(mat_from_json)
+            .transpose()
+            .map_err(|e| format!("normalized_out: {e}"))?,
+        norm_z: j
+            .norm_z
+            .map(vec_from_json)
+            .transpose()
+            .map_err(|e| format!("norm_z: {e}"))?,
+        norm_rem: j
+            .norm_rem
+            .map(mat_from_json)
+            .transpose()
+            .map_err(|e| format!("norm_rem: {e}"))?,
+        norm_diff: j
+            .norm_diff
+            .map(mat_from_json)
+            .transpose()
+            .map_err(|e| format!("norm_diff: {e}"))?,
         out: mat_from_json(j.out)?,
     })
 }
