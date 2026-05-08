@@ -650,6 +650,56 @@ impl HyraxBatchAccumulator {
         }
         Ok(())
     }
+
+    /// Fuse several accumulators that use identical Hyrax parameters into one
+    /// randomized commitment check. Each group keeps its own `mu` challenge;
+    /// `rho` randomizes across groups so invalid groups cannot cancel except
+    /// with negligible probability.
+    pub fn finalize_many_with_mus(
+        params: &HyraxParams,
+        groups: Vec<(HyraxBatchAccumulator, F)>,
+        rho: F,
+    ) -> Result<(), String> {
+        let num_cols = params.gens.len();
+        let rho_pows = powers_of(rho, groups.len());
+        let mut w_prime_combined = vec![F::ZERO; num_cols];
+        let mut all_points: Vec<G1Affine> = Vec::new();
+        let mut all_scalars: Vec<F> = Vec::new();
+
+        for ((acc, mu), rho_g) in groups.into_iter().zip(rho_pows.into_iter()) {
+            if acc.slots.is_empty() {
+                continue;
+            }
+            let mu_pows = powers_of(mu, acc.slots.len());
+            let total: usize = acc.slots.iter().map(|s| s.row_coms.len()).sum();
+            all_points.reserve(total);
+            all_scalars.reserve(total);
+
+            for (k, slot) in acc.slots.into_iter().enumerate() {
+                let group_weight = rho_g * mu_pows[k];
+                for (j, &w) in slot.w_prime.iter().enumerate() {
+                    w_prime_combined[j] += group_weight * w;
+                }
+                for (com, scalar) in slot.row_coms.into_iter().zip(slot.row_scalars.into_iter()) {
+                    all_points.push(com);
+                    all_scalars.push(group_weight * scalar);
+                }
+            }
+        }
+
+        if all_points.is_empty() {
+            return Ok(());
+        }
+
+        let lhs = msm(&all_points, &all_scalars);
+        let rhs = msm(&params.gens, &w_prime_combined);
+        if lhs != rhs {
+            return Err(
+                "HyraxBatchAccumulator fused finalize: commitment check failed".to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

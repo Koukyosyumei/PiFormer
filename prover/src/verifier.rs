@@ -865,14 +865,19 @@ pub fn verify(
     let mu_rng_m = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_quant_ffn = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_quant_m = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let rho_td = transcript.challenge_field_readonly::<F>(b"hyrax_fuse_td");
+    let rho_range_m = transcript.challenge_field_readonly::<F>(b"hyrax_fuse_range_m");
 
     let ((r0, r1), (r2, r3)) = rayon::join(
         || {
             rayon::join(
                 || {
-                    inter_acc
-                        .finalize_with_mu(&params_td, mu_inter)
-                        .map_err(|e| format!("inter_acc: {e}"))
+                    HyraxBatchAccumulator::finalize_many_with_mus(
+                        &params_td,
+                        vec![(inter_acc, mu_inter), (ln_acc_td, mu_ln_td)],
+                        rho_td,
+                    )
+                    .map_err(|e| format!("td fused acc: {e}"))
                 },
                 || {
                     ln_acc_t
@@ -884,14 +889,14 @@ pub fn verify(
         || {
             rayon::join(
                 || {
-                    ln_acc_td
-                        .finalize_with_mu(&params_td, mu_ln_td)
-                        .map_err(|e| format!("ln_acc_td: {e}"))
-                },
-                || {
                     proj_acc_w
                         .finalize_with_mu(&params_qkvo_w, mu_proj_w)
                         .map_err(|e| format!("proj_acc_w: {e}"))
+                },
+                || {
+                    acc_quant_ffn
+                        .finalize_with_mu(&params_mff, mu_quant_ffn)
+                        .map_err(|e| format!("acc_quant_ffn: {e}"))
                 },
             )
         },
@@ -933,23 +938,16 @@ pub fn verify(
                 .map_err(|e| format!("acc_range_y: {e}"))
         },
         || {
-            acc_range_m
-                .finalize_with_mu(&params_range_m, mu_rng_m)
-                .map_err(|e| format!("acc_range_m: {e}"))
+            HyraxBatchAccumulator::finalize_many_with_mus(
+                &params_range_m,
+                vec![(acc_range_m, mu_rng_m), (acc_quant_m, mu_quant_m)],
+                rho_range_m,
+            )
+            .map_err(|e| format!("range_m fused acc: {e}"))
         },
     );
-    let (r10, r11) = rayon::join(
-        || {
-            acc_quant_ffn
-                .finalize_with_mu(&params_mff, mu_quant_ffn)
-                .map_err(|e| format!("acc_quant_ffn: {e}"))
-        },
-        || {
-            acc_quant_m
-                .finalize_with_mu(&params_range_m, mu_quant_m)
-                .map_err(|e| format!("acc_quant_m: {e}"))
-        },
-    );
+    let r10: Result<(), String> = Ok(());
+    let r11: Result<(), String> = Ok(());
     eprintln!(
         "[model] acc_finalize:{:>8.3}ms",
         _tacc.elapsed().as_secs_f64() * 1000.0

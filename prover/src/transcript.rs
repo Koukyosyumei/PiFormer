@@ -53,6 +53,18 @@ impl Transcript {
         self.hasher.update(&hash);
         F::from_le_bytes_mod_order(&hash)
     }
+
+    /// Squeeze a verifier-local challenge without mutating the transcript.
+    ///
+    /// Use this only for local batching checks whose challenge is not part of
+    /// the prover/verifier transcript schedule. It must not replace protocol
+    /// Fiat-Shamir challenges that the prover also needs to derive.
+    pub fn challenge_field_readonly<F: PrimeField>(&self, label: &[u8]) -> F {
+        let mut h = self.hasher.clone();
+        h.update(label);
+        let hash = h.finalize();
+        F::from_le_bytes_mod_order(&hash)
+    }
 }
 
 pub fn challenge_vec(transcript: &mut Transcript, len: usize, label: &[u8]) -> Vec<F> {
