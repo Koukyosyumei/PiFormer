@@ -938,7 +938,6 @@ fn read_proj_proof<R: Read>(r: &mut R) -> io::Result<ProjectionProof> {
 fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Result<()> {
     write_ln_proof(w, &p.ln1_proof)?;
     write_ln_proof(w, &p.ln2_proof)?;
-    write_global_range_m(w, &p.block_range_m)?;
     // FFN per-block
     write_lasso_proof(w, &p.ffn_lasso_proof)?;
     write_hyrax_commitment(w, &p.ffn_a_com)?;
@@ -979,7 +978,6 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
     Ok(TransformerBlockProof {
         ln1_proof: read_ln_proof(r)?,
         ln2_proof: read_ln_proof(r)?,
-        block_range_m: read_global_range_m(r)?,
         // FFN per-block
         ffn_lasso_proof: read_lasso_proof(r)?,
         ffn_a_com: read_hyrax_commitment(r)?,
@@ -1030,7 +1028,7 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_lasso_multi_proof(w, &p.all_lasso_proof)?;
     write_quantization_proof(w, &p.ffn_quant_proof)?;
     write_quantization_proof(w, &p.qk_quant_proof)?;
-    write_global_range_m(w, &p.final_range_m)?;
+    write_global_range_m(w, &p.ln_range_m)?;
     // Cross-block batch sumchecks
     write_sumcheck_proof_multi(w, &p.batch_qkv)?;
     write_sumcheck_proof_multi(w, &p.batch_oproj)?;
@@ -1080,7 +1078,7 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         all_lasso_proof: read_lasso_multi_proof(r)?,
         ffn_quant_proof: read_quantization_proof(r)?,
         qk_quant_proof: read_quantization_proof(r)?,
-        final_range_m: read_global_range_m(r)?,
+        ln_range_m: read_global_range_m(r)?,
         // Cross-block batch sumchecks
         batch_qkv: read_sumcheck_proof_multi(r)?,
         batch_oproj: read_sumcheck_proof_multi(r)?,

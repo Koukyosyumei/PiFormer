@@ -300,39 +300,49 @@ pub fn verify(
     // 2. Phase 1: verify range proofs + LN1 + LN2 for all blocks
     // =========================================================================
     let mut current_x_com = proof.x_in_com.clone();
+    let ln_sigma_n = (2 * t).next_power_of_two().trailing_zeros() as usize;
+    let ln_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
+    let mut ln_range_proofs = Vec::with_capacity(4 * num_blocks + 2);
+    let mut ln_range_num_vars = Vec::with_capacity(4 * num_blocks + 2);
+    for bp in &proof.block_proofs {
+        ln_range_proofs.push(&bp.ln1_proof.sigma_range_proof);
+        ln_range_num_vars.push(ln_sigma_n);
+        ln_range_proofs.push(&bp.ln1_proof.y_range_proof);
+        ln_range_num_vars.push(ln_y_n);
+        ln_range_proofs.push(&bp.ln2_proof.sigma_range_proof);
+        ln_range_num_vars.push(ln_sigma_n);
+        ln_range_proofs.push(&bp.ln2_proof.y_range_proof);
+        ln_range_num_vars.push(ln_y_n);
+    }
+    ln_range_proofs.push(&proof.final_ln_proof.sigma_range_proof);
+    ln_range_num_vars.push(ln_sigma_n);
+    ln_range_proofs.push(&proof.final_ln_proof.y_range_proof);
+    ln_range_num_vars.push(ln_y_n);
+
+    let _t0 = Instant::now();
+    let (ln_range_r_vs, _) = verify_range_batched(
+        &ln_range_proofs,
+        &proof.ln_range_m,
+        &ln_range_num_vars,
+        LAYERNORM_RANGE_BITS,
+        transcript,
+        &mut acc_range_sig,
+        &mut acc_range_y,
+        &mut acc_range_m,
+    )?;
+    eprintln!(
+        "[model] ln_range_batch:{:>8.3}ms",
+        _t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     for i in 0..num_blocks {
         let bp = &proof.block_proofs[i];
         let bvk = &vk.block_vks[i];
-        let ln_sigma_n = (2 * t).next_power_of_two().trailing_zeros() as usize;
-        let ln_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
-
-        let _t0 = Instant::now();
-        let (block_r_vs, _) = verify_range_batched(
-            &[
-                &bp.ln1_proof.sigma_range_proof,
-                &bp.ln1_proof.y_range_proof,
-                &bp.ln2_proof.sigma_range_proof,
-                &bp.ln2_proof.y_range_proof,
-            ],
-            &bp.block_range_m,
-            &[ln_sigma_n, ln_y_n, ln_sigma_n, ln_y_n],
-            LAYERNORM_RANGE_BITS,
-            transcript,
-            &mut acc_range_sig,
-            &mut acc_range_y,
-            &mut acc_range_m,
-        )?;
-        eprintln!(
-            "[block {}] range_batch:{:>8.3}ms",
-            i,
-            _t0.elapsed().as_secs_f64() * 1000.0
-        );
-
-        let ln1_sig_rv = &block_r_vs[0];
-        let ln1_y_rv = &block_r_vs[1];
-        let ln2_sig_rv = &block_r_vs[2];
-        let ln2_y_rv = &block_r_vs[3];
+        let rv_base = 4 * i;
+        let ln1_sig_rv = &ln_range_r_vs[rv_base];
+        let ln1_y_rv = &ln_range_r_vs[rv_base + 1];
+        let ln2_sig_rv = &ln_range_r_vs[rv_base + 2];
+        let ln2_y_rv = &ln_range_r_vs[rv_base + 3];
 
         // LN1
         let ln1_io = LayerNormIOCommitments {
@@ -785,28 +795,6 @@ pub fn verify(
     // =========================================================================
     // 10. Final LayerNorm
     // =========================================================================
-    let final_sigma_n = (2 * t).next_power_of_two().trailing_zeros() as usize;
-    let final_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
-    let _t0 = Instant::now();
-    let (final_r_vs, _) = verify_range_batched(
-        &[
-            &proof.final_ln_proof.sigma_range_proof,
-            &proof.final_ln_proof.y_range_proof,
-        ],
-        &proof.final_range_m,
-        &[final_sigma_n, final_y_n],
-        LAYERNORM_RANGE_BITS,
-        transcript,
-        &mut acc_range_sig,
-        &mut acc_range_y,
-        &mut acc_range_m,
-    )
-    .map_err(|e| format!("Final LN range: {e}"))?;
-    eprintln!(
-        "[model] final_range:{:>8.3}ms",
-        _t0.elapsed().as_secs_f64() * 1000.0
-    );
-
     let _t0 = Instant::now();
     let ln_io = LayerNormIOCommitments {
         x_com: current_x_com.clone(),
@@ -816,8 +804,8 @@ pub fn verify(
         &proof.final_ln_proof,
         &ln_io,
         &vk.final_ln_vk,
-        &final_r_vs[0],
-        &final_r_vs[1],
+        &ln_range_r_vs[4 * num_blocks],
+        &ln_range_r_vs[4 * num_blocks + 1],
         transcript,
         &mut ln_acc_t,
         &mut ln_acc_td,

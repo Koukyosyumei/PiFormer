@@ -34,7 +34,9 @@ use crate::lookup::lasso::{
     LassoOutputBinding, LassoProof,
 };
 use crate::lookup::quantization::{prove_quantization_batch, QuantizationProof};
-use crate::lookup::range::{prove_range_batched, GlobalRangeM};
+use crate::lookup::range::{
+    prove_range_batched, GlobalRangeM, RangeProofWitness, RangeWitnessProof,
+};
 use crate::subprotocols::{prove_sumcheck_multi_batched, SumcheckProofMulti};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey};
 
@@ -48,7 +50,6 @@ use crate::verifier::{add_commitments, TransformerBlockVerifyingKey};
 pub struct TransformerBlockProof {
     pub ln1_proof: LayerNormProof,
     pub ln2_proof: LayerNormProof,
-    pub block_range_m: GlobalRangeM,
 
     // FFN per-block: Lasso for activation + A/M commitments
     pub ffn_lasso_proof: LassoProof,
@@ -120,7 +121,20 @@ pub struct TransformerBlockWitness {
 struct BlockPhase1Data {
     ln1_proof: LayerNormProof,
     ln2_proof: LayerNormProof,
-    block_range_m: GlobalRangeM,
+    x_norm1_com: HyraxCommitment,
+    q_com: HyraxCommitment,
+    k_com: HyraxCommitment,
+    v_com: HyraxCommitment,
+    out_attn_com: HyraxCommitment,
+    x_norm2_com: HyraxCommitment,
+    out_ffn_com: HyraxCommitment,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: commit block intermediates, then prove LNs after global range batch
+// ---------------------------------------------------------------------------
+
+struct BlockCommitData {
     x_norm1_com: HyraxCommitment,
     q_com: HyraxCommitment,
     k_com: HyraxCommitment,
@@ -131,16 +145,11 @@ struct BlockPhase1Data {
     x_mid_com: HyraxCommitment,
 }
 
-// ---------------------------------------------------------------------------
-// Phase 1: commit + LN proofs + absorb into transcript
-// ---------------------------------------------------------------------------
-
-fn commit_block_phase1(
+fn commit_block_intermediates(
     witness: &TransformerBlockWitness,
     x_in_com: &HyraxCommitment,
     pk: &TransformerBlockVerifyingKey,
-    transcript: &mut Transcript,
-) -> Result<BlockPhase1Data, String> {
+) -> BlockCommitData {
     let t = pk.seq_len;
     let d = pk.d_model;
 
@@ -160,33 +169,35 @@ fn commit_block_phase1(
     let out_attn_com = commit_mat(&witness.o_proj_wit.y, t, d);
     let x_norm2_com = commit_mat(&witness.ln2_wit.y, t, d);
     let out_ffn_com = commit_mat(&witness.ffn_wit.y, t, d);
+    let x_mid_com = add_commitments(x_in_com, &out_attn_com);
 
-    // Range proofs for LN1 and LN2
-    let ln1_rw = compute_range_witnesses(&witness.ln1_wit, &pk.ln1_vk);
-    let ln2_rw = compute_range_witnesses(&witness.ln2_wit, &pk.ln2_vk);
-    let (mut block_range_proofs, block_range_m, block_r_vs) = prove_range_batched(
-        &[
-            &ln1_rw.sigma_witness,
-            &ln1_rw.y_witness,
-            &ln2_rw.sigma_witness,
-            &ln2_rw.y_witness,
-        ],
-        LAYERNORM_RANGE_BITS,
-        transcript,
-    )?;
-    let ln2_y_rp = block_range_proofs.remove(3);
-    let ln2_sig_rp = block_range_proofs.remove(2);
-    let ln1_y_rp = block_range_proofs.remove(1);
-    let ln1_sig_rp = block_range_proofs.remove(0);
-    let ln2_y_rv = block_r_vs[3].clone();
-    let ln2_sig_rv = block_r_vs[2].clone();
-    let ln1_y_rv = block_r_vs[1].clone();
-    let ln1_sig_rv = block_r_vs[0].clone();
+    BlockCommitData {
+        x_norm1_com,
+        q_com,
+        k_com,
+        v_com,
+        out_attn_com,
+        x_norm2_com,
+        out_ffn_com,
+        x_mid_com,
+    }
+}
 
+fn prove_block_layernorms(
+    witness: &TransformerBlockWitness,
+    x_in_com: &HyraxCommitment,
+    pk: &TransformerBlockVerifyingKey,
+    commits: &BlockCommitData,
+    range_proofs: [RangeWitnessProof; 4],
+    range_rvs: [Vec<F>; 4],
+    transcript: &mut Transcript,
+) -> Result<BlockPhase1Data, String> {
+    let [ln1_sig_rp, ln1_y_rp, ln2_sig_rp, ln2_y_rp] = range_proofs;
+    let [ln1_sig_rv, ln1_y_rv, ln2_sig_rv, ln2_y_rv] = range_rvs;
     // LN1 sub-prover: absorbs x_norm1_com as y_com
     let ln1_io = LayerNormIOCommitments {
         x_com: x_in_com.clone(),
-        y_com: Some(x_norm1_com.clone()),
+        y_com: Some(commits.x_norm1_com.clone()),
     };
     let ln1_proof = prove_layernorm(
         &witness.ln1_wit,
@@ -198,19 +209,16 @@ fn commit_block_phase1(
     )?;
 
     // Explicitly absorb q/k/v_com with the same labels attention uses.
-    absorb_com(transcript, b"q_com", &q_com);
-    absorb_com(transcript, b"k_com", &k_com);
-    absorb_com(transcript, b"v_com", &v_com);
+    absorb_com(transcript, b"q_com", &commits.q_com);
+    absorb_com(transcript, b"k_com", &commits.k_com);
+    absorb_com(transcript, b"v_com", &commits.v_com);
     // out_attn_com not absorbed by any sub-prover; absorb explicitly here.
-    absorb_com(transcript, b"out_attn_com", &out_attn_com);
-
-    // Residual 1 (homomorphic)
-    let x_mid_com = add_commitments(x_in_com, &out_attn_com);
+    absorb_com(transcript, b"out_attn_com", &commits.out_attn_com);
 
     // LN2 sub-prover: absorbs x_norm2_com as y_com
     let ln2_io = LayerNormIOCommitments {
-        x_com: x_mid_com.clone(),
-        y_com: Some(x_norm2_com.clone()),
+        x_com: commits.x_mid_com.clone(),
+        y_com: Some(commits.x_norm2_com.clone()),
     };
     let ln2_proof = prove_layernorm(
         &witness.ln2_wit,
@@ -222,20 +230,18 @@ fn commit_block_phase1(
     )?;
 
     // Absorb out_ffn_com so transcript stays consistent with Phase 1.
-    absorb_com(transcript, b"y_com", &out_ffn_com);
+    absorb_com(transcript, b"y_com", &commits.out_ffn_com);
 
     Ok(BlockPhase1Data {
         ln1_proof,
         ln2_proof,
-        block_range_m,
-        x_norm1_com,
-        q_com,
-        k_com,
-        v_com,
-        out_attn_com,
-        x_norm2_com,
-        out_ffn_com,
-        x_mid_com,
+        x_norm1_com: commits.x_norm1_com.clone(),
+        q_com: commits.q_com.clone(),
+        k_com: commits.k_com.clone(),
+        v_com: commits.v_com.clone(),
+        out_attn_com: commits.out_attn_com.clone(),
+        x_norm2_com: commits.x_norm2_com.clone(),
+        out_ffn_com: commits.out_ffn_com.clone(),
     })
 }
 
@@ -280,7 +286,7 @@ pub struct TransformerModelProof {
     pub all_lasso_proof: LassoMultiProof,
     pub ffn_quant_proof: QuantizationProof,
     pub qk_quant_proof: QuantizationProof,
-    pub final_range_m: GlobalRangeM,
+    pub ln_range_m: GlobalRangeM,
 
     // Cross-block batch sumchecks (one per projection type + attention)
     pub batch_qkv: SumcheckProofMulti,
@@ -516,23 +522,83 @@ pub fn prove(
     absorb_com(transcript, b"x_in_com", &x_in_com);
 
     // =========================================================================
-    // 2. Phase 1: commit all blocks' intermediates + run LN proofs
+    // 2. Phase 1: commit all block intermediates, prove one global LN range batch,
+    // then run the per-LN algebraic proofs against those range challenges.
     // =========================================================================
+    let mut block_commits: Vec<BlockCommitData> = Vec::with_capacity(num_blocks);
+    let mut block_input_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
+    let mut ln_range_witnesses: Vec<RangeProofWitness> = Vec::with_capacity(4 * num_blocks + 2);
     let mut phase1_data: Vec<BlockPhase1Data> = Vec::with_capacity(num_blocks);
     let mut current_x_com = x_in_com.clone();
 
     for i in 0..num_blocks {
-        let p1 = commit_block_phase1(
+        block_input_coms.push(current_x_com.clone());
+        let commits = commit_block_intermediates(
             &witness.block_witnesses[i],
             &current_x_com,
             &pk.block_pks[i],
+        );
+        let ln1_rw =
+            compute_range_witnesses(&witness.block_witnesses[i].ln1_wit, &pk.block_pks[i].ln1_vk);
+        let ln2_rw =
+            compute_range_witnesses(&witness.block_witnesses[i].ln2_wit, &pk.block_pks[i].ln2_vk);
+        ln_range_witnesses.push(ln1_rw.sigma_witness);
+        ln_range_witnesses.push(ln1_rw.y_witness);
+        ln_range_witnesses.push(ln2_rw.sigma_witness);
+        ln_range_witnesses.push(ln2_rw.y_witness);
+        let next_x_com = add_commitments(&commits.x_mid_com, &commits.out_ffn_com);
+        current_x_com = next_x_com;
+        block_commits.push(commits);
+    }
+
+    let final_rw = compute_range_witnesses(&witness.final_ln_wit, &pk.vk.final_ln_vk);
+    ln_range_witnesses.push(final_rw.sigma_witness);
+    ln_range_witnesses.push(final_rw.y_witness);
+
+    let ln_range_refs: Vec<&RangeProofWitness> = ln_range_witnesses.iter().collect();
+    let (ln_range_proofs, ln_range_m, ln_range_rvs) =
+        prove_range_batched(&ln_range_refs, LAYERNORM_RANGE_BITS, transcript)?;
+    let mut ln_range_proofs = ln_range_proofs.into_iter();
+    let mut ln_range_rvs = ln_range_rvs.into_iter();
+
+    for i in 0..num_blocks {
+        let range_proofs = [
+            ln_range_proofs
+                .next()
+                .expect("missing ln1 sigma range proof"),
+            ln_range_proofs.next().expect("missing ln1 y range proof"),
+            ln_range_proofs
+                .next()
+                .expect("missing ln2 sigma range proof"),
+            ln_range_proofs.next().expect("missing ln2 y range proof"),
+        ];
+        let range_rvs = [
+            ln_range_rvs.next().expect("missing ln1 sigma range point"),
+            ln_range_rvs.next().expect("missing ln1 y range point"),
+            ln_range_rvs.next().expect("missing ln2 sigma range point"),
+            ln_range_rvs.next().expect("missing ln2 y range point"),
+        ];
+        let p1 = prove_block_layernorms(
+            &witness.block_witnesses[i],
+            &block_input_coms[i],
+            &pk.block_pks[i],
+            &block_commits[i],
+            range_proofs,
+            range_rvs,
             transcript,
         )?;
-        let x_mid_com = p1.x_mid_com.clone();
-        let next_x_com = add_commitments(&x_mid_com, &p1.out_ffn_com);
-        current_x_com = next_x_com;
         phase1_data.push(p1);
     }
+    let final_sig_rp = ln_range_proofs
+        .next()
+        .expect("missing final LN sigma range proof");
+    let final_y_rp = ln_range_proofs
+        .next()
+        .expect("missing final LN y range proof");
+    let final_sig_rv = ln_range_rvs
+        .next()
+        .expect("missing final LN sigma range point");
+    let final_y_rv = ln_range_rvs.next().expect("missing final LN y range point");
 
     // =========================================================================
     // 3. Derive global r_td after ALL blocks' Phase 1 commitments
@@ -1097,7 +1163,6 @@ pub fn prove(
         block_proofs.push(TransformerBlockProof {
             ln1_proof: p1.ln1_proof.clone(),
             ln2_proof: p1.ln2_proof.clone(),
-            block_range_m: p1.block_range_m.clone(),
             ffn_lasso_proof: empty_lasso_proof(),
             ffn_a_com: ffn_a_coms[i].clone(),
             ffn_m_com: ffn_m_coms[i].clone(),
@@ -1132,14 +1197,6 @@ pub fn prove(
     // =========================================================================
     // 11. Final LayerNorm
     // =========================================================================
-    let final_rw = compute_range_witnesses(&witness.final_ln_wit, &pk.vk.final_ln_vk);
-    let (mut final_range_proofs, final_range_m, final_r_vs) = prove_range_batched(
-        &[&final_rw.sigma_witness, &final_rw.y_witness],
-        LAYERNORM_RANGE_BITS,
-        transcript,
-    )?;
-    let final_y_rp = final_range_proofs.remove(1);
-    let final_sig_rp = final_range_proofs.remove(0);
     let final_ln_out_com = commit_mat(&witness.final_ln_wit.y, t, d);
     let ln_io = LayerNormIOCommitments {
         x_com: current_x_com.clone(),
@@ -1149,8 +1206,8 @@ pub fn prove(
         &witness.final_ln_wit,
         &ln_io,
         &pk.vk.final_ln_vk,
-        (final_sig_rp, final_r_vs[0].clone()),
-        (final_y_rp, final_r_vs[1].clone()),
+        (final_sig_rp, final_sig_rv),
+        (final_y_rp, final_y_rv),
         transcript,
     )?;
 
@@ -1495,7 +1552,7 @@ pub fn prove(
         all_lasso_proof,
         ffn_quant_proof,
         qk_quant_proof,
-        final_range_m,
+        ln_range_m,
         batch_qkv,
         batch_oproj,
         batch_ffn_y,
