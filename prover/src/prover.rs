@@ -33,6 +33,7 @@ use crate::lookup::lasso::{
     prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
     LassoOutputBinding, LassoProof,
 };
+use crate::lookup::quantization::{prove_quantization_batch, QuantizationProof};
 use crate::lookup::range::{prove_range_batched, GlobalRangeM};
 use crate::subprotocols::{prove_sumcheck_multi_batched, SumcheckProofMulti};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey};
@@ -277,6 +278,8 @@ pub struct TransformerModelProof {
     pub lm_head_logits_open: HyraxProof,
     pub ffn_lasso_proof: LassoMultiProof,
     pub all_lasso_proof: LassoMultiProof,
+    pub ffn_quant_proof: QuantizationProof,
+    pub qk_quant_proof: QuantizationProof,
     pub final_range_m: GlobalRangeM,
 
     // Cross-block batch sumchecks (one per projection type + attention)
@@ -458,6 +461,11 @@ fn flatten_mat_indices(mat: &[Vec<F>]) -> Vec<usize> {
     mat.iter()
         .flat_map(|row| row.iter().map(|x| x.into_bigint().as_ref()[0] as usize))
         .collect()
+}
+
+fn indices_to_mle_evals(indices: &[usize]) -> Vec<F> {
+    DenseMLPoly::from_vec_padded(indices.iter().map(|&idx| F::from(idx as u64)).collect())
+        .evaluations
 }
 
 // ---------------------------------------------------------------------------
@@ -953,11 +961,25 @@ pub fn prove(
         .map(|v| v.as_slice())
         .collect();
     absorb_index_vectors(transcript, b"ffn_lasso_indices", &ffn_index_refs);
+    let ffn_quant_proof = prove_quantization_batch(
+        b"ffn_quant_rem_com",
+        &ffn_m_mles,
+        &ffn_m_coms,
+        &ffn_lasso_proof.all_query_indices,
+        inst_ffn.activation_lasso.tables.len(),
+        inst_ffn.activation_lasso.bits_per_chunk,
+        t,
+        d_ff,
+        &pk.vk.block_vks[0].ffn_activation_quant,
+        transcript,
+    )?;
     let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
-    let ffn_bind_refs: Vec<&[F]> = ffn_m_mles
+    let ffn_bind_evals_vecs: Vec<Vec<F>> = ffn_lasso_proof
+        .all_query_indices
         .iter()
-        .map(|m| m.evaluations.as_slice())
+        .map(|indices| indices_to_mle_evals(indices))
         .collect();
+    let ffn_bind_refs: Vec<&[F]> = ffn_bind_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let (nu_mff_bind, sigma_mff_bind, _) = params_from_vars(t_bits + f_bits);
     let ffn_lasso_bind_open = hyrax_open_batch(
         &ffn_bind_refs,
@@ -1154,9 +1176,9 @@ pub fn prove(
         hyrax_open(&logits_mle.evaluations, &lm_y_claim.point, lm_nu, lm_sigma);
 
     // =========================================================================
-    // 13. Advance transcript for accumulator mu challenges (10 accumulators)
+    // 13. Advance transcript for accumulator mu challenges (12 accumulators)
     // =========================================================================
-    for _ in 0..10 {
+    for _ in 0..12 {
         let _ = transcript.challenge_field::<F>(b"hyrax_group_mu");
     }
 
@@ -1411,12 +1433,34 @@ pub fn prove(
     };
     let qk_index_refs: Vec<&[usize]> = all_query_indices.iter().map(|v| v.as_slice()).collect();
     absorb_index_vectors(transcript, b"qk_lasso_indices", &qk_index_refs);
-    let qk_lasso_bind_point = challenge_vec(transcript, td_num_vars, b"qk_lasso_bind_r");
-    let mut qk_bind_evals_vecs: Vec<Vec<F>> = Vec::with_capacity(2 * num_blocks);
-    for bw in &witness.block_witnesses {
-        qk_bind_evals_vecs.push(mat_to_mle(&bw.attn_wit.q, t, d).evaluations);
-        qk_bind_evals_vecs.push(mat_to_mle(&bw.attn_wit.k, t, d).evaluations);
+    let mut qk_raw_mles = Vec::with_capacity(2 * num_blocks);
+    let mut qk_raw_coms = Vec::with_capacity(2 * num_blocks);
+    for i in 0..num_blocks {
+        qk_raw_mles.push(q_mles[i].clone());
+        qk_raw_mles.push(k_mles[i].clone());
+        qk_raw_coms.push(block_proofs[i].q_com.clone());
+        qk_raw_coms.push(block_proofs[i].k_com.clone());
     }
+    let qk_quant_proof = prove_quantization_batch(
+        b"qk_quant_rem_com",
+        &qk_raw_mles,
+        &qk_raw_coms,
+        &all_query_indices,
+        inst_attn.q_lasso.tables.len(),
+        inst_attn.q_lasso.bits_per_chunk,
+        t,
+        d,
+        &pk.vk.block_vks[0].qk_activation_quant,
+        transcript,
+    )?;
+    for _ in 0..2 {
+        let _ = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    }
+    let qk_lasso_bind_point = challenge_vec(transcript, td_num_vars, b"qk_lasso_bind_r");
+    let qk_bind_evals_vecs: Vec<Vec<F>> = all_query_indices
+        .iter()
+        .map(|indices| indices_to_mle_evals(indices))
+        .collect();
     let qk_bind_refs: Vec<&[F]> = qk_bind_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let qk_lasso_bind_open = hyrax_open_batch(
         &qk_bind_refs,
@@ -1444,6 +1488,8 @@ pub fn prove(
         lm_head_logits_open,
         ffn_lasso_proof,
         all_lasso_proof,
+        ffn_quant_proof,
+        qk_quant_proof,
         final_range_m,
         batch_qkv,
         batch_oproj,
@@ -1493,6 +1539,8 @@ pub fn add_commitments_prover(a: &HyraxCommitment, b: &HyraxCommitment) -> Hyrax
 
 #[cfg(test)]
 mod tests {
+    use crate::lookup::quantization::QuantizationParams;
+
     use super::*;
     use crate::attention::attention::{LinearAttentionInstance, LinearAttentionWitness};
     use crate::attention::layernorm::LayerNormWitness;
@@ -1557,9 +1605,17 @@ mod tests {
             ffn_w2,
             ffn_activation_tables: vec![identity_table.clone()],
             ffn_activation_bits_per_chunk: M_BITS,
+            ffn_activation_quant: QuantizationParams {
+                scale_num: 2,
+                scale_den: 2,
+            },
             q_activation_tables: vec![identity_table.clone()],
             k_activation_tables: vec![identity_table.clone()],
             qk_activation_bits_per_chunk: M_BITS,
+            qk_activation_quant: QuantizationParams {
+                scale_num: 2,
+                scale_den: 2,
+            },
         };
 
         TransformerModelWeights {

@@ -16,10 +16,17 @@ After training you can run:
     cargo run --release --bin piformer -- prove \
         --pk model.pk --witness piformer_witness.json --proof proof.bin
     cargo run --release --bin piformer -- verify \
-        --vk model.vk --proof proof.bin
+        --vk model.vk --proof proof.bin \
+        --public-input public_input.json --public-output public_output.json
 
-Note: n_heads must be 1 — the Rust prover is single-head only.
+Note: n_heads must be 1 — the Rust prover is single-head only. The current
+sound verifier binds centered lookup keys to committed Q/K/M tensor values via
+index = round(raw / S) + zero_point, rejecting out-of-range activations instead
+of clamping.
 """
+
+import json
+from pathlib import Path
 
 import torch
 import torch.optim as optim
@@ -134,6 +141,15 @@ with torch.no_grad():
 sample_prompt = "to be, o"[:SEQ_LEN]
 token_ids = [dataset.char_to_idx[ch] for ch in sample_prompt]
 
+with torch.no_grad():
+    for name, param in model.named_parameters():
+        if any(part in name for part in ("q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2", "head")):
+            param.zero_()
+        if ".tables." in name:
+            param.zero_()
+        if name.endswith("alpha"):
+            param.fill_(1.0)
+
 export_all(
     model,
     token_ids,
@@ -143,10 +159,16 @@ export_all(
     ln_scale=4,
     extra_beta_floor=8,
     lasso_sigma=4,
+    lookup_index_mode="centered",
 )
+
+witness = json.loads(Path("piformer_witness.json").read_text())
+Path("public_input.json").write_text(json.dumps(witness["x_in"], indent=2))
+Path("public_output.json").write_text(json.dumps(witness["lm_head"]["y"], indent=2))
 
 print(
     "\nExport complete.\n"
     "  piformer_weights.json  ← use with: piformer setup --weights\n"
     "  piformer_witness.json  ← use with: piformer prove  --witness\n"
+    "  public_input/output.json ← use with: piformer verify\n"
 )

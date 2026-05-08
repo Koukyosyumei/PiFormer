@@ -758,10 +758,7 @@ pub fn verify_layernorm(
             proof.internal_coms.sum_x_com.clone(),
             proof.internal_coms.sq_sum_x_com.clone(),
         ],
-        &[
-            proof.openings.sum_x_at_rt,
-            proof.openings.sq_sum_x_at_rt,
-        ],
+        &[proof.openings.sum_x_at_rt, proof.openings.sq_sum_x_at_rt],
         &r_t,
         &proof.openings.rt_batch_proof,
         transcript,

@@ -27,6 +27,7 @@ use piformer_prover::{
             LassoMultiProvingKey, LassoProof, LassoProvingKey, LassoVerifyingKey,
             SelectorBindingProof, SelectorSumcheckProof,
         },
+        quantization::{QuantizationParams, QuantizationProof},
         range::{GlobalRangeM, LogUpWitnessProof, RangeWitnessProof},
     },
     pcs::{HyraxCommitment, HyraxProof},
@@ -162,6 +163,16 @@ fn write_vec_g1<W: Write>(w: &mut W, v: &[G1Affine]) -> io::Result<()> {
 }
 fn read_vec_g1<R: Read>(r: &mut R) -> io::Result<Vec<G1Affine>> {
     read_vec(r, read_g1)
+}
+fn write_quant_params<W: Write>(w: &mut W, q: &QuantizationParams) -> io::Result<()> {
+    write_u64(w, q.scale_num)?;
+    write_u64(w, q.scale_den)
+}
+fn read_quant_params<R: Read>(r: &mut R) -> io::Result<QuantizationParams> {
+    Ok(QuantizationParams {
+        scale_num: read_u64(r)?,
+        scale_den: read_u64(r)?,
+    })
 }
 fn write_vec_vec_t<W: Write>(w: &mut W, v: &[Vec<TernaryValue>]) -> io::Result<()> {
     write_vec(w, v, |w2, row| write_vec_t(w2, row))
@@ -637,6 +648,28 @@ fn write_global_range_m<W: Write>(w: &mut W, m: &GlobalRangeM) -> io::Result<()>
     write_f(w, &m.logup_m_at_rm2)?;
     write_hyrax_proof(w, &m.logup_m_open_rm2)
 }
+
+fn write_quantization_proof<W: Write>(w: &mut W, p: &QuantizationProof) -> io::Result<()> {
+    write_vec(w, &p.rem_coms, write_hyrax_commitment)?;
+    write_vec(w, &p.rem_range_proofs, write_range_witness_proof)?;
+    write_global_range_m(w, &p.rem_range_m)?;
+    write_vec_f(w, &p.raw_evals)?;
+    write_vec_f(w, &p.rem_evals)?;
+    write_hyrax_proof(w, &p.raw_open)?;
+    write_hyrax_proof(w, &p.rem_open)
+}
+
+fn read_quantization_proof<R: Read>(r: &mut R) -> io::Result<QuantizationProof> {
+    Ok(QuantizationProof {
+        rem_coms: read_vec(r, read_hyrax_commitment)?,
+        rem_range_proofs: read_vec(r, read_range_witness_proof)?,
+        rem_range_m: read_global_range_m(r)?,
+        raw_evals: read_vec_f(r)?,
+        rem_evals: read_vec_f(r)?,
+        raw_open: read_hyrax_proof(r)?,
+        rem_open: read_hyrax_proof(r)?,
+    })
+}
 fn read_global_range_m<R: Read>(r: &mut R) -> io::Result<GlobalRangeM> {
     Ok(GlobalRangeM {
         m_com: read_hyrax_commitment(r)?,
@@ -995,6 +1028,8 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_hyrax_proof(w, &p.lm_head_logits_open)?;
     write_lasso_multi_proof(w, &p.ffn_lasso_proof)?;
     write_lasso_multi_proof(w, &p.all_lasso_proof)?;
+    write_quantization_proof(w, &p.ffn_quant_proof)?;
+    write_quantization_proof(w, &p.qk_quant_proof)?;
     write_global_range_m(w, &p.final_range_m)?;
     // Cross-block batch sumchecks
     write_sumcheck_proof_multi(w, &p.batch_qkv)?;
@@ -1043,6 +1078,8 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         lm_head_logits_open: read_hyrax_proof(r)?,
         ffn_lasso_proof: read_lasso_multi_proof(r)?,
         all_lasso_proof: read_lasso_multi_proof(r)?,
+        ffn_quant_proof: read_quantization_proof(r)?,
+        qk_quant_proof: read_quantization_proof(r)?,
         final_range_m: read_global_range_m(r)?,
         // Cross-block batch sumchecks
         batch_qkv: read_sumcheck_proof_multi(r)?,
@@ -1297,6 +1334,8 @@ fn write_block_vk<W: Write>(
     write_proj_vk(w, &bvk.o_vk)?;
     write_ln_vk(w, &bvk.ln2_vk)?;
     write_ffn_vk(w, &bvk.ffn_vk)?;
+    write_quant_params(w, &bvk.ffn_activation_quant)?;
+    write_quant_params(w, &bvk.qk_activation_quant)?;
     // Always write attn_pk commitments: verifier needs them to replay transcript.
     write_attn_pk(w, &bvk.attn_pk)?;
     write_bool(w, include_weights)?;
@@ -1319,6 +1358,8 @@ fn read_block_vk<R: Read>(r: &mut R) -> io::Result<TransformerBlockVerifyingKey>
     let o_vk = read_proj_vk(r)?;
     let ln2_vk = read_ln_vk(r)?;
     let ffn_vk = read_ffn_vk(r)?;
+    let ffn_activation_quant = read_quant_params(r)?;
+    let qk_activation_quant = read_quant_params(r)?;
     // attn_pk commitments are always present (needed by verifier to replay transcript).
     let attn_pk = read_attn_pk(r)?;
     let has_weights = read_bool(r)?;
@@ -1365,6 +1406,8 @@ fn read_block_vk<R: Read>(r: &mut R) -> io::Result<TransformerBlockVerifyingKey>
         v_vk,
         o_vk,
         ffn_vk,
+        ffn_activation_quant,
+        qk_activation_quant,
         q_pk,
         k_pk,
         v_pk,

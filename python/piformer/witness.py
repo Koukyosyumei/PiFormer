@@ -11,9 +11,9 @@ Design contract
   arbitrary signed Python ints converted to BN254 field elements on output.
   Field arithmetic in the Rust prover reproduces the same arithmetic mod p.
 
-* The phi activation uses centered clamp-round quantization into
-  [0, 2^num_bits − 1], so Lasso query_indices are always small
-  non-negative integers while preserving negative inputs.
+* The phi activation uses centered no-saturation quantization:
+  query_index = round(raw / S) + zero_point. Out-of-range indices are rejected
+  instead of clamped, matching the Rust verifier.
 
 * LayerNorm witnesses (sum_x, var_x, sigma, y) are small non-negative Python
   ints computed with the exact formula from ``layernorm.rs``.
@@ -41,6 +41,8 @@ from .quant import (
     mat_to_json,
     mat_transpose,
     min_beta_floor,
+    effective_activation_scale,
+    quantize_raw_to_index,
     quantize_to_int,
     vec_to_json,
 )
@@ -71,6 +73,7 @@ def _phi_mat(
     c: int,
     phi_scale: float,
     quant_scale: int,
+    lookup_index_mode: str,
 ) -> Tuple[List[List[int]], List[int], List[int]]:
     """
     Apply the decomposed lookup activation φ to every element of a matrix.
@@ -86,13 +89,34 @@ def _phi_mat(
     bits_per_chunk = num_bits // c
     t, d = len(m_int), len(m_int[0])
 
-    # Compute query indices: clamp-round quantize each element.
-    # m_int is in "integer units"; effective float is m_int / quant_scale.
+    # Compute query indices.
+    #
+    # "centered" mode is the sound exported-circuit mode for decomposed lookup
+    # tables: the verifier proves idx = round(raw / S) + zero_point with no
+    # saturation, where S = quant_scale * phi_scale.
+    #
+    # "field" mode is kept for experiments with direct lookup keys.
     q_indices_flat: List[int] = []
+    max_val = (1 << num_bits) - 1
+    scale_num, scale_den = effective_activation_scale(phi_scale, quant_scale)
     for row in m_int:
         for v in row:
-            x_float_approx = v / quant_scale if quant_scale != 0 else float(v)
-            q_indices_flat.append(quantize_to_int(x_float_approx, phi_scale, num_bits))
+            if lookup_index_mode == "field":
+                if v < 0 or v > max_val:
+                    raise ValueError(
+                        "lookup_index_mode='field' requires Q/K/M values to be "
+                        f"lookup keys in [0, {max_val}], got {v}"
+                    )
+                q_indices_flat.append(v)
+            elif lookup_index_mode == "centered":
+                zero_point = 0 if c <= 1 else 1 << (num_bits - 1)
+                idx = quantize_raw_to_index(v, scale_num, scale_den, num_bits, zero_point)
+                q_indices_flat.append(idx)
+            else:
+                raise ValueError(
+                    "lookup_index_mode must be 'field' or 'centered', "
+                    f"got {lookup_index_mode!r}"
+                )
 
     outputs_flat, _ = apply_phi_int(q_indices_flat, tables_int, bits_per_chunk)
 
@@ -192,6 +216,7 @@ def _gen_block_witness(
     quant_scale: int,
     ln_scale: int,
     extra_beta_floor: int,
+    lookup_index_mode: str,
 ) -> Tuple[Dict[str, Any], List[List[int]]]:
     """
     Generate the integer witness for one transformer block.
@@ -270,10 +295,12 @@ def _gen_block_witness(
 
     # ---- φ activation on Q and K ----
     phi_q, q_indices, q_outputs = _phi_mat(
-        q_raw, attn_tables_int, phi_num_bits, phi_c, phi_scale, quant_scale
+        q_raw, attn_tables_int, phi_num_bits, phi_c, phi_scale, quant_scale,
+        lookup_index_mode,
     )
     phi_k, k_indices, k_outputs = _phi_mat(
-        k_raw, attn_tables_int, phi_num_bits, phi_c, phi_scale, quant_scale
+        k_raw, attn_tables_int, phi_num_bits, phi_c, phi_scale, quant_scale,
+        lookup_index_mode,
     )
 
     # ---- Linear attention ----
@@ -328,7 +355,8 @@ def _gen_block_witness(
     ffn_m = _project(ln2_y, w1_T)
 
     ffn_a, ffn_q_indices, ffn_q_outputs = _phi_mat(
-        ffn_m, ffn_tables_int, ffn_num_bits, ffn_c, ffn_phi_scale, quant_scale
+        ffn_m, ffn_tables_int, ffn_num_bits, ffn_c, ffn_phi_scale, quant_scale,
+        lookup_index_mode,
     )
 
     w2 = extract_ternary_weight_matrix(
@@ -438,6 +466,10 @@ class WitnessGenerator:
     lasso_sigma : int
         Hyrax PCS sigma parameter used for Lasso commitments in the Rust prover.
         Must match the value used in ``HyraxParams::new(lasso_sigma)``.
+    lookup_index_mode : str
+        ``"centered"`` means lookup keys are Q/K/M plus the activation
+        zero-point and is soundly bound by the current Rust verifier.
+        ``"field"`` means Q/K/M are already lookup keys.
     """
 
     def __init__(
@@ -446,11 +478,13 @@ class WitnessGenerator:
         ln_scale: int = 4,
         extra_beta_floor: int = 8,
         lasso_sigma: int = 4,
+        lookup_index_mode: str = "centered",
     ):
         self.quant_scale = quant_scale
         self.ln_scale = ln_scale
         self.extra_beta_floor = extra_beta_floor
         self.lasso_sigma = lasso_sigma
+        self.lookup_index_mode = lookup_index_mode
 
     def generate(self, model, token_ids: List[int]) -> Dict[str, Any]:
         """
@@ -497,7 +531,8 @@ class WitnessGenerator:
         block_ln_weights = []
         for blk in model.blocks:
             bwit, x_cur = _gen_block_witness(
-                x_cur, blk, self.quant_scale, self.ln_scale, self.extra_beta_floor
+                x_cur, blk, self.quant_scale, self.ln_scale, self.extra_beta_floor,
+                self.lookup_index_mode,
             )
             q_lasso_last, k_lasso_last = bwit.pop("_attn_lasso")
             ffn_lasso_last = bwit.pop("_ffn_lasso")

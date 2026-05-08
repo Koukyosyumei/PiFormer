@@ -12,6 +12,7 @@ use crate::field::F;
 use crate::lookup::lasso::{
     verify_lasso_multi_committed_outputs, LassoMultiInstance, LassoMultiVerifyingKey,
 };
+use crate::lookup::quantization::{verify_quantization_batch, QuantizationParams};
 use crate::lookup::range::verify_range_batched;
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_verify, hyrax_verify_batch, params_from_vars,
@@ -51,6 +52,8 @@ pub struct TransformerBlockVerifyingKey {
     pub o_vk: ProjectionVerifyingKey,
     pub ln2_vk: LayerNormVerifyingKey,
     pub ffn_vk: FFNVerifyingKey,
+    pub ffn_activation_quant: QuantizationParams,
+    pub qk_activation_quant: QuantizationParams,
     pub q_pk: ProjectionProvingKey,
     pub k_pk: ProjectionProvingKey,
     pub v_pk: ProjectionProvingKey,
@@ -124,6 +127,23 @@ fn commit_public_mat(mat: &[Vec<F>], rows: usize, cols: usize) -> Result<HyraxCo
         + cols.next_power_of_two().trailing_zeros() as usize;
     let (nu, _, params) = params_from_vars(vars);
     Ok(hyrax_commit(&mle.evaluations, nu, &params))
+}
+
+fn commit_public_indices(
+    indices: &[usize],
+    rows: usize,
+    cols: usize,
+) -> Result<HyraxCommitment, String> {
+    let values: Vec<F> = indices.iter().map(|&idx| F::from(idx as u64)).collect();
+    if values.len() != rows * cols {
+        return Err(format!(
+            "public index matrix length mismatch: got {}, expected {}",
+            values.len(),
+            rows * cols
+        ));
+    }
+    let mat: Vec<Vec<F>> = values.chunks(cols).map(|row| row.to_vec()).collect();
+    commit_public_mat(&mat, rows, cols)
 }
 
 fn commitments_equal(a: &HyraxCommitment, b: &HyraxCommitment) -> bool {
@@ -270,6 +290,9 @@ pub fn verify(
     let mut acc_range_sig = HyraxBatchAccumulator::new();
     let mut acc_range_y = HyraxBatchAccumulator::new();
     let mut acc_range_m = HyraxBatchAccumulator::new();
+    let mut acc_quant_ffn = HyraxBatchAccumulator::new();
+    let mut acc_quant_unused = HyraxBatchAccumulator::new();
+    let mut acc_quant_m = HyraxBatchAccumulator::new();
     // inter_acc: per-block v_attn opens (different eval point per block)
     let inter_acc = HyraxBatchAccumulator::new();
 
@@ -655,12 +678,33 @@ pub fn verify(
         .map(|v| v.as_slice())
         .collect();
     absorb_index_vectors(transcript, b"ffn_lasso_indices", &ffn_index_refs);
-    let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
-    let ffn_bind_m_coms: Vec<HyraxCommitment> = proof
+    let ffn_raw_coms: Vec<HyraxCommitment> = proof
         .block_proofs
         .iter()
         .map(|bp| bp.ffn_m_com.clone())
         .collect();
+    verify_quantization_batch(
+        b"ffn_quant_rem_com",
+        &proof.ffn_quant_proof,
+        &ffn_raw_coms,
+        &ffn_index_refs,
+        inst_ffn.activation_lasso.tables.len(),
+        inst_ffn.activation_lasso.bits_per_chunk,
+        t,
+        d_ff,
+        &vk.block_vks[0].ffn_activation_quant,
+        transcript,
+        &mut acc_quant_ffn,
+        &mut acc_quant_unused,
+        &mut acc_quant_m,
+    )?;
+    let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
+    let ffn_bind_m_coms: Vec<HyraxCommitment> = proof
+        .ffn_lasso_proof
+        .all_query_indices
+        .iter()
+        .map(|idx| commit_public_indices(idx, t, d_ff))
+        .collect::<Result<_, _>>()?;
     let (_, _, params_mff_bind) = params_from_vars(t_bits + f_bits);
     verify_query_indices_bound_batch(
         "FFN",
@@ -818,7 +862,7 @@ pub fn verify(
     .map_err(|e| format!("Logits commit: {e}"))?;
 
     // =========================================================================
-    // 12. Finalize 10 accumulators (same order as prover's mu challenge loop)
+    // 12. Finalize 12 accumulators (same order as prover's mu challenge loop)
     // =========================================================================
     let _tacc = Instant::now();
     let mu_inter = transcript.challenge_field::<F>(b"hyrax_group_mu");
@@ -831,6 +875,8 @@ pub fn verify(
     let mu_rng_sig = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_rng_y = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_rng_m = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_quant_ffn = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_quant_m = transcript.challenge_field::<F>(b"hyrax_group_mu");
 
     let ((r0, r1), (r2, r3)) = rayon::join(
         || {
@@ -904,6 +950,18 @@ pub fn verify(
                 .map_err(|e| format!("acc_range_m: {e}"))
         },
     );
+    let (r10, r11) = rayon::join(
+        || {
+            acc_quant_ffn
+                .finalize_with_mu(&params_mff, mu_quant_ffn)
+                .map_err(|e| format!("acc_quant_ffn: {e}"))
+        },
+        || {
+            acc_quant_m
+                .finalize_with_mu(&params_range_m, mu_quant_m)
+                .map_err(|e| format!("acc_quant_m: {e}"))
+        },
+    );
     eprintln!(
         "[model] acc_finalize:{:>8.3}ms",
         _tacc.elapsed().as_secs_f64() * 1000.0
@@ -918,6 +976,8 @@ pub fn verify(
     r7?;
     r8?;
     r9?;
+    r10?;
+    r11?;
 
     // =========================================================================
     // 13. Global batch open for 5L intermediate matrices at r_td (inter_batch_open)
@@ -1419,11 +1479,50 @@ pub fn verify(
         .map(|v| v.as_slice())
         .collect();
     absorb_index_vectors(transcript, b"qk_lasso_indices", &qk_index_refs);
+    let mut qk_raw_coms = Vec::with_capacity(2 * num_blocks);
+    for bp in &proof.block_proofs {
+        qk_raw_coms.push(bp.q_com.clone());
+        qk_raw_coms.push(bp.k_com.clone());
+    }
+    let mut acc_quant_qk = HyraxBatchAccumulator::new();
+    let mut acc_quant_qk_unused = HyraxBatchAccumulator::new();
+    let mut acc_quant_qk_m = HyraxBatchAccumulator::new();
+    verify_quantization_batch(
+        b"qk_quant_rem_com",
+        &proof.qk_quant_proof,
+        &qk_raw_coms,
+        &qk_index_refs,
+        inst_attn.q_lasso.tables.len(),
+        inst_attn.q_lasso.bits_per_chunk,
+        t,
+        d,
+        &vk.block_vks[0].qk_activation_quant,
+        transcript,
+        &mut acc_quant_qk,
+        &mut acc_quant_qk_unused,
+        &mut acc_quant_qk_m,
+    )?;
+    let mu_quant_qk = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    let mu_quant_qk_m = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    acc_quant_qk
+        .finalize_with_mu(&params_td, mu_quant_qk)
+        .map_err(|e| format!("acc_quant_qk: {e}"))?;
+    acc_quant_qk_m
+        .finalize_with_mu(&params_range_m, mu_quant_qk_m)
+        .map_err(|e| format!("acc_quant_qk_m: {e}"))?;
     let qk_lasso_bind_point = challenge_vec(transcript, td_num_vars, b"qk_lasso_bind_r");
     let mut qk_coms = Vec::with_capacity(2 * num_blocks);
-    for bp in &proof.block_proofs {
-        qk_coms.push(bp.q_com.clone());
-        qk_coms.push(bp.k_com.clone());
+    for i in 0..num_blocks {
+        qk_coms.push(commit_public_indices(
+            &proof.all_lasso_proof.all_query_indices[2 * i],
+            t,
+            d,
+        )?);
+        qk_coms.push(commit_public_indices(
+            &proof.all_lasso_proof.all_query_indices[2 * i + 1],
+            t,
+            d,
+        )?);
     }
     verify_query_indices_bound_batch(
         "attention Q/K",

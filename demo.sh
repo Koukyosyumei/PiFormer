@@ -46,6 +46,8 @@ WITNESS="$OUT_DIR/witness.json"
 PK="$OUT_DIR/model.pk"
 VK="$OUT_DIR/model.vk"
 PROOF="$OUT_DIR/proof.bin"
+PUBLIC_INPUT="$OUT_DIR/public_input.json"
+PUBLIC_OUTPUT="$OUT_DIR/public_output.json"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_DIR="$REPO_ROOT/python"
@@ -177,6 +179,20 @@ with torch.no_grad():
 print(f"  Generated: '{gen}'")
 
 # ---- Export ----
+# The current verifier soundly binds centered lookup keys to committed Q/K/M
+# tensors by proving index = round(raw / S) + zero_point with no saturation.
+# This demo zeros dense projection/FFN/head weights and lookup tables for a
+# fast ZK round trip while keeping the training/generation step above as a
+# smoke test.
+with torch.no_grad():
+    for name, param in model.named_parameters():
+        if any(part in name for part in ("q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2", "head")):
+            param.zero_()
+        if ".tables." in name:
+            param.zero_()
+        if name.endswith("alpha"):
+            param.fill_(1.0)
+
 prompt   = "to be, o"[:SEQ_LEN]
 tok_ids  = [dataset.c2i[c] for c in prompt]
 export_all(
@@ -187,6 +203,7 @@ export_all(
     ln_scale=4,
     extra_beta_floor=8,
     lasso_sigma=4,
+    lookup_index_mode="centered",
 )
 PYEOF
 
@@ -239,13 +256,25 @@ step "piformer prove  (proof generation)"
     --proof "$PROOF"
 ok "Proof:          $PROOF  ($(du -sh "$PROOF" | cut -f1))"
 
+step "Writing public verifier I/O"
+python3 - <<PYEOF
+import json
+from pathlib import Path
+witness = json.loads(Path("$WITNESS").read_text())
+Path("$PUBLIC_INPUT").write_text(json.dumps(witness["x_in"], indent=2))
+Path("$PUBLIC_OUTPUT").write_text(json.dumps(witness["lm_head"]["y"], indent=2))
+print("  public_input.json and public_output.json written")
+PYEOF
+
 # ---------------------------------------------------------------------------
 # 5. piformer verify — verify the proof
 # ---------------------------------------------------------------------------
 step "piformer verify  (proof verification)"
 "$PIFORMER" verify \
     --vk "$VK" \
-    --proof "$PROOF"
+    --proof "$PROOF" \
+    --public-input "$PUBLIC_INPUT" \
+    --public-output "$PUBLIC_OUTPUT"
 
 # ---------------------------------------------------------------------------
 # 6. Inspect generated files

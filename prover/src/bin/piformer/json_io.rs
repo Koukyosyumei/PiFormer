@@ -13,7 +13,7 @@ use piformer_prover::{
         projection::ProjectionWitness,
     },
     ffn::ffn::{FFNInstance, FFNWitness},
-    lookup::lasso::LassoInstance,
+    lookup::{lasso::LassoInstance, quantization::QuantizationParams},
     poly::utils::TernaryValue,
     prover::{TransformerBlockWitness, TransformerModelWitness},
     setup::{TransformerBlockWeights, TransformerModelWeights},
@@ -159,11 +159,19 @@ pub struct JsonBlockWeights {
     #[serde(default)]
     pub ffn_activation_bits_per_chunk: usize,
     #[serde(default)]
+    pub ffn_activation_scale_num: u64,
+    #[serde(default)]
+    pub ffn_activation_scale_den: u64,
+    #[serde(default)]
     pub q_activation_tables: Vec<Vec<String>>,
     #[serde(default)]
     pub k_activation_tables: Vec<Vec<String>>,
     #[serde(default)]
     pub qk_activation_bits_per_chunk: usize,
+    #[serde(default)]
+    pub qk_activation_scale_num: u64,
+    #[serde(default)]
+    pub qk_activation_scale_den: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -225,9 +233,13 @@ pub fn weights_to_json(w: &TransformerModelWeights) -> JsonWeights {
             ffn_w2: ternary_mat_to_json(&b.ffn_w2),
             ffn_activation_tables: mat_to_json(&b.ffn_activation_tables),
             ffn_activation_bits_per_chunk: b.ffn_activation_bits_per_chunk,
+            ffn_activation_scale_num: b.ffn_activation_quant.scale_num,
+            ffn_activation_scale_den: b.ffn_activation_quant.scale_den,
             q_activation_tables: mat_to_json(&b.q_activation_tables),
             k_activation_tables: mat_to_json(&b.k_activation_tables),
             qk_activation_bits_per_chunk: b.qk_activation_bits_per_chunk,
+            qk_activation_scale_num: b.qk_activation_quant.scale_num,
+            qk_activation_scale_den: b.qk_activation_quant.scale_den,
         })
         .collect();
     JsonWeights {
@@ -271,9 +283,33 @@ pub fn weights_from_json(j: JsonWeights) -> Result<TransformerModelWeights, Stri
                 ffn_w2: ternary_mat_from_json(b.ffn_w2)?,
                 ffn_activation_tables: mat_from_json(b.ffn_activation_tables)?,
                 ffn_activation_bits_per_chunk: b.ffn_activation_bits_per_chunk,
+                ffn_activation_quant: QuantizationParams {
+                    scale_num: if b.ffn_activation_scale_num == 0 {
+                        2
+                    } else {
+                        b.ffn_activation_scale_num
+                    },
+                    scale_den: if b.ffn_activation_scale_den == 0 {
+                        2
+                    } else {
+                        b.ffn_activation_scale_den
+                    },
+                },
                 q_activation_tables: mat_from_json(b.q_activation_tables)?,
                 k_activation_tables: mat_from_json(b.k_activation_tables)?,
                 qk_activation_bits_per_chunk: b.qk_activation_bits_per_chunk,
+                qk_activation_quant: QuantizationParams {
+                    scale_num: if b.qk_activation_scale_num == 0 {
+                        2
+                    } else {
+                        b.qk_activation_scale_num
+                    },
+                    scale_den: if b.qk_activation_scale_den == 0 {
+                        2
+                    } else {
+                        b.qk_activation_scale_den
+                    },
+                },
             })
         })
         .collect();

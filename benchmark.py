@@ -223,7 +223,7 @@ def _export(cfg: dict, out_dir: Path) -> float:
 
     # Build the Python inline script so we don't need the repo on PYTHONPATH
     seq_len = cfg["seq_len"]
-    token_ids = list(range(seq_len % cfg["vocab_size"]))  # deterministic dummy input
+    token_ids = list(range(min(seq_len, cfg["vocab_size"])))  # deterministic dummy input
     # Make sure token_ids have the right length
     token_ids = (token_ids * (seq_len // len(token_ids) + 1))[:seq_len]
 
@@ -252,15 +252,17 @@ model = PiFormerModel(
 )
 model.eval()
 
-# The current Rust proof binds lookup keys directly to the committed Q/K/M
-# tensors. Random Python weights use clamp/round quantized lookup keys, which
-# require an additional quantization proof not present in this protocol path.
-# For benchmark timing, keep the configured dimensions but zero only the
-# projection/FFN/head weights so lookup inputs are raw zero. Embeddings and
-# LayerNorm parameters stay nonzero to avoid degenerate all-zero range witnesses.
+# The Rust proof binds centered lookup keys to committed Q/K/M tensors by
+# proving index = round(raw / S) + zero_point with no saturation. For benchmark
+# timing, keep configured dimensions but zero dense projection/FFN/head weights
+# and lookup tables.
+# Embeddings and LayerNorm parameters stay nonzero to avoid degenerate all-zero
+# range witnesses.
 with torch.no_grad():
     for name, param in model.named_parameters():
         if any(part in name for part in ("q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2", "head")):
+            param.zero_()
+        if ".tables." in name:
             param.zero_()
         if name.endswith("alpha"):
             param.fill_(1.0)
@@ -274,6 +276,7 @@ export_all(
     ln_scale=4,
     extra_beta_floor=8,
     lasso_sigma=4,
+    lookup_index_mode="centered",
 )
 """
 

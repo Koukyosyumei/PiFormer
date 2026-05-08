@@ -174,6 +174,7 @@ pub fn prove_lasso(
     let m = instance.bits_per_chunk;
     let n = query_indices.len();
     let mask = (1usize << m) - 1;
+    validate_query_indices_bound(query_indices, c, m).expect("Lasso query index out of range");
 
     let nu = pk.nu;
     let sigma = params.sigma;
@@ -310,8 +311,12 @@ fn prove_lasso_committed_output_inner(
         weight_evals[j] = rho_pows[j];
     }
     let weight_poly = DenseMLPoly::new(weight_evals);
-    let (output_sumcheck, r_out) =
-        prove_sumcheck(&output_poly, &weight_poly, combined_output_claim, transcript);
+    let (output_sumcheck, r_out) = prove_sumcheck(
+        &output_poly,
+        &weight_poly,
+        combined_output_claim,
+        transcript,
+    );
     let (nu_out, sigma_out, _) = params_from_vars(output_binding.num_vars);
     let output_open = hyrax_open(&output_binding.mle_evals, &r_out, nu_out, sigma_out);
 
@@ -481,11 +486,7 @@ fn verify_lasso_with_outputs(
     let m = instance.bits_per_chunk;
     let committed_index_mode = proof.index_proof.is_some();
     let n = if committed_index_mode {
-        proof
-            .index_proof
-            .as_ref()
-            .map(|p| p.query_len)
-            .unwrap_or(0)
+        proof.index_proof.as_ref().map(|p| p.query_len).unwrap_or(0)
     } else {
         proof.query_indices.len()
     };
@@ -524,6 +525,9 @@ fn verify_lasso_with_outputs(
             proof.query_indices.len(),
             n
         ));
+    }
+    if !committed_index_mode {
+        validate_query_indices_bound(&proof.query_indices, c, m)?;
     }
 
     // Grand Sum Identity: Σ_j ρ^j · output_j = Σ_k sub_claim_k.
@@ -594,7 +598,6 @@ fn verify_lasso_with_outputs(
             params,
         )
         .map_err(|e| format!("Table {k} Hyrax T: {e}"))?;
-
     }
 
     if let Some((output_com, output_num_vars)) = committed_output {
@@ -606,9 +609,13 @@ fn verify_lasso_with_outputs(
             .output_open
             .as_ref()
             .ok_or_else(|| "missing committed Lasso output opening".to_string())?;
-        let (r_out, _) =
-            verify_sumcheck(output_sumcheck, sub_claims_combined_sum, output_num_vars, transcript)
-                .map_err(|e| format!("Lasso committed output sumcheck: {e}"))?;
+        let (r_out, _) = verify_sumcheck(
+            output_sumcheck,
+            sub_claims_combined_sum,
+            output_num_vars,
+            transcript,
+        )
+        .map_err(|e| format!("Lasso committed output sumcheck: {e}"))?;
         let mut weight_evals = vec![F::ZERO; 1usize << output_num_vars];
         for j in 0..n {
             weight_evals[j] = rho_pows[j];
@@ -758,6 +765,8 @@ pub fn prove_lasso_multi(
             "LassoInstance at index {} has inconsistent bits_per_chunk: expected {}, found {}",
             i, m, inst.bits_per_chunk
         );
+        validate_query_indices_bound(&all_query_indices[i], inst.tables.len(), m)
+            .expect("Multi-Lasso query index out of range");
     }
 
     // --- STEP 1: absorb precommitted table commitments (from setup phase) ---
@@ -1098,6 +1107,8 @@ fn verify_lasso_multi_with_outputs(
                 qi.len()
             ));
         }
+        validate_query_indices_bound(qi, multi_instance.instances[t].tables.len(), m)
+            .map_err(|e| format!("Multi-Lasso query index out of range at instance {t}: {e}"))?;
     }
     let rho_pows = powers_of(rho, n);
     if !committed_output_mode {
@@ -1406,10 +1417,7 @@ fn verify_index_binding(
     }
 
     let bind_r = challenge_vec(transcript, input_num_vars, b"lasso_idx_bind_r");
-    transcript.append_field_vec(
-        b"lasso_idx_bind_chunk_evals",
-        &index_proof.bind_chunk_evals,
-    );
+    transcript.append_field_vec(b"lasso_idx_bind_chunk_evals", &index_proof.bind_chunk_evals);
     let shift_mult = F::from(1u64 << bits_per_chunk);
     let mut shift = F::ONE;
     let mut input_eval = F::ZERO;
@@ -1549,7 +1557,8 @@ fn verify_selector_sumcheck(
         r.push(ch);
     }
     let final_weight = weight_poly.evaluate(&r);
-    let expected = final_weight * selector_eq_eval(bits_per_chunk, proof.final_eval_chunk, table_point);
+    let expected =
+        final_weight * selector_eq_eval(bits_per_chunk, proof.final_eval_chunk, table_point);
     if running_claim != expected {
         return Err("selector sumcheck final check failed".into());
     }
@@ -1606,6 +1615,33 @@ fn eq_table_point(bits_per_chunk: usize, value: usize, point: &[F]) -> F {
 /// Extract the k-th chunk of `idx`: (idx >> (k*m)) & mask.
 fn chunk(idx: usize, k: usize, m: usize, mask: usize) -> usize {
     (idx >> (k * m)) & mask
+}
+
+fn validate_query_indices_bound(
+    query_indices: &[usize],
+    chunks: usize,
+    bits_per_chunk: usize,
+) -> Result<(), String> {
+    let total_bits = chunks
+        .checked_mul(bits_per_chunk)
+        .ok_or_else(|| "lookup index bit width overflow".to_string())?;
+    if total_bits >= usize::BITS as usize {
+        return Err(format!(
+            "lookup index bit width {total_bits} exceeds supported usize domain"
+        ));
+    }
+    let max_exclusive = 1usize
+        .checked_shl(total_bits as u32)
+        .ok_or_else(|| format!("lookup index bit width {total_bits} exceeds usize"))?;
+    for (j, &idx) in query_indices.iter().enumerate() {
+        if idx >= max_exclusive {
+            return Err(format!(
+                "index {j} = {idx} exceeds {}-bit lookup domain [0, {})",
+                total_bits, max_exclusive
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Compute [1, ρ, ρ², ..., ρ^{n-1}].
@@ -1684,6 +1720,28 @@ mod lasso_tests {
             "Lasso verification failed: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn test_lasso_rejects_out_of_domain_query_index() {
+        let (instance, query_indices) = setup_test_instance();
+        let params = HyraxParams::new(instance.bits_per_chunk / 2);
+        let pk = precommit_lasso_tables(&instance.tables, instance.bits_per_chunk, &params);
+        let vk = pk.vk();
+
+        let mut prover_transcript = Transcript::new(b"lasso-domain-bound");
+        let mut proof = prove_lasso(
+            &instance,
+            &query_indices,
+            &pk,
+            &mut prover_transcript,
+            &params,
+        );
+        proof.query_indices[0] = 1usize << (instance.bits_per_chunk * instance.tables.len());
+
+        let mut verifier_transcript = Transcript::new(b"lasso-domain-bound");
+        let result = verify_lasso(&proof, &instance, &vk, &mut verifier_transcript, &params);
+        assert!(result.is_err(), "out-of-domain query index must reject");
     }
 
     #[test]
