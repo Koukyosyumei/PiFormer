@@ -55,15 +55,40 @@ pub struct AttentionVerifyingKey {
 }
 
 /// Precommit Q and K activation tables at setup time.
+///
+/// When Q and K share identical sub-tables (the common case — Python's
+/// exporter always writes them from the same source), we commit them once
+/// and reuse the row commitments for the K instance instead of running a
+/// duplicate `hyrax_commit` per sub-table. The downstream Lasso protocol
+/// still treats Q and K as separate instances (different outputs / queries),
+/// so soundness is unchanged.
 pub fn precommit_attention_tables(
     q_lasso: &LassoInstance,
     k_lasso: &LassoInstance,
     params: &HyraxParams,
 ) -> AttentionProvingKey {
-    let multi_inst = LassoMultiInstance {
-        instances: vec![q_lasso.clone(), k_lasso.clone()],
+    assert_eq!(
+        q_lasso.bits_per_chunk, k_lasso.bits_per_chunk,
+        "Q and K Lasso instances must agree on bits_per_chunk",
+    );
+    let qk_lasso_pk = if q_lasso.tables == k_lasso.tables {
+        let nu = q_lasso.bits_per_chunk / 2;
+        let q_coms: Vec<HyraxCommitment> = q_lasso
+            .tables
+            .iter()
+            .map(|t| hyrax_commit(t, nu, params))
+            .collect();
+        let k_coms = q_coms.clone();
+        LassoMultiProvingKey {
+            instance_table_coms: vec![q_coms, k_coms],
+            nu,
+        }
+    } else {
+        let multi_inst = LassoMultiInstance {
+            instances: vec![q_lasso.clone(), k_lasso.clone()],
+        };
+        precommit_lasso_multi_tables(&multi_inst, q_lasso.bits_per_chunk, params)
     };
-    let qk_lasso_pk = precommit_lasso_multi_tables(&multi_inst, q_lasso.bits_per_chunk, params);
     AttentionProvingKey { qk_lasso_pk }
 }
 
