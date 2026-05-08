@@ -1033,33 +1033,27 @@ pub fn prove(
 
         let phi_q_mle = mat_to_mle(&bw.attn_wit.phi_q, t, d);
         let phi_k_mle = mat_to_mle(&bw.attn_wit.phi_k, t, d);
-        let (ctx_mle, causal_context_com) = if inst_attn.causal {
-            let computed_causal_context;
-            let causal_context = match bw.attn_wit.causal_context.as_ref() {
-                Some(context) => {
-                    validate_causal_context_shape(context, t, d)?;
-                    context
-                }
-                None => {
-                    computed_causal_context =
-                        build_causal_context(&bw.attn_wit.phi_k, &bw.attn_wit.v, t, d);
-                    &computed_causal_context
-                }
-            };
-            let ctx_mle = mat_to_mle(causal_context, t * d, d);
-            let ctx_com = commit_mat(causal_context, t * d, d);
-            (ctx_mle, Some(ctx_com))
+        // GKR chain: in causal mode, causal_context is no longer committed; the
+        // CTX cubic sumcheck binds it algebraically via phi_k and v. In
+        // non-causal mode we still need the per-block ctx_mle for the OUT
+        // sumcheck's degree-2 dot product over k.
+        let ctx_mle = if inst_attn.causal {
+            // Validate the witness shape if provided, but otherwise we don't
+            // need a committed MLE — the CTX cubic sumcheck rebuilds the
+            // (s, a, b) tensor from phi_k and v directly.
+            if let Some(context) = bw.attn_wit.causal_context.as_ref() {
+                validate_causal_context_shape(context, t, d)?;
+            }
+            DenseMLPoly::new(vec![F::ZERO; 1])
         } else {
-            (mat_to_mle(&bw.attn_wit.context, d, d), None)
+            mat_to_mle(&bw.attn_wit.context, d, d)
         };
+        let causal_context_com: Option<HyraxCommitment> = None;
 
         let phi_q_com = commit_mat(&bw.attn_wit.phi_q, t, d);
         let phi_k_com = commit_mat(&bw.attn_wit.phi_k, t, d);
         absorb_com(transcript, b"phi_q_com", &phi_q_com);
         absorb_com(transcript, b"phi_k_com", &phi_k_com);
-        if let Some(ref ctx_com) = causal_context_com {
-            absorb_com(transcript, b"causal_ctx_com", ctx_com);
-        }
 
         let out_eval_i = if bw.attn_wit.normalized_out.is_some() {
             mat_to_mle(&bw.attn_wit.out, t, d).evaluate(&combine(&r_t, &r_k_o))
@@ -1182,21 +1176,27 @@ pub fn prove(
     let mut fs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut gs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut hs_attn_ctx: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
-    let mut causal_prefix_point: Option<Vec<F>> = None;
-    let mut causal_ctx_prefix_evals: Vec<F> = Vec::new();
+    // GKR chain: in causal mode the CTX-relation is proved at the prefix point
+    // implied by the OUT sumcheck terminal — (r_final_t, r_final_k) for the
+    // (t, a) axes from batch_r_attn_out, plus r_k_o for the b-axis. The CTX
+    // claim per block is OUT's final_evals_g[i] (= causal_context_mle at that
+    // point), so we don't sample fresh prefix challenges and don't need to
+    // separately bind the prefix-point opening of causal_context.
+    let causal_ctx_prefix_evals: Vec<F> = Vec::new();
     let attn_ctx_evals: Vec<F> = if inst_attn.causal {
-        let prefix_t = challenge_vec(transcript, t_bits, b"causal_prefix_t");
-        let prefix_a = challenge_vec(transcript, d_bits, b"causal_prefix_a");
-        let prefix_b = challenge_vec(transcript, d_bits, b"causal_prefix_b");
-        let prefix_point = combine(&combine(&prefix_t, &prefix_a), &prefix_b);
+        let prefix_t = batch_r_attn_out[..t_bits].to_vec();
+        let prefix_a = batch_r_attn_out[t_bits..t_bits + d_bits].to_vec();
+        let prefix_b = r_k_o.clone();
         let suffix_evals = suffix_eq_evals_msb(&prefix_t, t);
         let eq_a_evals = eq_evals_msb(&prefix_a, d);
         let eq_b_evals = eq_evals_msb(&prefix_b, d);
-        let mut claims = Vec::with_capacity(num_blocks);
+        let claims = batch_attn_out_causal
+            .as_ref()
+            .expect("causal mode always produces batch_attn_out_causal")
+            .final_evals_g
+            .clone();
         for i in 0..num_blocks {
             let bw = &witness.block_witnesses[i];
-            let ctx_eval = ctx_mles[i].evaluate(&prefix_point);
-            transcript.append_field(b"attn_ctx_eval", &ctx_eval);
             let (f_ctx, g_v, h_ctx) = causal_prefix_polys(
                 &bw.attn_wit.phi_k,
                 &bw.attn_wit.v,
@@ -1209,10 +1209,7 @@ pub fn prove(
             fs_attn_ctx.push(f_ctx);
             gs_attn_ctx.push(g_v);
             hs_attn_ctx.push(h_ctx);
-            claims.push(ctx_eval);
         }
-        causal_prefix_point = Some(prefix_point);
-        causal_ctx_prefix_evals = claims.clone();
         claims
     } else {
         let claims = batch_attn_out
@@ -1884,13 +1881,6 @@ pub fn prove(
         let r_s = batch_r_attn_ctx[..t_bits].to_vec();
         let r_a = batch_r_attn_ctx[t_bits..t_bits + d_bits].to_vec();
         let r_b = batch_r_attn_ctx[t_bits + d_bits..].to_vec();
-        let prefix_point = causal_prefix_point
-            .clone()
-            .ok_or_else(|| "missing causal prefix point".to_string())?;
-        let ctx_refs: Vec<&[F]> = ctx_mles.iter().map(|m| m.evaluations.as_slice()).collect();
-        let (nu_tdd, sigma_tdd, _) = params_from_vars(t_bits + 2 * d_bits);
-        let ctx_prefix_open =
-            hyrax_open_batch(&ctx_refs, &prefix_point, nu_tdd, sigma_tdd, transcript);
         let phi_k_point = combine(&r_s, &r_a);
         let v_point = combine(&r_s, &r_b);
         causal_phi_k_prefix_evals = phi_k_mles
@@ -1898,7 +1888,10 @@ pub fn prove(
             .map(|m| m.evaluate(&phi_k_point))
             .collect();
         causal_v_prefix_evals = v_mles.iter().map(|m| m.evaluate(&v_point)).collect();
-        (phi_k_point, v_point, Some(ctx_prefix_open))
+        // GKR chain: the CTX-relation prefix point is implied by the OUT
+        // sumcheck terminal, so no separate prefix-point open of
+        // causal_context_com is needed.
+        (phi_k_point, v_point, None)
     } else {
         (
             combine(&batch_r_attn_ctx, &batch_r_attn_out),
@@ -1946,22 +1939,10 @@ pub fn prove(
         None
     };
 
-    let causal_ctx_out_batch_open = if inst_attn.causal {
-        // Causal sumcheck has already folded r_t into batch_r_attn_out, so the
-        // causal-context open point is just (batch_r_attn_out, r_k_o).
-        let ctx_out_point = combine(&batch_r_attn_out, &r_k_o);
-        let ctx_refs: Vec<&[F]> = ctx_mles.iter().map(|m| m.evaluations.as_slice()).collect();
-        let (nu_tdd, sigma_tdd, _) = params_from_vars(t_bits + 2 * d_bits);
-        Some(hyrax_open_batch(
-            &ctx_refs,
-            &ctx_out_point,
-            nu_tdd,
-            sigma_tdd,
-            transcript,
-        ))
-    } else {
-        None
-    };
+    // GKR chain (step 2): causal_context is not committed, so no Hyrax open
+    // is required at the OUT-sumcheck terminal point. The CTX cubic sumcheck
+    // binds the OUT final_evals_g[i] to phi_k and v algebraically.
+    let causal_ctx_out_batch_open: Option<HyraxProof> = None;
 
     let (attn_norm_r_batch_open, attn_z_open, attn_norm_attn_point_open) =
         if let Some(ref r_norm) = attn_norm_r {
@@ -2599,9 +2580,12 @@ mod tests {
 
         let mut pt = Transcript::new(b"model_causal_e2e");
         let proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
-        assert!(proof.block_proofs[0].causal_context_com.is_some());
-        assert!(proof.causal_ctx_out_batch_open.is_some());
-        assert!(proof.causal_ctx_prefix_batch_open.is_some());
+        // GKR chain (step 2): causal_context_com and both causal_ctx opens are
+        // dropped — the CTX cubic sumcheck binds the OUT terminal claim
+        // algebraically through phi_k and v.
+        assert!(proof.block_proofs[0].causal_context_com.is_none());
+        assert!(proof.causal_ctx_out_batch_open.is_none());
+        assert!(proof.causal_ctx_prefix_batch_open.is_none());
 
         let mut vt = Transcript::new(b"model_causal_e2e");
         let result = verify(

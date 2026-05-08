@@ -594,15 +594,9 @@ pub fn verify(
         let bp = &proof.block_proofs[i];
         absorb_com(transcript, b"phi_q_com", &bp.attn_phi_q_com);
         absorb_com(transcript, b"phi_k_com", &bp.attn_phi_k_com);
-        if inst_attn.causal {
-            let ctx_com = bp
-                .causal_context_com
-                .as_ref()
-                .ok_or_else(|| format!("Block {i}: missing causal context commitment"))?;
-            absorb_com(transcript, b"causal_ctx_com", ctx_com);
-        } else if bp.causal_context_com.is_some() {
+        if bp.causal_context_com.is_some() {
             return Err(format!(
-                "Block {i}: unexpected causal context commitment in non-causal proof"
+                "Block {i}: causal_context_com is no longer used (GKR chain step 2)"
             ));
         }
     }
@@ -687,37 +681,32 @@ pub fn verify(
         }
     }
 
-    // 6c. Verify context relation. In causal mode this proves the committed
-    // prefix context by a random linear combination of all prefix equations.
-    let causal_prefix_point = if inst_attn.causal {
-        let prefix_t = challenge_vec(transcript, t_bits, b"causal_prefix_t");
-        let prefix_a = challenge_vec(transcript, d_bits, b"causal_prefix_a");
-        let prefix_b = challenge_vec(transcript, d_bits, b"causal_prefix_b");
-        Some(combine(&combine(&prefix_t, &prefix_a), &prefix_b))
-    } else {
-        None
-    };
-    let attn_ctx_claims = if inst_attn.causal {
-        if proof.causal_ctx_prefix_evals.len() != num_blocks {
-            return Err(format!(
-                "causal prefix eval count mismatch: got {}, expected {}",
-                proof.causal_ctx_prefix_evals.len(),
-                num_blocks
-            ));
+    // 6c. Verify context relation. With the GKR chain, the causal CTX-relation
+    // is bound at the OUT sumcheck terminal point, so no fresh prefix
+    // challenges or prefix-point Hyrax open are needed: the per-block claim
+    // for CTX is OUT's final_evals_g[i].
+    let attn_ctx_claims: Vec<F> = if inst_attn.causal {
+        if !proof.causal_ctx_prefix_evals.is_empty() {
+            return Err(
+                "unexpected causal_ctx_prefix_evals in causal proof (GKR-chained)".to_string(),
+            );
         }
-        proof
-            .causal_ctx_prefix_batch_open
-            .as_ref()
-            .ok_or_else(|| "missing causal_ctx_prefix_batch_open".to_string())?;
-        proof.causal_ctx_prefix_evals.clone()
+        if proof.causal_ctx_prefix_batch_open.is_some() {
+            return Err(
+                "unexpected causal_ctx_prefix_batch_open in causal proof (GKR-chained)".to_string(),
+            );
+        }
+        attn_out_final_evals_g.clone()
     } else {
         if !proof.causal_ctx_prefix_evals.is_empty() {
             return Err("unexpected causal_ctx_prefix_evals in non-causal proof".to_string());
         }
         attn_out_final_evals_g.clone()
     };
-    for claim in &attn_ctx_claims {
-        transcript.append_field(b"attn_ctx_eval", claim);
+    if !inst_attn.causal {
+        for claim in &attn_ctx_claims {
+            transcript.append_field(b"attn_ctx_eval", claim);
+        }
     }
     let eta_attn_ctx: F = transcript.challenge_field(b"batch_eta_attn_ctx");
     let weights_attn_ctx = powers_of(eta_attn_ctx, num_blocks);
@@ -740,14 +729,12 @@ pub fn verify(
             transcript,
         )
         .map_err(|e| format!("batch_attn_ctx_causal: {e}"))?;
-        // Verifier computes h_mle locally: suffix_eq(prefix_t, ·) ⊗
-        // eq(prefix_a, ·) ⊗ eq(prefix_b, ·) factor cleanly across (s, a, b).
-        let prefix_point = causal_prefix_point
-            .as_ref()
-            .ok_or_else(|| "missing causal prefix point".to_string())?;
-        let prefix_t = &prefix_point[..t_bits];
-        let prefix_a = &prefix_point[t_bits..t_bits + d_bits];
-        let prefix_b = &prefix_point[t_bits + d_bits..];
+        // GKR chain: the prefix point is implied by the OUT-sumcheck terminal
+        // — (r_final_t, r_final_k) for the (t, a) axes and r_k_o for the b
+        // axis, so suffix·eq_a·eq_b factors are computed off those.
+        let prefix_t: &[F] = &batch_r_attn_out[..t_bits];
+        let prefix_a: &[F] = &batch_r_attn_out[t_bits..t_bits + d_bits];
+        let prefix_b: &[F] = &r_k_o[..];
         let r_s = &r[..t_bits];
         let r_a = &r[t_bits..t_bits + d_bits];
         let r_b = &r[t_bits + d_bits..];
@@ -1671,35 +1658,10 @@ pub fn verify(
     )
     .map_err(|e| format!("phi_q_batch: {e}"))?;
 
-    let causal_ctx_coms: Option<Vec<HyraxCommitment>> = if inst_attn.causal {
-        let ctx_coms: Vec<HyraxCommitment> = proof
-            .block_proofs
-            .iter()
-            .map(|bp| {
-                bp.causal_context_com
-                    .clone()
-                    .ok_or_else(|| "missing causal context commitment".to_string())
-            })
-            .collect::<Result<_, _>>()?;
-        let (_, _, params_tdd) = params_from_vars(t_bits + 2 * d_bits);
-        hyrax_verify_batch(
-            &ctx_coms,
-            &proof.causal_ctx_prefix_evals,
-            causal_prefix_point
-                .as_ref()
-                .ok_or_else(|| "missing causal prefix point".to_string())?,
-            proof
-                .causal_ctx_prefix_batch_open
-                .as_ref()
-                .ok_or_else(|| "missing causal_ctx_prefix_batch_open".to_string())?,
-            &params_tdd,
-            transcript,
-        )
-        .map_err(|e| format!("causal_ctx_prefix_batch: {e}"))?;
-        Some(ctx_coms)
-    } else {
-        None
-    };
+    // GKR chain (step 2): causal_context_com is dropped — neither prefix-point
+    // nor terminal-point Hyrax open is needed; the CTX cubic sumcheck binds
+    // attn_out_final_evals_g algebraically via phi_k and v.
+    let causal_ctx_coms: Option<Vec<HyraxCommitment>> = None;
 
     let (phi_k_attn_point, phi_k_evals, v_attn_batch_point, v_evals) = if inst_attn.causal {
         if proof.causal_phi_k_prefix_evals.len() != num_blocks
@@ -1805,31 +1767,15 @@ pub fn verify(
         return Err("unexpected attention denominator phi_k opening".into());
     }
 
-    if inst_attn.causal {
-        let ctx_coms = causal_ctx_coms
-            .as_ref()
-            .ok_or_else(|| "missing causal context commitments".to_string())?;
-        // Causal sumcheck folded r_t into batch_r_attn_out, so the
-        // causal-context open point is just (batch_r_attn_out, r_k_o).
-        let ctx_out_point = combine(&batch_r_attn_out, &r_k_o);
-        let (_, _, params_tdd) = params_from_vars(t_bits + 2 * d_bits);
-        hyrax_verify_batch(
-            ctx_coms,
-            &attn_out_final_evals_g,
-            &ctx_out_point,
-            proof
-                .causal_ctx_out_batch_open
-                .as_ref()
-                .ok_or_else(|| "missing causal_ctx_out_batch_open".to_string())?,
-            &params_tdd,
-            transcript,
-        )
-        .map_err(|e| format!("causal_ctx_out_batch: {e}"))?;
-    } else if proof.causal_ctx_out_batch_open.is_some()
+    // GKR chain (step 2): causal_context_com is dropped; the CTX cubic sumcheck
+    // binds attn_out_final_evals_g algebraically via phi_k and v opens. So no
+    // Hyrax open of causal_context is required.
+    if proof.causal_ctx_out_batch_open.is_some()
         || proof.causal_ctx_prefix_batch_open.is_some()
     {
-        return Err("unexpected causal context openings in non-causal proof".to_string());
+        return Err("unexpected causal context openings (cc_com is dropped)".to_string());
     }
+    let _ = causal_ctx_coms;
 
     if let Some(ref r_norm) = attn_norm_r {
         let sc = proof.attn_norm_sumcheck.as_ref().unwrap();
