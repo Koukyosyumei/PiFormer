@@ -16,7 +16,7 @@ use crate::lookup::quantization::{verify_quantization_batch, QuantizationParams}
 use crate::lookup::range::verify_range_batched;
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_verify, hyrax_verify_batch, hyrax_verify_batch_with_eta,
-    params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams,
+    lagrange_basis, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams,
 };
 use crate::poly::utils::{combine, compute_eq_evals, mat_to_mle};
 use crate::poly::DenseMLPoly;
@@ -131,23 +131,6 @@ fn commit_public_mat(mat: &[Vec<F>], rows: usize, cols: usize) -> Result<HyraxCo
     Ok(hyrax_commit(&mle.evaluations, nu, &params))
 }
 
-fn commit_public_indices(
-    indices: &[usize],
-    rows: usize,
-    cols: usize,
-) -> Result<HyraxCommitment, String> {
-    let values: Vec<F> = indices.iter().map(|&idx| F::from(idx as u64)).collect();
-    if values.len() != rows * cols {
-        return Err(format!(
-            "public index matrix length mismatch: got {}, expected {}",
-            values.len(),
-            rows * cols
-        ));
-    }
-    let mat: Vec<Vec<F>> = values.chunks(cols).map(|row| row.to_vec()).collect();
-    commit_public_mat(&mat, rows, cols)
-}
-
 fn commitments_equal(a: &HyraxCommitment, b: &HyraxCommitment) -> bool {
     a.nu == b.nu && a.sigma == b.sigma && a.row_coms == b.row_coms
 }
@@ -193,7 +176,6 @@ fn eval_query_indices(
 fn verify_query_indices_bound_batch(
     label: &str,
     indices: &[&[usize]],
-    commitments: &[HyraxCommitment],
     rows: usize,
     cols: usize,
     point: &[F],
@@ -201,19 +183,84 @@ fn verify_query_indices_bound_batch(
     params: &HyraxParams,
     transcript: &mut Transcript,
 ) -> Result<(), String> {
-    if indices.len() != commitments.len() {
+    let count = indices.len();
+    if count == 0 {
+        return Ok(());
+    }
+
+    let sigma = params.sigma;
+    let nu = point
+        .len()
+        .checked_sub(sigma)
+        .ok_or_else(|| format!("{label} lookup binding point shorter than sigma"))?;
+    let num_cols = 1usize << sigma;
+    let num_rows = 1usize << nu;
+    let padded_len = num_rows * num_cols;
+    if proof.w_prime.len() != num_cols {
         return Err(format!(
-            "{label} lookup binding count mismatch: got {} index vectors, {} commitments",
-            indices.len(),
-            commitments.len()
+            "{label} lookup binding proof length mismatch: got {}, expected {}",
+            proof.w_prime.len(),
+            num_cols
         ));
     }
-    let evals = indices
+    let expected_unpadded_len = rows * cols;
+    for idx in indices {
+        if idx.len() != expected_unpadded_len {
+            return Err(format!(
+                "{label} lookup index length mismatch: got {}, expected {}",
+                idx.len(),
+                expected_unpadded_len
+            ));
+        }
+    }
+
+    let eta = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    let eta_pows = powers_of(eta, count);
+    let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
+    let r_r_rev: Vec<F> = point[nu..].iter().rev().copied().collect();
+    let l_vec = lagrange_basis(&r_l_rev);
+    let r_vec = lagrange_basis(&r_r_rev);
+
+    let mut expected_w_prime = vec![F::ZERO; num_cols];
+    for (k, idx) in indices.iter().enumerate() {
+        let eta_k = eta_pows[k];
+        for flat in 0..padded_len {
+            let value = if flat < idx.len() {
+                F::from(idx[flat] as u64)
+            } else {
+                F::ZERO
+            };
+            if value == F::ZERO {
+                continue;
+            }
+            expected_w_prime[flat % num_cols] += eta_k * l_vec[flat / num_cols] * value;
+        }
+    }
+    if proof.w_prime != expected_w_prime {
+        return Err(format!(
+            "{label} lookup index binding opening vector mismatch"
+        ));
+    }
+
+    let inner: F = r_vec
         .iter()
-        .map(|idx| eval_query_indices(idx, rows, cols, point))
-        .collect::<Result<Vec<_>, _>>()?;
-    hyrax_verify_batch(commitments, &evals, point, proof, params, transcript)
-        .map_err(|e| format!("{label} lookup index binding opening: {e}"))
+        .zip(proof.w_prime.iter())
+        .map(|(&r, &w)| r * w)
+        .sum();
+    let expected_inner = indices
+        .iter()
+        .zip(eta_pows.iter())
+        .map(|(idx, eta_k)| eval_query_indices(idx, rows, cols, point).map(|v| *eta_k * v))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum();
+    if inner != expected_inner {
+        return Err(format!(
+            "{label} lookup index binding inner product mismatch"
+        ));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -969,17 +1016,10 @@ pub fn verify(
         &mut acc_quant_m,
     )?;
     let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
-    let ffn_bind_m_coms: Vec<HyraxCommitment> = proof
-        .ffn_lasso_proof
-        .all_query_indices
-        .iter()
-        .map(|idx| commit_public_indices(idx, t, d_ff))
-        .collect::<Result<_, _>>()?;
     let (_, _, params_mff_bind) = params_from_vars(t_bits + f_bits);
     verify_query_indices_bound_batch(
         "FFN",
         &ffn_index_refs,
-        &ffn_bind_m_coms,
         t,
         d_ff,
         &ffn_lasso_bind_point,
@@ -2010,23 +2050,9 @@ pub fn verify(
         .finalize_with_mu(&params_range_m, mu_quant_qk_m)
         .map_err(|e| format!("acc_quant_qk_m: {e}"))?;
     let qk_lasso_bind_point = challenge_vec(transcript, td_num_vars, b"qk_lasso_bind_r");
-    let mut qk_coms = Vec::with_capacity(2 * num_blocks);
-    for i in 0..num_blocks {
-        qk_coms.push(commit_public_indices(
-            &proof.all_lasso_proof.all_query_indices[2 * i],
-            t,
-            d,
-        )?);
-        qk_coms.push(commit_public_indices(
-            &proof.all_lasso_proof.all_query_indices[2 * i + 1],
-            t,
-            d,
-        )?);
-    }
     verify_query_indices_bound_batch(
         "attention Q/K",
         &qk_index_refs,
-        &qk_coms,
         t,
         d,
         &qk_lasso_bind_point,
