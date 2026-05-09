@@ -51,7 +51,7 @@ const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
 const VERSION: u8 = 4;
-const PROOF_VERSION: u8 = 10;
+const PROOF_VERSION: u8 = 11;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -689,30 +689,13 @@ fn read_global_range_m<R: Read>(r: &mut R) -> io::Result<GlobalRangeM> {
 fn write_ln_internal_coms<W: Write>(w: &mut W, c: &LayerNormInternalCommitments) -> io::Result<()> {
     write_hyrax_commitment(w, &c.sum_x_com)?;
     write_hyrax_commitment(w, &c.sigma_com)?;
-    write_hyrax_commitment(w, &c.sq_sum_x_com)?;
-    let has_sy = c.sigma_y_com.is_some();
-    w.write_all(&[has_sy as u8])?;
-    if let Some(ref sy) = c.sigma_y_com {
-        write_hyrax_commitment(w, sy)?;
-    }
-    Ok(())
+    write_hyrax_commitment(w, &c.sq_sum_x_com)
 }
 fn read_ln_internal_coms<R: Read>(r: &mut R) -> io::Result<LayerNormInternalCommitments> {
-    let sum_x_com = read_hyrax_commitment(r)?;
-    let sigma_com = read_hyrax_commitment(r)?;
-    let sq_sum_x_com = read_hyrax_commitment(r)?;
-    let mut flag = [0u8; 1];
-    r.read_exact(&mut flag)?;
-    let sigma_y_com = if flag[0] != 0 {
-        Some(read_hyrax_commitment(r)?)
-    } else {
-        None
-    };
     Ok(LayerNormInternalCommitments {
-        sum_x_com,
-        sigma_com,
-        sq_sum_x_com,
-        sigma_y_com,
+        sum_x_com: read_hyrax_commitment(r)?,
+        sigma_com: read_hyrax_commitment(r)?,
+        sq_sum_x_com: read_hyrax_commitment(r)?,
     })
 }
 
@@ -733,12 +716,7 @@ fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<(
     write_hyrax_proof(w, &o.rsig_batch_proof)?;
     // Group 3: at combine(r_y_t, r_y_d)
     write_f(w, &o.x_at_ry)?;
-    // y_at_ry: None in GKR mode, Some in conventional mode
-    let has_y_at_ry = o.y_at_ry.is_some();
-    w.write_all(&[has_y_at_ry as u8])?;
-    if let Some(ref v) = o.y_at_ry {
-        write_f(w, v)?;
-    }
+    write_f(w, &o.y_at_ry)?;
     write_f(w, &o.gamma_x_at_ry)?;
     write_f(w, &o.sigma_y_at_ry)?;
     write_hyrax_proof(w, &o.ry_td_batch_proof)?;
@@ -748,28 +726,8 @@ fn write_ln_openings<W: Write>(w: &mut W, o: &LayerNormOpenings) -> io::Result<(
     write_hyrax_proof(w, &o.ryt_batch_proof)?;
     // Group 5: at r_f_gx
     write_ep!(w, &o.x_at_rf_gx, &o.x_at_rf_gx_proof);
-    // Group 6: at r_f_sy
-    // Conventional mode: y_at_rf_sy/proof present; GKR mode: sigma_y_at_rf + sum_x present
-    let has_y_at_rf_sy = o.y_at_rf_sy.is_some();
-    w.write_all(&[has_y_at_rf_sy as u8])?;
-    if has_y_at_rf_sy {
-        write_ep!(
-            w,
-            o.y_at_rf_sy.as_ref().unwrap(),
-            o.y_at_rf_sy_proof.as_ref().unwrap()
-        );
-    } else {
-        write_ep!(
-            w,
-            o.sigma_y_at_rf.as_ref().unwrap(),
-            o.sigma_y_at_rf_proof.as_ref().unwrap()
-        );
-        write_ep!(
-            w,
-            o.sum_x_at_rf_sy_t.as_ref().unwrap(),
-            o.sum_x_at_rf_sy_t_proof.as_ref().unwrap()
-        );
-    }
+    // Group 6: at r_f_sy — open y_com.
+    write_ep!(w, &o.y_at_rf_sy, &o.y_at_rf_sy_proof);
     write_ep!(w, &o.sigma_at_rf_sy_t, &o.sigma_at_rf_sy_t_proof);
     write_ep!(w, &o.sum_x_at_rf_sig, &o.sum_x_at_rf_sig_proof);
     // sigma_sq binding
@@ -793,9 +751,7 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
     let rsig_batch_proof = read_hyrax_proof(r)?;
     // Group 3: at combine(r_y_t, r_y_d)
     let x_at_ry = read_f(r)?;
-    let mut flag = [0u8; 1];
-    r.read_exact(&mut flag)?;
-    let y_at_ry = if flag[0] != 0 { Some(read_f(r)?) } else { None };
+    let y_at_ry = read_f(r)?;
     let gamma_x_at_ry = read_f(r)?;
     let sigma_y_at_ry = read_f(r)?;
     let ry_td_batch_proof = read_hyrax_proof(r)?;
@@ -806,22 +762,7 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
     // Group 5: at r_f_gx
     let (x_at_rf_gx, x_at_rf_gx_proof) = read_ep!(r);
     // Group 6: at r_f_sy
-    r.read_exact(&mut flag)?;
-    let (
-        y_at_rf_sy,
-        y_at_rf_sy_proof,
-        sigma_y_at_rf,
-        sigma_y_at_rf_proof,
-        sum_x_at_rf_sy_t,
-        sum_x_at_rf_sy_t_proof,
-    ) = if flag[0] != 0 {
-        let (v, p) = read_ep!(r);
-        (Some(v), Some(p), None, None, None, None)
-    } else {
-        let (sy_v, sy_p) = read_ep!(r);
-        let (sx_v, sx_p) = read_ep!(r);
-        (None, None, Some(sy_v), Some(sy_p), Some(sx_v), Some(sx_p))
-    };
+    let (y_at_rf_sy, y_at_rf_sy_proof) = read_ep!(r);
     let (sigma_at_rf_sy_t, sigma_at_rf_sy_t_proof) = read_ep!(r);
     let (sum_x_at_rf_sig, sum_x_at_rf_sig_proof) = read_ep!(r);
     let (sigma_at_rf_sigma_sq, sigma_at_rf_sigma_sq_proof) = read_ep!(r);
@@ -850,10 +791,6 @@ fn read_ln_openings<R: Read>(r: &mut R) -> io::Result<LayerNormOpenings> {
         x_at_rf_gx_proof,
         y_at_rf_sy,
         y_at_rf_sy_proof,
-        sigma_y_at_rf,
-        sigma_y_at_rf_proof,
-        sum_x_at_rf_sy_t,
-        sum_x_at_rf_sy_t_proof,
         sigma_at_rf_sy_t,
         sigma_at_rf_sy_t_proof,
         sum_x_at_rf_sig,
