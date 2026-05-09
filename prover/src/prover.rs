@@ -37,10 +37,13 @@ use crate::lookup::quantization::{prove_quantization_batch, QuantizationProof};
 use crate::lookup::range::{
     prove_range_batched, GlobalRangeM, RangeProofWitness, RangeWitnessProof,
 };
-use crate::subprotocols::{prove_sumcheck_cubic_multi_batched, SumcheckCubicProofMulti};
-use crate::subprotocols::{prove_sumcheck_multi_batched, SumcheckProofMulti};
+use crate::subprotocols::{
+    prove_sumcheck_cubic_multi_batched_owned, prove_sumcheck_multi_batched_owned,
+    SumcheckCubicProofMulti, SumcheckProofMulti,
+};
 use crate::verifier::{add_commitments, TransformerBlockVerifyingKey};
 use rayon::prelude::*;
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // Proof Structures
@@ -537,7 +540,11 @@ fn causal_prefix_polys(
             }
         }
     }
-    (DenseMLPoly::new(f), DenseMLPoly::new(g), DenseMLPoly::new(h))
+    (
+        DenseMLPoly::new(f),
+        DenseMLPoly::new(g),
+        DenseMLPoly::new(h),
+    )
 }
 
 fn causal_denominator_polys(
@@ -656,6 +663,8 @@ pub fn prove(
     transcript: &mut Transcript,
     lasso_params: &HyraxParams,
 ) -> Result<TransformerModelProof, String> {
+    let prove_t0 = Instant::now();
+    let mut phase_t0 = Instant::now();
     let num_blocks = pk.vk.num_blocks;
     let t = pk.vk.seq_len;
     let d = pk.vk.d_model;
@@ -685,6 +694,43 @@ pub fn prove(
         hyrax_commit(&mle.evaluations, nu, &params)
     };
 
+    struct StaticBlockMles {
+        w_q: DenseMLPoly,
+        w_k: DenseMLPoly,
+        w_v: DenseMLPoly,
+        w_o: DenseMLPoly,
+        w1: DenseMLPoly,
+        w2: DenseMLPoly,
+        b_q: DenseMLPoly,
+        b_k: DenseMLPoly,
+        b_v: DenseMLPoly,
+        b_o: DenseMLPoly,
+    }
+
+    let static_mles: Vec<StaticBlockMles> = (0..num_blocks)
+        .into_par_iter()
+        .map(|i| {
+            let bpk = &pk.block_pks[i];
+            StaticBlockMles {
+                w_q: mat_to_mle(&convert_tm_to_fm(&bpk.q_pk.w), d, d),
+                w_k: mat_to_mle(&convert_tm_to_fm(&bpk.k_pk.w), d, d),
+                w_v: mat_to_mle(&convert_tm_to_fm(&bpk.v_pk.w), d, d),
+                w_o: mat_to_mle(&convert_tm_to_fm(&bpk.o_pk.w), d, d),
+                w1: mat_to_mle(&convert_tm_to_fm(&bpk.ffn_pk.w1), d, d_ff),
+                w2: mat_to_mle(&convert_tm_to_fm(&bpk.ffn_pk.w2), d_ff, d),
+                b_q: vec_to_mle(&bpk.q_pk.bias, d),
+                b_k: vec_to_mle(&bpk.k_pk.bias, d),
+                b_v: vec_to_mle(&bpk.v_pk.bias, d),
+                b_o: vec_to_mle(&bpk.o_pk.bias, d),
+            }
+        })
+        .collect();
+    eprintln!(
+        "[prove] static_mles: {:7.3}ms",
+        phase_t0.elapsed().as_secs_f64() * 1000.0
+    );
+    phase_t0 = Instant::now();
+
     // =========================================================================
     // 1. Initial input commitment
     // =========================================================================
@@ -704,18 +750,21 @@ pub fn prove(
     // Phase 1a (PARALLEL): Per-block witness commits and LN range witnesses are
     // independent across blocks — neither depends on the residual chain or the
     // transcript. Compute them concurrently across L blocks.
-    let parallel_per_block: Vec<(BlockCommitDataNoResidual, LayerNormRangeWitnesses, LayerNormRangeWitnesses)> =
-        (0..num_blocks)
-            .into_par_iter()
-            .map(|i| {
-                let bw = &witness.block_witnesses[i];
-                let bpk = &pk.block_pks[i];
-                let partial = commit_block_intermediates_no_residual(bw, bpk);
-                let ln1_rw = compute_range_witnesses(&bw.ln1_wit, &bpk.ln1_vk);
-                let ln2_rw = compute_range_witnesses(&bw.ln2_wit, &bpk.ln2_vk);
-                (partial, ln1_rw, ln2_rw)
-            })
-            .collect();
+    let parallel_per_block: Vec<(
+        BlockCommitDataNoResidual,
+        LayerNormRangeWitnesses,
+        LayerNormRangeWitnesses,
+    )> = (0..num_blocks)
+        .into_par_iter()
+        .map(|i| {
+            let bw = &witness.block_witnesses[i];
+            let bpk = &pk.block_pks[i];
+            let partial = commit_block_intermediates_no_residual(bw, bpk);
+            let ln1_rw = compute_range_witnesses(&bw.ln1_wit, &bpk.ln1_vk);
+            let ln2_rw = compute_range_witnesses(&bw.ln2_wit, &bpk.ln2_vk);
+            (partial, ln1_rw, ln2_rw)
+        })
+        .collect();
 
     // Phase 1b (SEQUENTIAL): finalize the residual-chain x_mid_com per block
     // (homomorphic adds, cheap) and accumulate ln_range_witnesses in deterministic order.
@@ -819,6 +868,11 @@ pub fn prove(
         .next()
         .expect("missing final LN sigma range point");
     let final_y_rv = ln_range_rvs.next().expect("missing final LN y range point");
+    eprintln!(
+        "[prove] phase1_ln_range: {:7.3}ms",
+        phase_t0.elapsed().as_secs_f64() * 1000.0
+    );
+    phase_t0 = Instant::now();
 
     // =========================================================================
     // 3. Derive global r_td after ALL blocks' Phase 1 commitments
@@ -836,6 +890,7 @@ pub fn prove(
     let mut q_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut k_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut v_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
+    let mut x_norm1_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     // Per-block QKV data needed for proof construction
     let mut pb_q_eval: Vec<F> = Vec::with_capacity(num_blocks);
     let mut pb_k_eval: Vec<F> = Vec::with_capacity(num_blocks);
@@ -867,16 +922,14 @@ pub fn prove(
         let q_mle = mat_to_mle(&bw.attn_wit.q, t, d);
         let k_mle = mat_to_mle(&bw.attn_wit.k, t, d);
         let v_mle = mat_to_mle(&bw.attn_wit.v, t, d);
-        let bias_q_mle = vec_to_mle(&bpk.q_pk.bias, d);
-        let bias_k_mle = vec_to_mle(&bpk.k_pk.bias, d);
-        let bias_v_mle = vec_to_mle(&bpk.v_pk.bias, d);
+        let static_mle = &static_mles[i];
 
         let q_eval = q_mle.evaluate(&combine(&r_t, &r_out));
         let k_eval = k_mle.evaluate(&combine(&r_t, &r_out));
         let v_eval = v_mle.evaluate(&combine(&r_t, &r_out));
-        let bias_q_eval = bias_q_mle.evaluate(&r_out);
-        let bias_k_eval = bias_k_mle.evaluate(&r_out);
-        let bias_v_eval = bias_v_mle.evaluate(&r_out);
+        let bias_q_eval = static_mle.b_q.evaluate(&r_out);
+        let bias_k_eval = static_mle.b_k.evaluate(&r_out);
+        let bias_v_eval = static_mle.b_v.evaluate(&r_out);
 
         // Build f_i(k) = X_norm1_i[r_t, k]
         let f_x = eval_rows(&x_mle, t_bits, &r_t);
@@ -914,6 +967,7 @@ pub fn prove(
         q_mles.push(q_mle);
         k_mles.push(k_mle);
         v_mles.push(v_mle);
+        x_norm1_mles.push(x_mle);
     }
 
     // Cross-block QKV batch sumcheck
@@ -925,21 +979,23 @@ pub fn prove(
         .map(|(w, t)| *w * *t)
         .sum();
     let (batch_qkv, r_k_qkv) =
-        prove_sumcheck_multi_batched(&fs_qkv, &gs_qkv, &weights_qkv, claim_qkv, transcript);
+        prove_sumcheck_multi_batched_owned(fs_qkv, gs_qkv, &weights_qkv, claim_qkv, transcript);
 
     // Per-block weight evals at shared (r_k_qkv, r_out)
     let mut pb_w_q_eval: Vec<F> = Vec::with_capacity(num_blocks);
     let mut pb_w_k_eval: Vec<F> = Vec::with_capacity(num_blocks);
     let mut pb_w_v_eval: Vec<F> = Vec::with_capacity(num_blocks);
     for i in 0..num_blocks {
-        let bpk = &pk.block_pks[i];
-        let wq_mle = mat_to_mle(&convert_tm_to_fm(&bpk.q_pk.w), d, d);
-        let wk_mle = mat_to_mle(&convert_tm_to_fm(&bpk.k_pk.w), d, d);
-        let wv_mle = mat_to_mle(&convert_tm_to_fm(&bpk.v_pk.w), d, d);
-        pb_w_q_eval.push(wq_mle.evaluate(&combine(&r_k_qkv, &r_out)));
-        pb_w_k_eval.push(wk_mle.evaluate(&combine(&r_k_qkv, &r_out)));
-        pb_w_v_eval.push(wv_mle.evaluate(&combine(&r_k_qkv, &r_out)));
+        let point = combine(&r_k_qkv, &r_out);
+        pb_w_q_eval.push(static_mles[i].w_q.evaluate(&point));
+        pb_w_k_eval.push(static_mles[i].w_k.evaluate(&point));
+        pb_w_v_eval.push(static_mles[i].w_v.evaluate(&point));
     }
+    eprintln!(
+        "[prove] batch_qkv: {:7.3}ms",
+        phase_t0.elapsed().as_secs_f64() * 1000.0
+    );
+    phase_t0 = Instant::now();
 
     // =========================================================================
     // 5. Batch O-proj: absorb per-block coms, build polys
@@ -962,9 +1018,9 @@ pub fn prove(
 
         let x_inner_mle = mat_to_mle(&bw.o_proj_wit.x, t, d);
         let out_attn_mle = mat_to_mle(&bw.o_proj_wit.y, t, d);
-        let bias_o_mle = vec_to_mle(&bpk.o_pk.bias, d);
+        let static_mle = &static_mles[i];
 
-        let bias_o_eval = bias_o_mle.evaluate(&r_out);
+        let bias_o_eval = static_mle.b_o.evaluate(&r_out);
         let out_attn_eval = out_attn_mle.evaluate(&combine(&r_t, &r_out));
 
         // f_i(k) = alpha_o * X_inner_i[r_t, k]
@@ -995,9 +1051,9 @@ pub fn prove(
         .zip(oproj_targets.iter())
         .map(|(w, t)| *w * *t)
         .sum();
-    let (batch_oproj, r_k_o) = prove_sumcheck_multi_batched(
-        &fs_oproj,
-        &gs_oproj,
+    let (batch_oproj, r_k_o) = prove_sumcheck_multi_batched_owned(
+        fs_oproj,
+        gs_oproj,
         &weights_oproj,
         claim_oproj,
         transcript,
@@ -1006,10 +1062,13 @@ pub fn prove(
     // Per-block Wo evals at shared (r_k_o, r_out)
     let mut pb_w_o_eval: Vec<F> = Vec::with_capacity(num_blocks);
     for i in 0..num_blocks {
-        let bpk = &pk.block_pks[i];
-        let wo_mle = mat_to_mle(&convert_tm_to_fm(&bpk.o_pk.w), d, d);
-        pb_w_o_eval.push(wo_mle.evaluate(&combine(&r_k_o, &r_out)));
+        pb_w_o_eval.push(static_mles[i].w_o.evaluate(&combine(&r_k_o, &r_out)));
     }
+    eprintln!(
+        "[prove] batch_oproj: {:7.3}ms",
+        phase_t0.elapsed().as_secs_f64() * 1000.0
+    );
+    phase_t0 = Instant::now();
 
     // =========================================================================
     // 6. Cross-block Attention batch sumchecks
@@ -1104,9 +1163,9 @@ pub fn prove(
         .map(|(w, e)| *w * *e)
         .sum();
     let (batch_attn_out, batch_attn_out_causal, batch_r_attn_out) = if !inst_attn.causal {
-        let (sc, r) = prove_sumcheck_multi_batched(
-            &fs_attn_out,
-            &gs_attn_out,
+        let (sc, r) = prove_sumcheck_multi_batched_owned(
+            fs_attn_out,
+            gs_attn_out,
             &weights_attn_out,
             claim_attn_out,
             transcript,
@@ -1160,10 +1219,10 @@ pub fn prove(
             gs_cubic.push(DenseMLPoly::new(g_evals));
             hs_cubic.push(DenseMLPoly::new(h_evals));
         }
-        let (sc, r) = prove_sumcheck_cubic_multi_batched(
-            &fs_cubic,
-            &gs_cubic,
-            &hs_cubic,
+        let (sc, r) = prove_sumcheck_cubic_multi_batched_owned(
+            fs_cubic,
+            gs_cubic,
+            hs_cubic,
             &weights_attn_out,
             claim_attn_out,
             transcript,
@@ -1235,19 +1294,19 @@ pub fn prove(
         .map(|(w, e)| *w * *e)
         .sum();
     let (batch_attn_ctx, batch_attn_ctx_causal, batch_r_attn_ctx) = if !inst_attn.causal {
-        let (sc, r) = prove_sumcheck_multi_batched(
-            &fs_attn_ctx,
-            &gs_attn_ctx,
+        let (sc, r) = prove_sumcheck_multi_batched_owned(
+            fs_attn_ctx,
+            gs_attn_ctx,
             &weights_attn_ctx,
             claim_attn_ctx,
             transcript,
         );
         (Some(sc), None, r)
     } else {
-        let (sc, r) = prove_sumcheck_cubic_multi_batched(
-            &fs_attn_ctx,
-            &gs_attn_ctx,
-            &hs_attn_ctx,
+        let (sc, r) = prove_sumcheck_cubic_multi_batched_owned(
+            fs_attn_ctx,
+            gs_attn_ctx,
+            hs_attn_ctx,
             &weights_attn_ctx,
             claim_attn_ctx,
             transcript,
@@ -1323,7 +1382,7 @@ pub fn prove(
             ]);
         }
         let (proof, r_sc) =
-            prove_sumcheck_cubic_multi_batched(&fs, &gs, &hs, &ws, F::ZERO, transcript);
+            prove_sumcheck_cubic_multi_batched_owned(fs, gs, hs, &ws, F::ZERO, transcript);
         (Some(proof), Some(r_sc))
     } else {
         (None, None)
@@ -1366,8 +1425,9 @@ pub fn prove(
                 gs.push(g);
                 hs.push(h);
             }
-            let (sc, r_z) =
-                prove_sumcheck_cubic_multi_batched(&fs, &gs, &hs, &weights_z, claim_z, transcript);
+            let (sc, r_z) = prove_sumcheck_cubic_multi_batched_owned(
+                fs, gs, hs, &weights_z, claim_z, transcript,
+            );
             let r_i = r_z[..t_bits].to_vec();
             let r_s = r_z[t_bits..2 * t_bits].to_vec();
             let r_a = r_z[2 * t_bits..].to_vec();
@@ -1402,7 +1462,8 @@ pub fn prove(
                 gs.push(ksum_mle.clone());
                 ksum_mles.push(ksum_mle);
             }
-            let (sc, r_a) = prove_sumcheck_multi_batched(&fs, &gs, &weights_z, claim_z, transcript);
+            let (sc, r_a) =
+                prove_sumcheck_multi_batched_owned(fs, gs, &weights_z, claim_z, transcript);
             let ksum_claims = sc.final_evals_g.clone();
             let claim_ksum: F = weights_z
                 .iter()
@@ -1420,7 +1481,7 @@ pub fn prove(
                 )));
             }
             let (sc_k, r_s) =
-                prove_sumcheck_multi_batched(&fs_k, &gs_k, &weights_z, claim_ksum, transcript);
+                prove_sumcheck_multi_batched_owned(fs_k, gs_k, &weights_z, claim_ksum, transcript);
             let phi_q_point = combine(&r_norm_t, &r_a);
             let phi_k_point = combine(&r_s, &r_a);
             let phi_q_evals = sc.final_evals_f.clone();
@@ -1438,6 +1499,11 @@ pub fn prove(
     } else {
         (None, None, None, None, None, Vec::new(), Vec::new())
     };
+    eprintln!(
+        "[prove] batch_attn: {:7.3}ms",
+        phase_t0.elapsed().as_secs_f64() * 1000.0
+    );
+    phase_t0 = Instant::now();
     // =========================================================================
     // 7. Per-block FFN: Lasso + M commit + absorb coms
     // =========================================================================
@@ -1497,8 +1563,7 @@ pub fn prove(
     let global_ffn_lasso_inst = LassoMultiInstance {
         instances: ffn_lasso_instances,
     };
-    let ffn_instance_to_group =
-        crate::lookup::lasso::derive_instance_groups(&ffn_instance_coms);
+    let ffn_instance_to_group = crate::lookup::lasso::derive_instance_groups(&ffn_instance_coms);
     let global_ffn_lasso_pk = LassoMultiProvingKey {
         instance_table_coms: ffn_instance_coms,
         instance_to_group: ffn_instance_to_group,
@@ -1546,6 +1611,11 @@ pub fn prove(
         sigma_mff_bind,
         transcript,
     );
+    eprintln!(
+        "[prove] ffn_lasso: {:7.3}ms",
+        phase_t0.elapsed().as_secs_f64() * 1000.0
+    );
+    phase_t0 = Instant::now();
 
     // =========================================================================
     // 8. Batch FFN-Y: Y = A · W2 at shared (r_t, r_out) = r_td
@@ -1586,13 +1656,18 @@ pub fn prove(
         .zip(ffn_y_targets.iter())
         .map(|(w, t)| *w * *t)
         .sum();
-    let (batch_ffn_y, r_k_fy) = prove_sumcheck_multi_batched(
-        &fs_ffn_y,
-        &gs_ffn_y,
+    let (batch_ffn_y, r_k_fy) = prove_sumcheck_multi_batched_owned(
+        fs_ffn_y,
+        gs_ffn_y,
         &weights_ffn_y,
         claim_ffn_y,
         transcript,
     );
+    eprintln!(
+        "[prove] batch_ffn_y: {:7.3}ms",
+        phase_t0.elapsed().as_secs_f64() * 1000.0
+    );
+    phase_t0 = Instant::now();
 
     // =========================================================================
     // 9. Batch FFN-M: M = X2 · W1 with shared rx_m, ry_m
@@ -1637,13 +1712,18 @@ pub fn prove(
         .zip(ffn_m_targets.iter())
         .map(|(w, t)| *w * *t)
         .sum();
-    let (batch_ffn_m, r_k_m) = prove_sumcheck_multi_batched(
-        &fs_ffn_m,
-        &gs_ffn_m,
+    let (batch_ffn_m, r_k_m) = prove_sumcheck_multi_batched_owned(
+        fs_ffn_m,
+        gs_ffn_m,
         &weights_ffn_m,
         claim_ffn_m,
         transcript,
     );
+    eprintln!(
+        "[prove] batch_ffn_m: {:7.3}ms",
+        phase_t0.elapsed().as_secs_f64() * 1000.0
+    );
+    phase_t0 = Instant::now();
 
     // =========================================================================
     // 10. Build per-block proof structs
@@ -1707,6 +1787,11 @@ pub fn prove(
         (final_y_rp, final_y_rv),
         transcript,
     )?;
+    eprintln!(
+        "[prove] final_ln: {:7.3}ms",
+        phase_t0.elapsed().as_secs_f64() * 1000.0
+    );
+    phase_t0 = Instant::now();
 
     // =========================================================================
     // 12. LM Head
@@ -1728,6 +1813,11 @@ pub fn prove(
     let (lm_nu, lm_sigma, _) = params_from_vars(lm_logits_num_vars);
     let lm_head_logits_open =
         hyrax_open(&logits_mle.evaluations, &lm_y_claim.point, lm_nu, lm_sigma);
+    eprintln!(
+        "[prove] lm_head: {:7.3}ms",
+        phase_t0.elapsed().as_secs_f64() * 1000.0
+    );
+    phase_t0 = Instant::now();
 
     // =========================================================================
     // 13. Advance transcript for accumulator mu challenges
@@ -1755,73 +1845,73 @@ pub fn prove(
 
     // x_norm1_batch: L x_norm1_i at combine(r_t, r_k_qkv) [td_num_vars]
     let x_norm1_point = combine(&r_t, &r_k_qkv);
-    let x_norm1_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
-        .map(|i| mat_to_mle(&witness.block_witnesses[i].ln1_wit.y, t, d).evaluations)
+    let x_norm1_refs: Vec<&[F]> = x_norm1_mles
+        .iter()
+        .map(|m| m.evaluations.as_slice())
         .collect();
-    let x_norm1_refs: Vec<&[F]> = x_norm1_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let x_norm1_batch_open =
         hyrax_open_batch(&x_norm1_refs, &x_norm1_point, nu_td, sigma_td, transcript);
 
     // w_q_batch: L Wq_i at combine(r_k_qkv, r_out) [d_bits + d_bits]
     let wq_point = combine(&r_k_qkv, &r_out);
-    let wq_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
-        .map(|i| mat_to_mle(&convert_tm_to_fm(&pk.block_pks[i].q_pk.w), d, d).evaluations)
+    let wq_refs: Vec<&[F]> = static_mles
+        .iter()
+        .map(|m| m.w_q.evaluations.as_slice())
         .collect();
-    let wq_refs: Vec<&[F]> = wq_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let w_q_batch_open = hyrax_open_batch(&wq_refs, &wq_point, nu_w, sigma_w, transcript);
 
-    let wk_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
-        .map(|i| mat_to_mle(&convert_tm_to_fm(&pk.block_pks[i].k_pk.w), d, d).evaluations)
+    let wk_refs: Vec<&[F]> = static_mles
+        .iter()
+        .map(|m| m.w_k.evaluations.as_slice())
         .collect();
-    let wk_refs: Vec<&[F]> = wk_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let w_k_batch_open = hyrax_open_batch(&wk_refs, &wq_point, nu_w, sigma_w, transcript);
 
-    let wv_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
-        .map(|i| mat_to_mle(&convert_tm_to_fm(&pk.block_pks[i].v_pk.w), d, d).evaluations)
+    let wv_refs: Vec<&[F]> = static_mles
+        .iter()
+        .map(|m| m.w_v.evaluations.as_slice())
         .collect();
-    let wv_refs: Vec<&[F]> = wv_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let w_v_batch_open = hyrax_open_batch(&wv_refs, &wq_point, nu_w, sigma_w, transcript);
 
     // bias_q/k/v batch at r_out [d_bits]
-    let bq_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
-        .map(|i| vec_to_mle(&pk.block_pks[i].q_pk.bias, d).evaluations)
+    let bq_refs: Vec<&[F]> = static_mles
+        .iter()
+        .map(|m| m.b_q.evaluations.as_slice())
         .collect();
-    let bq_refs: Vec<&[F]> = bq_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let bias_q_batch_open = hyrax_open_batch(&bq_refs, &r_out, nu_b, sigma_b, transcript);
 
-    let bk_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
-        .map(|i| vec_to_mle(&pk.block_pks[i].k_pk.bias, d).evaluations)
+    let bk_refs: Vec<&[F]> = static_mles
+        .iter()
+        .map(|m| m.b_k.evaluations.as_slice())
         .collect();
-    let bk_refs: Vec<&[F]> = bk_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let bias_k_batch_open = hyrax_open_batch(&bk_refs, &r_out, nu_b, sigma_b, transcript);
 
-    let bv_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
-        .map(|i| vec_to_mle(&pk.block_pks[i].v_pk.bias, d).evaluations)
+    let bv_refs: Vec<&[F]> = static_mles
+        .iter()
+        .map(|m| m.b_v.evaluations.as_slice())
         .collect();
-    let bv_refs: Vec<&[F]> = bv_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let bias_v_batch_open = hyrax_open_batch(&bv_refs, &r_out, nu_b, sigma_b, transcript);
 
     // w_o_batch: L Wo_i at combine(r_k_o, r_out) [d_bits + d_bits]
     let wo_point = combine(&r_k_o, &r_out);
-    let wo_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
-        .map(|i| mat_to_mle(&convert_tm_to_fm(&pk.block_pks[i].o_pk.w), d, d).evaluations)
+    let wo_refs: Vec<&[F]> = static_mles
+        .iter()
+        .map(|m| m.w_o.evaluations.as_slice())
         .collect();
-    let wo_refs: Vec<&[F]> = wo_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let w_o_batch_open = hyrax_open_batch(&wo_refs, &wo_point, nu_w, sigma_w, transcript);
 
     // bias_o_batch at r_out
-    let bo_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
-        .map(|i| vec_to_mle(&pk.block_pks[i].o_pk.bias, d).evaluations)
+    let bo_refs: Vec<&[F]> = static_mles
+        .iter()
+        .map(|m| m.b_o.evaluations.as_slice())
         .collect();
-    let bo_refs: Vec<&[F]> = bo_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let bias_o_batch_open = hyrax_open_batch(&bo_refs, &r_out, nu_b, sigma_b, transcript);
 
     // w2_batch: L W2_i at combine(r_k_fy, r_out) [f_bits + d_bits]
     let w2_point = combine(&r_k_fy, &r_out);
-    let w2_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
-        .map(|i| mat_to_mle(&convert_tm_to_fm(&pk.block_pks[i].ffn_pk.w2), d_ff, d).evaluations)
+    let w2_refs: Vec<&[F]> = static_mles
+        .iter()
+        .map(|m| m.w2.evaluations.as_slice())
         .collect();
-    let w2_refs: Vec<&[F]> = w2_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let w2_batch_open = hyrax_open_batch(&w2_refs, &w2_point, nu_wff, sigma_wff, transcript);
 
     // ffn_a_batch: L A_i at combine(r_t, r_k_fy) [t_bits + f_bits]
@@ -1835,10 +1925,10 @@ pub fn prove(
 
     // w1_batch: L W1_i at combine(r_k_m, ry_m) [d_bits + f_bits]
     let w1_point = combine(&r_k_m, &ry_m);
-    let w1_evals_vecs: Vec<Vec<F>> = (0..num_blocks)
-        .map(|i| mat_to_mle(&convert_tm_to_fm(&pk.block_pks[i].ffn_pk.w1), d, d_ff).evaluations)
+    let w1_refs: Vec<&[F]> = static_mles
+        .iter()
+        .map(|m| m.w1.evaluations.as_slice())
         .collect();
-    let w1_refs: Vec<&[F]> = w1_evals_vecs.iter().map(|v| v.as_slice()).collect();
     let w1_batch_open = hyrax_open_batch(&w1_refs, &w1_point, nu_wff, sigma_wff, transcript);
 
     // x_norm2_batch: L x_norm2_i at combine(rx_m, r_k_m) [td_num_vars]
@@ -1944,92 +2034,86 @@ pub fn prove(
     // binds the OUT final_evals_g[i] to phi_k and v algebraically.
     let causal_ctx_out_batch_open: Option<HyraxProof> = None;
 
-    let (attn_norm_r_batch_open, attn_z_open, attn_norm_attn_point_open) =
-        if let Some(ref r_norm) = attn_norm_r {
-            let r_norm_t = r_norm[..t_bits].to_vec();
-            let num_evals: Vec<Vec<F>> = witness
-                .block_witnesses
-                .iter()
-                .map(|b| mat_to_mle(&b.attn_wit.out, t, d).evaluations)
-                .collect();
-            let norm_evals: Vec<Vec<F>> = witness
-                .block_witnesses
-                .iter()
-                .map(|b| {
-                    mat_to_mle(
-                        b.attn_wit
-                            .normalized_out
-                            .as_ref()
-                            .expect("missing normalized attention"),
-                        t,
-                        d,
-                    )
-                    .evaluations
-                })
-                .collect();
-            let z_evals: Vec<Vec<F>> = witness
-                .block_witnesses
-                .iter()
-                .map(|b| {
-                    vec_to_mle(b.attn_wit.norm_z.as_ref().expect("missing attention z"), t)
-                        .evaluations
-                })
-                .collect();
-            let rem_evals: Vec<Vec<F>> = witness
-                .block_witnesses
-                .iter()
-                .map(|b| {
-                    mat_to_mle(b.attn_wit.norm_rem.as_ref().expect("missing rem"), t, d).evaluations
-                })
-                .collect();
-            let diff_evals: Vec<Vec<F>> = witness
-                .block_witnesses
-                .iter()
-                .map(|b| {
-                    mat_to_mle(b.attn_wit.norm_diff.as_ref().expect("missing diff"), t, d)
-                        .evaluations
-                })
-                .collect();
-            let z_refs: Vec<&[F]> = z_evals.iter().map(|v| v.as_slice()).collect();
-            let (nu_t, sigma_t, _) = params_from_vars(t_bits);
+    let (attn_norm_r_batch_open, attn_z_open, attn_norm_attn_point_open) = if let Some(ref r_norm) =
+        attn_norm_r
+    {
+        let r_norm_t = r_norm[..t_bits].to_vec();
+        let num_evals: Vec<Vec<F>> = witness
+            .block_witnesses
+            .iter()
+            .map(|b| mat_to_mle(&b.attn_wit.out, t, d).evaluations)
+            .collect();
+        let norm_evals: Vec<Vec<F>> = witness
+            .block_witnesses
+            .iter()
+            .map(|b| {
+                mat_to_mle(
+                    b.attn_wit
+                        .normalized_out
+                        .as_ref()
+                        .expect("missing normalized attention"),
+                    t,
+                    d,
+                )
+                .evaluations
+            })
+            .collect();
+        let z_evals: Vec<Vec<F>> = witness
+            .block_witnesses
+            .iter()
+            .map(|b| {
+                vec_to_mle(b.attn_wit.norm_z.as_ref().expect("missing attention z"), t).evaluations
+            })
+            .collect();
+        let rem_evals: Vec<Vec<F>> = witness
+            .block_witnesses
+            .iter()
+            .map(|b| {
+                mat_to_mle(b.attn_wit.norm_rem.as_ref().expect("missing rem"), t, d).evaluations
+            })
+            .collect();
+        let diff_evals: Vec<Vec<F>> = witness
+            .block_witnesses
+            .iter()
+            .map(|b| {
+                mat_to_mle(b.attn_wit.norm_diff.as_ref().expect("missing diff"), t, d).evaluations
+            })
+            .collect();
+        let z_refs: Vec<&[F]> = z_evals.iter().map(|v| v.as_slice()).collect();
+        let (nu_t, sigma_t, _) = params_from_vars(t_bits);
 
-            // Merged open at r_norm: [num | norm | rem | diff], same size & params.
-            let r_norm_refs: Vec<&[F]> = num_evals
-                .iter()
-                .chain(norm_evals.iter())
-                .chain(rem_evals.iter())
-                .chain(diff_evals.iter())
-                .map(|v| v.as_slice())
-                .collect();
-            let attn_norm_r_batch_open =
-                hyrax_open_batch(&r_norm_refs, r_norm, nu_td, sigma_td, transcript);
+        // Merged open at r_norm: [num | norm | rem | diff], same size & params.
+        let r_norm_refs: Vec<&[F]> = num_evals
+            .iter()
+            .chain(norm_evals.iter())
+            .chain(rem_evals.iter())
+            .chain(diff_evals.iter())
+            .map(|v| v.as_slice())
+            .collect();
+        let attn_norm_r_batch_open =
+            hyrax_open_batch(&r_norm_refs, r_norm, nu_td, sigma_td, transcript);
 
-            // attn_z is at a different point (r_norm_t) and different params.
-            let attn_z_open = hyrax_open_batch(&z_refs, &r_norm_t, nu_t, sigma_t, transcript);
+        // attn_z is at a different point (r_norm_t) and different params.
+        let attn_z_open = hyrax_open_batch(&z_refs, &r_norm_t, nu_t, sigma_t, transcript);
 
-            // Merged open at attn_point: [num | norm].
-            let attn_point = combine(&r_t, &r_k_o);
-            let attn_point_refs: Vec<&[F]> = num_evals
-                .iter()
-                .chain(norm_evals.iter())
-                .map(|v| v.as_slice())
-                .collect();
-            let attn_norm_attn_point_open = hyrax_open_batch(
-                &attn_point_refs,
-                &attn_point,
-                nu_td,
-                sigma_td,
-                transcript,
-            );
+        // Merged open at attn_point: [num | norm].
+        let attn_point = combine(&r_t, &r_k_o);
+        let attn_point_refs: Vec<&[F]> = num_evals
+            .iter()
+            .chain(norm_evals.iter())
+            .map(|v| v.as_slice())
+            .collect();
+        let attn_norm_attn_point_open =
+            hyrax_open_batch(&attn_point_refs, &attn_point, nu_td, sigma_td, transcript);
 
-            (
-                Some(attn_norm_r_batch_open),
-                Some(attn_z_open),
-                Some(attn_norm_attn_point_open),
-            )
-        } else {
-            (None, None, None)
-        };
+        (
+            Some(attn_norm_r_batch_open),
+            Some(attn_z_open),
+            Some(attn_norm_attn_point_open),
+        )
+    } else {
+        (None, None, None)
+    };
 
     // =========================================================================
     // 16. Global batched Lasso (attention)
@@ -2080,8 +2164,7 @@ pub fn prove(
     let global_multi_inst = LassoMultiInstance {
         instances: all_lasso_instances,
     };
-    let global_instance_to_group =
-        crate::lookup::lasso::derive_instance_groups(&all_instance_coms);
+    let global_instance_to_group = crate::lookup::lasso::derive_instance_groups(&all_instance_coms);
     let global_lasso_pk = LassoMultiProvingKey {
         instance_table_coms: all_instance_coms,
         instance_to_group: global_instance_to_group,
@@ -2137,6 +2220,14 @@ pub fn prove(
         &all_output_bindings,
         transcript,
         lasso_params,
+    );
+    eprintln!(
+        "[prove] batch_opens_qk_lasso: {:7.3}ms",
+        phase_t0.elapsed().as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "[prove] total: {:7.3}ms",
+        prove_t0.elapsed().as_secs_f64() * 1000.0
     );
 
     Ok(TransformerModelProof {

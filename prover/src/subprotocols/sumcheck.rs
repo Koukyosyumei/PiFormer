@@ -360,23 +360,38 @@ pub fn prove_sumcheck_cubic_multi_batched(
     claim: F,
     transcript: &mut Transcript,
 ) -> (SumcheckCubicProofMulti, Vec<F>) {
-    let num_triples = fs.len();
-    assert_eq!(gs.len(), num_triples);
-    assert_eq!(hs.len(), num_triples);
+    prove_sumcheck_cubic_multi_batched_owned(
+        fs.to_vec(),
+        gs.to_vec(),
+        hs.to_vec(),
+        weights,
+        claim,
+        transcript,
+    )
+}
+
+pub fn prove_sumcheck_cubic_multi_batched_owned(
+    mut fs_cur: Vec<DenseMLPoly>,
+    mut gs_cur: Vec<DenseMLPoly>,
+    mut hs_cur: Vec<DenseMLPoly>,
+    weights: &[F],
+    claim: F,
+    transcript: &mut Transcript,
+) -> (SumcheckCubicProofMulti, Vec<F>) {
+    let num_triples = fs_cur.len();
+    assert_eq!(gs_cur.len(), num_triples);
+    assert_eq!(hs_cur.len(), num_triples);
     assert_eq!(weights.len(), num_triples);
 
-    let n = fs[0].num_vars;
+    let n = fs_cur[0].num_vars;
     for k in 1..num_triples {
-        assert_eq!(fs[k].num_vars, n);
-        assert_eq!(gs[k].num_vars, n);
-        assert_eq!(hs[k].num_vars, n);
+        assert_eq!(fs_cur[k].num_vars, n);
+        assert_eq!(gs_cur[k].num_vars, n);
+        assert_eq!(hs_cur[k].num_vars, n);
     }
 
     transcript.append_field(b"sc_claim", &claim);
 
-    let mut fs_cur: Vec<DenseMLPoly> = fs.to_vec();
-    let mut gs_cur: Vec<DenseMLPoly> = gs.to_vec();
-    let mut hs_cur: Vec<DenseMLPoly> = hs.to_vec();
     let mut round_polys = Vec::with_capacity(n);
     let mut challenges = Vec::with_capacity(n);
 
@@ -495,23 +510,31 @@ pub fn prove_sumcheck_multi_batched(
     claim: F,
     transcript: &mut Transcript,
 ) -> (SumcheckProofMulti, Vec<F>) {
-    let num_pairs = fs.len();
-    assert_eq!(gs.len(), num_pairs);
+    prove_sumcheck_multi_batched_owned(fs.to_vec(), gs.to_vec(), weights, claim, transcript)
+}
+
+pub fn prove_sumcheck_multi_batched_owned(
+    mut fs_cur: Vec<DenseMLPoly>,
+    mut gs_cur: Vec<DenseMLPoly>,
+    weights: &[F],
+    claim: F,
+    transcript: &mut Transcript,
+) -> (SumcheckProofMulti, Vec<F>) {
+    let num_pairs = fs_cur.len();
+    assert_eq!(gs_cur.len(), num_pairs);
     assert_eq!(weights.len(), num_pairs);
 
-    let n = fs[0].num_vars;
+    let n = fs_cur[0].num_vars;
     for k in 1..num_pairs {
         assert_eq!(
-            fs[k].num_vars, n,
+            fs_cur[k].num_vars, n,
             "All polynomials must have the same number of variables"
         );
-        assert_eq!(gs[k].num_vars, n);
+        assert_eq!(gs_cur[k].num_vars, n);
     }
 
     transcript.append_field(b"sc_claim", &claim);
 
-    let mut fs_cur: Vec<DenseMLPoly> = fs.to_vec();
-    let mut gs_cur: Vec<DenseMLPoly> = gs.to_vec();
     let mut round_polys = Vec::with_capacity(n);
     let mut challenges = Vec::with_capacity(n);
 
