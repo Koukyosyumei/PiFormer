@@ -284,13 +284,44 @@ pub fn prove_range_batched(
     let beta = transcript.challenge_field::<F>(b"logup_beta");
 
     // Per-witness per-chunk: combined sumcheck Σ_i h_k[i]*(1 + β*(α - C_k[i])) = claim_k + β*n_pad
+    struct LogupChunkPrecompute {
+        q_mle: DenseMLPoly,
+        claim_k: F,
+        combined: F,
+    }
+
+    let logup_precomputed: Vec<Vec<LogupChunkPrecompute>> = (0..witnesses.len())
+        .into_par_iter()
+        .map(|i| {
+            let n = witnesses[i].values.len();
+            let num_vars = n.next_power_of_two().trailing_zeros() as usize;
+            let n_padded = F::from((1usize << num_vars) as u64);
+            (0..num_chunks)
+                .map(|c| {
+                    // q_k[i] = 1 + β*(α - C_k[i])
+                    let q_vals: Vec<F> = all_chunk_vals[i][c]
+                        .iter()
+                        .map(|&cv| F::ONE + beta * (alpha - cv))
+                        .collect();
+                    let q_mle = vec_to_mle(&q_vals, n);
+                    let claim_k: F = all_h_mles[i][c].evaluations.iter().sum();
+                    let combined = claim_k + beta * n_padded;
+                    LogupChunkPrecompute {
+                        q_mle,
+                        claim_k,
+                        combined,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
     let mut all_logup_witness: Vec<LogUpWitnessProof> = Vec::with_capacity(witnesses.len());
     let mut total_lhs_claim = F::ZERO;
 
     for i in 0..witnesses.len() {
         let n = witnesses[i].values.len();
         let num_vars = n.next_power_of_two().trailing_zeros() as usize;
-        let n_padded = 1usize << num_vars;
         let (nu_c, sigma_c, _) = params_from_vars(num_vars);
 
         let mut h_coms_w = Vec::with_capacity(num_chunks);
@@ -303,19 +334,11 @@ pub fn prove_range_batched(
 
         for c in 0..num_chunks {
             let h_mle = &all_h_mles[i][c];
-            // q_k[i] = 1 + β*(α - C_k[i])
-            let q_vals: Vec<F> = all_chunk_vals[i][c]
-                .iter()
-                .map(|&cv| F::ONE + beta * (alpha - cv))
-                .collect();
-            let q_mle = vec_to_mle(&q_vals, n);
+            let pre = &logup_precomputed[i][c];
+            // combined_claim = Σ_i h_k[i]*q_k[i] = claim_k + β*n_padded.
+            total_lhs_claim += pre.claim_k;
 
-            // combined_claim = Σ_i h_k[i]*q_k[i] = claim_k + β*n_padded
-            let claim_k: F = h_mle.evaluations.iter().sum();
-            total_lhs_claim += claim_k;
-            let combined = claim_k + beta * F::from(n_padded as u64);
-
-            let (sc, r_k) = prove_sumcheck(h_mle, &q_mle, combined, transcript);
+            let (sc, r_k) = prove_sumcheck(h_mle, &pre.q_mle, pre.combined, transcript);
 
             let h_val = h_mle.evaluate(&r_k);
             let chunk_val = all_chunk_mles[i][c].evaluate(&r_k);
@@ -324,7 +347,7 @@ pub fn prove_range_batched(
 
             h_coms_w.push(all_h_coms[i][c].clone());
             combined_sumchecks.push(sc);
-            combined_claims.push(combined);
+            combined_claims.push(pre.combined);
             h_at_rk.push(h_val);
             chunk_at_rk.push(chunk_val);
             h_open_proofs.push(h_open);
