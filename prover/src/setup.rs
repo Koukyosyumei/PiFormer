@@ -38,6 +38,16 @@ pub struct TransformerBlockWeights {
     pub o_w: Vec<Vec<TernaryValue>>, // d_model × d_model
     pub o_alpha: F,
     pub o_bias: Vec<F>,
+    // QK-norm: per-head LayerNorms applied between projection and φ.
+    // For n_heads=1 these have d_head = d_model and seq_len = T, so they
+    // share the LN1/LN2 shape; for n_heads>1 the rows would be n_heads*T.
+    pub q_norm_gamma: Vec<F>,
+    pub q_norm_beta: Vec<F>,
+    pub k_norm_gamma: Vec<F>,
+    pub k_norm_beta: Vec<F>,
+    // NOTE: attn_out_norm exists in the trained PyTorch model for stabilization,
+    // but is bypassed in the proof pipeline because its input (post-attention
+    // out_attn) has magnitude that exceeds the 32-bit range proof capacity.
     // LayerNorm 2
     pub ln2_gamma: Vec<F>,
     pub ln2_beta: Vec<F>,
@@ -114,6 +124,23 @@ pub fn preprocess_transformer_model(
             scale_gamma: F::from(1u64),
             scale_beta: F::from(1u64),
         };
+        // QK-norm VKs.  attn_out_norm is intentionally NOT in the proof pipeline.
+        let q_norm_vk = LayerNormVerifyingKey {
+            seq_len: t,
+            d_head: d,
+            gamma: bw.q_norm_gamma.clone(),
+            beta: bw.q_norm_beta.clone(),
+            scale_gamma: F::from(1u64),
+            scale_beta: F::from(1u64),
+        };
+        let k_norm_vk = LayerNormVerifyingKey {
+            seq_len: t,
+            d_head: d,
+            gamma: bw.k_norm_gamma.clone(),
+            beta: bw.k_norm_beta.clone(),
+            scale_gamma: F::from(1u64),
+            scale_beta: F::from(1u64),
+        };
 
         // --- Projectionの事前計算 (ここで重い O(N) の hyrax_commit が走る) ---
         let q_pk = preprocess_projection(t, d, d, bw.q_w.clone(), bw.q_alpha, bw.q_bias.clone());
@@ -166,6 +193,8 @@ pub fn preprocess_transformer_model(
             o_pk,
             ffn_pk,
             attn_pk,
+            q_norm_vk,
+            k_norm_vk,
         };
 
         block_vks.push(block_vk.clone());

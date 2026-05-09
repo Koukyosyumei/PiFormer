@@ -36,16 +36,36 @@ fn make_block(d_model: usize, d_ff: usize, m_bits: usize) -> TransformerBlockWei
         ln1_beta: vec![F::from(5u64); d_model],
         q_w: zero_ternary_mat(d_model, d_model),
         q_alpha: F::ONE,
-        q_bias: vec![F::ZERO; d_model],
+        // q_bias chosen so q_proj.y = bias has non-zero variance per row,
+        // which the QK-norm LayerNorm requires to satisfy its range proofs.
+        q_bias: {
+            let mut b = vec![F::ZERO; d_model];
+            if d_model >= 1 {
+                b[0] = F::from(2u64);
+            }
+            b
+        },
         k_w: zero_ternary_mat(d_model, d_model),
         k_alpha: F::ONE,
-        k_bias: vec![F::ZERO; d_model],
+        k_bias: {
+            let mut b = vec![F::ZERO; d_model];
+            if d_model >= 1 {
+                b[0] = F::from(2u64);
+            }
+            b
+        },
         v_w: zero_ternary_mat(d_model, d_model),
         v_alpha: F::ONE,
         v_bias: vec![F::ZERO; d_model],
         o_w: zero_ternary_mat(d_model, d_model),
         o_alpha: F::ONE,
         o_bias: vec![F::ZERO; d_model],
+        // QK-norm — same shape as ln1/ln2 for n_heads=1.
+        // attn_out_norm is bypassed in the proof pipeline.
+        q_norm_gamma: vec![F::from(2u64); d_model],
+        q_norm_beta: vec![F::from(5u64); d_model],
+        k_norm_gamma: vec![F::from(2u64); d_model],
+        k_norm_beta: vec![F::from(5u64); d_model],
         ln2_gamma: vec![F::from(2u64); d_model],
         ln2_beta: vec![F::from(5u64); d_model],
         ffn_w1: zero_ternary_mat(d_model, d_ff),
@@ -121,32 +141,58 @@ pub fn build_zero_witness(
 
     let make_ln_wit = || build_ln_witness(&x_in, d_model);
     let ln_y = make_ln_wit().y.clone();
-    let qk_zp = 0usize;
     let ffn_zp = 0usize;
+
+    // q_proj.y = q_raw = q_bias broadcast across rows: each row = [2, 0].
+    // (W_q is zero, so q_proj.y = α * 0 + bias = bias.)  The q_norm_wit below
+    // is the LN of this with gamma=[2,2], beta=[5,5], yielding y=[[7,3],[7,3]],
+    // which then becomes attn_wit.q (the input to φ).
+    let qk_raw: Vec<Vec<F>> = vec![
+        vec![F::from(2u64), F::from(0u64)],
+        vec![F::from(2u64), F::from(0u64)],
+    ];
+    let qk_norm: Vec<Vec<F>> = vec![
+        vec![F::from(7u64), F::from(3u64)],
+        vec![F::from(7u64), F::from(3u64)],
+    ];
+    let make_qk_norm_wit = || LayerNormWitness {
+        x: qk_raw.clone(),
+        y: qk_norm.clone(),
+        sum_x: vec![F::from(2u64); seq_len],
+        sigma: vec![F::from(1u64); seq_len],
+        sq_sum_x: vec![F::from(4u64); seq_len],
+        sum_x_sq: vec![F::from(4u64); seq_len],
+        // sigma_sq_scaled[i] = (d * sigma[i])^2 = (2 * 1)^2 = 4.
+        sigma_sq_scaled: vec![F::from(4u64); seq_len],
+    };
+    // Lookup indices for the φ stage: chunk index = q_n value (M_BITS=4 → table 0..16).
+    let qk_query_indices: Vec<usize> = vec![7, 3, 7, 3];
 
     let block_wit = TransformerBlockWitness {
         x_in: x_in.clone(),
         ln1_wit: make_ln_wit(),
         q_proj_wit: ProjectionWitness {
             x: ln_y.clone(),
-            y: zero_td.clone(),
+            y: qk_raw.clone(),
         },
         k_proj_wit: ProjectionWitness {
             x: ln_y.clone(),
-            y: zero_td.clone(),
+            y: qk_raw.clone(),
         },
         v_proj_wit: ProjectionWitness {
             x: ln_y.clone(),
             y: zero_td.clone(),
         },
+        q_norm_wit: make_qk_norm_wit(),
+        k_norm_wit: make_qk_norm_wit(),
         attn_wit: LinearAttentionWitness {
-            q: zero_td.clone(),
-            k: zero_td.clone(),
+            q: qk_norm.clone(),
+            k: qk_norm.clone(),
             v: zero_td.clone(),
             phi_q: zero_td.clone(),
             phi_k: zero_td.clone(),
-            q_query_indices: vec![qk_zp; seq_len * d_model],
-            k_query_indices: vec![qk_zp; seq_len * d_model],
+            q_query_indices: qk_query_indices.clone(),
+            k_query_indices: qk_query_indices.clone(),
             context: zero_dd,
             causal_context: None,
             normalized_out: None,
@@ -188,8 +234,8 @@ pub fn build_zero_witness(
         causal: false,
         q_lasso: make_lasso(num_queries_td),
         k_lasso: make_lasso(num_queries_td),
-        q_query_indices: vec![qk_zp; num_queries_td],
-        k_query_indices: vec![qk_zp; num_queries_td],
+        q_query_indices: qk_query_indices.clone(),
+        k_query_indices: qk_query_indices,
     };
     let inst_ffn = FFNInstance {
         activation_lasso: make_lasso(num_queries_tff),

@@ -136,9 +136,12 @@ def export_weights_rust(
         quant_scale:        Integer scale applied to TernaryLinear alpha values.
         ln_scale:           Integer scale applied to LayerNorm gamma/beta.
         extra_beta_floor:   Extra margin added to the auto-computed beta_floor.
-        block_ln_weights:   Pre-computed list of (ln1_gamma, ln1_beta,
-                            ln2_gamma, ln2_beta) per block.  When provided,
-                            these are used directly instead of recomputing.
+        block_ln_weights:   Pre-computed list of dicts per block, with keys
+                            "ln1", "ln2", "q_norm", "k_norm", each mapping to
+                            (gamma_int, beta_int).  When provided, these are
+                            used directly instead of recomputing.  Note: the
+                            PyTorch model's attn_out_norm exists for training
+                            stabilization but is bypassed in the proof path.
         final_ln_weights:   Pre-computed (gamma, beta) for the final LN layer.
 
     Raises:
@@ -173,10 +176,16 @@ def export_weights_rust(
     for i, blk in enumerate(model.blocks):
         attn = blk.attn
         if block_ln_weights and i < len(block_ln_weights):
-            ln1_gamma, ln1_beta, ln2_gamma, ln2_beta = block_ln_weights[i]
+            block_lns = block_ln_weights[i]
+            ln1_gamma, ln1_beta = block_lns["ln1"]
+            ln2_gamma, ln2_beta = block_lns["ln2"]
+            qn_gamma, qn_beta = block_lns["q_norm"]
+            kn_gamma, kn_beta = block_lns["k_norm"]
         else:
             ln1_gamma, ln1_beta = _ln(blk.norm1)
             ln2_gamma, ln2_beta = _ln(blk.norm2)
+            qn_gamma, qn_beta = _ln(attn.q_norm)
+            kn_gamma, kn_beta = _ln(attn.k_norm)
 
         q_w = _proj_weight_int(attn.q_proj, quant_scale)   # d × d
         k_w = _proj_weight_int(attn.k_proj, quant_scale)
@@ -212,6 +221,11 @@ def export_weights_rust(
             "k_alpha": int_to_field_hex(_proj_alpha_int(attn.k_proj)),
             "v_w":  v_w,
             "v_alpha": int_to_field_hex(_proj_alpha_int(attn.v_proj)),
+            # QK-norm (per-head LayerNorm; for n_heads=1 this is over d_model)
+            "q_norm_gamma": vec_to_json(qn_gamma),
+            "q_norm_beta":  vec_to_json(qn_beta),
+            "k_norm_gamma": vec_to_json(kn_gamma),
+            "k_norm_beta":  vec_to_json(kn_beta),
             # o_proj: witness applies bias, so export it
             "o_w":  o_w,
             "o_alpha": int_to_field_hex(_proj_alpha_int(attn.out_proj)),

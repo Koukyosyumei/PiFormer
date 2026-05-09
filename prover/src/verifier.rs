@@ -62,6 +62,11 @@ pub struct TransformerBlockVerifyingKey {
     pub o_pk: ProjectionProvingKey,
     pub ffn_pk: FFNProvingKey,
     pub attn_pk: AttentionProvingKey,
+    // QK-norm (training-time additions; conventional-mode proofs).
+    // attn_out_norm is in the trained model but bypassed in the proof pipeline
+    // (its post-attention input exceeds the 32-bit range proof capacity).
+    pub q_norm_vk: LayerNormVerifyingKey,
+    pub k_norm_vk: LayerNormVerifyingKey,
 }
 
 // ---------------------------------------------------------------------------
@@ -354,8 +359,8 @@ pub fn verify(
     let mut current_x_com = proof.x_in_com.clone();
     let ln_sigma_n = (2 * t).next_power_of_two().trailing_zeros() as usize;
     let ln_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
-    let mut ln_range_proofs = Vec::with_capacity(4 * num_blocks + 2);
-    let mut ln_range_num_vars = Vec::with_capacity(4 * num_blocks + 2);
+    let mut ln_range_proofs = Vec::with_capacity(8 * num_blocks + 2);
+    let mut ln_range_num_vars = Vec::with_capacity(8 * num_blocks + 2);
     for bp in &proof.block_proofs {
         ln_range_proofs.push(&bp.ln1_proof.sigma_range_proof);
         ln_range_num_vars.push(ln_sigma_n);
@@ -364,6 +369,15 @@ pub fn verify(
         ln_range_proofs.push(&bp.ln2_proof.sigma_range_proof);
         ln_range_num_vars.push(ln_sigma_n);
         ln_range_proofs.push(&bp.ln2_proof.y_range_proof);
+        ln_range_num_vars.push(ln_y_n);
+        // QK-norm: order matches prover's ln_range_witnesses push order.
+        ln_range_proofs.push(&bp.q_norm_proof.sigma_range_proof);
+        ln_range_num_vars.push(ln_sigma_n);
+        ln_range_proofs.push(&bp.q_norm_proof.y_range_proof);
+        ln_range_num_vars.push(ln_y_n);
+        ln_range_proofs.push(&bp.k_norm_proof.sigma_range_proof);
+        ln_range_num_vars.push(ln_sigma_n);
+        ln_range_proofs.push(&bp.k_norm_proof.y_range_proof);
         ln_range_num_vars.push(ln_y_n);
     }
     ln_range_proofs.push(&proof.final_ln_proof.sigma_range_proof);
@@ -430,11 +444,19 @@ pub fn verify(
     for i in 0..num_blocks {
         let bp = &proof.block_proofs[i];
         let bvk = &vk.block_vks[i];
-        let rv_base = 4 * i;
+        // 8 sub-witnesses per block in the model-level batched range proof:
+        //   [ln1_sigma, ln1_y, ln2_sigma, ln2_y,
+        //    q_norm_sigma, q_norm_y, k_norm_sigma, k_norm_y]
+        // (attn_out_norm is bypassed in the proof pipeline, see Pass-1 notes.)
+        let rv_base = 8 * i;
         let ln1_sig_rv = &ln_range_r_vs[rv_base];
         let ln1_y_rv = &ln_range_r_vs[rv_base + 1];
         let ln2_sig_rv = &ln_range_r_vs[rv_base + 2];
         let ln2_y_rv = &ln_range_r_vs[rv_base + 3];
+        let q_norm_sig_rv = &ln_range_r_vs[rv_base + 4];
+        let q_norm_y_rv = &ln_range_r_vs[rv_base + 5];
+        let k_norm_sig_rv = &ln_range_r_vs[rv_base + 6];
+        let k_norm_y_rv = &ln_range_r_vs[rv_base + 7];
 
         // LN1
         let ln1_io = LayerNormIOCommitments {
@@ -478,6 +500,42 @@ pub fn verify(
         }
         absorb_com(transcript, b"out_attn_com", &bp.out_attn_com);
 
+        // q_norm: x = q_raw (q_com), y = q_n (q_norm_y_com).
+        let q_norm_io = LayerNormIOCommitments {
+            x_com: bp.q_com.clone(),
+            y_com: Some(bp.q_norm_y_com.clone()),
+        };
+        verify_layernorm(
+            &bp.q_norm_proof,
+            &q_norm_io,
+            &bvk.q_norm_vk,
+            q_norm_sig_rv,
+            q_norm_y_rv,
+            transcript,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
+        )?;
+        absorb_com(transcript, b"q_norm_y_com", &bp.q_norm_y_com);
+
+        // k_norm: x = k_raw (k_com), y = k_n (k_norm_y_com).
+        let k_norm_io = LayerNormIOCommitments {
+            x_com: bp.k_com.clone(),
+            y_com: Some(bp.k_norm_y_com.clone()),
+        };
+        verify_layernorm(
+            &bp.k_norm_proof,
+            &k_norm_io,
+            &bvk.k_norm_vk,
+            k_norm_sig_rv,
+            k_norm_y_rv,
+            transcript,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
+        )?;
+        absorb_com(transcript, b"k_norm_y_com", &bp.k_norm_y_com);
+
+        // Residual: x_mid = x_in + out_attn (raw).  attn_out_norm exists in the
+        // PyTorch model for stabilization but is bypassed in the proof pipeline.
         let x_mid_com = add_commitments(&current_x_com, &bp.out_attn_com);
 
         // LN2
@@ -1104,8 +1162,8 @@ pub fn verify(
         &proof.final_ln_proof,
         &ln_io,
         &vk.final_ln_vk,
-        &ln_range_r_vs[4 * num_blocks],
-        &ln_range_r_vs[4 * num_blocks + 1],
+        &ln_range_r_vs[8 * num_blocks],
+        &ln_range_r_vs[8 * num_blocks + 1],
         transcript,
         &mut ln_acc_t,
         &mut ln_acc_td,
@@ -2018,10 +2076,13 @@ pub fn verify(
     {
         return Err("Q/K quantization lookup domains must match".to_string());
     }
+    // The Lasso φ_q / φ_k are computed from q_n / k_n (post-q_norm / post-k_norm).
+    // So query_indices come from q_norm_y / k_norm_y and must be bound against
+    // q_norm_y_com / k_norm_y_com — NOT q_com / k_com (which are q_raw / k_raw).
     let mut qk_raw_coms = Vec::with_capacity(2 * num_blocks);
     for bp in &proof.block_proofs {
-        qk_raw_coms.push(bp.q_com.clone());
-        qk_raw_coms.push(bp.k_com.clone());
+        qk_raw_coms.push(bp.q_norm_y_com.clone());
+        qk_raw_coms.push(bp.k_norm_y_com.clone());
     }
     let mut acc_quant_qk = HyraxBatchAccumulator::new();
     let mut acc_quant_qk_unused = HyraxBatchAccumulator::new();
