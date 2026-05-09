@@ -16,6 +16,7 @@ use crate::poly::DenseMLPoly;
 use crate::subprotocols::{prove_sumcheck, verify_sumcheck, SumcheckProof};
 use crate::transcript::Transcript;
 use ark_ff::{batch_inversion, Field, PrimeField};
+use rayon::prelude::*;
 
 // 8-bit chunks: table size = 256 (was 65536 with 16-bit chunks).
 // 16-bit values need 2 chunks; 32-bit values need 4 chunks.
@@ -114,47 +115,75 @@ pub fn prove_range_batched(
     let (nu_m, sigma_m, params_m) = params_from_vars(CHUNK_BITS);
 
     // ---- Phase 1: chunk decomposition + chunk_com commitments per witness ----
+    struct RangePrecompute {
+        chunks: Vec<Vec<F>>,
+        chunk_mles: Vec<DenseMLPoly>,
+        v_mle: DenseMLPoly,
+        chunk_coms: Vec<HyraxCommitment>,
+        nu_c: usize,
+        sigma_c: usize,
+        m_local: Vec<F>,
+    }
+
+    let precomputed: Vec<RangePrecompute> = witnesses
+        .par_iter()
+        .map(|witness| {
+            let n = witness.values.len();
+            let num_vars = n.next_power_of_two().trailing_zeros() as usize;
+            let (nu_c, sigma_c, params_c) = params_from_vars(num_vars);
+
+            let mut chunks = vec![vec![F::ZERO; n]; num_chunks];
+            let mut m_local = vec![F::ZERO; CHUNK_SIZE];
+            for (i, &v) in witness.values.iter().enumerate() {
+                let val_u64 = v.into_bigint().as_ref()[0];
+                for c in 0..num_chunks {
+                    let cv = (val_u64 >> (c * CHUNK_BITS)) & ((1 << CHUNK_BITS) - 1);
+                    chunks[c][i] = F::from(cv as u64);
+                    m_local[cv as usize] += F::ONE;
+                }
+            }
+
+            let chunk_mles: Vec<DenseMLPoly> =
+                chunks.iter().map(|chunk| vec_to_mle(chunk, n)).collect();
+            let chunk_coms: Vec<HyraxCommitment> = chunk_mles
+                .par_iter()
+                .map(|mle| hyrax_commit(&mle.evaluations, nu_c, &params_c))
+                .collect();
+
+            let v_mle = vec_to_mle(&witness.values, n);
+            RangePrecompute {
+                chunks,
+                chunk_mles,
+                v_mle,
+                chunk_coms,
+                nu_c,
+                sigma_c,
+                m_local,
+            }
+        })
+        .collect();
+
     let mut all_chunk_vals: Vec<Vec<Vec<F>>> = Vec::with_capacity(witnesses.len()); // [w][c][i]
     let mut all_chunk_mles: Vec<Vec<DenseMLPoly>> = Vec::with_capacity(witnesses.len());
     let mut all_v_mles: Vec<DenseMLPoly> = Vec::with_capacity(witnesses.len());
     let mut all_chunk_coms: Vec<Vec<HyraxCommitment>> = Vec::with_capacity(witnesses.len());
     let mut all_nu_c: Vec<usize> = Vec::with_capacity(witnesses.len());
     let mut all_sigma_c: Vec<usize> = Vec::with_capacity(witnesses.len());
-
     let mut m_global = vec![F::ZERO; CHUNK_SIZE];
 
-    for witness in witnesses {
-        let n = witness.values.len();
-        let num_vars = n.next_power_of_two().trailing_zeros() as usize;
-        let (nu_c, sigma_c, params_c) = params_from_vars(num_vars);
-
-        let mut chunks = vec![vec![F::ZERO; n]; num_chunks];
-        for (i, &v) in witness.values.iter().enumerate() {
-            let val_u64 = v.into_bigint().as_ref()[0];
-            for c in 0..num_chunks {
-                let cv = (val_u64 >> (c * CHUNK_BITS)) & ((1 << CHUNK_BITS) - 1);
-                chunks[c][i] = F::from(cv as u64);
-                m_global[cv as usize] += F::ONE;
-            }
+    for item in precomputed {
+        for (dst, src) in m_global.iter_mut().zip(item.m_local.iter()) {
+            *dst += *src;
         }
-
-        let mut chunk_mles = Vec::with_capacity(num_chunks);
-        let mut chunk_coms = Vec::with_capacity(num_chunks);
-        for c in 0..num_chunks {
-            let mle = vec_to_mle(&chunks[c], n);
-            let com = hyrax_commit(&mle.evaluations, nu_c, &params_c);
-            absorb_com(transcript, b"chunk_com", &com);
-            chunk_coms.push(com);
-            chunk_mles.push(mle);
+        for com in &item.chunk_coms {
+            absorb_com(transcript, b"chunk_com", com);
         }
-
-        let v_mle = vec_to_mle(&witness.values, n);
-        all_chunk_vals.push(chunks);
-        all_chunk_mles.push(chunk_mles);
-        all_v_mles.push(v_mle);
-        all_chunk_coms.push(chunk_coms);
-        all_nu_c.push(nu_c);
-        all_sigma_c.push(sigma_c);
+        all_chunk_vals.push(item.chunks);
+        all_chunk_mles.push(item.chunk_mles);
+        all_v_mles.push(item.v_mle);
+        all_chunk_coms.push(item.chunk_coms);
+        all_nu_c.push(item.nu_c);
+        all_sigma_c.push(item.sigma_c);
     }
 
     // ---- Commit merged m ----
@@ -221,20 +250,31 @@ pub fn prove_range_batched(
     let mut all_h_mles: Vec<Vec<DenseMLPoly>> = Vec::with_capacity(witnesses.len());
     let mut all_h_coms: Vec<Vec<HyraxCommitment>> = Vec::with_capacity(witnesses.len());
 
-    for i in 0..witnesses.len() {
-        let n = witnesses[i].values.len();
-        let num_vars = n.next_power_of_two().trailing_zeros() as usize;
-        let (nu_c, _, params_c) = params_from_vars(num_vars);
-        let mut h_mles_w = Vec::with_capacity(num_chunks);
-        let mut h_coms_w = Vec::with_capacity(num_chunks);
-        for c in 0..num_chunks {
-            let mut h_vals: Vec<F> = all_chunk_vals[i][c].iter().map(|&cv| alpha - cv).collect();
-            batch_inversion(&mut h_vals);
-            let h_mle = vec_to_mle(&h_vals, n);
-            let h_com = hyrax_commit(&h_mle.evaluations, nu_c, &params_c);
-            absorb_com(transcript, b"logup_h_com", &h_com);
-            h_mles_w.push(h_mle);
-            h_coms_w.push(h_com);
+    let h_precomputed: Vec<(Vec<DenseMLPoly>, Vec<HyraxCommitment>)> = (0..witnesses.len())
+        .into_par_iter()
+        .map(|i| {
+            let n = witnesses[i].values.len();
+            let num_vars = n.next_power_of_two().trailing_zeros() as usize;
+            let (nu_c, _, params_c) = params_from_vars(num_vars);
+            let h_mles_w: Vec<DenseMLPoly> = (0..num_chunks)
+                .map(|c| {
+                    let mut h_vals: Vec<F> =
+                        all_chunk_vals[i][c].iter().map(|&cv| alpha - cv).collect();
+                    batch_inversion(&mut h_vals);
+                    vec_to_mle(&h_vals, n)
+                })
+                .collect();
+            let h_coms_w: Vec<HyraxCommitment> = h_mles_w
+                .par_iter()
+                .map(|h_mle| hyrax_commit(&h_mle.evaluations, nu_c, &params_c))
+                .collect();
+            (h_mles_w, h_coms_w)
+        })
+        .collect();
+
+    for (h_mles_w, h_coms_w) in h_precomputed {
+        for h_com in &h_coms_w {
+            absorb_com(transcript, b"logup_h_com", h_com);
         }
         all_h_mles.push(h_mles_w);
         all_h_coms.push(h_coms_w);
