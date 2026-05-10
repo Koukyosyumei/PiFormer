@@ -52,7 +52,7 @@ const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
 const VERSION: u8 = 5;
-const PROOF_VERSION: u8 = 19;
+const PROOF_VERSION: u8 = 20;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -604,6 +604,7 @@ fn write_logup_witness_proof<W: Write>(w: &mut W, p: &LogUpWitnessProof) -> io::
     write_vec(w, &p.h_coms, write_hyrax_commitment)?;
     write_vec_f(w, &p.combined_claims)?;
     write_vec_f(w, &p.chunk_at_rk)?;
+    write_vec_f(w, &p.h_at_rk)?;
     write_vec(w, &p.h_open_proofs, write_hyrax_proof)?;
     write_vec(w, &p.chunk_open_proofs, write_hyrax_proof)
 }
@@ -612,6 +613,7 @@ fn read_logup_witness_proof<R: Read>(r: &mut R) -> io::Result<LogUpWitnessProof>
         h_coms: read_vec(r, read_hyrax_commitment)?,
         combined_claims: read_vec_f(r)?,
         chunk_at_rk: read_vec_f(r)?,
+        h_at_rk: read_vec_f(r)?,
         h_open_proofs: read_vec(r, read_hyrax_proof)?,
         chunk_open_proofs: read_vec(r, read_hyrax_proof)?,
     })

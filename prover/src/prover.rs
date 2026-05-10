@@ -3409,6 +3409,13 @@ mod tests {
     }
 
     #[test]
+    fn test_model_rejects_tampered_range_h_terminal_claim() {
+        assert_tampered_model_rejected(b"model_tamper_range_h_terminal", |proof, _| {
+            proof.ffn_quant_proof.rem_range_proofs[0].logup.h_at_rk[0] += F::ONE;
+        });
+    }
+
+    #[test]
     fn test_model_rejects_tampered_qk_quant_remainder_commitment() {
         assert_tampered_model_rejected(b"model_tamper_qk_quant_rem_com", |proof, _| {
             proof.qk_quant_proof.rem_coms[0] = proof.block_proofs[0].q_com.clone();

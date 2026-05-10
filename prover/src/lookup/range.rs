@@ -9,7 +9,7 @@
 
 use crate::field::F;
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_open_batch_with_eta, hyrax_verify, params_from_vars, powers_of,
+    hyrax_commit, hyrax_open, hyrax_open_batch_with_eta, params_from_vars, powers_of,
     HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
 };
 use crate::poly::DenseMLPoly;
@@ -74,6 +74,10 @@ pub struct LogUpWitnessProof {
     /// challenge. (h_c(r_k_bucket) is recovered from the bucket sumcheck's
     /// final_evals_f at index witness_offset_in_bucket * num_chunks + c.)
     pub chunk_at_rk: Vec<F>,
+    /// H_c(r_k_bucket), opened against `h_coms[c]`. The fused bucket sumcheck
+    /// terminal value is checked as the eq-weighted combination of these small
+    /// openings, avoiding a large commitment to H_bucket(pair, x).
+    pub h_at_rk: Vec<F>,
     /// Hyrax opening proofs for h_c at the bucket's r_k.
     pub h_open_proofs: Vec<HyraxProof>,
     /// Hyrax opening proofs for chunk_com[c] at the bucket's r_k.
@@ -114,8 +118,8 @@ pub struct GlobalRangeM {
     /// fuses all inverse polynomials into H_bucket(pair, x), and proves
     /// H_bucket(pair, x) · W_bucket(pair) · (1 + β(α - C_bucket(pair, x))).
     pub bucket_sumchecks: Vec<SumcheckCubicProofMulti>,
-    /// One fused commitment to all LogUp inverse polynomials per `num_vars`
-    /// bucket, ordered like `bucket_sumchecks`.
+    /// Legacy fused H_bucket fields. New proofs leave these empty and bind the
+    /// GKR terminal H claim through per-chunk h_com openings.
     pub bucket_h_coms: Vec<HyraxCommitment>,
     pub bucket_h_opens: Vec<HyraxProof>,
 }
@@ -454,8 +458,8 @@ pub fn prove_range_batched(
         .map(|(m, g)| *m * *g)
         .sum();
 
-    // Build all h_k = [1/(α - C_k[i])] BEFORE drawing β. We bind them via one
-    // fused H_bucket(pair, x) commitment per witness-size bucket.
+    // Build all h_k = [1/(α - C_k[i])] BEFORE drawing β. The fused bucket
+    // sumcheck later reduces its terminal H claim to these per-chunk openings.
     let mut all_h_mles: Vec<Vec<DenseMLPoly>> = Vec::with_capacity(witnesses.len());
 
     let h_precomputed: Vec<Vec<DenseMLPoly>> = (0..witnesses.len())
@@ -483,15 +487,27 @@ pub fn prove_range_batched(
         buckets_by_num_vars.entry(nv).or_default().push(i);
     }
 
+    let mut all_h_coms: Vec<Vec<HyraxCommitment>> = vec![Vec::new(); witnesses.len()];
+    for i in 0..witnesses.len() {
+        let (_, _, params_h) = params_from_vars(all_num_vars[i]);
+        all_h_coms[i] = all_h_mles[i]
+            .par_iter()
+            .map(|mle| hyrax_commit(&mle.evaluations, all_nu_c[i], &params_h))
+            .collect();
+    }
+    for h_coms in &all_h_coms {
+        for com in h_coms {
+            absorb_com(transcript, b"logup_h_com", com);
+        }
+    }
+
     let mut bucket_h_mles: Vec<DenseMLPoly> = Vec::with_capacity(buckets_by_num_vars.len());
     let mut bucket_c_mles: Vec<DenseMLPoly> = Vec::with_capacity(buckets_by_num_vars.len());
-    let mut bucket_h_coms: Vec<HyraxCommitment> = Vec::with_capacity(buckets_by_num_vars.len());
     for (&num_vars, indices) in buckets_by_num_vars.iter() {
         let pair_count = indices.len() * num_chunks;
         let pair_bits = pair_count.next_power_of_two().trailing_zeros() as usize;
         let pair_padded = 1usize << pair_bits;
         let n_elem = 1usize << num_vars;
-        let total_vars = pair_bits + num_vars;
         let mut h_evals = vec![F::ZERO; pair_padded * n_elem];
         let mut c_evals = vec![F::ZERO; pair_padded * n_elem];
         for (w, &i) in indices.iter().enumerate() {
@@ -505,12 +521,8 @@ pub fn prove_range_batched(
         }
         let h_mle = DenseMLPoly::new(h_evals);
         let c_mle = DenseMLPoly::new(c_evals);
-        let (nu_h, _, params_h) = params_from_vars(total_vars);
-        let h_com = hyrax_commit(&h_mle.evaluations, nu_h, &params_h);
-        absorb_com(transcript, b"logup_h_bucket_com", &h_com);
         bucket_h_mles.push(h_mle);
         bucket_c_mles.push(c_mle);
-        bucket_h_coms.push(h_com);
     }
 
     eprintln!(
@@ -568,7 +580,6 @@ pub fn prove_range_batched(
     let mut witness_r_k: Vec<Vec<F>> = vec![Vec::new(); witnesses.len()];
     let mut bucket_sumchecks: Vec<SumcheckCubicProofMulti> =
         Vec::with_capacity(buckets_by_num_vars.len());
-    let mut bucket_h_opens: Vec<HyraxProof> = Vec::with_capacity(buckets_by_num_vars.len());
 
     for (bucket_idx, (&num_vars, indices)) in buckets_by_num_vars.iter().enumerate() {
         let bucket_size = indices.len();
@@ -623,13 +634,6 @@ pub fn prove_range_batched(
         for &i in indices {
             witness_r_k[i] = r_k.clone();
         }
-        let (nu_h, sigma_h, _) = params_from_vars(pair_bits + num_vars);
-        bucket_h_opens.push(hyrax_open(
-            &bucket_h_mles[bucket_idx].evaluations,
-            &r_k_full,
-            nu_h,
-            sigma_h,
-        ));
         bucket_sumchecks.push(super_sumcheck);
     }
 
@@ -648,6 +652,8 @@ pub fn prove_range_batched(
     // larger y-witness opens).  hyrax_open itself is internally par_iter'd over
     // its column dimension, so rayon nesting handles work-stealing. ----
     struct WitnessOpens {
+        h_at_rk: Vec<F>,
+        h_open_proofs: Vec<HyraxProof>,
         chunk_at_rk: Vec<F>,
         chunk_open_proofs: Vec<HyraxProof>,
     }
@@ -657,12 +663,19 @@ pub fn prove_range_batched(
         .map(|i| {
             let (nu_c, sigma_c, _) = params_from_vars(all_num_vars[i]);
             let r_k = &witness_r_k[i];
+            let h_at_rk: Vec<F> = all_h_mles[i].iter().map(|m| m.evaluate(r_k)).collect();
+            let h_open_proofs: Vec<HyraxProof> = all_h_mles[i]
+                .iter()
+                .map(|h_mle| hyrax_open(&h_mle.evaluations, r_k, nu_c, sigma_c))
+                .collect();
             let chunk_at_rk: Vec<F> = all_chunk_mles[i].iter().map(|m| m.evaluate(r_k)).collect();
             let chunk_open_proofs: Vec<HyraxProof> = all_chunk_mles[i]
                 .iter()
                 .map(|chunk_mle| hyrax_open(&chunk_mle.evaluations, r_k, nu_c, sigma_c))
                 .collect();
             WitnessOpens {
+                h_at_rk,
+                h_open_proofs,
                 chunk_at_rk,
                 chunk_open_proofs,
             }
@@ -680,10 +693,11 @@ pub fn prove_range_batched(
         .into_iter()
         .enumerate()
         .map(|(i, ops)| LogUpWitnessProof {
-            h_coms: Vec::new(),
+            h_coms: all_h_coms[i].clone(),
             combined_claims: logup_precomputed[i].combined.clone(),
             chunk_at_rk: ops.chunk_at_rk,
-            h_open_proofs: Vec::new(),
+            h_at_rk: ops.h_at_rk,
+            h_open_proofs: ops.h_open_proofs,
             chunk_open_proofs: ops.chunk_open_proofs,
         })
         .collect();
@@ -727,8 +741,8 @@ pub fn prove_range_batched(
         logup_m_at_rm2,
         logup_m_open_rm2,
         bucket_sumchecks,
-        bucket_h_coms,
-        bucket_h_opens,
+        bucket_h_coms: Vec::new(),
+        bucket_h_opens: Vec::new(),
     };
 
     Ok((witness_proofs, global_m, r_vs))
@@ -826,9 +840,12 @@ pub fn verify_range_batched(
     // ---- Phase 3: LogUp consistency verification ----
     let alpha = transcript.challenge_field::<F>(b"logup_alpha");
 
-    // Absorb fused H_bucket commitments before drawing β (mirrors prover ordering).
-    for com in &global_m.bucket_h_coms {
-        absorb_com(transcript, b"logup_h_bucket_com", com);
+    // Absorb per-chunk H commitments before drawing β. The fused GKR terminal
+    // H value is later reduced to an eq-weighted combination of these openings.
+    for proof in witness_proofs {
+        for com in &proof.logup.h_coms {
+            absorb_com(transcript, b"logup_h_com", com);
+        }
     }
     let beta = transcript.challenge_field::<F>(b"logup_beta");
 
@@ -842,11 +859,11 @@ pub fn verify_range_batched(
         buckets_by_num_vars.entry(nv).or_default().push(i);
     }
     if buckets_by_num_vars.len() != global_m.bucket_sumchecks.len()
-        || buckets_by_num_vars.len() != global_m.bucket_h_coms.len()
-        || buckets_by_num_vars.len() != global_m.bucket_h_opens.len()
+        || !global_m.bucket_h_coms.is_empty()
+        || !global_m.bucket_h_opens.is_empty()
     {
         return Err(format!(
-            "GlobalRange: bucket count mismatch (sumchecks={}, h_coms={}, h_opens={}, expected={})",
+            "GlobalRange: bucket count mismatch (sumchecks={}, legacy_h_coms={}, legacy_h_opens={}, expected={})",
             global_m.bucket_sumchecks.len(),
             global_m.bucket_h_coms.len(),
             global_m.bucket_h_opens.len(),
@@ -858,6 +875,9 @@ pub fn verify_range_batched(
     for (i, proof) in witness_proofs.iter().enumerate() {
         if proof.logup.combined_claims.len() != num_chunks
             || proof.logup.chunk_at_rk.len() != num_chunks
+            || proof.logup.h_coms.len() != num_chunks
+            || proof.logup.h_at_rk.len() != num_chunks
+            || proof.logup.h_open_proofs.len() != num_chunks
             || proof.logup.chunk_open_proofs.len() != num_chunks
         {
             return Err(format!(
@@ -867,10 +887,9 @@ pub fn verify_range_batched(
     }
 
     let mut total_lhs_claim = F::ZERO;
-    for (bucket_idx, ((num_vars, indices), super_sumcheck)) in buckets_by_num_vars
+    for ((num_vars, indices), super_sumcheck) in buckets_by_num_vars
         .iter()
         .zip(global_m.bucket_sumchecks.iter())
-        .enumerate()
     {
         let bucket_size = indices.len();
         let total_triples = bucket_size * num_chunks;
@@ -925,6 +944,7 @@ pub fn verify_range_batched(
             ));
         }
 
+        let mut expected_h = F::ZERO;
         let mut expected_w = F::ZERO;
         let mut expected_c = F::ZERO;
         for (w, &i) in indices.iter().enumerate() {
@@ -932,11 +952,21 @@ pub fn verify_range_batched(
             let acc_logup: &mut HyraxBatchAccumulator = &mut *chunk_accs[acc_indices[i]].1;
             for c in 0..num_chunks {
                 let idx = w * num_chunks + c;
+                let h_val = logup.h_at_rk[c];
                 let chunk_val = logup.chunk_at_rk[c];
                 let pair_weight = eq_basis_eval(idx, pair_bits, r_pair);
+                expected_h += pair_weight * h_val;
                 expected_w += pair_weight * weights[idx];
                 expected_c += pair_weight * chunk_val;
 
+                acc_logup
+                    .add_verify(
+                        &logup.h_coms[c],
+                        h_val,
+                        &r_k,
+                        &logup.h_open_proofs[c],
+                    )
+                    .map_err(|e| format!("LogUp witness {i} chunk {c} H opening: {e}"))?;
                 acc_logup
                     .add_verify(
                         &witness_proofs[i].chunk_coms[c],
@@ -952,21 +982,17 @@ pub fn verify_range_batched(
                 "LogUp bucket nv={num_vars}: fused weight W(r) algebra mismatch"
             ));
         }
+        if final_evals_f[0] != expected_h {
+            return Err(format!(
+                "LogUp bucket nv={num_vars}: fused H(r) algebra mismatch"
+            ));
+        }
         let expected_r = F::ONE + beta * (alpha - expected_c);
         if final_evals_h[0] != expected_r {
             return Err(format!(
                 "LogUp bucket nv={num_vars}: fused R(r) algebra mismatch"
             ));
         }
-        let (_, _, params_h) = params_from_vars(pair_bits + *num_vars);
-        hyrax_verify(
-            &global_m.bucket_h_coms[bucket_idx],
-            final_evals_f[0],
-            &r_k_full,
-            &global_m.bucket_h_opens[bucket_idx],
-            &params_h,
-        )
-        .map_err(|e| format!("LogUp bucket nv={num_vars} fused H opening: {e}"))?;
     }
 
     // RHS sumcheck: Σ_j M[j] * g[j] = logup_rhs_claim, g[j] = 1/(α - j)
