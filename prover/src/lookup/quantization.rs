@@ -267,8 +267,7 @@ pub fn verify_quantization_batch(
     cols: usize,
     params: &QuantizationParams,
     transcript: &mut Transcript,
-    acc_range_sig: &mut HyraxBatchAccumulator,
-    acc_range_y: &mut HyraxBatchAccumulator,
+    acc_range_chunk: &mut HyraxBatchAccumulator,
     acc_range_m: &mut HyraxBatchAccumulator,
 ) -> Result<(), String> {
     validate_quant_params(params)?;
@@ -293,8 +292,7 @@ pub fn verify_quantization_batch(
         &vec![rem_n_vars; proof.rem_range_proofs.len()],
         range_bits_for_scale_num(params.scale_num),
         transcript,
-        acc_range_sig,
-        acc_range_y,
+        &mut [(rem_n_vars, acc_range_chunk)],
         acc_range_m,
     )?;
     let r = challenge_vec(transcript, num_vars, b"quant_r");

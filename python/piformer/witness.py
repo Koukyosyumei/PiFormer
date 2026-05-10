@@ -351,13 +351,37 @@ def _gen_block_witness(
     k_raw = _project(ln1_y, w_k_T)
     v_raw = _project(ln1_y, w_v_T)
 
-    # ---- φ activation on Q and K ----
+    # ---- QK-norm (per-head LayerNorm; n_heads=1 → operates on full d_model) ----
+    qn_gamma_int, qn_beta_int = _prepare_ln_weights(
+        attn.q_norm.weight.detach().tolist(),
+        attn.q_norm.bias.detach().tolist(),
+        q_raw,
+        d,
+        ln_scale,
+        extra_beta_floor,
+    )
+    q_n, qn_sum_x, qn_var_x, qn_sigma = compute_ln_witness(
+        q_raw, qn_gamma_int, qn_beta_int, d
+    )
+    kn_gamma_int, kn_beta_int = _prepare_ln_weights(
+        attn.k_norm.weight.detach().tolist(),
+        attn.k_norm.bias.detach().tolist(),
+        k_raw,
+        d,
+        ln_scale,
+        extra_beta_floor,
+    )
+    k_n, kn_sum_x, kn_var_x, kn_sigma = compute_ln_witness(
+        k_raw, kn_gamma_int, kn_beta_int, d
+    )
+
+    # ---- φ activation on normalized Q and K (post-q_norm / k_norm) ----
     phi_q, q_indices, q_outputs = _phi_mat(
-        q_raw, attn_tables_int, phi_num_bits, phi_c, phi_scale, quant_scale,
+        q_n, attn_tables_int, phi_num_bits, phi_c, phi_scale, quant_scale,
         lookup_index_mode,
     )
     phi_k, k_indices, k_outputs = _phi_mat(
-        k_raw, attn_tables_int, phi_num_bits, phi_c, phi_scale, quant_scale,
+        k_n, attn_tables_int, phi_num_bits, phi_c, phi_scale, quant_scale,
         lookup_index_mode,
     )
 
@@ -411,8 +435,25 @@ def _gen_block_witness(
     )
     out_attn = _add_bias_int(_project(attn_proj_in, w_o_T), o_bias)
 
-    # ---- Residual 1 ----
-    x_mid = mat_add_int(x_in, out_attn)
+    # ---- attn_out_norm (sandwich norm post-attention LayerNorm) ----
+    # The PyTorch model applies LayerNorm to out_attn before the residual.
+    # Production range proofs are 64-bit (LAYERNORM_RANGE_BITS), which is wide
+    # enough for typical model dimensions; an earlier 32-bit version of the
+    # range proof was the reason this LN was bypassed.
+    aon_gamma_int, aon_beta_int = _prepare_ln_weights(
+        blk.attn_out_norm.weight.detach().tolist(),
+        blk.attn_out_norm.bias.detach().tolist(),
+        out_attn,
+        d,
+        ln_scale,
+        extra_beta_floor,
+    )
+    aon_y, aon_sum_x, aon_var_x, aon_sigma = compute_ln_witness(
+        out_attn, aon_gamma_int, aon_beta_int, d
+    )
+
+    # ---- Residual 1 (uses normalized attention output) ----
+    x_mid = mat_add_int(x_in, aon_y)
 
     # ---- LN2 ----
     ln2_gamma_int, ln2_beta_int = _prepare_ln_weights(
@@ -486,9 +527,23 @@ def _gen_block_witness(
         "q_proj": {"x": mat_to_json(ln1_y), "y": mat_to_json(q_raw)},
         "k_proj": {"x": mat_to_json(ln1_y), "y": mat_to_json(k_raw)},
         "v_proj": {"x": mat_to_json(ln1_y), "y": mat_to_json(v_raw)},
+        "q_norm": {
+            "x": mat_to_json(q_raw),
+            "y": mat_to_json(q_n),
+            "sum_x": vec_to_json(qn_sum_x),
+            "var_x": vec_to_json(qn_var_x),
+            "sigma": vec_to_json(qn_sigma),
+        },
+        "k_norm": {
+            "x": mat_to_json(k_raw),
+            "y": mat_to_json(k_n),
+            "sum_x": vec_to_json(kn_sum_x),
+            "var_x": vec_to_json(kn_var_x),
+            "sigma": vec_to_json(kn_sigma),
+        },
         "attn": {
-            "q": mat_to_json(q_raw),
-            "k": mat_to_json(k_raw),
+            "q": mat_to_json(q_n),
+            "k": mat_to_json(k_n),
             "v": mat_to_json(v_raw),
             "phi_q": mat_to_json(phi_q),
             "phi_k": mat_to_json(phi_k),
@@ -510,6 +565,13 @@ def _gen_block_witness(
             "out": mat_to_json(attn_out),
         },
         "o_proj": {"x": mat_to_json(attn_proj_in), "y": mat_to_json(out_attn)},
+        "attn_out_norm": {
+            "x": mat_to_json(out_attn),
+            "y": mat_to_json(aon_y),
+            "sum_x": vec_to_json(aon_sum_x),
+            "var_x": vec_to_json(aon_var_x),
+            "sigma": vec_to_json(aon_sigma),
+        },
         "x_mid": mat_to_json(x_mid),
         "ln2": {
             "x": mat_to_json(x_mid),
@@ -533,8 +595,13 @@ def _gen_block_witness(
     # Return metadata needed to build LassoInstances at the top level
     block_wit["_attn_lasso"] = (q_lasso, k_lasso)
     block_wit["_ffn_lasso"] = ffn_lasso
-    block_wit["_ln1_weights"] = (ln1_gamma_int, ln1_beta_int)
-    block_wit["_ln2_weights"] = (ln2_gamma_int, ln2_beta_int)
+    block_wit["_ln_weights"] = {
+        "ln1": (ln1_gamma_int, ln1_beta_int),
+        "ln2": (ln2_gamma_int, ln2_beta_int),
+        "q_norm": (qn_gamma_int, qn_beta_int),
+        "k_norm": (kn_gamma_int, kn_beta_int),
+        "attn_out_norm": (aon_gamma_int, aon_beta_int),
+    }
 
     return block_wit, x_out
 
@@ -632,9 +699,7 @@ class WitnessGenerator:
             )
             q_lasso_last, k_lasso_last = bwit.pop("_attn_lasso")
             ffn_lasso_last = bwit.pop("_ffn_lasso")
-            ln1_gamma, ln1_beta = bwit.pop("_ln1_weights")
-            ln2_gamma, ln2_beta = bwit.pop("_ln2_weights")
-            block_ln_weights.append((ln1_gamma, ln1_beta, ln2_gamma, ln2_beta))
+            block_ln_weights.append(bwit.pop("_ln_weights"))
             block_witnesses.append(bwit)
 
         # ---- Final LayerNorm ----

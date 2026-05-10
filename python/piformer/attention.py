@@ -68,6 +68,12 @@ class LinearAttentionLayer(nn.Module):
         self.v_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=False)
         self.out_proj = TernaryLinear(d_model, d_model, max_exp=max_exp, bias=True)
 
+        # Per-head QK-norm. Pins the dynamic range of Q and K so the kernel
+        # features φ(Q), φ(K) — and the normalizer Z — stay in a stable regime
+        # regardless of the single-alpha ternary projection scale.
+        self.q_norm = nn.LayerNorm(self.d_head)
+        self.k_norm = nn.LayerNorm(self.d_head)
+
         # Single strictly positive φ shared by Q and K projections. Linear
         # attention normalizers are unstable if the kernel features can go
         # negative or collapse to zero for half the signed input range.
@@ -93,6 +99,9 @@ class LinearAttentionLayer(nn.Module):
             return t.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
         Q, K, V = split_heads(Q), split_heads(K), split_heads(V)
+
+        Q = self.q_norm(Q)
+        K = self.k_norm(K)
 
         # Apply φ element-wise
         phiQ = self.phi(Q)  # (B, n_heads, T, d_head)

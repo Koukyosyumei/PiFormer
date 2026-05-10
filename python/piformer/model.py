@@ -66,6 +66,10 @@ class PiFormerBlock(nn.Module):
             causal=causal, attention_mode=attention_mode,
             attention_scale=attention_scale,
         )
+        # Sandwich norm on the attention output: linear attention has no
+        # softmax bound, so without this the residual stream can drift in
+        # magnitude and destabilize downstream LayerNorms.
+        self.attn_out_norm = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = PiFormerFFN(
             d_model, d_ff,
@@ -73,7 +77,7 @@ class PiFormerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn_out_norm(self.attn(self.norm1(x)))
         x = x + self.ffn(self.norm2(x))
         return x
 
