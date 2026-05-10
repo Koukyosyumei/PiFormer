@@ -15,7 +15,7 @@ use crate::pcs::{
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{
     prove_sumcheck, prove_sumcheck_multi_batched_owned, verify_sumcheck,
-    verify_sumcheck_multi_batched, SumcheckProof, SumcheckProofMulti,
+    verify_sumcheck_multi_batched, RoundPoly, SumcheckProof, SumcheckProofMulti,
 };
 use crate::transcript::Transcript;
 use ark_ff::{batch_inversion, Field, PrimeField};
@@ -117,6 +117,138 @@ pub struct GlobalRangeM {
     /// bucket_size · num_chunks; element at index w·num_chunks + c is the
     /// (witness, chunk) pair's reduced eval.
     pub bucket_sumchecks: Vec<SumcheckProofMulti>,
+}
+
+fn prove_logup_bucket_sumcheck_affine_q(
+    all_h_mles: &[Vec<DenseMLPoly>],
+    all_chunk_mles: &[Vec<DenseMLPoly>],
+    pairs: &[(usize, usize)],
+    weights: &[F],
+    alpha: F,
+    beta: F,
+    claim: F,
+    transcript: &mut Transcript,
+) -> (SumcheckProofMulti, Vec<F>) {
+    assert_eq!(pairs.len(), weights.len());
+    let num_pairs = pairs.len();
+    let n = all_h_mles[pairs[0].0][pairs[0].1].num_vars;
+    transcript.append_field(b"sc_claim", &claim);
+
+    let mut h_cur: Vec<Vec<F>> = pairs
+        .iter()
+        .map(|&(i, c)| all_h_mles[i][c].evaluations.clone())
+        .collect();
+    let mut chunk_cur: Vec<Vec<F>> = pairs
+        .iter()
+        .map(|&(i, c)| all_chunk_mles[i][c].evaluations.clone())
+        .collect();
+
+    let mut round_polys = Vec::with_capacity(n);
+    let mut challenges = Vec::with_capacity(n);
+    let two = F::from(2u64);
+
+    for _ in 0..n {
+        let half = h_cur[0].len() >> 1;
+        const PAR_THRESHOLD: usize = 512;
+        let (e0, e1, e2) = if half >= PAR_THRESHOLD {
+            (0..half)
+                .into_par_iter()
+                .map(|idx| {
+                    let mut r0 = F::ZERO;
+                    let mut r1 = F::ZERO;
+                    let mut r2 = F::ZERO;
+                    for k in 0..num_pairs {
+                        let h0 = h_cur[k][idx];
+                        let h1 = h_cur[k][idx + half];
+                        let c0 = chunk_cur[k][idx];
+                        let c1 = chunk_cur[k][idx + half];
+                        let h2 = two * h1 - h0;
+                        let c2 = two * c1 - c0;
+                        let q0 = F::ONE + beta * (alpha - c0);
+                        let q1 = F::ONE + beta * (alpha - c1);
+                        let q2 = F::ONE + beta * (alpha - c2);
+                        let w = weights[k];
+                        r0 += w * h0 * q0;
+                        r1 += w * h1 * q1;
+                        r2 += w * h2 * q2;
+                    }
+                    (r0, r1, r2)
+                })
+                .reduce(
+                    || (F::ZERO, F::ZERO, F::ZERO),
+                    |(a0, a1, a2), (b0, b1, b2)| (a0 + b0, a1 + b1, a2 + b2),
+                )
+        } else {
+            (0..half).fold((F::ZERO, F::ZERO, F::ZERO), |(a0, a1, a2), idx| {
+                let mut r0 = F::ZERO;
+                let mut r1 = F::ZERO;
+                let mut r2 = F::ZERO;
+                for k in 0..num_pairs {
+                    let h0 = h_cur[k][idx];
+                    let h1 = h_cur[k][idx + half];
+                    let c0 = chunk_cur[k][idx];
+                    let c1 = chunk_cur[k][idx + half];
+                    let h2 = two * h1 - h0;
+                    let c2 = two * c1 - c0;
+                    let q0 = F::ONE + beta * (alpha - c0);
+                    let q1 = F::ONE + beta * (alpha - c1);
+                    let q2 = F::ONE + beta * (alpha - c2);
+                    let w = weights[k];
+                    r0 += w * h0 * q0;
+                    r1 += w * h1 * q1;
+                    r2 += w * h2 * q2;
+                }
+                (a0 + r0, a1 + r1, a2 + r2)
+            })
+        };
+
+        let rp = RoundPoly {
+            evals: [e0, e1, e2],
+        };
+        for e in &rp.evals {
+            transcript.append_field(b"sc_round", e);
+        }
+        let r_i = transcript.challenge_field::<F>(b"sc_challenge");
+        challenges.push(r_i);
+
+        h_cur.par_iter_mut().for_each(|evals| {
+            let next: Vec<F> = (0..half)
+                .map(|idx| {
+                    let lo = evals[idx];
+                    let hi = evals[idx + half];
+                    lo + r_i * (hi - lo)
+                })
+                .collect();
+            *evals = next;
+        });
+        chunk_cur.par_iter_mut().for_each(|evals| {
+            let next: Vec<F> = (0..half)
+                .map(|idx| {
+                    let lo = evals[idx];
+                    let hi = evals[idx + half];
+                    lo + r_i * (hi - lo)
+                })
+                .collect();
+            *evals = next;
+        });
+
+        round_polys.push(rp);
+    }
+
+    let final_evals_f: Vec<F> = h_cur.iter().map(|evals| evals[0]).collect();
+    let final_evals_g: Vec<F> = chunk_cur
+        .iter()
+        .map(|evals| F::ONE + beta * (alpha - evals[0]))
+        .collect();
+
+    (
+        SumcheckProofMulti {
+            round_polys,
+            final_evals_f,
+            final_evals_g,
+        },
+        challenges,
+    )
 }
 
 /// Prove that every value in every witness is in [0, 2^bits) using a single
@@ -366,6 +498,10 @@ pub fn prove_range_batched(
 
     // β drawn after h_coms — used to combine the two LogUp checks into one sumcheck per chunk.
     let beta = transcript.challenge_field::<F>(b"logup_beta");
+    let use_affine_q_sumcheck = witnesses
+        .iter()
+        .enumerate()
+        .all(|(i, w)| w.values.len() == (1usize << all_num_vars[i]));
 
     // Per-witness: one batched sumcheck folding all `num_chunks` per-chunk
     // combined sumchecks via verifier-supplied weights γ_0..γ_{nc-1}.
@@ -387,11 +523,13 @@ pub fn prove_range_batched(
             let mut claims = Vec::with_capacity(num_chunks);
             let mut combined = Vec::with_capacity(num_chunks);
             for c in 0..num_chunks {
-                let q_vals: Vec<F> = all_chunk_vals[i][c]
-                    .iter()
-                    .map(|&cv| F::ONE + beta * (alpha - cv))
-                    .collect();
-                q_mles.push(vec_to_mle(&q_vals, n));
+                if !use_affine_q_sumcheck {
+                    let q_vals: Vec<F> = all_chunk_vals[i][c]
+                        .iter()
+                        .map(|&cv| F::ONE + beta * (alpha - cv))
+                        .collect();
+                    q_mles.push(vec_to_mle(&q_vals, n));
+                }
                 let claim_c: F = all_h_mles[i][c].evaluations.iter().sum();
                 claims.push(claim_c);
                 combined.push(claim_c + beta * n_padded);
@@ -437,8 +575,17 @@ pub fn prove_range_batched(
             .collect();
 
         let mut weights = Vec::with_capacity(total_triples);
-        let mut fs = Vec::with_capacity(total_triples);
-        let mut gs = Vec::with_capacity(total_triples);
+        let mut pairs = Vec::with_capacity(total_triples);
+        let mut fs = if use_affine_q_sumcheck {
+            Vec::new()
+        } else {
+            Vec::with_capacity(total_triples)
+        };
+        let mut gs = if use_affine_q_sumcheck {
+            Vec::new()
+        } else {
+            Vec::with_capacity(total_triples)
+        };
         let mut bucket_claim = F::ZERO;
 
         for (w, &i) in indices.iter().enumerate() {
@@ -449,21 +596,31 @@ pub fn prove_range_batched(
             for c in 0..num_chunks {
                 let weight = eta_pows[w] * gammas[c];
                 weights.push(weight);
-                // Move-clone h/q mles (sumcheck mutates in place). h_mles
-                // are still needed in Pass B for h_open_proofs.
-                fs.push(all_h_mles[i][c].clone());
-                gs.push(pre.q_mles[c].clone());
+                pairs.push((i, c));
+                if !use_affine_q_sumcheck {
+                    // Move-clone h/q mles (sumcheck mutates in place). h_mles
+                    // are still needed in Pass B for h_open_proofs.
+                    fs.push(all_h_mles[i][c].clone());
+                    gs.push(pre.q_mles[c].clone());
+                }
                 bucket_claim += weight * pre.combined[c];
             }
         }
 
-        let (super_sumcheck, r_k) = prove_sumcheck_multi_batched_owned(
-            fs,
-            gs,
-            &weights,
-            bucket_claim,
-            transcript,
-        );
+        let (super_sumcheck, r_k) = if use_affine_q_sumcheck {
+            prove_logup_bucket_sumcheck_affine_q(
+                &all_h_mles,
+                &all_chunk_mles,
+                &pairs,
+                &weights,
+                alpha,
+                beta,
+                bucket_claim,
+                transcript,
+            )
+        } else {
+            prove_sumcheck_multi_batched_owned(fs, gs, &weights, bucket_claim, transcript)
+        };
 
         // Every witness in this bucket shares r_k_bucket for Pass B.
         for &i in indices {
