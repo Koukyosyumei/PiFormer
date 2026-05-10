@@ -52,7 +52,7 @@ const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
 const VERSION: u8 = 5;
-const PROOF_VERSION: u8 = 13;
+const PROOF_VERSION: u8 = 14;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -602,9 +602,8 @@ fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
 
 fn write_logup_witness_proof<W: Write>(w: &mut W, p: &LogUpWitnessProof) -> io::Result<()> {
     write_vec(w, &p.h_coms, write_hyrax_commitment)?;
-    write_vec(w, &p.combined_sumchecks, write_sumcheck_proof)?;
+    write_sumcheck_proof_multi(w, &p.batched_sumcheck)?;
     write_vec_f(w, &p.combined_claims)?;
-    write_vec_f(w, &p.h_at_rk)?;
     write_vec_f(w, &p.chunk_at_rk)?;
     write_vec(w, &p.h_open_proofs, write_hyrax_proof)?;
     write_vec(w, &p.chunk_open_proofs, write_hyrax_proof)
@@ -612,9 +611,8 @@ fn write_logup_witness_proof<W: Write>(w: &mut W, p: &LogUpWitnessProof) -> io::
 fn read_logup_witness_proof<R: Read>(r: &mut R) -> io::Result<LogUpWitnessProof> {
     Ok(LogUpWitnessProof {
         h_coms: read_vec(r, read_hyrax_commitment)?,
-        combined_sumchecks: read_vec(r, read_sumcheck_proof)?,
+        batched_sumcheck: read_sumcheck_proof_multi(r)?,
         combined_claims: read_vec_f(r)?,
-        h_at_rk: read_vec_f(r)?,
         chunk_at_rk: read_vec_f(r)?,
         h_open_proofs: read_vec(r, read_hyrax_proof)?,
         chunk_open_proofs: read_vec(r, read_hyrax_proof)?,
@@ -622,8 +620,6 @@ fn read_logup_witness_proof<R: Read>(r: &mut R) -> io::Result<LogUpWitnessProof>
 }
 
 fn write_range_witness_proof<W: Write>(w: &mut W, p: &RangeWitnessProof) -> io::Result<()> {
-    write_sumcheck_proof(w, &p.sumcheck)?;
-    write_f(w, &p.claim_v)?;
     write_vec(w, &p.chunk_coms, write_hyrax_commitment)?;
     write_vec_f(w, &p.chunk_evals)?;
     write_hyrax_proof(w, &p.chunk_batch_proof)?;
@@ -631,8 +627,6 @@ fn write_range_witness_proof<W: Write>(w: &mut W, p: &RangeWitnessProof) -> io::
 }
 fn read_range_witness_proof<R: Read>(r: &mut R) -> io::Result<RangeWitnessProof> {
     Ok(RangeWitnessProof {
-        sumcheck: read_sumcheck_proof(r)?,
-        claim_v: read_f(r)?,
         chunk_coms: read_vec(r, read_hyrax_commitment)?,
         chunk_evals: read_vec_f(r)?,
         chunk_batch_proof: read_hyrax_proof(r)?,

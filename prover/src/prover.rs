@@ -3249,8 +3249,12 @@ mod tests {
 
     #[test]
     fn test_model_rejects_tampered_ffn_quant_range_claim() {
+        // PROOF_VERSION 14: claim_v / Phase-2 sumcheck were removed (they reduced
+        // a vacuous claim about an uncommitted v).  The equivalent surface to
+        // tamper with is the chunk evaluation at r_v, which is bound to chunk_coms
+        // via the deferred Hyrax batch open and must therefore be rejected.
         assert_tampered_model_rejected(b"model_tamper_ffn_quant_range_claim", |proof, _| {
-            proof.ffn_quant_proof.rem_range_proofs[0].claim_v += F::ONE;
+            proof.ffn_quant_proof.rem_range_proofs[0].chunk_evals[0] += F::ONE;
         });
     }
 
@@ -3277,8 +3281,9 @@ mod tests {
 
     #[test]
     fn test_model_rejects_tampered_qk_quant_range_claim() {
+        // See note on test_model_rejects_tampered_ffn_quant_range_claim.
         assert_tampered_model_rejected(b"model_tamper_qk_quant_range_claim", |proof, _| {
-            proof.qk_quant_proof.rem_range_proofs[0].claim_v += F::ONE;
+            proof.qk_quant_proof.rem_range_proofs[0].chunk_evals[0] += F::ONE;
         });
     }
 
