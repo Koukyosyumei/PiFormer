@@ -15,8 +15,8 @@ use crate::lookup::lasso::{
 use crate::lookup::quantization::{verify_quantization_batch, QuantizationParams};
 use crate::lookup::range::{verify_range_batched, RangeWitnessProof};
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_verify, hyrax_verify_batch, hyrax_verify_batch_with_eta,
-    lagrange_basis, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams,
+    absorb_com, hyrax_commit, hyrax_verify, hyrax_verify_batch, lagrange_basis, params_from_vars,
+    HyraxBatchAccumulator, HyraxCommitment, HyraxParams,
 };
 use crate::poly::utils::{combine, compute_eq_evals, mat_to_mle};
 use crate::poly::DenseMLPoly;
@@ -28,7 +28,6 @@ use crate::transcript::{challenge_vec, Transcript};
 use crate::attention::attention::{AttentionProvingKey, LinearAttentionInstance};
 use crate::attention::layernorm::{
     verify_layernorms_batched, LayerNormIOCommitments, LayerNormVerifyingKey,
-    LAYERNORM_RANGE_BITS,
 };
 use crate::attention::projection::{
     verify_projection, ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
@@ -368,12 +367,14 @@ pub fn verify(
     // k_norm, attn_out_norm — interleaved sigma/y; then final_ln sigma + y).
     if proof.ln_batched_proof.sigma_range_proofs.len() != 5 * num_blocks + 1
         || proof.ln_batched_proof.y_range_proofs.len() != 5 * num_blocks + 1
+        || proof.ln_batched_proof.sigma_range_bits.len() != 5 * num_blocks + 1
+        || proof.ln_batched_proof.y_range_bits.len() != 5 * num_blocks + 1
     {
         return Err("LN range proof count mismatch (expected 5L+1 each)".into());
     }
-    let mut ln_range_proofs: Vec<&RangeWitnessProof> =
-        Vec::with_capacity(10 * num_blocks + 2);
+    let mut ln_range_proofs: Vec<&RangeWitnessProof> = Vec::with_capacity(10 * num_blocks + 2);
     let mut ln_range_num_vars: Vec<usize> = Vec::with_capacity(10 * num_blocks + 2);
+    let mut ln_range_bits: Vec<usize> = Vec::with_capacity(10 * num_blocks + 2);
     // Build the global range batch input in the SAME order the prover used:
     //   per block i: ln1_sig, ln1_y, ln2_sig, ln2_y, q_norm_sig, q_norm_y,
     //                k_norm_sig, k_norm_y, aon_sig, aon_y
@@ -382,6 +383,8 @@ pub fn verify(
     // proof for the rv mapping below.
     let sig_rps = &proof.ln_batched_proof.sigma_range_proofs;
     let y_rps = &proof.ln_batched_proof.y_range_proofs;
+    let sig_bits = &proof.ln_batched_proof.sigma_range_bits;
+    let y_bits = &proof.ln_batched_proof.y_range_bits;
     // Index mapping: for block i, the LN order in the *batched proof* is
     // (ln1, q_norm, k_norm, aon, ln2) == sig_rps positions (5i+0..5i+4).
     // We want global range input in (ln1, ln2, q_norm, k_norm, aon) order.
@@ -402,15 +405,19 @@ pub fn verify(
             let k = ln_idx_in_batched(i, slot);
             ln_range_proofs.push(&sig_rps[k]);
             ln_range_num_vars.push(ln_sigma_n);
+            ln_range_bits.push(sig_bits[k]);
             ln_range_proofs.push(&y_rps[k]);
             ln_range_num_vars.push(ln_y_n);
+            ln_range_bits.push(y_bits[k]);
         }
     }
     let final_idx = 5 * num_blocks;
     ln_range_proofs.push(&sig_rps[final_idx]);
     ln_range_num_vars.push(ln_sigma_n);
+    ln_range_bits.push(sig_bits[final_idx]);
     ln_range_proofs.push(&y_rps[final_idx]);
     ln_range_num_vars.push(ln_y_n);
+    ln_range_bits.push(y_bits[final_idx]);
 
     // PROOF_VERSION 15 (P1): attn-norm rem/diff are appended to the LN range
     // batch and verified in a single call (one shared m_com / α / β / RHS
@@ -425,48 +432,90 @@ pub fn verify(
     if has_attn_norm {
         if proof.attn_norm_rem_range_proofs.len() != num_blocks
             || proof.attn_norm_diff_range_proofs.len() != num_blocks
+            || proof.attn_norm_rem_range_bits.len() != num_blocks
+            || proof.attn_norm_diff_range_bits.len() != num_blocks
         {
             return Err("attention normalization range proof count mismatch".into());
         }
         for i in 0..num_blocks {
             ln_range_proofs.push(&proof.attn_norm_rem_range_proofs[i]);
             ln_range_num_vars.push(n_attn_norm);
+            ln_range_bits.push(proof.attn_norm_rem_range_bits[i]);
             ln_range_proofs.push(&proof.attn_norm_diff_range_proofs[i]);
             ln_range_num_vars.push(n_attn_norm);
+            ln_range_bits.push(proof.attn_norm_diff_range_bits[i]);
         }
     } else if !proof.attn_norm_rem_range_proofs.is_empty()
         || !proof.attn_norm_diff_range_proofs.is_empty()
+        || !proof.attn_norm_rem_range_bits.is_empty()
+        || !proof.attn_norm_diff_range_bits.is_empty()
     {
         return Err("unexpected attention normalization range proof".into());
     }
 
-    // Build chunk_accs slice — one accumulator per distinct num_vars value.
-    // σ-witnesses: ln_sigma_n; y-witnesses: ln_y_n; attn-norm rem/diff: n_attn_norm.
-    // (n_attn_norm may coincide with one of the others on small models like the
-    // sample where d is small enough that ceil(log2(T·d)) == ceil(log2(2·T)).)
-    let mut chunk_accs: Vec<(usize, &mut HyraxBatchAccumulator)> = Vec::with_capacity(3);
-    chunk_accs.push((ln_sigma_n, &mut acc_range_sig));
-    if ln_y_n != ln_sigma_n {
-        chunk_accs.push((ln_y_n, &mut acc_range_y));
+    let _t0 = Instant::now();
+    for &bits in &ln_range_bits {
+        if bits != 32 && bits != 64 {
+            return Err(format!("unsupported LN range bit width: {bits}"));
+        }
     }
-    if has_attn_norm
-        && n_attn_norm != ln_sigma_n
-        && n_attn_norm != ln_y_n
-    {
-        chunk_accs.push((n_attn_norm, &mut acc_attn_norm));
+    let expected_bucket_bits: Vec<usize> = [32usize, 64usize]
+        .into_iter()
+        .filter(|bits| ln_range_bits.iter().any(|b| b == bits))
+        .collect();
+    if proof.ln_range_ms.len() != expected_bucket_bits.len() {
+        return Err("LN range batch count mismatch".into());
+    }
+    for (batch, expected_bits) in proof.ln_range_ms.iter().zip(expected_bucket_bits.iter()) {
+        if batch.bits != *expected_bits {
+            return Err("LN range batch bit-width order mismatch".into());
+        }
     }
 
-    let _t0 = Instant::now();
-    let (ln_range_r_vs, _) = verify_range_batched(
-        &ln_range_proofs,
-        &proof.ln_range_m,
-        &ln_range_num_vars,
-        LAYERNORM_RANGE_BITS,
-        transcript,
-        &mut chunk_accs,
-        &mut acc_range_m,
-    )?;
-    drop(chunk_accs);
+    let mut ln_range_r_vs_by_idx: Vec<Option<Vec<F>>> = vec![None; ln_range_proofs.len()];
+    for batch in &proof.ln_range_ms {
+        let bucket_indices: Vec<usize> = ln_range_bits
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &bits)| (bits == batch.bits).then_some(idx))
+            .collect();
+        let bucket_proofs: Vec<&RangeWitnessProof> = bucket_indices
+            .iter()
+            .map(|&idx| ln_range_proofs[idx])
+            .collect();
+        let bucket_num_vars: Vec<usize> = bucket_indices
+            .iter()
+            .map(|&idx| ln_range_num_vars[idx])
+            .collect();
+
+        // Build chunk_accs slice — one accumulator per distinct num_vars value.
+        let mut chunk_accs: Vec<(usize, &mut HyraxBatchAccumulator)> = Vec::with_capacity(3);
+        chunk_accs.push((ln_sigma_n, &mut acc_range_sig));
+        if ln_y_n != ln_sigma_n {
+            chunk_accs.push((ln_y_n, &mut acc_range_y));
+        }
+        if has_attn_norm && n_attn_norm != ln_sigma_n && n_attn_norm != ln_y_n {
+            chunk_accs.push((n_attn_norm, &mut acc_attn_norm));
+        }
+
+        let (bucket_r_vs, _) = verify_range_batched(
+            &bucket_proofs,
+            &batch.m,
+            &bucket_num_vars,
+            batch.bits,
+            transcript,
+            &mut chunk_accs,
+            &mut acc_range_m,
+        )?;
+        drop(chunk_accs);
+        for (idx, rv) in bucket_indices.into_iter().zip(bucket_r_vs.into_iter()) {
+            ln_range_r_vs_by_idx[idx] = Some(rv);
+        }
+    }
+    let ln_range_r_vs: Vec<Vec<F>> = ln_range_r_vs_by_idx
+        .into_iter()
+        .map(|rv| rv.expect("missing LN range rv"))
+        .collect();
     eprintln!(
         "[model] ln_range_batch:{:>8.3}ms",
         _t0.elapsed().as_secs_f64() * 1000.0
@@ -475,10 +524,8 @@ pub fn verify(
     // Collect per-LN IO commitments for the cross-LN batched verify call at
     // the end. For each block we push 5 LNs in the same order the prover used:
     //   ln1, q_norm, k_norm, attn_out_norm, ln2.
-    let mut ln_io_coms_owned: Vec<LayerNormIOCommitments> =
-        Vec::with_capacity(5 * num_blocks + 1);
-    let mut ln_vks_refs: Vec<&LayerNormVerifyingKey> =
-        Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_io_coms_owned: Vec<LayerNormIOCommitments> = Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_vks_refs: Vec<&LayerNormVerifyingKey> = Vec::with_capacity(5 * num_blocks + 1);
     let mut ln_sigma_r_vs_idx: Vec<usize> = Vec::with_capacity(5 * num_blocks + 1);
     let mut ln_y_r_vs_idx: Vec<usize> = Vec::with_capacity(5 * num_blocks + 1);
 
@@ -556,11 +603,7 @@ pub fn verify(
         ln_vks_refs.push(&bvk.attn_out_norm_vk);
         ln_sigma_r_vs_idx.push(rv_base + 8);
         ln_y_r_vs_idx.push(rv_base + 9);
-        absorb_com(
-            transcript,
-            b"attn_out_norm_y_com",
-            &bp.attn_out_norm_y_com,
-        );
+        absorb_com(transcript, b"attn_out_norm_y_com", &bp.attn_out_norm_y_com);
 
         // Residual flows through the normalized attention output.
         let x_mid_com = add_commitments(&current_x_com, &bp.attn_out_norm_y_com);
@@ -1735,9 +1778,7 @@ pub fn verify(
     // GKR chain (step 2): causal_context_com is dropped; the CTX cubic sumcheck
     // binds attn_out_final_evals_g algebraically via phi_k and v opens. So no
     // Hyrax open of causal_context is required.
-    if proof.causal_ctx_out_batch_open.is_some()
-        || proof.causal_ctx_prefix_batch_open.is_some()
-    {
+    if proof.causal_ctx_out_batch_open.is_some() || proof.causal_ctx_prefix_batch_open.is_some() {
         return Err("unexpected causal context openings (cc_com is dropped)".to_string());
     }
     let _ = causal_ctx_coms;
@@ -1978,8 +2019,7 @@ pub fn verify(
     let global_multi_inst = LassoMultiInstance {
         instances: all_lasso_instances,
     };
-    let global_instance_to_group =
-        crate::lookup::lasso::derive_instance_groups(&all_instance_coms);
+    let global_instance_to_group = crate::lookup::lasso::derive_instance_groups(&all_instance_coms);
     let global_lasso_vk = LassoMultiVerifyingKey {
         instance_table_coms: all_instance_coms,
         instance_to_group: global_instance_to_group,

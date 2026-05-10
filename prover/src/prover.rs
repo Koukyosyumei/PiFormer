@@ -23,7 +23,7 @@ use crate::attention::attention::{LinearAttentionInstance, LinearAttentionWitnes
 use crate::attention::layernorm::{
     compute_range_witnesses, prove_layernorms_batched, LayerNormIOCommitments,
     LayerNormRangeWitnesses, LayerNormVerifyingKey, LayerNormWitness, LayerNormsBatchedInput,
-    LayerNormsBatchedProof, LAYERNORM_RANGE_BITS,
+    LayerNormsBatchedProof,
 };
 use crate::attention::projection::{
     prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionProvingKey,
@@ -120,6 +120,36 @@ pub struct TransformerBlockProof {
 
 pub const ATTN_NORM_SCALE: u64 = 64;
 pub const ATTN_NORM_RANGE_BITS: usize = 64;
+const FAST_RANGE_BITS: usize = 32;
+const WIDE_RANGE_BITS: usize = 64;
+
+fn field_fits_bits(x: &F, bits: usize) -> bool {
+    let limbs = x.into_bigint();
+    let words = limbs.as_ref();
+    match bits {
+        32 => words[0] <= u32::MAX as u64 && words[1..].iter().all(|&w| w == 0),
+        64 => words[1..].iter().all(|&w| w == 0),
+        _ => false,
+    }
+}
+
+fn choose_range_bits(witness: &RangeProofWitness) -> Result<usize, String> {
+    if witness
+        .values
+        .iter()
+        .all(|v| field_fits_bits(v, FAST_RANGE_BITS))
+    {
+        Ok(FAST_RANGE_BITS)
+    } else if witness
+        .values
+        .iter()
+        .all(|v| field_fits_bits(v, WIDE_RANGE_BITS))
+    {
+        Ok(WIDE_RANGE_BITS)
+    } else {
+        Err("range witness contains a value >= 2^64; no configured bucket can prove it".into())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Witness Structures
@@ -418,30 +448,10 @@ fn prove_block_layernorms(
     // Absorb out_ffn_com so transcript stays consistent with Phase 1.
     absorb_com(transcript, b"y_com", &commits.out_ffn_com);
 
-    let [
-        ln1_sig_rp,
-        ln1_y_rp,
-        ln2_sig_rp,
-        ln2_y_rp,
-        q_norm_sig_rp,
-        q_norm_y_rp,
-        k_norm_sig_rp,
-        k_norm_y_rp,
-        aon_sig_rp,
-        aon_y_rp,
-    ] = range_proofs;
-    let [
-        ln1_sig_rv,
-        ln1_y_rv,
-        ln2_sig_rv,
-        ln2_y_rv,
-        q_norm_sig_rv,
-        q_norm_y_rv,
-        k_norm_sig_rv,
-        k_norm_y_rv,
-        aon_sig_rv,
-        aon_y_rv,
-    ] = range_rvs;
+    let [ln1_sig_rp, ln1_y_rp, ln2_sig_rp, ln2_y_rp, q_norm_sig_rp, q_norm_y_rp, k_norm_sig_rp, k_norm_y_rp, aon_sig_rp, aon_y_rp] =
+        range_proofs;
+    let [ln1_sig_rv, ln1_y_rv, ln2_sig_rv, ln2_y_rv, q_norm_sig_rv, q_norm_y_rv, k_norm_sig_rv, k_norm_y_rv, aon_sig_rv, aon_y_rv] =
+        range_rvs;
     let ln_inputs = BlockLnInputs {
         ln1_io: ln1_io.clone(),
         q_norm_io: q_norm_io.clone(),
@@ -526,7 +536,9 @@ pub struct TransformerModelProof {
     pub all_lasso_proof: LassoMultiProof,
     pub ffn_quant_proof: QuantizationProof,
     pub qk_quant_proof: QuantizationProof,
-    pub ln_range_m: GlobalRangeM,
+    /// Global range multiplicity proofs, one per bit-width bucket used by the
+    /// model-level LayerNorm/attention-normalization range proofs.
+    pub ln_range_ms: Vec<RangeBatchM>,
 
     // Cross-block batch sumchecks (one per projection type + attention)
     pub batch_qkv: SumcheckProofMulti,
@@ -550,11 +562,12 @@ pub struct TransformerModelProof {
     pub attn_z_sumcheck: Option<SumcheckProofMulti>,
     pub attn_z_ksum_sumcheck: Option<SumcheckProofMulti>,
     pub attn_z_causal_sumcheck: Option<SumcheckCubicProofMulti>,
-    /// PROOF_VERSION 15: attn-norm rem/diff range proofs share the same
-    /// `ln_range_m` as the LayerNorm range batch — they were folded into one
-    /// global `prove_range_batched` call for amortized LogUp consistency.
+    /// Attention normalization rem/diff range proofs.  Their bit-width metadata
+    /// is stored separately so the verifier can replay the same range buckets.
     pub attn_norm_rem_range_proofs: Vec<RangeWitnessProof>,
     pub attn_norm_diff_range_proofs: Vec<RangeWitnessProof>,
+    pub attn_norm_rem_range_bits: Vec<usize>,
+    pub attn_norm_diff_range_bits: Vec<usize>,
 
     // Global batch open for 5L intermediate matrices at shared r_td
     pub inter_batch_open: HyraxProof,
@@ -590,6 +603,12 @@ pub struct TransformerModelProof {
     pub causal_ctx_out_batch_open: Option<HyraxProof>,
     pub causal_ctx_prefix_batch_open: Option<HyraxProof>,
     pub qk_lasso_bind_open: HyraxProof,
+}
+
+#[derive(Clone)]
+pub struct RangeBatchM {
+    pub bits: usize,
+    pub m: GlobalRangeM,
 }
 
 // ---------------------------------------------------------------------------
@@ -895,8 +914,7 @@ pub fn prove(
             let ln2_rw = compute_range_witnesses(&bw.ln2_wit, &bpk.ln2_vk);
             let q_norm_rw = compute_range_witnesses(&bw.q_norm_wit, &bpk.q_norm_vk);
             let k_norm_rw = compute_range_witnesses(&bw.k_norm_wit, &bpk.k_norm_vk);
-            let aon_rw =
-                compute_range_witnesses(&bw.attn_out_norm_wit, &bpk.attn_out_norm_vk);
+            let aon_rw = compute_range_witnesses(&bw.attn_out_norm_wit, &bpk.attn_out_norm_vk);
             (partial, ln1_rw, ln2_rw, q_norm_rw, k_norm_rw, aon_rw)
         })
         .collect();
@@ -928,13 +946,10 @@ pub fn prove(
     ln_range_witnesses.push(final_rw.sigma_witness);
     ln_range_witnesses.push(final_rw.y_witness);
 
-    // PROOF_VERSION 15 (P1): merge attn-norm range witnesses into the same
-    // global batch as the LN range witnesses.  Both use 64-bit ranges and the
-    // same chunking, so they can share one m_com / one LogUp α/β chain / one
-    // RHS sumcheck.  Witnesses are appended AFTER all LN witnesses (including
-    // final_ln) in deterministic block order so the verifier mirrors exactly.
-    let _: usize = ATTN_NORM_RANGE_BITS; // sanity: must equal LAYERNORM_RANGE_BITS
-    debug_assert_eq!(ATTN_NORM_RANGE_BITS, LAYERNORM_RANGE_BITS);
+    // Range witnesses are routed to the narrowest configured bit-width bucket.
+    // The verifier replays this from serialized metadata and verifies one
+    // GlobalRangeM per used bucket.
+    let _: usize = ATTN_NORM_RANGE_BITS;
 
     let mut norm_range_witnesses: Vec<RangeProofWitness> = Vec::new();
     let has_attn_norm = witness
@@ -972,8 +987,47 @@ pub fn prove(
         all_range_refs.push(w);
     }
 
-    let (all_range_proofs, ln_range_m, all_range_rvs) =
-        prove_range_batched(&all_range_refs, LAYERNORM_RANGE_BITS, transcript)?;
+    let all_range_bits: Vec<usize> = all_range_refs
+        .iter()
+        .map(|w| choose_range_bits(w))
+        .collect::<Result<_, _>>()?;
+
+    let mut all_range_proofs_by_idx: Vec<Option<RangeWitnessProof>> =
+        vec![None; all_range_refs.len()];
+    let mut all_range_rvs_by_idx: Vec<Option<Vec<F>>> = vec![None; all_range_refs.len()];
+    let mut ln_range_ms = Vec::new();
+
+    for bits in [FAST_RANGE_BITS, WIDE_RANGE_BITS] {
+        let bucket: Vec<(usize, &RangeProofWitness)> = all_range_refs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &w)| (all_range_bits[idx] == bits).then_some((idx, w)))
+            .collect();
+        if bucket.is_empty() {
+            continue;
+        }
+        let bucket_refs: Vec<&RangeProofWitness> = bucket.iter().map(|(_, w)| *w).collect();
+        let (bucket_proofs, bucket_m, bucket_rvs) =
+            prove_range_batched(&bucket_refs, bits, transcript)?;
+        ln_range_ms.push(RangeBatchM { bits, m: bucket_m });
+        for (((idx, _), proof), rv) in bucket
+            .into_iter()
+            .zip(bucket_proofs.into_iter())
+            .zip(bucket_rvs.into_iter())
+        {
+            all_range_proofs_by_idx[idx] = Some(proof);
+            all_range_rvs_by_idx[idx] = Some(rv);
+        }
+    }
+
+    let all_range_proofs: Vec<RangeWitnessProof> = all_range_proofs_by_idx
+        .into_iter()
+        .map(|p| p.expect("missing bucketed range proof"))
+        .collect();
+    let all_range_rvs: Vec<Vec<F>> = all_range_rvs_by_idx
+        .into_iter()
+        .map(|rv| rv.expect("missing bucketed range rv"))
+        .collect();
 
     // Split back into LN proofs (first 10·L+2) and attn-norm proofs (next 2·L).
     let ln_count = ln_range_witnesses.len();
@@ -989,11 +1043,25 @@ pub fn prove(
         .collect::<Vec<_>>()
         .into_iter();
 
-    let (attn_norm_rem_range_proofs, attn_norm_diff_range_proofs) = if has_attn_norm {
+    let ln_range_bits_vec = all_range_bits[..ln_count].to_vec();
+    let mut all_bits_iter = all_range_bits.into_iter().skip(ln_count);
+    let (
+        attn_norm_rem_range_proofs,
+        attn_norm_diff_range_proofs,
+        attn_norm_rem_range_bits,
+        attn_norm_diff_range_bits,
+    ) = if has_attn_norm {
         let mut rem = Vec::with_capacity(num_blocks);
         let mut diff = Vec::with_capacity(num_blocks);
+        let mut rem_bits = Vec::with_capacity(num_blocks);
+        let mut diff_bits = Vec::with_capacity(num_blocks);
         for _ in 0..num_blocks {
-            rem.push(all_proofs_iter.next().expect("missing attn rem range proof"));
+            rem.push(
+                all_proofs_iter
+                    .next()
+                    .expect("missing attn rem range proof"),
+            );
+            rem_bits.push(all_bits_iter.next().expect("missing attn rem range bits"));
             // discard attn-norm rvs — they aren't consumed by downstream sub-proofs
             let _ = all_rvs_iter.next().expect("missing attn rem range rv");
             diff.push(
@@ -1001,11 +1069,12 @@ pub fn prove(
                     .next()
                     .expect("missing attn diff range proof"),
             );
+            diff_bits.push(all_bits_iter.next().expect("missing attn diff range bits"));
             let _ = all_rvs_iter.next().expect("missing attn diff range rv");
         }
-        (rem, diff)
+        (rem, diff, rem_bits, diff_bits)
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
     };
 
     for i in 0..num_blocks {
@@ -1998,10 +2067,7 @@ pub fn prove(
         x_com: current_x_com.clone(),
         y_com: Some(final_ln_out_com.clone()),
     };
-    let final_ln_ranges = [
-        (final_sig_rp, final_sig_rv),
-        (final_y_rp, final_y_rv),
-    ];
+    let final_ln_ranges = [(final_sig_rp, final_sig_rv), (final_y_rp, final_y_rv)];
     eprintln!(
         "[prove] final_ln_absorb: {:7.3}ms",
         phase_t0.elapsed().as_secs_f64() * 1000.0
@@ -2013,47 +2079,58 @@ pub fn prove(
     //      Order matches the verifier's mirrored collection in verifier.rs.
     // =========================================================================
     let mut ln_witnesses: Vec<&LayerNormWitness> = Vec::with_capacity(5 * num_blocks + 1);
-    let mut ln_io_coms_local: Vec<&LayerNormIOCommitments> =
-        Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_io_coms_local: Vec<&LayerNormIOCommitments> = Vec::with_capacity(5 * num_blocks + 1);
     let mut ln_vks: Vec<&LayerNormVerifyingKey> = Vec::with_capacity(5 * num_blocks + 1);
     let mut ln_sigma_ranges: Vec<(RangeWitnessProof, Vec<F>)> =
         Vec::with_capacity(5 * num_blocks + 1);
-    let mut ln_y_ranges: Vec<(RangeWitnessProof, Vec<F>)> =
-        Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_y_ranges: Vec<(RangeWitnessProof, Vec<F>)> = Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_sigma_range_bits: Vec<usize> = Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_y_range_bits: Vec<usize> = Vec::with_capacity(5 * num_blocks + 1);
     for i in 0..num_blocks {
         let bw = &witness.block_witnesses[i];
         let bpk = &pk.block_pks[i];
         let li = &block_ln_inputs[i];
+        let rb = 10 * i;
         // Order: ln1, q_norm, k_norm, attn_out_norm, ln2.
         ln_witnesses.push(&bw.ln1_wit);
         ln_io_coms_local.push(&li.ln1_io);
         ln_vks.push(&bpk.ln1_vk);
         ln_sigma_ranges.push(li.ranges[0].clone());
         ln_y_ranges.push(li.ranges[1].clone());
+        ln_sigma_range_bits.push(ln_range_bits_vec[rb]);
+        ln_y_range_bits.push(ln_range_bits_vec[rb + 1]);
 
         ln_witnesses.push(&bw.q_norm_wit);
         ln_io_coms_local.push(&li.q_norm_io);
         ln_vks.push(&bpk.q_norm_vk);
         ln_sigma_ranges.push(li.ranges[4].clone());
         ln_y_ranges.push(li.ranges[5].clone());
+        ln_sigma_range_bits.push(ln_range_bits_vec[rb + 4]);
+        ln_y_range_bits.push(ln_range_bits_vec[rb + 5]);
 
         ln_witnesses.push(&bw.k_norm_wit);
         ln_io_coms_local.push(&li.k_norm_io);
         ln_vks.push(&bpk.k_norm_vk);
         ln_sigma_ranges.push(li.ranges[6].clone());
         ln_y_ranges.push(li.ranges[7].clone());
+        ln_sigma_range_bits.push(ln_range_bits_vec[rb + 6]);
+        ln_y_range_bits.push(ln_range_bits_vec[rb + 7]);
 
         ln_witnesses.push(&bw.attn_out_norm_wit);
         ln_io_coms_local.push(&li.aon_io);
         ln_vks.push(&bpk.attn_out_norm_vk);
         ln_sigma_ranges.push(li.ranges[8].clone());
         ln_y_ranges.push(li.ranges[9].clone());
+        ln_sigma_range_bits.push(ln_range_bits_vec[rb + 8]);
+        ln_y_range_bits.push(ln_range_bits_vec[rb + 9]);
 
         ln_witnesses.push(&bw.ln2_wit);
         ln_io_coms_local.push(&li.ln2_io);
         ln_vks.push(&bpk.ln2_vk);
         ln_sigma_ranges.push(li.ranges[2].clone());
         ln_y_ranges.push(li.ranges[3].clone());
+        ln_sigma_range_bits.push(ln_range_bits_vec[rb + 2]);
+        ln_y_range_bits.push(ln_range_bits_vec[rb + 3]);
     }
     ln_witnesses.push(&witness.final_ln_wit);
     ln_io_coms_local.push(&final_ln_io);
@@ -2061,6 +2138,8 @@ pub fn prove(
     let [final_sig_pair, final_y_pair] = final_ln_ranges;
     ln_sigma_ranges.push(final_sig_pair);
     ln_y_ranges.push(final_y_pair);
+    ln_sigma_range_bits.push(ln_range_bits_vec[10 * num_blocks]);
+    ln_y_range_bits.push(ln_range_bits_vec[10 * num_blocks + 1]);
 
     let ln_batched_input = LayerNormsBatchedInput {
         witnesses: ln_witnesses,
@@ -2068,6 +2147,8 @@ pub fn prove(
         vks: ln_vks,
         sigma_ranges: ln_sigma_ranges,
         y_ranges: ln_y_ranges,
+        sigma_range_bits: ln_sigma_range_bits,
+        y_range_bits: ln_y_range_bits,
     };
     let ln_batched_proof = prove_layernorms_batched(&ln_batched_input, transcript)?;
     eprintln!(
@@ -2147,8 +2228,7 @@ pub fn prove(
         qkv_w_refs.push(sm.w_k.evaluations.as_slice());
         qkv_w_refs.push(sm.w_v.evaluations.as_slice());
     }
-    let qkv_w_batch_open =
-        hyrax_open_batch(&qkv_w_refs, &wq_point, nu_w, sigma_w, transcript);
+    let qkv_w_batch_open = hyrax_open_batch(&qkv_w_refs, &wq_point, nu_w, sigma_w, transcript);
 
     // w_o_batch: L Wo_i at combine(r_k_o, r_out) [d_bits + d_bits].  Different
     // point from the qkv_w group; stays as its own (small) batch.
@@ -2168,8 +2248,7 @@ pub fn prove(
         qkvo_bias_refs.push(sm.b_v.evaluations.as_slice());
         qkvo_bias_refs.push(sm.b_o.evaluations.as_slice());
     }
-    let qkvo_bias_batch_open =
-        hyrax_open_batch(&qkvo_bias_refs, &r_out, nu_b, sigma_b, transcript);
+    let qkvo_bias_batch_open = hyrax_open_batch(&qkvo_bias_refs, &r_out, nu_b, sigma_b, transcript);
 
     // w2_batch: L W2_i at combine(r_k_fy, r_out) [f_bits + d_bits]
     let w2_point = combine(&r_k_fy, &r_out);
@@ -2518,7 +2597,7 @@ pub fn prove(
         all_lasso_proof,
         ffn_quant_proof,
         qk_quant_proof,
-        ln_range_m,
+        ln_range_ms,
         batch_qkv,
         batch_oproj,
         batch_ffn_y,
@@ -2533,6 +2612,8 @@ pub fn prove(
         attn_z_causal_sumcheck,
         attn_norm_rem_range_proofs,
         attn_norm_diff_range_proofs,
+        attn_norm_rem_range_bits,
+        attn_norm_diff_range_bits,
         inter_batch_open,
         x_norm1_batch_open,
         qkv_w_batch_open,

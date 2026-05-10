@@ -34,7 +34,7 @@ use piformer_prover::{
     pcs::{HyraxCommitment, HyraxProof},
     poly::utils::TernaryValue,
     prover::{
-        TransformerBlockProof, TransformerModelProof, TransformerModelProvingKey,
+        RangeBatchM, TransformerBlockProof, TransformerModelProof, TransformerModelProvingKey,
         TransformerModelVerifyingKey,
     },
     subprotocols::sumcheck::{
@@ -52,7 +52,7 @@ const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
 const VERSION: u8 = 5;
-const PROOF_VERSION: u8 = 16;
+const PROOF_VERSION: u8 = 17;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -644,6 +644,11 @@ fn write_global_range_m<W: Write>(w: &mut W, m: &GlobalRangeM) -> io::Result<()>
     write_hyrax_proof(w, &m.logup_m_open_rm2)
 }
 
+fn write_range_batch_m<W: Write>(w: &mut W, b: &RangeBatchM) -> io::Result<()> {
+    write_usize(w, b.bits)?;
+    write_global_range_m(w, &b.m)
+}
+
 fn write_quantization_proof<W: Write>(w: &mut W, p: &QuantizationProof) -> io::Result<()> {
     write_vec(w, &p.rem_coms, write_hyrax_commitment)?;
     write_vec(w, &p.rem_range_proofs, write_range_witness_proof)?;
@@ -674,6 +679,13 @@ fn read_global_range_m<R: Read>(r: &mut R) -> io::Result<GlobalRangeM> {
         logup_rhs_claim: read_f(r)?,
         logup_m_at_rm2: read_f(r)?,
         logup_m_open_rm2: read_hyrax_proof(r)?,
+    })
+}
+
+fn read_range_batch_m<R: Read>(r: &mut R) -> io::Result<RangeBatchM> {
+    Ok(RangeBatchM {
+        bits: read_usize(r)?,
+        m: read_global_range_m(r)?,
     })
 }
 
@@ -822,10 +834,7 @@ fn read_ln_proof<R: Read>(r: &mut R) -> io::Result<LayerNormProof> {
 // LayerNorms batched proof (PROOF_VERSION 13)
 // ---------------------------------------------------------------------------
 
-fn write_ln_group_openings<W: Write>(
-    w: &mut W,
-    o: &LayerNormsGroupOpenings,
-) -> io::Result<()> {
+fn write_ln_group_openings<W: Write>(w: &mut W, o: &LayerNormsGroupOpenings) -> io::Result<()> {
     write_vec_f(w, &o.sum_x_at_rt)?;
     write_vec_f(w, &o.sq_sum_x_at_rt)?;
     write_hyrax_proof(w, &o.rt_batch_proof)?;
@@ -955,6 +964,8 @@ fn write_ln_batched_proof<W: Write>(w: &mut W, p: &LayerNormsBatchedProof) -> io
     write_vec(w, &p.groups, write_ln_group_proof)?;
     write_vec(w, &p.sigma_range_proofs, write_range_witness_proof)?;
     write_vec(w, &p.y_range_proofs, write_range_witness_proof)?;
+    write_vec_usize(w, &p.sigma_range_bits)?;
+    write_vec_usize(w, &p.y_range_bits)?;
     Ok(())
 }
 
@@ -962,10 +973,14 @@ fn read_ln_batched_proof<R: Read>(r: &mut R) -> io::Result<LayerNormsBatchedProo
     let groups = read_vec(r, read_ln_group_proof)?;
     let sigma_range_proofs = read_vec(r, read_range_witness_proof)?;
     let y_range_proofs = read_vec(r, read_range_witness_proof)?;
+    let sigma_range_bits = read_vec_usize(r)?;
+    let y_range_bits = read_vec_usize(r)?;
     Ok(LayerNormsBatchedProof {
         groups,
         sigma_range_proofs,
         y_range_proofs,
+        sigma_range_bits,
+        y_range_bits,
     })
 }
 
@@ -1126,7 +1141,7 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_lasso_multi_proof(w, &p.all_lasso_proof)?;
     write_quantization_proof(w, &p.ffn_quant_proof)?;
     write_quantization_proof(w, &p.qk_quant_proof)?;
-    write_global_range_m(w, &p.ln_range_m)?;
+    write_vec(w, &p.ln_range_ms, write_range_batch_m)?;
     // Cross-block batch sumchecks
     write_sumcheck_proof_multi(w, &p.batch_qkv)?;
     write_sumcheck_proof_multi(w, &p.batch_oproj)?;
@@ -1164,10 +1179,10 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     if let Some(ref sc) = p.attn_z_causal_sumcheck {
         write_sumcheck_cubic_proof_multi(w, sc)?;
     }
-    // PROOF_VERSION 15: attn_norm rem/diff share the global ln_range_m — no
-    // separate m_com is serialized.
     write_vec(w, &p.attn_norm_rem_range_proofs, write_range_witness_proof)?;
     write_vec(w, &p.attn_norm_diff_range_proofs, write_range_witness_proof)?;
+    write_vec_usize(w, &p.attn_norm_rem_range_bits)?;
+    write_vec_usize(w, &p.attn_norm_diff_range_bits)?;
     // Global intermediate batch open
     write_hyrax_proof(w, &p.inter_batch_open)?;
     // 13 cross-block weight/activation batch opens
@@ -1210,7 +1225,7 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         all_lasso_proof: read_lasso_multi_proof(r)?,
         ffn_quant_proof: read_quantization_proof(r)?,
         qk_quant_proof: read_quantization_proof(r)?,
-        ln_range_m: read_global_range_m(r)?,
+        ln_range_ms: read_vec(r, read_range_batch_m)?,
         // Cross-block batch sumchecks
         batch_qkv: read_sumcheck_proof_multi(r)?,
         batch_oproj: read_sumcheck_proof_multi(r)?,
@@ -1258,6 +1273,8 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         },
         attn_norm_rem_range_proofs: read_vec(r, read_range_witness_proof)?,
         attn_norm_diff_range_proofs: read_vec(r, read_range_witness_proof)?,
+        attn_norm_rem_range_bits: read_vec_usize(r)?,
+        attn_norm_diff_range_bits: read_vec_usize(r)?,
         // Global intermediate batch open
         inter_batch_open: read_hyrax_proof(r)?,
         // 13 cross-block weight/activation batch opens

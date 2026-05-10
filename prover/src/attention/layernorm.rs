@@ -357,9 +357,7 @@ pub fn prove_layernorm(
         let mut acc = F::zero();
         for i in 0..t {
             for j in 0..d {
-                acc += eq_y.evaluations[i << d_bits | j]
-                    * witness.sigma[i]
-                    * witness.y[i][j];
+                acc += eq_y.evaluations[i << d_bits | j] * witness.sigma[i] * witness.y[i][j];
             }
         }
         acc
@@ -870,6 +868,10 @@ pub struct LayerNormsBatchedProof {
     /// Range proofs in input order (one sigma + one y per LN).
     pub sigma_range_proofs: Vec<RangeWitnessProof>,
     pub y_range_proofs: Vec<RangeWitnessProof>,
+    /// Bit width used for each sigma/y range proof.  This lets the model proof
+    /// route each proof to the matching global range batch.
+    pub sigma_range_bits: Vec<usize>,
+    pub y_range_bits: Vec<usize>,
 }
 
 pub struct LayerNormsBatchedInput<'a> {
@@ -880,6 +882,8 @@ pub struct LayerNormsBatchedInput<'a> {
     /// Length must match witnesses.
     pub sigma_ranges: Vec<(RangeWitnessProof, Vec<F>)>,
     pub y_ranges: Vec<(RangeWitnessProof, Vec<F>)>,
+    pub sigma_range_bits: Vec<usize>,
+    pub y_range_bits: Vec<usize>,
 }
 
 /// Group LNs by (seq_len, d_head) preserving stable input order. Returns a
@@ -914,6 +918,8 @@ pub fn prove_layernorms_batched(
         || input.vks.len() != n
         || input.sigma_ranges.len() != n
         || input.y_ranges.len() != n
+        || input.sigma_range_bits.len() != n
+        || input.y_range_bits.len() != n
     {
         return Err("prove_layernorms_batched: input length mismatch".into());
     }
@@ -942,6 +948,8 @@ pub fn prove_layernorms_batched(
         groups: group_proofs,
         sigma_range_proofs,
         y_range_proofs,
+        sigma_range_bits: input.sigma_range_bits.clone(),
+        y_range_bits: input.y_range_bits.clone(),
     })
 }
 
@@ -1030,9 +1038,8 @@ fn prove_layernorm_group(
         mean_fs.push(DenseMLPoly::from_vec_padded(collapsed));
         mean_gs.push(DenseMLPoly::from_vec_padded(vec![F::one(); d]));
     }
-    let (mean_sumcheck, r_d_mean) = prove_sumcheck_multi_batched(
-        &mean_fs, &mean_gs, &mean_weights, mean_claim, transcript,
-    );
+    let (mean_sumcheck, r_d_mean) =
+        prove_sumcheck_multi_batched(&mean_fs, &mean_gs, &mean_weights, mean_claim, transcript);
 
     let rt_rmean = combine(&r_t, &r_d_mean);
     let x_at_rt_rmean: Vec<F> = x_mles.iter().map(|p| p.evaluate(&rt_rmean)).collect();
@@ -1059,7 +1066,12 @@ fn prove_layernorm_group(
     let sq_gs: Vec<DenseMLPoly> = x_mles.clone();
     let sq_hs: Vec<DenseMLPoly> = x_mles.clone();
     let (sq_sum_sumcheck, r_final_q) = prove_sumcheck_cubic_multi_batched(
-        &sq_fs, &sq_gs, &sq_hs, &sq_weights, sq_claim, transcript,
+        &sq_fs,
+        &sq_gs,
+        &sq_hs,
+        &sq_weights,
+        sq_claim,
+        transcript,
     );
     let x_at_r_final_q: Vec<F> = x_mles.iter().map(|p| p.evaluate(&r_final_q)).collect();
 
@@ -1333,8 +1345,10 @@ fn prove_layernorm_group(
     let rf_xy_batch_proof = hyrax_open_batch(&rf_xy_evals, &r_f, nu_td, sigma_td, transcript);
 
     // 9. r_f[..t_bits] (sigma at the row-prefix of r_f): [sigma_com_k for all k]. (N at T)
-    let sigma_eval_refs: Vec<&[F]> =
-        sigma_mles.iter().map(|p| p.evaluations.as_slice()).collect();
+    let sigma_eval_refs: Vec<&[F]> = sigma_mles
+        .iter()
+        .map(|p| p.evaluations.as_slice())
+        .collect();
     let rf_sigma_t_batch_proof =
         hyrax_open_batch(&sigma_eval_refs, r_f_t, nu_t, sigma_t, transcript);
 
@@ -1727,10 +1741,7 @@ fn verify_layernorm_group(
 
     // 2. rt_rmean batched: [x_com_k] at (r_t, r_d_mean).
     let rt_rmean = combine(&r_t, &r_d_mean);
-    let xcoms: Vec<HyraxCommitment> = indices
-        .iter()
-        .map(|&i| io_coms[i].x_com.clone())
-        .collect();
+    let xcoms: Vec<HyraxCommitment> = indices.iter().map(|&i| io_coms[i].x_com.clone()).collect();
     acc_td.add_verify_batch(
         &xcoms,
         &op.x_at_rt_rmean,
@@ -1756,13 +1767,7 @@ fn verify_layernorm_group(
             proof.internal_coms[k].sq_sum_x_com.clone(),
         ];
         let evals = [op.sigma_at_rsig[k], op.sq_sum_x_at_rsig[k]];
-        acc_t.add_verify_batch(
-            &coms,
-            &evals,
-            r_sig_t,
-            &op.rsig_batch_proofs[k],
-            transcript,
-        )?;
+        acc_t.add_verify_batch(&coms, &evals, r_sig_t, &op.rsig_batch_proofs[k], transcript)?;
     }
 
     // 5. rf_sig batched: [sum_x_com_k, sigma_com_k for k] at r_f_sig.
@@ -1810,13 +1815,7 @@ fn verify_layernorm_group(
             proof.internal_coms[k].sigma_com.clone(),
         ];
         let evals = [op.sum_x_at_ryt[k], op.sigma_at_ryt[k]];
-        acc_t.add_verify_batch(
-            &coms,
-            &evals,
-            r_y_t,
-            &op.ryt_batch_proofs[k],
-            transcript,
-        )?;
+        acc_t.add_verify_batch(&coms, &evals, r_y_t, &op.ryt_batch_proofs[k], transcript)?;
     }
 
     // 8. rf_xy batched: [x_com_k, y_com_k for k] at r_f.
@@ -2126,12 +2125,7 @@ mod layernorm_tests {
             ]
         } else if d == 4 {
             vec![
-                vec![
-                    F::from(5u64),
-                    F::from(10u64),
-                    F::from(5u64),
-                    F::from(10u64),
-                ],
+                vec![F::from(5u64), F::from(10u64), F::from(5u64), F::from(10u64)],
                 vec![
                     F::from(12u64),
                     F::from(20u64),
@@ -2285,6 +2279,8 @@ mod layernorm_tests {
             vks: vks_owned.iter().collect(),
             sigma_ranges,
             y_ranges,
+            sigma_range_bits: vec![32; n],
+            y_range_bits: vec![32; n],
         };
         let proof = prove_layernorms_batched(&input, &mut pt).unwrap();
 
@@ -2308,11 +2304,8 @@ mod layernorm_tests {
         let mut accs: Vec<HyraxBatchAccumulator> = (0..distinct_nvs.len())
             .map(|_| HyraxBatchAccumulator::new())
             .collect();
-        let mut chunk_accs: Vec<(usize, &mut HyraxBatchAccumulator)> = distinct_nvs
-            .iter()
-            .copied()
-            .zip(accs.iter_mut())
-            .collect();
+        let mut chunk_accs: Vec<(usize, &mut HyraxBatchAccumulator)> =
+            distinct_nvs.iter().copied().zip(accs.iter_mut()).collect();
         let mut acc_range_m = HyraxBatchAccumulator::new();
         let (rv_v, _) = verify_range_batched(
             &proof_refs,
@@ -2398,8 +2391,7 @@ mod layernorm_tests {
         }
 
         let mut pt = Transcript::new(b"ln_batch_test");
-        let prov_result =
-            prove_range_batched(&range_witness_refs, 32, &mut pt);
+        let prov_result = prove_range_batched(&range_witness_refs, 32, &mut pt);
         let (range_proofs, global_m, r_vs) = match prov_result {
             Ok(r) => r,
             Err(_) => return, // tampered range may legitimately fail to prove; accept that as rejection
@@ -2419,6 +2411,8 @@ mod layernorm_tests {
             vks: vks_owned.iter().collect(),
             sigma_ranges,
             y_ranges,
+            sigma_range_bits: vec![32; n],
+            y_range_bits: vec![32; n],
         };
         let proof = match prove_layernorms_batched(&input, &mut pt) {
             Ok(p) => p,
@@ -2442,11 +2436,8 @@ mod layernorm_tests {
         let mut accs: Vec<HyraxBatchAccumulator> = (0..distinct_nvs.len())
             .map(|_| HyraxBatchAccumulator::new())
             .collect();
-        let mut chunk_accs: Vec<(usize, &mut HyraxBatchAccumulator)> = distinct_nvs
-            .iter()
-            .copied()
-            .zip(accs.iter_mut())
-            .collect();
+        let mut chunk_accs: Vec<(usize, &mut HyraxBatchAccumulator)> =
+            distinct_nvs.iter().copied().zip(accs.iter_mut()).collect();
         let mut acc_range_m = HyraxBatchAccumulator::new();
         let rv_result = verify_range_batched(
             &proof_refs,
@@ -2482,7 +2473,10 @@ mod layernorm_tests {
             &mut ln_acc_td,
         );
         let final_t = ln_acc_t.finalize(&params_from_n(2usize.next_power_of_two()).2, &mut vt);
-        let final_td = ln_acc_td.finalize(&params_from_n(2usize.next_power_of_two() * 2usize.next_power_of_two()).2, &mut vt);
+        let final_td = ln_acc_td.finalize(
+            &params_from_n(2usize.next_power_of_two() * 2usize.next_power_of_two()).2,
+            &mut vt,
+        );
         assert!(
             result.is_err() || final_t.is_err() || final_td.is_err(),
             "Tampered batched LN proof must be rejected somewhere"
