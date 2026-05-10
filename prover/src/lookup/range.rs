@@ -9,7 +9,7 @@
 
 use crate::field::F;
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_open_batch, params_from_vars, HyraxBatchAccumulator,
+    hyrax_commit, hyrax_open, hyrax_open_batch_with_eta, params_from_vars, HyraxBatchAccumulator,
     HyraxCommitment, HyraxProof,
 };
 use crate::poly::DenseMLPoly;
@@ -212,27 +212,47 @@ pub fn prove_range_batched(
     absorb_com(transcript, b"logup_m_com", &m_com);
 
     // ---- Phase 2: per-witness chunk opening at r_v ----
-    // r_v is drawn directly via Fiat-Shamir.  v_mle is never committed
-    // externally, so any sumcheck on (v_mle, ones) would only reduce a vacuous
-    // claim; the Hyrax batch open at r_v already binds chunk_evals to chunk_coms.
-    let mut witness_proofs_partial: Vec<(Vec<HyraxCommitment>, Vec<F>, HyraxProof)> = Vec::new();
+    // Pre-draw all (r_v_i, eta_i) sequentially via FS so the heavy O(num_chunks·N)
+    // chunk_evals + hyrax_open_batch_with_eta computation can run in parallel
+    // across witnesses. The FS state advances exactly as before (same labels in
+    // the same order), only the post-FS computation is parallelized.
     let mut r_vs: Vec<Vec<F>> = Vec::with_capacity(witnesses.len());
-
+    let mut etas: Vec<F> = Vec::with_capacity(witnesses.len());
     for i in 0..witnesses.len() {
-        let num_vars = all_num_vars[i];
-        let r_v = challenge_vec(transcript, num_vars, b"range_r_v");
-
-        let chunk_evals: Vec<F> = all_chunk_mles[i].iter().map(|m| m.evaluate(&r_v)).collect();
-        let chunk_slices: Vec<&[F]> = all_chunk_mles[i]
-            .iter()
-            .map(|m| m.evaluations.as_slice())
-            .collect();
-        let chunk_batch_proof =
-            hyrax_open_batch(&chunk_slices, &r_v, all_nu_c[i], all_sigma_c[i], transcript);
-
-        witness_proofs_partial.push((all_chunk_coms[i].clone(), chunk_evals, chunk_batch_proof));
+        let r_v = challenge_vec(transcript, all_num_vars[i], b"range_r_v");
+        let eta = transcript.challenge_field::<F>(b"hyrax_batch_eta");
         r_vs.push(r_v);
+        etas.push(eta);
     }
+
+    let phase2_results: Vec<(Vec<F>, HyraxProof)> = (0..witnesses.len())
+        .into_par_iter()
+        .map(|i| {
+            let r_v = &r_vs[i];
+            let chunk_evals: Vec<F> =
+                all_chunk_mles[i].iter().map(|m| m.evaluate(r_v)).collect();
+            let chunk_slices: Vec<&[F]> = all_chunk_mles[i]
+                .iter()
+                .map(|m| m.evaluations.as_slice())
+                .collect();
+            let chunk_batch_proof = hyrax_open_batch_with_eta(
+                &chunk_slices,
+                r_v,
+                all_nu_c[i],
+                all_sigma_c[i],
+                etas[i],
+            );
+            (chunk_evals, chunk_batch_proof)
+        })
+        .collect();
+
+    let witness_proofs_partial: Vec<(Vec<HyraxCommitment>, Vec<F>, HyraxProof)> = phase2_results
+        .into_iter()
+        .enumerate()
+        .map(|(i, (chunk_evals, chunk_batch_proof))| {
+            (all_chunk_coms[i].clone(), chunk_evals, chunk_batch_proof)
+        })
+        .collect();
 
     // ---- Open shared m (old commitment, kept for LayerNorm accumulator) ----
     let r_m = challenge_vec(transcript, CHUNK_BITS, b"logup_rm");

@@ -41,19 +41,48 @@ The naïve approach of encoding the entire transformer in an R1CS circuit is pro
 
 ### 2.1 Block Structure
 
-Each transformer block computes:
+Each transformer block uses **sandwich normalization**: in addition to the two
+classical pre-norms, the block applies a per-head LayerNorm to $Q$ and $K$
+(QK-norm) and a post-attention LayerNorm to the merged attention output before
+the residual sum. Concretely each block computes:
 
 ```
-X_norm1  = LayerNorm(X_in,     γ₁, β₁)
-Q, K, V  = X_norm1 · W_{Q,K,V}          (batched projection)
-Out_attn = φ(Q)(φ(K)ᵀV) · W_O           (linear attention + output projection)
-X_mid    = X_in + Out_attn               (residual 1, homomorphic)
-X_norm2  = LayerNorm(X_mid,    γ₂, β₂)
-Out_ffn  = FFN(X_norm2)                  (feed-forward network)
-X_out    = X_mid + Out_ffn               (residual 2, homomorphic)
+X_norm1  = LayerNorm(X_in,                     γ_ln1,  β_ln1)
+Q, K, V  = X_norm1 · W_{Q,K,V}                                          (batched ternary projection)
+Q_n      = LayerNorm(Q, γ_qn, β_qn)            (per-head QK-norm on Q)
+K_n      = LayerNorm(K, γ_kn, β_kn)            (per-head QK-norm on K)
+attn_num = φ(Q_n) · (φ(K_n)ᵀ V)                (un-normalized linear-attention numerator)
+Z        = φ(Q_n) · Σ_s φ(K_n)_s               (per-token denominator, scalar per row)
+attn_y   = floor(scale · attn_num / Z)         (fixed-point row normalization)
+Out_attn = attn_y · W_O + b_O                                         (output projection, ternary)
+attn_out = LayerNorm(Out_attn, γ_aon, β_aon)   (sandwich norm)
+X_mid    = X_in + attn_out                                              (residual 1, homomorphic)
+X_norm2  = LayerNorm(X_mid, γ_ln2, β_ln2)
+Out_ffn  = FFN(X_norm2)                                                  (feed-forward network)
+X_out    = X_mid + Out_ffn                                              (residual 2, homomorphic)
 ```
 
-After all $L$ blocks, a final LayerNorm and language-model head projection produce the output logits.
+After all $L$ blocks a final LayerNorm and the LM head produce the output logits, so the model contains **$5L+1$ LayerNorms** in total.
+
+The two normalizations that are not present in a textbook pre-norm transformer
+are essential here:
+
+1. **QK-norm** (`q_norm` / `k_norm`) pins the dynamic range of the kernel
+   inputs $Q,K$ so that $\phi(Q)$, $\phi(K)$ and the denominator $Z$ stay
+   inside the lookup-table range regardless of the single-$\alpha$ ternary
+   projection scale. Without it, a poorly conditioned $\alpha$ collapses
+   $\phi$ to a degenerate region and breaks the lookup index assumptions.
+2. **Sandwich norm** (`attn_out_norm`) absorbs the unbounded scale of
+   linear attention before it enters the residual stream. Softmax attention
+   is row-stochastic, so its output is naturally bounded; the linear-attention
+   numerator $\phi(Q)(\phi(K)^\top V)$ has no such bound, and without
+   normalization the residual stream drifts in magnitude and destabilizes
+   downstream LayerNorms.
+
+Both are LayerNorms over the same primitive (§3.7), so they cost no new SNARK
+machinery — they only enlarge the LN witness count, which is mostly absorbed
+by the model-level batched LN proof of §4 and the bucketed range batch of
+§3.6.
 
 ### 2.2 Linear Attention
 
@@ -200,27 +229,50 @@ The proof still carries raw lookup query indices. To prevent those indices from 
 
 ### 3.6 Global Batched Range Proof
 
-The range proof proves that field elements lie in $[0, 2^{32})$ using a chunked Lasso approach. Because all range constraints in a transformer block check the same table $[0, 2^{32})$, the multiplicity commitments are **globally batched** across all witnesses.
+The range proof proves that field elements lie in $[0, 2^{\mathsf{bits}})$ using
+a chunked Lasso approach with `CHUNK_BITS = 16`. The current implementation
+exposes two width buckets — $\mathsf{bits} = 32$ (FAST) and $\mathsf{bits} = 64$
+(WIDE) — and routes every range witness to the narrowest bucket that contains
+it (`choose_range_bits` in `prover/src/prover.rs`). LayerNorm $\sigma$/$y$
+witnesses use 64-bit range proofs (`LAYERNORM_RANGE_BITS = 64`); the optional
+attention-normalization residuals (§3.9) also use 64-bit range proofs
+(`ATTN_NORM_RANGE_BITS = 64`).
 
-**Per-witness setup.** Each witness $V \in \mathbb{F}^{2^n}$ is split into two 16-bit chunk arrays:
+**Per-witness setup.** Each witness $V \in \mathbb{F}^{2^n}$ is split into 16-bit
+chunks. For 32-bit width:
 $$V[i] = V_{lo}[i] + 2^{16} \cdot V_{hi}[i]$$
+For 64-bit width the witness is split into four 16-bit chunks
+$V_{c_0}, V_{c_1}, V_{c_2}, V_{c_3}$ with the analogous reconstruction.
 
-**Two-phase protocol (for a batch of $B$ witnesses):**
+**Two-phase protocol with per-bucket batching.** All range witnesses across
+the entire model are collected into one list and partitioned by bit-width
+bucket. Each non-empty bucket runs the protocol below independently, producing
+one $m_{\mathsf{com}}$ per bucket. For $B$ witnesses in a single bucket:
 
 *Phase 1 — Commit all chunks + shared multiplicity:*
-1. For each witness $b$: commit $V^{(b)}_{lo}$, $V^{(b)}_{hi}$ via Hyrax → chunk commitments $\mathsf{cc}^{(b)}_0, \mathsf{cc}^{(b)}_1$.
-2. Merge all chunk arrays into a global multiplicity array $m$: $m[v]$ counts the total occurrences of value $v$ across all witnesses.
+1. For each witness $b$ and each chunk $c$: commit $V^{(b)}_c$ via Hyrax →
+   chunk commitments $\mathsf{cc}^{(b)}_c$.
+2. Merge all chunk arrays into a global multiplicity array $m$: $m[v]$ counts
+   the total occurrences of value $v$ across all witnesses *and all chunks*
+   in this bucket.
 3. Commit $m$ via Hyrax → single shared $m_{\mathsf{com}}$.
 
 *Phase 2 — Per-witness sumcheck and openings:*
-4. For each witness $b$: absorb claim $V^{(b)}(1,\ldots,1)$, run sumcheck to bind $V^{(b)}$ to random point $r_v^{(b)}$.
-5. Verify chunk reconstruction: $V^{(b)}(r_v^{(b)}) = \mathsf{cc}^{(b)}_0(r_v^{(b)}) + 2^{16} \cdot \mathsf{cc}^{(b)}_1(r_v^{(b)})$ (Hyrax batch open).
+4. For each witness $b$: absorb claim $V^{(b)}(1,\ldots,1)$, run sumcheck to
+   bind $V^{(b)}$ to random point $r_v^{(b)}$.
+5. Verify chunk reconstruction at $r_v^{(b)}$ via one Hyrax batch open over
+   $\{\mathsf{cc}^{(b)}_c\}_c$.
 
 *Shared multiplicity check:*
 6. Sample $r_m \stackrel{\$}{\leftarrow} \mathbb{F}^{16}$; open $m(r_m)$ via Hyrax.
 7. LogUp identity check: $\sum_{b,c} \mathsf{cc}^{(b)}_c(r_m) = m(r_m) \cdot T_{\mathsf{id}}(r_m)$ where $T_{\mathsf{id}}[i] = i$.
 
-**Key saving:** Instead of $B$ independent $m_{\mathsf{com}}$ commitments ($B \times \sqrt{2^{16}}$ MSMs), there is exactly one $m_{\mathsf{com}}$. For $B=6$ (two LayerNorms per block, two range proofs each, plus final LayerNorm's two): saves 5 × $\sqrt{2^{16}}$ = 1280 MSMs.
+**Key saving.** Instead of one $m_{\mathsf{com}}$ per witness, there is exactly
+one $m_{\mathsf{com}}$ per width bucket per model. For the LN bucket alone,
+$B = 10L + 2$ (5 LayerNorms per block × 2 witnesses each, plus 2 for the
+final LN); when normalized attention is enabled, the optional attn-norm bucket
+adds another $2L$ witnesses (rem and diff per block, §3.9). The savings scale
+with $L$: $(B-1)$ saved $m_{\mathsf{com}}$ MSMs per bucket.
 
 ### 3.7 LayerNorm Circuit
 
@@ -244,6 +296,18 @@ $$\gamma_j \cdot (d \cdot x[i][j] - \mathsf{sum\_x}[i]) + \beta_j \cdot d \cdot 
 
 **All constraints are verified at a single random point** — the verifier runs O(1) equations, not O($T \cdot d$) loops.
 
+**Model-level batched LN proof.** The end-to-end prover (§4.2) does **not**
+emit one independent LayerNorm sub-proof per LN. Instead, a single call to
+`prove_layernorms_batched` collects all $5L+1$ LN witnesses
+(`ln1`, `q_norm`, `k_norm`, `attn_out_norm`, `ln2` per block, plus the final
+LN) at the end of the prover and runs one batched cubic sumcheck for the
+combined Y constraint, plus one shared mean / variance / sigma sumcheck per
+LN folded by Fiat–Shamir powers. The verifier mirrors this with
+`verify_layernorms_batched` (`prover/src/verifier.rs:1243`). This batch is
+orthogonal to the cross-block batching of §4.2 — it folds claims of the
+*same protocol type* across *different positions* within a block as well as
+across blocks.
+
 ### 3.8 Projection Circuit
 
 Proves $Y = \alpha \cdot (X \cdot W) + b$ where $W$ is a committed ternary weight matrix ($W \in \mathcal{T}^{m \times n}$) and $\alpha \in \mathbb{F}_r$ is a per-layer scale absorbed into the sumcheck claim.
@@ -261,24 +325,78 @@ All three projections share the same sumcheck challenge $r_k$, reducing the sumc
 
 ### 3.9 Linear Attention Circuit
 
-The Rust prover proves the **un-normalized** linear-attention output
+For a single head ($n_{\mathsf{heads}} = 1$), the linear-attention output that
+the prover proves is
 
-$$\mathsf{Out}_{\mathsf{attn}} = \phi(Q)\,\big(\phi(K)^\top V\big) \cdot W_O$$
+$$\mathsf{attn\_y}[t][j] \;=\; \left\lfloor \frac{\mathsf{ATTN\_NORM\_SCALE}\,\cdot\,\mathsf{attn\_num}[t][j]}{Z[t]} \right\rfloor, \qquad
+\mathsf{Out}_{\mathsf{attn}} = \mathsf{attn\_y} \cdot W_O + b_O,$$
 
-for a single head ($n_{\mathsf{heads}} = 1$). The Python `LinearAttentionLayer` additionally divides by a normalizer $Z = \phi(Q) \cdot \sum_s \phi(K_s)$ for training stability; that division is **not** currently part of the SNARK circuit. To match the Rust prover at inference time, either disable $Z$ in the export step or extend the circuit with a row-normalization sumcheck (planned).
+where $\mathsf{attn\_num} = \phi(Q_n)\,(\phi(K_n)^\top V)$ is the un-normalized
+numerator and $Z[t] = \phi(Q_n)_t \cdot \sum_s \phi(K_n)_s$ is the per-row
+denominator ($Q_n, K_n$ are the post-QK-norm tensors of §2.1). The integer
+constant $\mathsf{ATTN\_NORM\_SCALE} = 64$ (`prover/src/prover.rs:121`)
+re-introduces fractional precision before the floor division.
 
-The four core claims for a single head are:
+The five core claims for a single head are:
 
 | Step | Statement | Protocol |
 |------|-----------|----------|
-| 1 | $\Phi_Q[t][d] = \phi(Q[t][d])$ | Lasso (§3.5) per chunk |
-| 2 | $\Phi_K[t][d] = \phi(K[t][d])$ | Lasso per chunk |
+| 1 | $\Phi_Q[t][d] = \phi(Q_n[t][d])$ | Lasso (§3.5), bound to `q_norm_y_com` |
+| 2 | $\Phi_K[t][d] = \phi(K_n[t][d])$ | Lasso, bound to `k_norm_y_com` |
 | 3 | $C[i][j] = \sum_t \Phi_K[t][i] \cdot V[t][j]$ | Degree-2 sumcheck over $t$ |
-| 4 | $\mathsf{Out}[t][j] = \sum_i \Phi_Q[t][i] \cdot C[i][j]$ | Degree-2 sumcheck over $i$ |
+| 4 | $\mathsf{attn\_num}[t][j] = \sum_i \Phi_Q[t][i] \cdot C[i][j]$ | Degree-2 sumcheck over $i$ |
+| 5 | $\mathsf{attn\_y}, Z$ correctly normalize $\mathsf{attn\_num}$ | Cubic multi-batched sumcheck + range (below) |
 
-Steps 3–4 use a random-entry reduction. The verifier draws $(r_{out}, r_i)$ via Fiat-Shamir and audits a single entry per matrix product.
+Steps 3–4 use a random-entry reduction at $(r_t, r_{k_o})$ and are folded
+across blocks by `batch_attn_out` and `batch_attn_ctx` (§4.2). Lookup binding
+to $Q_n, K_n$ (rather than the pre-norm $Q, K$) is critical: `q_com` and
+`k_com` commit to $W_Q\!\cdot\!\mathsf{ln1\_y}$ before QK-norm, while
+`q_norm_y_com` / `k_norm_y_com` commit to the post-QK-norm tensors fed to
+$\phi$. The Lasso index-binding step opens *both* commitments at the
+transcript-derived point (§4.2 step 14) so a cheating prover cannot mix
+pre-norm and post-norm values.
 
-**Cross-block batching of attention.** The end-to-end model prover (§4.2) batches steps 3 and 4 across all $L$ blocks. Two `SumcheckProofMulti` instances — `batch_attn_out` and `batch_attn_ctx` — share one set of sumcheck challenges across all blocks, with per-block claims combined by Fiat-Shamir powers of $\eta$. Per-block opening claims for $\Phi_Q$, $\Phi_K$, $V$ at the shared evaluation points are folded into the global cross-block batch opens (§4.2).
+**Step 5 — Floor-division proof.** When `attention_mode = "normalized_fixed"`
+the witness includes the auxiliary tensors
+
+| Tensor | Meaning |
+|--------|---------|
+| $\mathsf{attn\_num}[t][j]$ | un-normalized numerator (step 4 output) |
+| $\mathsf{attn\_y}[t][j]$  | claimed normalized output (output of step 5) |
+| $Z[t]$ | denominator (one scalar per row, broadcast) |
+| $\mathsf{rem}[t][j]$ | remainder, $\in [0, Z[t])$ |
+| $\mathsf{diff}[t][j]$ | $Z[t] - 1 - \mathsf{rem}[t][j]$, also $\in [0, Z[t])$ |
+
+The prover commits all five (`attn_num_com`, `attn_norm_com`, `attn_z_com`,
+`attn_rem_com`, `attn_diff_com`) and runs a single random-point cubic
+multi-batched sumcheck at $r_{\mathsf{norm}} \in \mathbb{F}^{t_\mathsf{bits}+d_\mathsf{bits}}$
+that enforces, per element,
+
+$$\mathsf{ATTN\_NORM\_SCALE}\cdot\mathsf{attn\_num} \;-\; \mathsf{rem} \;-\; Z\!\cdot\!\mathsf{attn\_y} \;=\; 0,$$
+$$\lambda\,\bigl(\,Z \;-\; 1 \;-\; \mathsf{rem} \;-\; \mathsf{diff}\,\bigr) \;=\; 0,$$
+
+merged into one cubic claim by the Fiat–Shamir scalar $\lambda$
+(`prover/src/prover.rs:1599`). Range proofs on `rem` and `diff` (added to the
+64-bit bucket of §3.6) prove $\mathsf{rem}, \mathsf{diff} \geq 0$, which
+combined with the second identity gives $0 \le \mathsf{rem} < Z$, the integer
+floor-division witness.
+
+**Z derivation.** A second sumcheck (`attn_z_sumcheck`) at $r_{\mathsf{norm},t}$
+proves $Z[t] = \phi(Q_n)_t \cdot \sum_s \phi(K_n)_s$ from the same $\Phi_Q,
+\Phi_K$ MLEs already committed, reusing `phi_q_com` and `phi_k_com`. In the
+causal mode an additional cubic sumcheck binds $Z$ to the prefix sum
+$\sum_{s \le t} \phi(K_n)_s$ instead.
+
+**Cross-block batching of attention.** The end-to-end prover (§4.2) batches
+steps 3 and 4 across all $L$ blocks. Two `SumcheckProofMulti` instances —
+`batch_attn_out` and `batch_attn_ctx` — share one set of sumcheck challenges
+across all blocks, with per-block claims combined by Fiat-Shamir powers of
+$\eta$. The step-5 cubic sumcheck and the $Z$ sumcheck are themselves
+multi-batched (one shared sumcheck across all blocks, $7\!\cdot\!L$ summand
+slots in step 5). Per-block opening claims for $\Phi_Q, \Phi_K, V$,
+$\mathsf{attn\_num}, \mathsf{attn\_y}, \mathsf{rem}, \mathsf{diff}$ at the
+shared evaluation points are folded into the global cross-block batch opens
+(`attn_norm_r_batch_open`, `attn_norm_attn_point_open`).
 
 ### 3.10 FFN Circuit
 
@@ -335,7 +453,16 @@ Algorithm Setup(model_weights θ, params):
 
 ### 4.2 End-to-End Prover (Cross-Block Batch Architecture)
 
-The model prover does **not** prove blocks independently. Instead, after a per-block "Phase 1" that commits intermediate matrices and runs LayerNorm + range proofs, the prover runs a small number of *cross-block* batched sumchecks that cover one protocol type (e.g. QKV projection) across all $L$ blocks at once, with per-block claims combined by Fiat-Shamir powers of $\eta$.
+The model prover does **not** prove blocks independently. Instead, after a
+per-block "Phase 1" that commits intermediate matrices and absorbs all five
+LayerNorm IO commitments into the transcript, the prover runs a small number
+of *cross-block* batched sumchecks that cover one protocol type (e.g. QKV
+projection) across all $L$ blocks at once, with per-block claims combined by
+Fiat-Shamir powers of $\eta$. The LayerNorm sumchecks themselves are deferred
+to a single model-end `prove_layernorms_batched` call that covers all $5L+1$
+LNs in the model, and the global range proof is bucketed by bit-width over
+*all* range witnesses (LN $\sigma$/$y$ plus optional attn-norm rem/diff)
+across all blocks.
 
 ```
 Algorithm Prove(PK, witness W, instances inst):
@@ -352,14 +479,23 @@ Algorithm Prove(PK, witness W, instances inst):
   x_in_com ← Com(W.x_in)
   FS.absorb("x_in_com", x_in_com)
 
-  // ── 2. Phase 1 (per block): commit 7 intermediates, prove LN1+LN2 ──────
+  // ── 2. Phase 1 (per block): commit intermediates, absorb 5 LN IO coms ──
   x_cur_com ← x_in_com
   phase1[0..L-1] ← []
   For ℓ = 0 to L-1:
     p1 ← CommitBlockPhase1(W.block_witnesses[ℓ], x_cur_com, PK.block_pks[ℓ], FS)
-    // p1 contains: x_norm1_com, q_com, k_com, v_com, out_attn_com,
-    //              x_norm2_com, out_ffn_com, x_mid_com, ln1_proof, ln2_proof,
-    //              block_range_m
+    // p1 contains:
+    //   x_norm1_com, q_com, k_com, v_com,
+    //   q_norm_y_com, k_norm_y_com,            (post-QK-norm tensors → φ inputs)
+    //   attn_num_com?, attn_norm_com?,
+    //   attn_z_com?, attn_rem_com?, attn_diff_com?,    (when normalized mode)
+    //   out_attn_com,                          (W_O · attn_y + b_O)
+    //   attn_out_norm_y_com,                   (sandwich-norm output)
+    //   x_norm2_com, out_ffn_com, x_mid_com
+    // The 5 LN IO commitments (ln1, q_norm, k_norm, attn_out_norm, ln2) and
+    // the auxiliary attn-norm commitments are absorbed into FS in fixed order;
+    // no per-block LN sumcheck is produced here — it is deferred to step 11b.
+    // Residual 1 = HyraxAdd(x_cur_com, attn_out_norm_y_com)  (sandwich norm).
     x_cur_com ← HyraxAdd(p1.x_mid_com, p1.out_ffn_com)
     phase1.append(p1)
 
@@ -386,12 +522,31 @@ Algorithm Prove(PK, witness W, instances inst):
   // ── 6. Cross-block Attention (out, then ctx) ────────────────────────────
   For ℓ = 0 to L-1:
     Commit phi_q_ℓ, phi_k_ℓ; absorb both
-  // 6a. out_ℓ(r_t, r_k_o) = Σ_k phi_q_ℓ(r_t, k) · ctx_ℓ(k, r_k_o)
+  // 6a. attn_num_ℓ(r_t, r_k_o) = Σ_k phi_q_ℓ(r_t, k) · ctx_ℓ(k, r_k_o)
   (batch_attn_out, batch_r_attn_out) ← ProveSumcheckMulti({phi_q_ℓ@(r_t, ·)},
                                                            {ctx_ℓ@(·, r_k_o)}, ...)
   // 6b. ctx_ℓ(batch_r_attn_out, r_k_o) = Σ_t phi_k_ℓ(t, batch_r_attn_out) · v_ℓ(t, r_k_o)
   (batch_attn_ctx, batch_r_attn_ctx) ← ProveSumcheckMulti({phi_k_ℓ@(·, batch_r_attn_out)},
                                                            {v_ℓ@(·, r_k_o)}, ...)
+
+  // ── 6c. Cross-block attention normalization sumcheck (when has_attn_norm) ─
+  // Proves, per element of (t, j) at one shared random point r_norm:
+  //   ATTN_NORM_SCALE · attn_num - rem - Z · attn_y = 0
+  //   λ ( Z - 1 - rem - diff ) = 0
+  // merged into one cubic multi-batched sumcheck across all L blocks.
+  r_norm  ← FS.challenge_vec("attn_norm_r", t_bits + d_bits)
+  λ       ← FS.challenge("attn_norm_lambda")
+  attn_norm_sumcheck ← ProveSumcheckCubicMultiBatched(
+      [eq(r_norm,·)] × 7L,
+      [n, r, z, z, 1, r, d]  per block (7L summand slots),
+      [1, 1, y, 1, 1, 1, 1]  per block,
+      weights = [SCALE, -1, -1, λ, -λ, -λ, -λ]  per block,
+      target = 0, FS)
+  // Then a separate sumcheck binds Z[t] = phi(Q_n)_t · Σ_s phi(K_n)_s
+  // (or the causal prefix version) at r_norm_t; rem and diff are added to the
+  // 64-bit range-batch witness list.
+  attn_z_sumcheck ← ProveSumcheckMultiBatched(
+      [phi_q_ℓ@(r_norm_t, ·)], [phi_k_sum_ℓ@(·)], η_z, claim_z, FS)
 
   // ── 7. Global FFN activation Lasso + M index binding ───────────────────
   For ℓ = 0 to L-1:
@@ -422,27 +577,56 @@ Algorithm Prove(PK, witness W, instances inst):
   Per block: f_ℓ(k) = X_norm2_ℓ(rx_m, k), g_ℓ(k) = W1_ℓ(k, ry_m)
   (batch_ffn_m, r_k_m) ← ProveSumcheckMulti(...)
 
-  // ── 10. Final LayerNorm + LM head ───────────────────────────────────────
-  final_rw ← ComputeRangeWitnesses(W.final_ln_wit, PK.final_ln_vk)
-  (final_rps, final_range_m, final_rvs) ← ProveRangeBatched(
-      [final_rw.σ_witness, final_rw.y_witness], bits=32, FS)
+  // ── 10. Final LayerNorm IO commitment ───────────────────────────────────
   final_ln_out_com ← Com(W.final_ln_wit.y)
-  final_ln_π ← ProveLayerNorm(W.final_ln_wit, {x_cur_com, final_ln_out_com},
-                              PK.final_ln_vk, final_rps[0..1], FS)
+  FS.absorb final_ln IO commitments (deferred sumcheck — see step 11b)
+
+  // ── 11. Global range batch (all buckets, all witnesses in the model) ────
+  // Witness list (in fixed order):
+  //   block ℓ ∈ [0..L): ln1.σ, ln1.y, ln2.σ, ln2.y,
+  //                     q_norm.σ, q_norm.y, k_norm.σ, k_norm.y,
+  //                     attn_out_norm.σ, attn_out_norm.y          (10 per block)
+  //   final_ln.σ, final_ln.y                                       (2)
+  //   when has_attn_norm: per block: attn_norm.rem, attn_norm.diff (2L)
+  // Each witness is routed to the narrowest of {32, 64} bit buckets.
+  // One ProveRangeBatched call per non-empty bucket → one m_com per bucket.
+  for bits ∈ {32, 64}:
+      bucket ← witnesses with choose_range_bits(w) == bits
+      if bucket non-empty:
+          (rps[bucket], m[bits], rvs[bucket]) ← ProveRangeBatched(bucket, bits, FS)
+
+  // ── 11b. Cross-LN batched proof (covers all 5L+1 LayerNorms) ───────────
+  // One call to prove_layernorms_batched produces a single transcript that
+  // bundles every LN's mean / variance / Y-fusion claim.  The LN witnesses
+  // are presented in fixed order:
+  //   for ℓ in 0..L: ln1, q_norm, k_norm, attn_out_norm, ln2
+  //   then final_ln
+  // The prover passes the σ/y RangeWitnessProofs from step 11 as inputs, so
+  // the LN's σ-floor-sqrt and Y-residual checks reuse those range proofs.
+  ln_batched_π ← ProveLayerNormsBatched(
+      witnesses=[ln1_ℓ, q_norm_ℓ, k_norm_ℓ, attn_out_norm_ℓ, ln2_ℓ for ℓ]
+                 ++ [final_ln],
+      io_coms=..., σ_ranges=..., y_ranges=..., FS)
+
+  // ── 12. LM head ─────────────────────────────────────────────────────────
   logits_com ← Com(W.lm_head_wit.y)
   (lm_head_π, lm_y_claim, _) ← ProveProjection(PK.lm_head_pk, W.lm_head_wit,
                                                 {x_com: final_ln_out_com}, FS, None)
   lm_head_logits_open ← HyraxOpen(W.lm_head_wit.y, lm_y_claim.point, ...)
 
-  // ── 11. Advance transcript for accumulator μ-challenges ─────────────────
-  For 10 deferred accumulators: FS.challenge("hyrax_group_mu")
+  // ── 13. Advance transcript for accumulator μ-challenges ─────────────────
+  For 5 deferred accumulators (params_td, params_qkvo_w, params_qkvo_b,
+                                params_wff, params_mff):
+      FS.challenge("hyrax_group_mu")
 
-  // ── 12. Global intermediate batch open ──────────────────────────────────
-  // 5L matrices (Q, K, V, Out_attn, Out_ffn) opened at shared r_td
+  // ── 14. Global intermediate batch open ──────────────────────────────────
+  // 5L matrices (Q, K, V, Out_attn, Out_ffn) opened at shared r_td.
+  // (q_norm_y_com, k_norm_y_com, attn_out_norm_y_com, attn_num_com,
+  //  attn_norm_com are opened as part of step 15 cross-block batches.)
   inter_batch_open ← HyraxOpenBatch({Q_ℓ, K_ℓ, V_ℓ, Out_attn_ℓ, Out_ffn_ℓ}_{ℓ=0..L-1},
                                      r_td, ν_td, σ_td, FS)
 
-  // ── 13. Cross-block batch opens for weights, biases, activations ────────
+  // ── 15. Cross-block batch opens for weights, biases, activations ────────
   // One HyraxOpenBatch per (matrix-type, evaluation-point) pair:
   //   x_norm1 @ (r_t, r_k_qkv);   Wq, Wk, Wv @ (r_k_qkv, r_out);   bq, bk, bv @ r_out
   //   Wo @ (r_k_o, r_out);        bo @ r_out
@@ -451,6 +635,10 @@ Algorithm Prove(PK, witness W, instances inst):
   //   M  @ (rx_m, ry_m)
   //   phi_q @ (r_t, batch_r_attn_out);   phi_k @ (batch_r_attn_ctx, batch_r_attn_out)
   //   v @ (batch_r_attn_ctx, r_k_o)      (per-block opening; v_attn_batch_open)
+  //   (when has_attn_norm)
+  //   [attn_num | attn_norm | rem | diff] @ r_norm                (one batch open)
+  //   z_ℓ @ r_norm_t                                              (separate, smaller PCS params)
+  //   [attn_num | attn_norm] @ (r_t, r_k_o)                       (binds attn_num to step-4 sumcheck)
   // (See prover.rs cross-block batch-open section for the full list.)
 
   // ── 14. Global attention Lasso batch (all φ(Q), φ(K) blocks) ───────────
@@ -481,128 +669,164 @@ Algorithm Prove(PK, witness W, instances inst):
 
 Each `TransformerBlockProof` carries the 7 intermediate commitments, the LN1/LN2 sub-proofs, the per-block range-multiplicity commitment, the FFN `A` and `M` commitments, the `phi_q`/`phi_k` commitments, and the per-block scalar evaluations consumed by the cross-block batch sumchecks (`q_eval`, `k_eval`, `v_eval`, `attn_phi_q_eval`, `attn_phi_k_eval`, `attn_ctx_eval`, `attn_v_eval`, etc.). The per-block FFN Lasso field is now an empty compatibility placeholder; the real FFN activation lookup proof is the model-level `ffn_lasso_proof`.
 
-### 4.3 Block Phase 1 (Per-Block Commit + LayerNorm)
+### 4.3 Block Phase 1 (Per-Block Commit + LN IO Absorption)
 
-The only truly per-block step is **Phase 1**: it commits the seven intermediate matrices, runs the global range batch for both LayerNorms, and proves LN1 / LN2. The remaining sub-protocols (QKV, O-projection, attention, FFN) are *not* run independently per block — they are batched cross-block in §4.2 steps 4–9.
+The only truly per-block step is **Phase 1**: it commits the per-block
+intermediate matrices and absorbs all five LN IO commitments (plus the
+optional attention-normalization auxiliary commitments) into the transcript
+in a fixed order. **No per-block LN sumcheck is emitted** in Phase 1 — the
+LN sumchecks are deferred to the model-end batched call of §4.2 step 11b,
+and the LN range proofs are deferred to the global bucketed range batch of
+§4.2 step 11.
 
 ```
 Algorithm CommitBlockPhase1(wit, x_in_com, pk, FS):
   Input:
-    pk      : TransformerBlockVerifyingKey (carries projection / attention PKs too)
+    pk      : TransformerBlockVerifyingKey (carries projection / attention PKs)
     wit     : { ln1_wit, q_proj_wit, k_proj_wit, v_proj_wit,
-                o_proj_wit, attn_wit, ln2_wit, ffn_wit }
+                q_norm_wit, k_norm_wit, attn_wit, o_proj_wit,
+                attn_out_norm_wit, ln2_wit, ffn_wit }
     x_in_com: Hyrax commitment to X_in ∈ F^{T×d}
   Output:
     BlockPhase1Data
-      { ln1_proof, ln2_proof, block_range_m,
-        x_norm1_com, q_com, k_com, v_com,
-        out_attn_com, x_norm2_com, out_ffn_com, x_mid_com }
+      { x_norm1_com, q_com, k_com, v_com,
+        q_norm_y_com, k_norm_y_com,
+        attn_num_com?, attn_norm_com?,
+        attn_z_com?, attn_rem_com?, attn_diff_com?,
+        out_attn_com, attn_out_norm_y_com,
+        x_norm2_com, out_ffn_com, x_mid_com }
 
-  // ── 0. Commit 7 intermediate matrices ───────────────────────────────────
-  x_norm1_com  ← Com(wit.ln1_wit.y)
-  q_com        ← Com(wit.attn_wit.q)
-  k_com        ← Com(wit.attn_wit.k)
-  v_com        ← Com(wit.attn_wit.v)
-  out_attn_com ← Com(wit.o_proj_wit.y)
-  x_norm2_com  ← Com(wit.ln2_wit.y)
-  out_ffn_com  ← Com(wit.ffn_wit.y)
+  // ── 0. Commit intermediate matrices ────────────────────────────────────
+  x_norm1_com         ← Com(wit.ln1_wit.y)
+  q_com               ← Com(wit.q_proj_wit.y)            // pre-QK-norm Q
+  k_com               ← Com(wit.k_proj_wit.y)            // pre-QK-norm K
+  v_com               ← Com(wit.v_proj_wit.y)
+  q_norm_y_com        ← Com(wit.q_norm_wit.y)            // post-QK-norm Q (φ input)
+  k_norm_y_com        ← Com(wit.k_norm_wit.y)            // post-QK-norm K (φ input)
+  if has_attn_norm:
+      attn_num_com    ← Com(wit.attn_wit.out)            // un-normalized attn_num
+      attn_norm_com   ← Com(wit.attn_wit.normalized_out) // attn_y after floor div
+      attn_z_com      ← Com(wit.attn_wit.norm_z)         // per-row Z (length T)
+      attn_rem_com    ← Com(wit.attn_wit.norm_rem)
+      attn_diff_com   ← Com(wit.attn_wit.norm_diff)
+  out_attn_com        ← Com(wit.o_proj_wit.y)            // W_O · attn_y + b_O
+  attn_out_norm_y_com ← Com(wit.attn_out_norm_wit.y)     // sandwich-norm output
+  x_norm2_com         ← Com(wit.ln2_wit.y)
+  out_ffn_com         ← Com(wit.ffn_wit.y)
 
-  // ── 1. Global range batch for both LayerNorms in this block ────────────
-  // 4 witnesses (ln1.σ, ln1.y, ln2.σ, ln2.y) share one m_com
-  rw1 ← ComputeRangeWitnesses(wit.ln1_wit, pk.ln1_vk)
-  rw2 ← ComputeRangeWitnesses(wit.ln2_wit, pk.ln2_vk)
-  (block_rps, block_range_m, block_rvs) ← ProveRangeBatched(
-      [rw1.σ_witness, rw1.y_witness, rw2.σ_witness, rw2.y_witness],
-      bits=32, FS)
+  // ── 1. Absorb LN1 IO commitments (sumcheck deferred to step 11b) ───────
+  FS.absorb("x_com", x_in_com);  FS.absorb("y_com", x_norm1_com)
 
-  // ── 2. LayerNorm 1 (uses x_norm1_com as y_com) ─────────────────────────
-  ln1_io ← { x_com: x_in_com, y_com: x_norm1_com }
-  ln1_proof ← ProveLayerNorm(wit.ln1_wit, ln1_io, pk.ln1_vk,
-                              σ_range=(block_rps[0], block_rvs[0]),
-                              y_range=(block_rps[1], block_rvs[1]), FS)
+  // ── 2. Absorb projection / attention-norm commitments ──────────────────
+  FS.absorb("q_com", q_com);  FS.absorb("k_com", k_com);  FS.absorb("v_com", v_com)
+  if has_attn_norm:
+      FS.absorb("attn_norm_com", attn_norm_com)
+      FS.absorb("attn_num_com",  attn_num_com)
+      FS.absorb("attn_z_com",    attn_z_com)
+      FS.absorb("attn_rem_com",  attn_rem_com)
+      FS.absorb("attn_diff_com", attn_diff_com)
 
-  // ── 3. Absorb q/k/v_com and out_attn_com explicitly ────────────────────
-  // (the cross-block QKV / O-proj sumchecks rely on this transcript order)
-  FS.absorb("q_com", q_com)
-  FS.absorb("k_com", k_com)
-  FS.absorb("v_com", v_com)
+  // ── 3. Absorb QK-norm IO commitments ───────────────────────────────────
+  // q_norm: x = q_com (pre-norm),  y = q_norm_y_com (post-norm).
+  FS.absorb(q_com); FS.absorb(q_norm_y_com)
+  // k_norm: x = k_com (pre-norm),  y = k_norm_y_com (post-norm).
+  FS.absorb(k_com); FS.absorb(k_norm_y_com)
+
+  // ── 4. Absorb O-projection output ──────────────────────────────────────
   FS.absorb("out_attn_com", out_attn_com)
 
-  // ── 4. Residual 1 (homomorphic) ────────────────────────────────────────
-  x_mid_com ← HyraxAdd(x_in_com, out_attn_com)
+  // ── 5. Absorb attn_out_norm (sandwich norm) IO commitments ─────────────
+  // x = out_attn_com (W_O · attn_y + b_O),  y = attn_out_norm_y_com.
+  FS.absorb(out_attn_com); FS.absorb(attn_out_norm_y_com)
 
-  // ── 5. LayerNorm 2 (uses x_norm2_com as y_com) ─────────────────────────
-  ln2_io ← { x_com: x_mid_com, y_com: x_norm2_com }
-  ln2_proof ← ProveLayerNorm(wit.ln2_wit, ln2_io, pk.ln2_vk,
-                              σ_range=(block_rps[2], block_rvs[2]),
-                              y_range=(block_rps[3], block_rvs[3]), FS)
+  // ── 6. Residual 1 — sandwich norm output added to the residual stream ──
+  x_mid_com ← HyraxAdd(x_in_com, attn_out_norm_y_com)
 
-  // ── 6. Absorb out_ffn_com (so transcript matches Phase 2 expectations) ─
+  // ── 7. Absorb LN2 IO commitments ───────────────────────────────────────
+  FS.absorb("x_com", x_mid_com);  FS.absorb("y_com", x_norm2_com)
+
+  // ── 8. Absorb FFN output (matches downstream cross-block expectations) ─
   FS.absorb("y_com", out_ffn_com)
 
-  return { ln1_proof, ln2_proof, block_range_m,
-           x_norm1_com, q_com, k_com, v_com,
-           out_attn_com, x_norm2_com, out_ffn_com, x_mid_com }
+  return { x_norm1_com, q_com, k_com, v_com,
+           q_norm_y_com, k_norm_y_com,
+           attn_num_com, attn_norm_com,
+           attn_z_com, attn_rem_com, attn_diff_com,
+           out_attn_com, attn_out_norm_y_com,
+           x_norm2_com, out_ffn_com, x_mid_com }
 ```
 
-Residual 2 (`x_out_com = HyraxAdd(x_mid_com, out_ffn_com)`) is computed by the model-level prover after Phase 1 returns. The cross-block sumchecks in §4.2 (steps 4–9) consume the per-block intermediate commitments and the witness arrays directly; no further per-block sub-proofs are produced.
+Residual 2 (`x_out_com = HyraxAdd(x_mid_com, out_ffn_com)`) is computed by the
+model-level prover after Phase 1 returns. The cross-block sumchecks in §4.2
+(steps 4–9) consume the per-block intermediate commitments and the witness
+arrays directly; per-block LN sumchecks are folded into the model-level
+batched LN proof of step 11b, and per-block range witnesses are folded into
+the bucketed range batch of step 11.
 
-### 4.4 Range Proof Prover (Batched)
+### 4.4 Range Proof Prover (Batched, Bucketed by Bit-Width)
+
+`ProveRangeBatched` is invoked once per bit-width bucket (currently $\{32, 64\}$);
+the model-level prover builds the bucket lists from all LN $\sigma$/$y$
+witnesses (10·L + 2) and, when `has_attn_norm`, the attention-normalization
+remainders (2·L). The number of chunks $C = \lceil \mathsf{bits}/16 \rceil$
+is 2 for the 32-bit bucket and 4 for the 64-bit bucket.
 
 ```
-Algorithm ProveRangeBatched(witnesses[0..B-1], bits, FS):
+Algorithm ProveRangeBatched(witnesses[0..B-1], bits ∈ {32, 64}, FS):
   Input:
-    witnesses[b] = { values: V^(b) ∈ F^{2^n_b} }   // B witnesses
-    bits = 32, CHUNK_BITS = 16
+    witnesses[b] = { values: V^(b) ∈ F^{2^n_b} }    // B witnesses in this bucket
+    CHUNK_BITS = 16,  C = bits / 16  ∈ {2, 4}
   Output:
     (rps[0..B-1], global_m, r_vs[0..B-1])
 
   // ── Phase 1: Commit all chunks ───────────────────────────────────────────
   For b = 0 to B-1:
-    V_lo^(b)[i] ← V^(b)[i] mod 2^16
-    V_hi^(b)[i] ← V^(b)[i] >> 16
-    cc^(b)_0    ← Com(V_lo^(b));  cc^(b)_1 ← Com(V_hi^(b))
-    FS.absorb("chunk_com", cc^(b)_0, cc^(b)_1)
+    For c = 0 to C-1:
+      V_c^(b)[i] ← (V^(b)[i] >> (16·c)) mod 2^16
+      cc^(b)_c    ← Com(V_c^(b))
+      FS.absorb("chunk_com", cc^(b)_c)
 
-  // ── Phase 1b: Merge multiplicities and commit once ───────────────────────
+  // ── Phase 1b: Merge multiplicities and commit once per bucket ───────────
   m[v] ← 0  for v in 0..2^16-1
-  For b = 0 to B-1:
-    For i in 0..2^n_b-1:
-      m[V_lo^(b)[i]] += 1
-      m[V_hi^(b)[i]] += 1
+  For b = 0 to B-1, c = 0 to C-1, i = 0 to 2^{n_b}-1:
+      m[V_c^(b)[i]] += 1
   m_com ← Com(m)
   FS.absorb("m_com", m_com)
 
   // ── Phase 2: Per-witness sumcheck + openings ─────────────────────────────
   For b = 0 to B-1:
-    claim_v^(b) ← Σ_i V^(b)[i]   // sum over all evaluations
+    claim_v^(b) ← Σ_i V^(b)[i]
     FS.append("claim_v", claim_v^(b))
     (sc_π^(b), r_v^(b)) ← ProveSumcheck(V_mle^(b), ones_mle, claim_v^(b), FS)
-
-    // Batch open both chunks at r_v^(b)
-    ce^(b)_0 ← V_lo_mle^(b)(r_v^(b))
-    ce^(b)_1 ← V_hi_mle^(b)(r_v^(b))
-    Assert V^(b)(r_v^(b)) == ce^(b)_0 + 2^16 * ce^(b)_1
-    chunk_batch_π^(b) ← HyraxOpenBatch([V_lo^(b), V_hi^(b)], r_v^(b), FS)
-
-    rps[b] ← RangeWitnessProof {
-      chunk_coms: [cc^(b)_0, cc^(b)_1],
-      chunk_evals: [ce^(b)_0, ce^(b)_1],
-      chunk_batch_π: chunk_batch_π^(b),
-      sumcheck: sc_π^(b),
-      claim_v: claim_v^(b)
-    }
+    ce^(b)_c ← V_c_mle^(b)(r_v^(b))   for c = 0..C-1
+    Assert V^(b)(r_v^(b)) == Σ_c 2^{16·c} · ce^(b)_c
+    chunk_batch_π^(b) ← HyraxOpenBatch([V_c^(b)]_c, r_v^(b), FS)
+    rps[b] ← RangeWitnessProof { chunk_coms, chunk_evals, chunk_batch_π,
+                                  sumcheck: sc_π^(b), claim_v: claim_v^(b) }
 
   // ── Phase 3: Shared multiplicity opening ────────────────────────────────
-  r_m ← FS.challenge_vec("range_m_r", 16)
-  m_eval ← m_mle(r_m)
+  r_m   ← FS.challenge_vec("range_m_r", 16)
   m_open ← HyraxOpen(m, r_m, FS)
-
-  global_m ← GlobalRangeM { m_com, m_eval, m_open }
-  return (rps, global_m, r_vs)
+  return (rps, GlobalRangeM { m_com, m_mle(r_m), m_open }, r_vs)
 ```
 
+The model-level proof carries one `GlobalRangeM` per non-empty bucket; the
+verifier replays the bucket selection deterministically from the serialized
+metadata.
+
 ### 4.5 LayerNorm Prover
+
+The pseudocode below describes the LayerNorm protocol *for one LN witness*.
+The end-to-end model prover does **not** invoke it once per LN; instead, it
+collects all $5L+1$ LN witnesses (in fixed order: per block ln1, q_norm,
+k_norm, attn_out_norm, ln2; then the final LN) and runs a single
+`prove_layernorms_batched` call (§4.2 step 11b). That batched call shares
+the row challenge $r_t$, the variance / Y-fusion sumchecks, and the deferred
+Hyrax accumulator pushes across all LN witnesses, with per-LN claims
+combined by Fiat–Shamir powers of an independent challenge. The single-LN
+description below defines the constraint system; the batched call is its
+$5L+1$-fold cross-instance random-linear combination, which is sound by the
+same Schwartz–Zippel argument as cross-block batching (Theorem 2).
 
 ```
 Algorithm ProveLayerNorm(wit, io_coms, vk, σ_range, y_range, FS):
@@ -699,25 +923,16 @@ Algorithm Verify(VK, π, inst_attn, inst_ffn, public_x_in, public_logits):
   FS.init("piformer")
   FS.absorb("x_in_com", π.x_in_com)
 
-  // ── 2. Phase 1 verify (per block): range + LN1 + LN2 ───────────────────
-  Initialize accumulators: ln_acc_t, ln_acc_td, proj_acc_w, proj_acc_b,
-                           lmh_acc_w, lmh_acc_b,
-                           acc_range_sig, acc_range_y, acc_range_m, inter_acc
+  // ── 2. Phase 1 verify (per block): absorb LN IO + projection commitments ─
+  Initialize deferred accumulators (10 cross-cutting groups).
   x_cur_com ← π.x_in_com
   For ℓ = 0 to L-1:
     bp ← π.block_proofs[ℓ]
-    block_r_vs ← VerifyRangeBatched(
-        [bp.ln1_proof.σ_range_proof, bp.ln1_proof.y_range_proof,
-         bp.ln2_proof.σ_range_proof, bp.ln2_proof.y_range_proof],
-        bp.block_range_m, [ln_σ_n, ln_y_n, ln_σ_n, ln_y_n], 32, FS,
-        acc_range_sig, acc_range_y, acc_range_m)
-    VerifyLayerNorm(bp.ln1_proof, {x_cur_com, bp.x_norm1_com}, vk.ln1_vk,
-                    block_r_vs[0..1], FS, ln_acc_t, ln_acc_td)
-    FS.absorb(q_com, k_com, v_com, out_attn_com from bp)
-    x_mid_com ← HyraxAdd(x_cur_com, bp.out_attn_com)
-    VerifyLayerNorm(bp.ln2_proof, {x_mid_com, bp.x_norm2_com}, vk.ln2_vk,
-                    block_r_vs[2..4], FS, ln_acc_t, ln_acc_td)
-    FS.absorb(bp.out_ffn_com)
+    // Absorb in the same fixed order as prover Phase 1 (§4.3): LN1 IO,
+    // q_com / k_com / v_com, optional attn-norm aux commits, q_norm IO,
+    // k_norm IO, out_attn_com, attn_out_norm IO, LN2 IO, out_ffn_com.
+    AbsorbBlockPhase1Commits(bp, x_cur_com, FS)
+    x_mid_com ← HyraxAdd(x_cur_com, bp.attn_out_norm_y_com)   // sandwich-norm residual
     x_cur_com ← HyraxAdd(x_mid_com, bp.out_ffn_com)
 
   // ── 3. Derive global r_td after ALL Phase 1 ────────────────────────────
@@ -728,30 +943,48 @@ Algorithm Verify(VK, π, inst_attn, inst_ffn, public_x_in, public_logits):
   Verify batch_oproj    → recover r_k_o
   Verify batch_attn_out → recover batch_r_attn_out
   Verify batch_attn_ctx → recover batch_r_attn_ctx
+  if has_attn_norm:
+      Verify attn_norm_sumcheck → recover r_norm
+      Verify attn_z_sumcheck    → recover r_norm_t-derived openings
   Verify global FFN Lasso committed to ffn_a_com and ffn_lasso_bind opening
   Verify batch_ffn_y    → recover r_k_fy
   Verify batch_ffn_m    → recover r_k_m
-  // Each sumcheck reduces L per-block claims to one batched final claim,
-  // which is checked algebraically against per-block (W, b, X, ...) evals
-  // produced by the corresponding cross-block batch open below.
 
-  // ── 10. Final LayerNorm + LM head ──────────────────────────────────────
-  (final_r_vs, _) ← VerifyRangeBatched(
-      [π.final_ln_proof.σ_range_proof, π.final_ln_proof.y_range_proof],
-      π.final_range_m, [ln_σ_n, ln_y_n], 32, FS, …)
-  VerifyLayerNorm(π.final_ln_proof, {x_cur_com, π.final_ln_out_com},
-                  VK.final_ln_vk, final_r_vs[0..1], FS, ln_acc_t, ln_acc_td)
+  // ── 10. Final LN IO absorption ─────────────────────────────────────────
+  Absorb final_ln IO commitments (sumcheck deferred to step 11b)
+
+  // ── 11. Global range batch verify (per non-empty bit-width bucket) ─────
+  for bits ∈ {32, 64} that the prover used:
+      VerifyRangeBatched(bucket_witness_proofs, π.range_m_for_bits, bits, FS,
+                          accs.range_sig, accs.range_y, accs.range_m)
+
+  // ── 11b. Cross-LN batched verify (5L+1 LayerNorms in one transcript) ────
+  VerifyLayerNormsBatched(π.ln_batched_proof, all 5L+1 LN io_coms,
+                           σ-range r_v's, y-range r_v's, FS,
+                           ln_acc_t, ln_acc_td)
+
+  // ── 12. LM head + logits opening ───────────────────────────────────────
   VerifyProjection(π.lm_head_proof, VK.lm_head_vk,
                    {x_com: π.final_ln_out_com}, FS, lmh_acc_w, lmh_acc_b)
   Assert HyraxVerify(π.logits_com, lm_y_claim, π.lm_head_logits_open, FS)
 
-  // ── 11–13. Global intermediate batch open + cross-block batch opens ───
+  // ── 13. Drain accumulator μ-challenges (5 groups, mirrors prover) ──────
+  for _ in 0..5: FS.challenge("hyrax_group_mu")
+
+  // ── 14–15. Global intermediate batch open + cross-block batch opens ───
   Assert HyraxVerifyBatch({Q_ℓ, K_ℓ, V_ℓ, Out_attn_ℓ, Out_ffn_ℓ}_ℓ at r_td,
                            π.inter_batch_open, …) == ACCEPT
-  For each (matrices, point, batch_open) listed in §4.2 step 13:
+  For each (matrices, point, batch_open) listed in §4.2 step 15:
       Assert HyraxVerifyBatch(matrices, point, batch_open, …) == ACCEPT
+  if has_attn_norm:
+      Assert HyraxVerifyBatch([attn_num | attn_norm | rem | diff]_ℓ at r_norm,
+                               π.attn_norm_r_batch_open, …) == ACCEPT
+      Assert HyraxVerifyBatch([z_ℓ] at r_norm_t,
+                               π.attn_z_open, …) == ACCEPT
+      Assert HyraxVerifyBatch([attn_num | attn_norm]_ℓ at (r_t, r_k_o),
+                               π.attn_norm_attn_point_open, …) == ACCEPT
 
-  // ── 14. Finalise deferred Hyrax accumulators (2 MSMs each) ─────────────
+  // ── 16. Finalise deferred Hyrax accumulators (one MSM pair per group) ──
   Assert ln_acc_t.finalize(FS) == ACCEPT
   Assert ln_acc_td.finalize(FS) == ACCEPT
   Assert proj_acc_w.finalize(FS) == ACCEPT
@@ -1004,9 +1237,46 @@ Algorithm VerifyLayerNorm(proof, io_coms, vk, σ_rv, y_rv, FS, acc_t, acc_td):
 
 *Proof.* The verifier draws Fiat-Shamir scalars $\lambda, \mu \stackrel{\$}{\leftarrow} \mathbb{F}_r$ before the sumcheck challenge $r_k$. The combined claim is $\lambda \cdot Y_Q(r_t, r_d) + \mu \cdot Y_K(r_t, r_d) + Y_V(r_t, r_d)$. A cheating prover who fakes any single projection $\hat{Y}_Q \neq Y_Q$ changes the combined polynomial by $\lambda \cdot (\hat{Y}_Q - Y_Q)$, which is a non-zero polynomial in $\lambda$ of degree $\leq 1$. The verifier's random $\lambda$ fails to catch this with probability $\leq 1 / |\mathbb{F}_r| \approx 2^{-254}$. Combined with the sumcheck error: total soundness error $\leq 2 / |\mathbb{F}_r| + n\delta / |\mathbb{F}_r|$. $\square$
 
-**Theorem 6 (Global Range Batch Soundness).** *Sharing one $m_{\mathsf{com}}$ across $B$ range witnesses is sound: a cheating prover cannot supply chunk values outside $[0, 2^{16})$ for any single witness.*
+**Theorem 6 (Global Range Batch Soundness).** *Sharing one $m_{\mathsf{com}}$ per bit-width bucket across all $B$ range witnesses (over all blocks and the final LN, plus optional attention-normalization residuals) is sound: a cheating prover cannot supply chunk values outside $[0, 2^{16})$ for any single witness.*
 
-*Proof.* The key commitment-ordering invariant is that $m_{\mathsf{com}}$ is absorbed into the transcript *before* any per-witness sumcheck challenges $r_v^{(b)}$ are derived. Since $m$ aggregates all chunk occurrences across all witnesses, and the prover must commit to $m$ before seeing any $r_v^{(b)}$, the prover cannot adaptively choose the chunk values after learning the sumcheck challenges. Formally: suppose a cheating prover supplies $\hat{V}_{lo}^{(b_0)}$ with some entry $\hat{V}_{lo}^{(b_0)}[i] = v^* \geq 2^{16}$. For the LogUp check to pass, $m[v^*]$ must be positive, but $T_{\mathsf{id}}[v^*]$ does not exist (the identity table only has entries $0 \ldots 2^{16}-1$), so the LogUp identity $\sum_{b,c,i} \delta_{v^*, \mathsf{chunk}^{(b,c)}[i]} = m[v^*] \cdot T_{\mathsf{id}}[v^*]$ fails. The committed $m_{\mathsf{com}}$ binds the prover to the claimed multiplicities before all sumchecks (Lemma 2). $\square$
+*Proof.* Each bucket is processed independently and the argument applies per bucket. The key commitment-ordering invariant is that $m_{\mathsf{com}}$ is absorbed into the transcript *before* any per-witness sumcheck challenge $r_v^{(b)}$ in the bucket is derived. Since $m$ aggregates all chunk occurrences across all witnesses (and all $C$ chunks per witness) in the bucket, and the prover must commit to $m$ before seeing any $r_v^{(b)}$, the prover cannot adaptively choose the chunk values after learning the sumcheck challenges. Formally: suppose a cheating prover supplies $\hat{V}_c^{(b_0)}[i] = v^* \geq 2^{16}$ for some witness $b_0$ and chunk index $c$. For the LogUp check to pass, $m[v^*]$ must be positive, but $T_{\mathsf{id}}[v^*]$ does not exist (the identity table only has entries $0 \ldots 2^{16}-1$), so the LogUp identity $\sum_{b,c,i} \delta_{v^*, \mathsf{chunk}^{(b,c)}[i]} = m[v^*] \cdot T_{\mathsf{id}}[v^*]$ fails. The committed $m_{\mathsf{com}}$ binds the prover to the claimed multiplicities before all sumchecks (Lemma 2). $\square$
+
+**Theorem 6b (Model-level batched LayerNorm soundness).** *The single
+`prove_layernorms_batched` call covering all $5L+1$ LayerNorms is as sound
+as $5L+1$ independent LayerNorm sub-proofs run with independent challenges.*
+
+*Proof.* The batched LN proof folds the $5L+1$ per-LN claims via Fiat–Shamir
+powers of an independent batching challenge $\eta$, drawn after every per-LN
+IO commitment ($x$, $y$, $\mathsf{sum\_x}$, $\mathsf{sq\_sum}$, $\sigma$) has
+been absorbed into the transcript and after the bucketed range batch has
+committed to all $\sigma$/$y$ chunks. The same Schwartz–Zippel argument as
+Theorem 2 applies: a single false LN claim makes the combined polynomial in
+$\eta$ non-zero of degree $\le 5L$, caught with probability $\ge 1 - 5L/|\mathbb{F}_r|$.
+The shared inner sumchecks (mean, variance, Y-fusion) inherit
+Lemma 1 soundness on the combined claim. $\square$
+
+**Theorem 6c (Attention-normalization sumcheck soundness).** *When
+`has_attn_norm` is set, the cubic multi-batched sumcheck for*
+$\mathsf{ATTN\_NORM\_SCALE} \cdot \mathsf{attn\_num} - \mathsf{rem} - Z\!\cdot\!\mathsf{attn\_y} = 0$
+*and* $\lambda(Z - 1 - \mathsf{rem} - \mathsf{diff}) = 0$ *combined with the
+range proofs on $\mathsf{rem}$, $\mathsf{diff}$ and the auxiliary $Z$
+sumcheck soundly enforces the floor-division identity*
+$\mathsf{attn\_y}[t][j] = \lfloor \mathsf{ATTN\_NORM\_SCALE}\cdot\mathsf{attn\_num}[t][j] / Z[t]\rfloor$
+*at every $(t,j)$.*
+
+*Proof sketch.* Range proofs (Theorem 6) constrain $\mathsf{rem} \ge 0$ and
+$\mathsf{diff} \ge 0$. The second identity then gives
+$\mathsf{rem} \le Z - 1$, i.e. $0 \le \mathsf{rem} < Z$. The first identity
+expresses $Z\cdot\mathsf{attn\_y} = \mathsf{ATTN\_NORM\_SCALE}\cdot\mathsf{attn\_num} - \mathsf{rem}$
+with the unique-quotient property of integer division given $0 \le \mathsf{rem} < Z$.
+Both identities are checked at one Fiat–Shamir random point $r_{\mathsf{norm}}$
+of $t_{\mathsf{bits}}+d_{\mathsf{bits}}$ variables, with cubic-sumcheck error
+$3(t_{\mathsf{bits}}+d_{\mathsf{bits}})/|\mathbb{F}_r|$ (Lemma 1) and a
+$\lambda$-batching error $1/|\mathbb{F}_r|$ (Lemma 3). The auxiliary
+$Z$ sumcheck binds $Z[t]$ to $\phi(Q_n)_t \cdot \sum_s \phi(K_n)_s$ via the
+already-committed $\phi(Q_n), \phi(K_n)$ MLEs (Lemmas 1 and 2). Hyrax
+binding (Lemma 2) on `attn_num_com`, `attn_norm_com`, `attn_z_com`,
+`attn_rem_com`, `attn_diff_com` closes the loop. $\square$
 
 ---
 
@@ -1025,13 +1295,15 @@ $$\varepsilon_{\mathsf{sound}} \leq L \cdot n_{\max} \cdot \delta_{\max} / |\mat
 2. **Block-level chaining:** In block $\ell$, the output commitment $C_{x_{\mathsf{out}}}^\ell$ is the *homomorphic sum* of three committed tensors. Binding of each component tensor (Lemma 2) implies binding of $C_{x_{\mathsf{out}}}^\ell$. The first block's input is $x_{\mathsf{in\_com}}$, which the verifier holds independently; binding proceeds inductively.
 
 3. **Within each block:** The transcript state after block $\ell-1$ is a deterministic function of all commitments and proofs from blocks $0 \ldots \ell-1$. All challenges in block $\ell$ are Fiat-Shamir outputs from this state. Given Hyrax binding and sumcheck soundness:
-   - The 4-element global range batch is sound (Theorem 6).
-   - Each LayerNorm is sound (sumcheck error + range proof soundness, Lemma 5).
+   - The bucketed global range batch over all witnesses (LN $\sigma$/$y$ + optional attn-norm rem/diff) is sound (Theorem 6).
+   - Each of the five LayerNorms (ln1, q_norm, k_norm, attn_out_norm, ln2) is sound under the model-level batched LN proof (Theorem 6b) which composes the mean / variance / σ-floor / Y-fusion sub-claims with range-proof soundness (Lemma 5).
+   - The sandwich-norm residual $C_{x_{\mathsf{mid}}} = C_{x_{\mathsf{in}}} + C_{\mathsf{attn\_out\_norm.y}}$ requires no proof (Theorem 3).
+   - When `has_attn_norm`, the floor-division identity is sound (Theorem 6c).
    - Batched QKV soundness (Theorem 5).
-   - GKR fusion soundness (Theorem 2).
+   - GKR fusion soundness (Theorem 2) for the six cross-block sumchecks.
    - Global FFN Lasso soundness (Theorem 4).
    - Homomorphic residuals require no proof (Theorem 3).
-   - Lasso soundness (Lemma 4) for all activation tables.
+   - Lasso soundness (Lemma 4) for all activation tables, with lookup binding to the post-norm `q_norm_y_com`, `k_norm_y_com` (attention) and `ffn_m_com` (FFN) — i.e. the φ inputs are exactly the LayerNorm outputs.
 
 4. **Final layer + LM head:** Same argument as a single block.
 
@@ -1066,7 +1338,7 @@ The Python training pipeline uses the same quantization so the exported integer 
 
 ## 7. Complexity Summary
 
-Let $L$ = layers, $T$ = sequence length, $d$ = embedding dimension, $d_{ff}$ = FFN width, $m$ = bits per chunk, $c$ = chunk count, $B_{rng}$ = range witnesses per block (4 for ln1+ln2).
+Let $L$ = layers, $T$ = sequence length, $d$ = embedding dimension, $d_{ff}$ = FFN width, $m$ = bits per chunk, $c$ = chunk count, $B_{rng}$ = range witnesses per block (10 for the five LayerNorms, plus 2 for the optional attn-norm rem/diff in normalized mode).
 
 | Component | Prover time | Verifier time | Proof size |
 |-----------|-------------|---------------|------------|
@@ -1077,7 +1349,9 @@ Let $L$ = layers, $T$ = sequence length, $d$ = embedding dimension, $d_{ff}$ = F
 | Lasso (one sub-table, $N$ queries) | O($N \cdot 2^m + m \cdot 2^m$) | O($N \cdot m$) | O($m$) $\mathbb{F}$ |
 | Range proof (1 witness, batched $m$) | O($\sqrt{2^{16}}$) G1 | O($\sqrt{2^{16}}$) G1 | O($\sqrt{2^{16}}$) $\mathbb{F}$ |
 | Range proof global $m_\mathsf{com}$ | O($\sqrt{2^{16}}$) G1 **once** | O($\sqrt{2^{16}}$) G1 **once** | O($\sqrt{2^{16}}$) $\mathbb{F}$ |
-| LayerNorm (per block) | 2 sumchecks + 2 range witnesses | O($d$) + O($\log T$) | O($\sqrt{Td}$) |
+| LayerNorm (per LN, model-level batched across $5L+1$) | 3 sumchecks + 2 range witnesses, folded into one batched proof | O($d$) + O($\log T$) per LN | O($\sqrt{Td}$) per LN, shared transcript |
+| Sandwich + QK norms (per block) | 3 extra LN witnesses (q_norm, k_norm, attn_out_norm) folded into the model-level LN batch | O($d$) + O($\log T$) per LN | absorbed by LN batch |
+| Attention normalization (per model, normalized mode) | 1 cubic multi-batched sumcheck + 1 $Z$ sumcheck + 2L 64-bit range witnesses | O($\log T + \log d$) + 2 batch opens | O($\sqrt{T d}$) for `[num \| norm \| rem \| diff]` batch open + $Z$ open |
 | Projection (per matrix) | O($T \cdot d$) | O($\log(Td)$) | O($\sqrt{Td}$) |
 | Batched QKV (3 matrices) | O($T \cdot d$) (1×) | O($\log(Td)$) | O($\sqrt{Td}$) |
 | Linear attention (per block) | O($T d_h^2$) | O($d_h \log T$) | O($d_h \log T$) |
@@ -1096,7 +1370,10 @@ Let $L$ = layers, $T$ = sequence length, $d$ = embedding dimension, $d_{ff}$ = F
 | Global FFN activation Lasso (one `LassoMultiProof` vs $L$ local proofs) | $(L-1)$ lookup sumcheck transcripts and table-opening batches | model-level `ffn_lasso_proof` |
 | Committed-output Lasso (no proof-carried lookup outputs) | $O(N)$ field elements per lookup instance | `ffn_lasso_proof`, `all_lasso_proof` |
 | Homomorphic residuals (no proof) | 2 Hyrax opens per block | per block |
-| Global range batch (1 $m_{\mathsf{com}}$ vs $B_{rng}$) | $(B_{rng}-1) \times \sqrt{2^{16}}$ G1 | per block + final |
+| Global range batch (1 $m_{\mathsf{com}}$ per bucket vs per witness) | $(B - 1) \times \sqrt{2^{16}}$ G1 per bucket, where $B = 10L+2$ for the LN bucket plus $2L$ for the optional attn-norm bucket | model-level |
+| Model-level batched LN proof (1 transcript vs $5L+1$) | $(5L+1 - 1)$ LN sumcheck transcripts | `prove_layernorms_batched` |
+| Sandwich + QK norms reuse the LN primitive | no extra primitive — $5L+1$ LN witnesses fold into the LN batch + range bucket | per block |
+| Attention normalization fused into one cubic multi-batched sumcheck | $7L$ summand slots in one transcript instead of $L$ separate normalization proofs | `attn_norm_sumcheck` |
 | Deferred batch accumulators (10 cross-cutting groups) | $(K-1) \times 2$ MSMs per group | model-level |
 | Ternary weight encoding (no field mults in projection sumcheck) | $T \cdot d$ field mults → $T \cdot d$ adds per layer | every projection |
 
@@ -1161,17 +1438,21 @@ The `--transcript-label` flag in the CLI must match between `prove` and `verify`
 
 The implementation enforces several strict transcript-ordering rules that the soundness proofs rely on:
 
-1. **Per-block range batch** is the very first action inside `commit_block_phase1`: all chunk commitments and the shared $m_{\mathsf{com}}$ are absorbed *before* any per-witness sumcheck challenges. `prove_layernorm` / `verify_layernorm` deliberately do *not* call range-proof functions themselves; the Phase 1 wrapper is responsible. Violating this ordering breaks Theorem 6.
+1. **Phase 1 absorbs all five LN IO commitments per block, in fixed order.** Each block absorbs `(x_in, x_norm1)` for LN1; `(q_com, k_com, v_com)` plus the optional `(attn_norm_com, attn_num_com, attn_z_com, attn_rem_com, attn_diff_com)`; `(q_com, q_norm_y_com)` for q_norm; `(k_com, k_norm_y_com)` for k_norm; `out_attn_com`; `(out_attn_com, attn_out_norm_y_com)` for attn_out_norm; `(x_mid_com, x_norm2_com)` for LN2; and finally `out_ffn_com`. No per-block LN sumcheck is emitted at this stage — it is deferred to the model-end batched LN call.
 
-2. **Phase 1 completes for ALL blocks** before the global `r_td = (r_t \| r_{\mathsf{out}})` challenge is sampled. This guarantees that every per-block intermediate commitment ($Q_\ell, K_\ell, V_\ell, \mathsf{Out\_attn}_\ell, \mathsf{Out\_ffn}_\ell, X_{\mathsf{norm}1,\ell}, X_{\mathsf{norm}2,\ell}$) is bound to the transcript before the cross-block batch sumcheck challenges are drawn.
+2. **Phase 1 completes for ALL blocks** before the global `r_td = (r_t \| r_{\mathsf{out}})` challenge is sampled. This guarantees that every per-block intermediate commitment ($Q_\ell, K_\ell, V_\ell$, $Q^{\mathrm{n}}_\ell, K^{\mathrm{n}}_\ell$, $\mathsf{Out\_attn}_\ell$, $\mathsf{attn\_out\_norm.y}_\ell$, $\mathsf{Out\_ffn}_\ell$, $X_{\mathsf{norm}1,\ell}, X_{\mathsf{norm}2,\ell}$, plus the optional attn-norm aux commits) is bound to the transcript before the cross-block batch sumcheck challenges are drawn.
 
 3. **Per-block QKV/O-proj/FFN absorbs precede the corresponding batch $\eta$**. Inside the cross-block QKV loop, each block's $(W_Q, W_K, W_V, \alpha, b_Q, b_K, b_V)$ commitments and the per-block $(\lambda_\ell, \mu_\ell)$ challenges are absorbed before the model-level $\eta_{\mathsf{qkv}}$ is sampled. The same pattern holds for `batch_oproj`, `batch_ffn_y`, `batch_ffn_m`, `batch_attn_out`, and `batch_attn_ctx`.
 
-4. **Committed-output Lasso absorbs output commitments before lookup batching challenges**. `prove_lasso_multi` / `verify_lasso_multi_committed_outputs` absorb `lasso_output_com` for every committed output before deriving `instance_batch_alpha` and `lookup_batch_rho`. This applies to `ffn_lasso_proof` (`ffn_a_com`) and `all_lasso_proof` (`attn_phi_q_com`, `attn_phi_k_com`).
+4. **Attention-normalization sumcheck challenges are sampled after step-4 (`batch_attn_out`) terminates**, so $\mathsf{attn\_num}$ is already bound to its $(r_t, r_{k_o})$ evaluation point before $r_{\mathsf{norm}}$ is drawn. The cubic multi-batched sumcheck and the auxiliary $Z$ sumcheck use independent Fiat–Shamir challenges drawn after the `attn_num_com`, `attn_norm_com`, `attn_z_com`, `attn_rem_com`, `attn_diff_com` were absorbed in Phase 1.
 
-5. **Lookup indices are transcript-bound before index-opening challenges**. The raw query-index vectors in both global Lasso proofs are absorbed before deriving `ffn_lasso_bind_r` or `qk_lasso_bind_r`. The corresponding Hyrax batch openings bind those index vectors to `ffn_m_com` or to the `q_com` / `k_com` commitments.
+5. **Bucketed range batch precedes the model-level LN batched sumcheck.** All chunk commitments and the per-bucket $m_{\mathsf{com}}$ values are absorbed *before* any LN $\sigma$/$y$ sumcheck challenge or any LN-batch cross-instance challenge is sampled. Violating this ordering breaks Theorem 6 / 6b.
 
-6. **Ten deferred μ-challenges** are advanced after the LM-head proof and before the global intermediate batch open. The verifier mirrors this `for _ in 0..10 { transcript.challenge_field(b"hyrax_group_mu") }` loop so that the Hyrax accumulators consume the same μ values the prover used.
+6. **Committed-output Lasso absorbs output commitments before lookup batching challenges**. `prove_lasso_multi` / `verify_lasso_multi_committed_outputs` absorb `lasso_output_com` for every committed output before deriving `instance_batch_alpha` and `lookup_batch_rho`. This applies to `ffn_lasso_proof` (`ffn_a_com`) and `all_lasso_proof` (`attn_phi_q_com`, `attn_phi_k_com`).
+
+7. **Lookup indices are transcript-bound before index-opening challenges**. The raw query-index vectors in both global Lasso proofs are absorbed before deriving `ffn_lasso_bind_r` or `qk_lasso_bind_r`. The corresponding Hyrax batch openings bind those index vectors to `ffn_m_com` (FFN) or to the post-norm `q_norm_y_com` / `k_norm_y_com` (attention) — *not* to the pre-norm `q_com` / `k_com`, since the Lasso queries are evaluated on the post-QK-norm tensors.
+
+8. **Five deferred μ-challenges** are advanced after the model-level batched LN proof, after the LM-head proof, and before the global intermediate batch open. The verifier mirrors this `for _ in 0..5 { transcript.challenge_field(b"hyrax_group_mu") }` loop so that the Hyrax accumulators consume the same μ values the prover used. The five groups are `params_td`, `params_qkvo_w`, `params_qkvo_b`, `params_wff`, `params_mff`.
 
 ### Bit-Ordering Convention
 
@@ -1280,7 +1561,10 @@ lasso_sigma: varint u64
 
 `TransformerModelProof` carries:
 
-- One `TransformerBlockProof` per block with the LN1/LN2 sub-proofs, the block-level `GlobalRangeM`, the seven intermediate Hyrax commitments, `ffn_a_com`, `ffn_m_com`, the per-block `phi_q`/`phi_k` commitments, and the per-block scalar evaluations consumed by the cross-block batch sumchecks. The per-block `ffn_lasso_proof` is an empty compatibility field; the real FFN lookup proof is model-level.
+- One `TransformerBlockProof` per block with the per-block intermediate Hyrax commitments (`x_norm1_com`, `q_com`, `k_com`, `v_com`, `q_norm_y_com`, `k_norm_y_com`, optional `attn_norm_com`/`attn_num_com`/`attn_z_com`/`attn_rem_com`/`attn_diff_com`, `out_attn_com`, `attn_out_norm_y_com`, `x_norm2_com`, `out_ffn_com`), `ffn_a_com`, `ffn_m_com`, the per-block `phi_q`/`phi_k` commitments, and the per-block scalar evaluations consumed by the cross-block batch sumchecks. The per-block LN sub-proofs are no longer carried — they are replaced by a single model-level `ln_batched_proof`.
+- A model-level `ln_batched_proof` (`prove_layernorms_batched` output) covering all $5L+1$ LayerNorms (`ln1, q_norm, k_norm, attn_out_norm, ln2` per block, plus the final LN), and the five LN's IO commitments are recovered from the per-block proofs and the top-level `final_ln_out_com`.
+- A bucketed range batch (one `GlobalRangeM` per non-empty bit-width bucket) covering all LN $\sigma$/$y$ witnesses and, when normalized attention is used, the attn-norm `rem`/`diff` residuals.
+- When normalized attention is used: the cubic multi-batched `attn_norm_sumcheck`, the auxiliary `attn_z_sumcheck` (and a causal variant when applicable), and the corresponding batch opens `attn_norm_r_batch_open`, `attn_z_open`, `attn_norm_attn_point_open`.
 - Six model-level cross-block batched sumcheck proofs: `batch_qkv`, `batch_oproj`, `batch_attn_out`, `batch_attn_ctx`, `batch_ffn_y`, `batch_ffn_m`.
 - One `inter_batch_open` covering the 5L intermediate matrices (Q, K, V, Out_attn, Out_ffn for each block) opened jointly at `r_td`.
 - Cross-block batch opens for the per-type weight, bias, activation, and intermediate matrices at their respective shared evaluation points (`x_norm1`, `w_q`, `w_k`, `w_v`, `bias_q`, `bias_k`, `bias_v`, `w_o`, `bias_o`, `w2`, `ffn_a`, `w1`, `x_norm2`, `ffn_m_com`, `ffn_lasso_bind`, `phi_q`, `phi_k`, `v_attn`, `qk_lasso_bind`).
