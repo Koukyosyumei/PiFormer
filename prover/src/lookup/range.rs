@@ -20,6 +20,7 @@ use crate::subprotocols::{
 use crate::transcript::Transcript;
 use ark_ff::{batch_inversion, Field, PrimeField};
 use rayon::prelude::*;
+use std::time::Instant;
 
 // 16-bit chunks: table size = 65536. 32-bit values need 2 chunks; 64-bit values
 // need 4 chunks. The fixed m_com / RHS-sumcheck / g_mle overhead grows by 256×
@@ -132,6 +133,13 @@ pub fn prove_range_batched(
 ) -> Result<(Vec<RangeWitnessProof>, GlobalRangeM, Vec<Vec<F>>), String> {
     let num_chunks = (bits + CHUNK_BITS - 1) / CHUNK_BITS;
     let (nu_m, sigma_m, params_m) = params_from_vars(CHUNK_BITS);
+    let n_w = witnesses.len();
+    let mut t_section = Instant::now();
+    eprintln!(
+        "[range bits={bits}] start: {n_w} witnesses, num_chunks={num_chunks}, sizes: min={} max={}",
+        witnesses.iter().map(|w| w.values.len()).min().unwrap_or(0),
+        witnesses.iter().map(|w| w.values.len()).max().unwrap_or(0)
+    );
 
     // ---- Phase 1: chunk decomposition + chunk_com commitments per witness ----
     // Note: v_mle is not materialized — v is never committed externally and the
@@ -182,6 +190,12 @@ pub fn prove_range_batched(
             }
         })
         .collect();
+
+    eprintln!(
+        "[range bits={bits}]   p1_chunks_and_commits: {:7.3}ms",
+        t_section.elapsed().as_secs_f64() * 1000.0
+    );
+    t_section = Instant::now();
 
     let mut all_chunk_vals: Vec<Vec<Vec<F>>> = Vec::with_capacity(witnesses.len()); // [w][c][i]
     let mut all_chunk_mles: Vec<Vec<DenseMLPoly>> = Vec::with_capacity(witnesses.len());

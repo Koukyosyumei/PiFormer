@@ -52,6 +52,7 @@
 \newcommand{\bB}{\mathbf{B}}
 \newcommand{\bb}{\mathbf{b}}
 \newcommand{\bM}{\mathbf{M}}
+\newcommand{\bN}{\mathbf{N}}
 \newcommand{\bX}{\mathbf{X}}
 \newcommand{\bY}{\mathbf{Y}}
 \newcommand{\bW}{\mathbf{W}}
@@ -120,16 +121,21 @@ substitution under Lasso, whose prover/verifier cost depends only on
 table size and query count, not on table contents.
 
 On top of this architecture we build a transparent SNARK over BN254
-with the Hyrax polynomial commitment scheme. The proof system batches
-all per-block sub-protocols into six \emph{model-level} cross-block
-sumchecks (QKV, output projection, attention out, attention context,
-FFN-Y, FFN-M), one global Lasso proof per lookup family, one shared
-range-multiplicity commitment per block, and ten cross-cutting Hyrax
-accumulators that finalise into one MSM pair per group. Residual
-connections cost no proof at all~--- they are checked by homomorphic
-addition of Hyrax commitments. We give cross-block batching soundness
-theorems and an end-to-end soundness reduction to discrete log on
-BN254 G1.
+with the Hyrax polynomial commitment scheme. The block uses
+\emph{sandwich normalisation}~--- five LayerNorms per block (LN$_1$, QK-norm
+on $\bQ$ and $\bK$, post-attention LN before the residual, LN$_2$)~---
+to keep linear-attention activations and lookup inputs in range, and the
+prover handles all $5L\!+\!1$ LNs in a \emph{single model-level batched
+LN proof}. The proof system batches all per-block sub-protocols into six
+cross-block sumchecks (QKV, output projection, attention out, attention
+context, FFN-Y, FFN-M), one global Lasso proof per lookup family, one
+shared range-multiplicity commitment per width bucket across the entire
+model, an in-circuit floor-division proof for the row-normaliser $Z$, and
+ten cross-cutting Hyrax accumulators that finalise into one MSM pair per
+group. Residual connections cost no proof at all~--- they are checked by
+homomorphic addition of Hyrax commitments. We give cross-block /
+cross-LN batching soundness theorems and an end-to-end soundness
+reduction to discrete log on BN254 G1.
 \end{abstract}
 
 %-------------------------------------------------------------------------------
@@ -1197,17 +1203,22 @@ witnesses (\S\ref{sec:disc}).
 %-------------------------------------------------------------------------------
 
 \paragraph{What is and is not in the SNARK.}
-The Rust prover proves the un-normalised LLA output
-$\bphi(\bQ)(\bphi(\bK)^\top\bV)\bW_O$. The Python forward pass adds
-the row-wise normaliser $Z_t=\bphi(\bq_t)^\top\sum_s\bphi(\bk_s)$ for
-training stability; matching the two requires either disabling $Z$
-at export time or extending the circuit with a row-normalisation
-sumcheck. The current implementation also lacks causal masking,
-multi-head attention, and zero-knowledge masking. None of these
-changes the protocol architecture: causal masking is a sumcheck-time
-indicator polynomial, multi-head splits the attention sumchecks into
-parallel batches, and ZK is an additional blinding layer over
-committed witnesses.
+The Rust prover proves the full normalised LLA output
+$\bY^{\mathrm{att}}=\lfloor S\!\cdot\!\bphi(\bQ^{\mathrm{n}})(\bphi(\bK^{\mathrm{n}})^\top\bV)/Z\rfloor$
+followed by the ternary output projection
+$\bO_{\mathrm{att}}=\bY^{\mathrm{att}}\bW_O+\bb_O$ and the sandwich-norm
+$\LN_{\mathrm{aon}}(\bO_{\mathrm{att}})$ before the residual sum. The
+Python pipeline supports two attention modes:
+\texttt{normalized\_fixed} (proven end-to-end by the Rust circuit,
+including the floor division) and \texttt{prover} (un-normalised numerator
+only, retained for legacy export). \texttt{normalized\_float} is rejected
+at export time. The current implementation lacks causal masking
+(an experimental causal $Z$ sumcheck exists in the code but is not enabled
+in the production export), multi-head attention, and zero-knowledge
+masking. None of these changes the protocol architecture: causal masking
+is a sumcheck-time indicator polynomial, multi-head splits the attention
+sumchecks into parallel batches, and ZK is an additional blinding layer
+over committed witnesses.
 
 \paragraph{Model-quality evaluation.}
 Because \sys{} changes the attention kernel and constrains weights to
