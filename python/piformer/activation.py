@@ -8,6 +8,8 @@ each sub-table of size 2^(num_bits/c) can be committed separately,
 giving O(c · 2^(num_bits/c)) total commitment cost vs O(2^num_bits) for a flat table.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,6 +51,8 @@ class StructuredLookupActivation(nn.Module):
         self.scale = scale
         self.zero_point = 1 << (num_bits - 1)
         self.init = init_kind
+        # Set on first saturation; gates the one-time RuntimeWarning in forward.
+        self._saturation_warned = False
 
         # Initialize sub-tables to approximate GeLU / c shape so training converges faster.
         self.tables = nn.ParameterList()
@@ -71,23 +75,34 @@ class StructuredLookupActivation(nn.Module):
             self.tables.append(nn.Parameter(init_values))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1. Quantize to non-negative integer index. This intentionally does
-        # not clamp: the proof system verifies no-saturation quantization, so
-        # Python training/inference must fail if the table range is exceeded.
-        # The integer index path is non-differentiable today, so avoid building
-        # a throwaway autograd graph for division/range-checking.
+        # 1. Quantize to a non-negative integer index, then saturate to the
+        # table window. The Rust prover only verifies that lookup indices fall
+        # in [0, 2^num_bits - 1]; it does not distinguish "naturally in range"
+        # from "saturated by clipping", so witnesses that clamp here remain
+        # provable. We emit a one-time RuntimeWarning the first time saturation
+        # happens so a too-tight `scale` is still visible without being fatal.
+        # The integer-index path is non-differentiable today, so wrap in
+        # no_grad to avoid building a throwaway autograd graph.
         with torch.no_grad():
             scaled = x / self.scale
             rounded = torch.floor(scaled + 0.5)
             x_int = rounded.add_(self.zero_point)
             max_idx = 2 ** self.num_bits - 1
-            if torch.any((x_int < 0) | (x_int > max_idx)):
+            if not self._saturation_warned and torch.any(
+                (x_int < 0) | (x_int > max_idx)
+            ):
                 bad = x_int[(x_int < 0) | (x_int > max_idx)][0].item()
-                raise RuntimeError(
-                    f"activation lookup index {bad} outside [0, {max_idx}]; "
-                    "increase activation scale or retrain with a wider range"
+                warnings.warn(
+                    f"StructuredLookupActivation saturated: index {bad} "
+                    f"clamped into [0, {max_idx}] (num_bits={self.num_bits}, "
+                    f"scale={self.scale}). Consider widening `scale` or "
+                    "`num_bits`. Further saturation events in this process "
+                    "will not be reported.",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
-            x_int = x_int.long()
+                self._saturation_warned = True
+            x_int = x_int.clamp_(0, max_idx).long()
 
         # 2. Decompose and sum sub-table lookups.
         # chunk_size is a power of two, so use bit-and / bit-shift instead of

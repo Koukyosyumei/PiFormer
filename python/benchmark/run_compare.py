@@ -33,7 +33,6 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from piformer.activation import StructuredLookupActivation
 from piformer.model import PiFormerModel
 from piformer.projection import TernaryLinear
 
@@ -118,88 +117,6 @@ def _qat_schedule(step: int, total_steps: int, warmup_frac: float, ramp_frac: fl
         span = max(1, ramp_end - warmup_end)
         return (step - warmup_end) / span, "ramp"
     return 1.0, "finetune"
-
-
-class ActivationRangeTracker:
-    """Training-time safety net for ``StructuredLookupActivation``.
-
-    The Rust prover refuses to prove witnesses where the quantized lookup
-    index is outside ``[0, 2^num_bits - 1]``; ``StructuredLookupActivation``
-    mirrors that contract with a hard ``RuntimeError`` — fatal mid-training.
-
-    This tracker installs a forward pre-hook on every activation that:
-
-      1. **Clips** the incoming tensor to the lookup window
-         ``[lo, hi] = [-zp*scale, (max_idx-zp)*scale]`` *before* it reaches
-         ``StructuredLookupActivation.forward``. Clipping is what prevents
-         the crash — the lookup never sees an out-of-range value.
-
-      2. Records the squared clip distance ``mean((x - clip(x))**2)`` on the
-         module; ``pop()`` sums these into a single auxiliary-loss tensor.
-         The clip distance is positive only when clipping was needed, so
-         adding ``λ * pop()`` to the training loss provides gradient
-         pressure to reduce clipping over time and steer the model toward
-         producing naturally in-range activations.
-
-    With a positive penalty weight, the model converges toward not needing
-    the clip; without it, training still doesn't crash but activations may
-    saturate at the boundary indefinitely (the model has no incentive to
-    pull back). Either way, training never raises.
-    """
-
-    def __init__(self, model: nn.Module):
-        self._handles: list = []
-        self._modules: list[StructuredLookupActivation] = []
-        for module in unwrap_compiled_model(model).modules():
-            if not isinstance(module, StructuredLookupActivation):
-                continue
-            zp = module.zero_point
-            max_idx = (1 << module.num_bits) - 1
-            lo = -float(zp) * float(module.scale)
-            hi = float(max_idx - zp) * float(module.scale)
-            module._range_penalty = None  # type: ignore[attr-defined]
-            module._range_lo = lo  # type: ignore[attr-defined]
-            module._range_hi = hi  # type: ignore[attr-defined]
-
-            def hook(mod, args, _kwargs=None):
-                x = args[0]
-                # Clip first so the activation kernel never sees an
-                # out-of-range value; record the (squared, mean) clip
-                # distance for the auxiliary loss.
-                clipped = x.clamp(min=mod._range_lo, max=mod._range_hi)
-                mod._range_penalty = (x - clipped).pow(2).mean()
-                # `with_kwargs=True` requires returning (args, kwargs) when
-                # we want to replace the inputs. The activation takes a
-                # single positional tensor.
-                return ((clipped,), {})
-
-            self._handles.append(
-                module.register_forward_pre_hook(hook, with_kwargs=True)
-            )
-            self._modules.append(module)
-
-    def __len__(self) -> int:
-        return len(self._modules)
-
-    def pop(self) -> torch.Tensor:
-        """Sum penalties from the most recent forward and clear them."""
-        parts = [m._range_penalty for m in self._modules if m._range_penalty is not None]
-        if not parts:
-            return torch.tensor(0.0)
-        total = torch.stack(parts).sum()
-        for m in self._modules:
-            m._range_penalty = None
-        return total
-
-    def remove(self) -> None:
-        for h in self._handles:
-            h.remove()
-        self._handles.clear()
-        for m in self._modules:
-            for attr in ("_range_penalty", "_range_lo", "_range_hi"):
-                if hasattr(m, attr):
-                    delattr(m, attr)
-        self._modules.clear()
 
 
 def maybe_compile_model(name: str, model: nn.Module, args, device: torch.device) -> nn.Module:
@@ -360,21 +277,6 @@ def train_one(
     print(f"  params: {count_params(model):,}")
     print(f"  steps:  {steps}")
 
-    # Activation range penalty: keep StructuredLookupActivation inputs inside
-    # the prover's quantization window. Only meaningful for PiFormer; baseline
-    # has no lookup activations so this is a no-op there.
-    range_tracker: ActivationRangeTracker | None = None
-    if args.act_range_penalty > 0:
-        range_tracker = ActivationRangeTracker(model)
-        if len(range_tracker) == 0:
-            range_tracker.remove()
-            range_tracker = None
-        else:
-            print(
-                f"  act_range_penalty: weight={args.act_range_penalty:g} "
-                f"on {len(range_tracker)} StructuredLookupActivation layer(s)"
-            )
-
     optim = make_optimizer(model, args)
     history = {
         "step": [],
@@ -411,8 +313,6 @@ def train_one(
         loss = nn.functional.cross_entropy(
             logits.reshape(-1, logits.size(-1)), y.reshape(-1)
         )
-        if range_tracker is not None:
-            loss = loss + args.act_range_penalty * range_tracker.pop()
         loss.backward()
         optim.zero_grad(set_to_none=True)
     if device.type == "cuda":
@@ -439,14 +339,9 @@ def train_one(
 
         x, y = random_batch(train_ids, args.batch_size, args.seq_len, device)
         logits = model(x)
-        ce_loss = nn.functional.cross_entropy(
+        loss = nn.functional.cross_entropy(
             logits.reshape(-1, logits.size(-1)), y.reshape(-1)
         )
-        if range_tracker is not None:
-            range_pen = range_tracker.pop()
-            loss = ce_loss + args.act_range_penalty * range_pen
-        else:
-            loss = ce_loss
         if not torch.isfinite(loss):
             raise FloatingPointError(f"{name} produced non-finite loss at step {step}: {loss}")
         optim.zero_grad(set_to_none=True)
@@ -454,9 +349,7 @@ def train_one(
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optim.step()
-        # Log CE loss only — it's directly comparable to the baseline. The
-        # auxiliary penalty is a regularizer, not a quality metric.
-        running += ce_loss.item()
+        running += loss.item()
 
         if step % args.log_every == 0 or step == steps:
             logged_steps = step - log_start + 1
@@ -487,12 +380,6 @@ def train_one(
     # inference benchmarks — that's the model we'll actually ship.
     if tern_modules:
         _set_quant_strength(tern_modules, 1.0)
-
-    # Detach the range-penalty hooks before final eval / inference / generation
-    # so downstream calls don't pay the per-forward overhead.
-    if range_tracker is not None:
-        range_tracker.remove()
-        range_tracker = None
 
     final_val = eval_loss(model, val_ids, args.batch_size, args.seq_len, device, n_batches=50)
     return {
@@ -609,20 +496,6 @@ def parse_args():
     p.add_argument("--c", type=int, default=2)
     p.add_argument("--scale", type=float, default=0.1)
     p.add_argument("--max_exp", type=int, default=4)
-    p.add_argument(
-        "--act_range_penalty", type=float, default=0.0,
-        help="Enable the StructuredLookupActivation training-time safety net "
-             "(value > 0). When enabled, a forward pre-hook on every PiFormer "
-             "lookup activation (a) clips the input to the lookup window "
-             "BEFORE the kernel sees it — preventing the hard 'index outside "
-             "[0, 2^num_bits]' RuntimeError that otherwise kills training mid-run "
-             "— and (b) adds `weight * mean((x - clip(x))**2)` to the loss so "
-             "the model is pushed toward producing naturally in-range activations "
-             "and stops needing the clip. Recommended: 1e-3 to 1e-2 for "
-             "tinyshakespeare-scale runs. Default 0 disables both clip AND "
-             "penalty (training will crash on overflow, matching the previous "
-             "behavior).",
-    )
 
     # Training
     p.add_argument("--seq_len", type=int, default=128)
@@ -865,17 +738,7 @@ def main():
                     f"ramp={args.ternary_ramp_frac:.2f} "
                     f"(pass --ternary_warmup_frac/--ternary_ramp_frac to override)"
                 )
-        # The activation range penalty uses forward pre-hooks that mutate
-        # per-module Python attributes; under torch.compile (especially
-        # reduce-overhead / CUDAGraphs) those side effects are unreliable.
-        # Skip compile for piformer in that case.
-        if args.act_range_penalty > 0 and not args.no_compile and device.type == "cuda":
-            print(
-                "  torch.compile: skipped for piformer "
-                "(--act_range_penalty>0 needs eager mode for hook side effects)"
-            )
-        else:
-            model = maybe_compile_model("piformer", model, args, device)
+        model = maybe_compile_model("piformer", model, args, device)
         results["models"]["piformer"] = train_one(
             "piformer", model, train_ids, val_ids, args, device, piformer_steps
         )
