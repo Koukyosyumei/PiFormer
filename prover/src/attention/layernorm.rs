@@ -1985,8 +1985,10 @@ mod layernorm_tests {
             &[sigma_n_vars, y_n_vars],
             32,
             &mut vt,
-            &mut acc_range_sig,
-            &mut acc_range_y,
+            &mut [
+                (sigma_n_vars, &mut acc_range_sig),
+                (y_n_vars, &mut acc_range_y),
+            ],
             &mut acc_range_m,
         )
         .unwrap();
@@ -2065,8 +2067,10 @@ mod layernorm_tests {
                 &[sigma_n_vars, y_n_vars],
                 32,
                 &mut vt,
-                &mut acc_range_sig,
-                &mut acc_range_y,
+                &mut [
+                    (sigma_n_vars, &mut acc_range_sig),
+                    (y_n_vars, &mut acc_range_y),
+                ],
                 &mut acc_range_m,
             )
             .unwrap();
@@ -2295,8 +2299,20 @@ mod layernorm_tests {
         // Verifier path.
         let mut vt = Transcript::new(b"ln_batch_test");
         let proof_refs: Vec<&RangeWitnessProof> = range_proofs.iter().collect();
-        let mut acc_range_sig = HyraxBatchAccumulator::new();
-        let mut acc_range_y = HyraxBatchAccumulator::new();
+        let distinct_nvs: Vec<usize> = {
+            let mut v: Vec<usize> = n_vars.iter().copied().collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let mut accs: Vec<HyraxBatchAccumulator> = (0..distinct_nvs.len())
+            .map(|_| HyraxBatchAccumulator::new())
+            .collect();
+        let mut chunk_accs: Vec<(usize, &mut HyraxBatchAccumulator)> = distinct_nvs
+            .iter()
+            .copied()
+            .zip(accs.iter_mut())
+            .collect();
         let mut acc_range_m = HyraxBatchAccumulator::new();
         let (rv_v, _) = verify_range_batched(
             &proof_refs,
@@ -2304,8 +2320,7 @@ mod layernorm_tests {
             &n_vars,
             32,
             &mut vt,
-            &mut acc_range_sig,
-            &mut acc_range_y,
+            &mut chunk_accs,
             &mut acc_range_m,
         )
         .unwrap();
@@ -2350,10 +2365,11 @@ mod layernorm_tests {
 
         // Range accumulator finalization (params depend on n_vars per witness).
         // For simplicity, drain the challenges so transcript alignment isn't a
-        // concern; the range proofs already passed structural checks.
-        let _ = vt.challenge_field::<F>(b"hyrax_group_mu");
-        let _ = vt.challenge_field::<F>(b"hyrax_group_mu");
-        let _ = vt.challenge_field::<F>(b"hyrax_group_mu");
+        // concern; the range proofs already passed structural checks.  One mu
+        // per chunk-acc + one for acc_range_m.
+        for _ in 0..(distinct_nvs.len() + 1) {
+            let _ = vt.challenge_field::<F>(b"hyrax_group_mu");
+        }
     }
 
     /// Tampered batched test: corrupt one LN's witness — verify must reject.
@@ -2417,8 +2433,20 @@ mod layernorm_tests {
         for rw_ref in &range_witness_refs {
             n_vars.push(rw_ref.values.len().next_power_of_two().trailing_zeros() as usize);
         }
-        let mut acc_range_sig = HyraxBatchAccumulator::new();
-        let mut acc_range_y = HyraxBatchAccumulator::new();
+        let distinct_nvs: Vec<usize> = {
+            let mut v: Vec<usize> = n_vars.iter().copied().collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let mut accs: Vec<HyraxBatchAccumulator> = (0..distinct_nvs.len())
+            .map(|_| HyraxBatchAccumulator::new())
+            .collect();
+        let mut chunk_accs: Vec<(usize, &mut HyraxBatchAccumulator)> = distinct_nvs
+            .iter()
+            .copied()
+            .zip(accs.iter_mut())
+            .collect();
         let mut acc_range_m = HyraxBatchAccumulator::new();
         let rv_result = verify_range_batched(
             &proof_refs,
@@ -2426,8 +2454,7 @@ mod layernorm_tests {
             &n_vars,
             32,
             &mut vt,
-            &mut acc_range_sig,
-            &mut acc_range_y,
+            &mut chunk_accs,
             &mut acc_range_m,
         );
         let rv_v = match rv_result {

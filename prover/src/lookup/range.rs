@@ -463,6 +463,13 @@ pub fn prove_range_batched(
 /// Hyrax MSMs for chunk openings are deferred via accumulators; LogUp Hyrax calls
 /// are done immediately (transcript-free, so ordering is irrelevant).
 ///
+/// `chunk_accs` is a slice of `(num_vars, &mut accumulator)` pairs.  The caller
+/// must provide one accumulator per distinct `num_vars` value present in
+/// `num_vars_list`; the function routes each witness's chunk-com and LogUp
+/// h-com / chunk-com opens to the matching accumulator (since each accumulator
+/// is finalized with `params_from_vars(num_vars)` and Hyrax params depend on
+/// that size, mixing sizes within one accumulator would be unsound).
+///
 /// Returns `(r_vs, r_m)`.
 pub fn verify_range_batched(
     witness_proofs: &[&RangeWitnessProof],
@@ -470,12 +477,29 @@ pub fn verify_range_batched(
     num_vars_list: &[usize],
     bits: usize,
     transcript: &mut Transcript,
-    acc_small: &mut HyraxBatchAccumulator,
-    acc_large: &mut HyraxBatchAccumulator,
+    chunk_accs: &mut [(usize, &mut HyraxBatchAccumulator)],
     acc_m: &mut HyraxBatchAccumulator,
 ) -> Result<(Vec<Vec<F>>, Vec<F>), String> {
     let num_chunks = (bits + CHUNK_BITS - 1) / CHUNK_BITS;
-    let min_nv = num_vars_list.iter().copied().min().unwrap_or(0);
+
+    // Pre-compute the per-witness accumulator index (linear search over the
+    // small chunk_accs list).  Doing this in a separate pass keeps `chunk_accs`
+    // free of any outstanding immutable borrow when we later index it mutably.
+    let acc_indices: Vec<usize> = num_vars_list
+        .iter()
+        .map(|&nv| {
+            chunk_accs
+                .iter()
+                .position(|(n, _)| *n == nv)
+                .ok_or_else(|| {
+                    format!(
+                        "verify_range_batched: no accumulator registered for num_vars={nv} \
+                         (available: {:?})",
+                        chunk_accs.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Phase 1: absorb chunk_coms for each witness
     for proof in witness_proofs {
@@ -495,11 +519,7 @@ pub fn verify_range_batched(
         let num_vars = num_vars_list[i];
         let r_v = challenge_vec(transcript, num_vars, b"range_r_v");
 
-        let acc_chunk = if num_vars == min_nv {
-            &mut *acc_small
-        } else {
-            &mut *acc_large
-        };
+        let acc_chunk = &mut *chunk_accs[acc_indices[i]].1;
         acc_chunk
             .add_verify_batch(
                 &proof.chunk_coms,
@@ -545,12 +565,9 @@ pub fn verify_range_batched(
     for (i, proof) in witness_proofs.iter().enumerate() {
         let num_vars = num_vars_list[i];
         let n_padded = 1usize << num_vars;
-        // Route LogUp opens to the same accumulator as Phase-2 chunk opens.
-        let acc_logup: &mut HyraxBatchAccumulator = if num_vars == min_nv {
-            &mut *acc_small
-        } else {
-            &mut *acc_large
-        };
+        // Route LogUp opens to the same accumulator as Phase-2 chunk opens
+        // (h_c and chunk_c live at the same Hyrax param size as chunk_coms).
+        let acc_logup: &mut HyraxBatchAccumulator = &mut *chunk_accs[acc_indices[i]].1;
 
         if proof.logup.combined_claims.len() != num_chunks
             || proof.logup.chunk_at_rk.len() != num_chunks

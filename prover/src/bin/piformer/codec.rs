@@ -52,7 +52,7 @@ const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
 const VERSION: u8 = 5;
-const PROOF_VERSION: u8 = 14;
+const PROOF_VERSION: u8 = 16;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -1164,24 +1164,17 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     if let Some(ref sc) = p.attn_z_causal_sumcheck {
         write_sumcheck_cubic_proof_multi(w, sc)?;
     }
-    write_bool(w, p.attn_norm_range_m.is_some())?;
-    if let Some(ref m) = p.attn_norm_range_m {
-        write_global_range_m(w, m)?;
-    }
+    // PROOF_VERSION 15: attn_norm rem/diff share the global ln_range_m — no
+    // separate m_com is serialized.
     write_vec(w, &p.attn_norm_rem_range_proofs, write_range_witness_proof)?;
     write_vec(w, &p.attn_norm_diff_range_proofs, write_range_witness_proof)?;
     // Global intermediate batch open
     write_hyrax_proof(w, &p.inter_batch_open)?;
     // 13 cross-block weight/activation batch opens
     write_hyrax_proof(w, &p.x_norm1_batch_open)?;
-    write_hyrax_proof(w, &p.w_q_batch_open)?;
-    write_hyrax_proof(w, &p.w_k_batch_open)?;
-    write_hyrax_proof(w, &p.w_v_batch_open)?;
-    write_hyrax_proof(w, &p.bias_q_batch_open)?;
-    write_hyrax_proof(w, &p.bias_k_batch_open)?;
-    write_hyrax_proof(w, &p.bias_v_batch_open)?;
+    write_hyrax_proof(w, &p.qkv_w_batch_open)?;
     write_hyrax_proof(w, &p.w_o_batch_open)?;
-    write_hyrax_proof(w, &p.bias_o_batch_open)?;
+    write_hyrax_proof(w, &p.qkvo_bias_batch_open)?;
     write_hyrax_proof(w, &p.w2_batch_open)?;
     write_hyrax_proof(w, &p.ffn_a_batch_open)?;
     write_hyrax_proof(w, &p.w1_batch_open)?;
@@ -1263,25 +1256,15 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         } else {
             None
         },
-        attn_norm_range_m: if read_bool(r)? {
-            Some(read_global_range_m(r)?)
-        } else {
-            None
-        },
         attn_norm_rem_range_proofs: read_vec(r, read_range_witness_proof)?,
         attn_norm_diff_range_proofs: read_vec(r, read_range_witness_proof)?,
         // Global intermediate batch open
         inter_batch_open: read_hyrax_proof(r)?,
         // 13 cross-block weight/activation batch opens
         x_norm1_batch_open: read_hyrax_proof(r)?,
-        w_q_batch_open: read_hyrax_proof(r)?,
-        w_k_batch_open: read_hyrax_proof(r)?,
-        w_v_batch_open: read_hyrax_proof(r)?,
-        bias_q_batch_open: read_hyrax_proof(r)?,
-        bias_k_batch_open: read_hyrax_proof(r)?,
-        bias_v_batch_open: read_hyrax_proof(r)?,
+        qkv_w_batch_open: read_hyrax_proof(r)?,
         w_o_batch_open: read_hyrax_proof(r)?,
-        bias_o_batch_open: read_hyrax_proof(r)?,
+        qkvo_bias_batch_open: read_hyrax_proof(r)?,
         w2_batch_open: read_hyrax_proof(r)?,
         ffn_a_batch_open: read_hyrax_proof(r)?,
         w1_batch_open: read_hyrax_proof(r)?,

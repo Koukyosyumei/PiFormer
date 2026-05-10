@@ -550,23 +550,22 @@ pub struct TransformerModelProof {
     pub attn_z_sumcheck: Option<SumcheckProofMulti>,
     pub attn_z_ksum_sumcheck: Option<SumcheckProofMulti>,
     pub attn_z_causal_sumcheck: Option<SumcheckCubicProofMulti>,
-    pub attn_norm_range_m: Option<GlobalRangeM>,
+    /// PROOF_VERSION 15: attn-norm rem/diff range proofs share the same
+    /// `ln_range_m` as the LayerNorm range batch — they were folded into one
+    /// global `prove_range_batched` call for amortized LogUp consistency.
     pub attn_norm_rem_range_proofs: Vec<RangeWitnessProof>,
     pub attn_norm_diff_range_proofs: Vec<RangeWitnessProof>,
 
     // Global batch open for 5L intermediate matrices at shared r_td
     pub inter_batch_open: HyraxProof,
 
-    // Cross-block batch opens (13 total, one per weight/activation type)
+    // Cross-block batch opens.  PROOF_VERSION 16 (P2): wq/wk/wv share point
+    // `combine(r_k_qkv, r_out)` and bq/bk/bv/bo share point `r_out`, so they
+    // are folded into one merged `hyrax_open_batch` per shared point.
     pub x_norm1_batch_open: HyraxProof,
-    pub w_q_batch_open: HyraxProof,
-    pub w_k_batch_open: HyraxProof,
-    pub w_v_batch_open: HyraxProof,
-    pub bias_q_batch_open: HyraxProof,
-    pub bias_k_batch_open: HyraxProof,
-    pub bias_v_batch_open: HyraxProof,
+    pub qkv_w_batch_open: HyraxProof,
     pub w_o_batch_open: HyraxProof,
-    pub bias_o_batch_open: HyraxProof,
+    pub qkvo_bias_batch_open: HyraxProof,
     pub w2_batch_open: HyraxProof,
     pub ffn_a_batch_open: HyraxProof,
     pub w1_batch_open: HyraxProof,
@@ -929,11 +928,13 @@ pub fn prove(
     ln_range_witnesses.push(final_rw.sigma_witness);
     ln_range_witnesses.push(final_rw.y_witness);
 
-    let ln_range_refs: Vec<&RangeProofWitness> = ln_range_witnesses.iter().collect();
-    let (ln_range_proofs, ln_range_m, ln_range_rvs) =
-        prove_range_batched(&ln_range_refs, LAYERNORM_RANGE_BITS, transcript)?;
-    let mut ln_range_proofs = ln_range_proofs.into_iter();
-    let mut ln_range_rvs = ln_range_rvs.into_iter();
+    // PROOF_VERSION 15 (P1): merge attn-norm range witnesses into the same
+    // global batch as the LN range witnesses.  Both use 64-bit ranges and the
+    // same chunking, so they can share one m_com / one LogUp α/β chain / one
+    // RHS sumcheck.  Witnesses are appended AFTER all LN witnesses (including
+    // final_ln) in deterministic block order so the verifier mirrors exactly.
+    let _: usize = ATTN_NORM_RANGE_BITS; // sanity: must equal LAYERNORM_RANGE_BITS
+    debug_assert_eq!(ATTN_NORM_RANGE_BITS, LAYERNORM_RANGE_BITS);
 
     let mut norm_range_witnesses: Vec<RangeProofWitness> = Vec::new();
     let has_attn_norm = witness
@@ -959,21 +960,53 @@ pub fn prove(
             });
         }
     }
-    let (attn_norm_rem_range_proofs, attn_norm_diff_range_proofs, attn_norm_range_m) =
-        if has_attn_norm {
-            let refs: Vec<&RangeProofWitness> = norm_range_witnesses.iter().collect();
-            let (proofs, m, _) = prove_range_batched(&refs, ATTN_NORM_RANGE_BITS, transcript)?;
-            let mut rem = Vec::with_capacity(num_blocks);
-            let mut diff = Vec::with_capacity(num_blocks);
-            let mut it = proofs.into_iter();
-            for _ in 0..num_blocks {
-                rem.push(it.next().expect("missing attention rem range proof"));
-                diff.push(it.next().expect("missing attention diff range proof"));
-            }
-            (rem, diff, Some(m))
-        } else {
-            (Vec::new(), Vec::new(), None)
-        };
+
+    // Single unified witness list: 10·L LN sub-witnesses + 2 final_ln + (when
+    // has_attn_norm) 2·L attn-norm rem/diff witnesses.
+    let mut all_range_refs: Vec<&RangeProofWitness> =
+        Vec::with_capacity(ln_range_witnesses.len() + norm_range_witnesses.len());
+    for w in &ln_range_witnesses {
+        all_range_refs.push(w);
+    }
+    for w in &norm_range_witnesses {
+        all_range_refs.push(w);
+    }
+
+    let (all_range_proofs, ln_range_m, all_range_rvs) =
+        prove_range_batched(&all_range_refs, LAYERNORM_RANGE_BITS, transcript)?;
+
+    // Split back into LN proofs (first 10·L+2) and attn-norm proofs (next 2·L).
+    let ln_count = ln_range_witnesses.len();
+    let mut all_proofs_iter = all_range_proofs.into_iter();
+    let mut all_rvs_iter = all_range_rvs.into_iter();
+
+    let mut ln_range_proofs = (0..ln_count)
+        .map(|_| all_proofs_iter.next().expect("missing LN range proof"))
+        .collect::<Vec<_>>()
+        .into_iter();
+    let mut ln_range_rvs = (0..ln_count)
+        .map(|_| all_rvs_iter.next().expect("missing LN range rv"))
+        .collect::<Vec<_>>()
+        .into_iter();
+
+    let (attn_norm_rem_range_proofs, attn_norm_diff_range_proofs) = if has_attn_norm {
+        let mut rem = Vec::with_capacity(num_blocks);
+        let mut diff = Vec::with_capacity(num_blocks);
+        for _ in 0..num_blocks {
+            rem.push(all_proofs_iter.next().expect("missing attn rem range proof"));
+            // discard attn-norm rvs — they aren't consumed by downstream sub-proofs
+            let _ = all_rvs_iter.next().expect("missing attn rem range rv");
+            diff.push(
+                all_proofs_iter
+                    .next()
+                    .expect("missing attn diff range proof"),
+            );
+            let _ = all_rvs_iter.next().expect("missing attn diff range rv");
+        }
+        (rem, diff)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     for i in 0..num_blocks {
         let range_proofs = [
@@ -2072,7 +2105,10 @@ pub fn prove(
     // =========================================================================
     // 13. Advance transcript for accumulator mu challenges
     // =========================================================================
-    for _ in 0..15 {
+    // Verifier draws 13 mus (PROOF_VERSION 15): inter, ln_t, ln_td, proj_w,
+    // proj_b, lmh_w, lmh_b, rng_sig, rng_y, rng_m, quant_ffn, quant_m,
+    // attn_norm.  Plus 2 read-only rho fuse challenges (consumed below).
+    for _ in 0..13 {
         let _ = transcript.challenge_field::<F>(b"hyrax_group_mu");
     }
 
@@ -2102,46 +2138,20 @@ pub fn prove(
     let x_norm1_batch_open =
         hyrax_open_batch(&x_norm1_refs, &x_norm1_point, nu_td, sigma_td, transcript);
 
-    // w_q_batch: L Wq_i at combine(r_k_qkv, r_out) [d_bits + d_bits]
+    // P2: wq/wk/wv all open at the same point combine(r_k_qkv, r_out) with
+    // params_qkvo_w — fold into ONE hyrax_open_batch over 3·L commitments.
     let wq_point = combine(&r_k_qkv, &r_out);
-    let wq_refs: Vec<&[F]> = static_mles
-        .iter()
-        .map(|m| m.w_q.evaluations.as_slice())
-        .collect();
-    let w_q_batch_open = hyrax_open_batch(&wq_refs, &wq_point, nu_w, sigma_w, transcript);
+    let mut qkv_w_refs: Vec<&[F]> = Vec::with_capacity(3 * num_blocks);
+    for sm in &static_mles {
+        qkv_w_refs.push(sm.w_q.evaluations.as_slice());
+        qkv_w_refs.push(sm.w_k.evaluations.as_slice());
+        qkv_w_refs.push(sm.w_v.evaluations.as_slice());
+    }
+    let qkv_w_batch_open =
+        hyrax_open_batch(&qkv_w_refs, &wq_point, nu_w, sigma_w, transcript);
 
-    let wk_refs: Vec<&[F]> = static_mles
-        .iter()
-        .map(|m| m.w_k.evaluations.as_slice())
-        .collect();
-    let w_k_batch_open = hyrax_open_batch(&wk_refs, &wq_point, nu_w, sigma_w, transcript);
-
-    let wv_refs: Vec<&[F]> = static_mles
-        .iter()
-        .map(|m| m.w_v.evaluations.as_slice())
-        .collect();
-    let w_v_batch_open = hyrax_open_batch(&wv_refs, &wq_point, nu_w, sigma_w, transcript);
-
-    // bias_q/k/v batch at r_out [d_bits]
-    let bq_refs: Vec<&[F]> = static_mles
-        .iter()
-        .map(|m| m.b_q.evaluations.as_slice())
-        .collect();
-    let bias_q_batch_open = hyrax_open_batch(&bq_refs, &r_out, nu_b, sigma_b, transcript);
-
-    let bk_refs: Vec<&[F]> = static_mles
-        .iter()
-        .map(|m| m.b_k.evaluations.as_slice())
-        .collect();
-    let bias_k_batch_open = hyrax_open_batch(&bk_refs, &r_out, nu_b, sigma_b, transcript);
-
-    let bv_refs: Vec<&[F]> = static_mles
-        .iter()
-        .map(|m| m.b_v.evaluations.as_slice())
-        .collect();
-    let bias_v_batch_open = hyrax_open_batch(&bv_refs, &r_out, nu_b, sigma_b, transcript);
-
-    // w_o_batch: L Wo_i at combine(r_k_o, r_out) [d_bits + d_bits]
+    // w_o_batch: L Wo_i at combine(r_k_o, r_out) [d_bits + d_bits].  Different
+    // point from the qkv_w group; stays as its own (small) batch.
     let wo_point = combine(&r_k_o, &r_out);
     let wo_refs: Vec<&[F]> = static_mles
         .iter()
@@ -2149,12 +2159,17 @@ pub fn prove(
         .collect();
     let w_o_batch_open = hyrax_open_batch(&wo_refs, &wo_point, nu_w, sigma_w, transcript);
 
-    // bias_o_batch at r_out
-    let bo_refs: Vec<&[F]> = static_mles
-        .iter()
-        .map(|m| m.b_o.evaluations.as_slice())
-        .collect();
-    let bias_o_batch_open = hyrax_open_batch(&bo_refs, &r_out, nu_b, sigma_b, transcript);
+    // P2: bq/bk/bv/bo all open at r_out with params_qkvo_b — fold all four
+    // bias groups into ONE hyrax_open_batch over 4·L commitments.
+    let mut qkvo_bias_refs: Vec<&[F]> = Vec::with_capacity(4 * num_blocks);
+    for sm in &static_mles {
+        qkvo_bias_refs.push(sm.b_q.evaluations.as_slice());
+        qkvo_bias_refs.push(sm.b_k.evaluations.as_slice());
+        qkvo_bias_refs.push(sm.b_v.evaluations.as_slice());
+        qkvo_bias_refs.push(sm.b_o.evaluations.as_slice());
+    }
+    let qkvo_bias_batch_open =
+        hyrax_open_batch(&qkvo_bias_refs, &r_out, nu_b, sigma_b, transcript);
 
     // w2_batch: L W2_i at combine(r_k_fy, r_out) [f_bits + d_bits]
     let w2_point = combine(&r_k_fy, &r_out);
@@ -2365,6 +2380,13 @@ pub fn prove(
         (None, None, None)
     };
 
+    // V1: drain mus for the 5 cross_batch_opens accumulators (params_td,
+    // params_qkvo_w, params_qkvo_b, params_wff, params_mff).  Mirrors verifier
+    // ordering at end of cross_batch_opens.
+    for _ in 0..5 {
+        let _ = transcript.challenge_field::<F>(b"hyrax_group_mu");
+    }
+
     // =========================================================================
     // 16. Global batched Lasso (attention)
     // =========================================================================
@@ -2509,19 +2531,13 @@ pub fn prove(
         attn_z_sumcheck,
         attn_z_ksum_sumcheck,
         attn_z_causal_sumcheck,
-        attn_norm_range_m,
         attn_norm_rem_range_proofs,
         attn_norm_diff_range_proofs,
         inter_batch_open,
         x_norm1_batch_open,
-        w_q_batch_open,
-        w_k_batch_open,
-        w_v_batch_open,
-        bias_q_batch_open,
-        bias_k_batch_open,
-        bias_v_batch_open,
+        qkv_w_batch_open,
         w_o_batch_open,
-        bias_o_batch_open,
+        qkvo_bias_batch_open,
         w2_batch_open,
         ffn_a_batch_open,
         w1_batch_open,
