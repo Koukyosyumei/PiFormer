@@ -18,7 +18,7 @@ use piformer_prover::{
             LayerNormsBatchedProof, LayerNormsGroupOpenings, LayerNormsGroupProof,
         },
         projection::{
-            ProjectionOpenings, ProjectionProof, ProjectionProvingKey, ProjectionVerifyingKey,
+            ProjectionGKRProof, ProjectionProvingKey, ProjectionVerifyingKey,
         },
     },
     ffn::ffn::{FFNInstance, FFNProvingKey, FFNVerifyingKey},
@@ -52,7 +52,7 @@ const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
 const VERSION: u8 = 5;
-const PROOF_VERSION: u8 = 17;
+const PROOF_VERSION: u8 = 18;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -984,40 +984,26 @@ fn read_ln_batched_proof<R: Read>(r: &mut R) -> io::Result<LayerNormsBatchedProo
     })
 }
 
-// ---------------------------------------------------------------------------
-// Projection proof
-// ---------------------------------------------------------------------------
-
-fn write_proj_openings<W: Write>(w: &mut W, o: &ProjectionOpenings) -> io::Result<()> {
-    write_f(w, &o.y_eval)?;
-    write_f(w, &o.x_eval)?;
-    write_ep!(w, &o.w_eval, &o.w_open);
-    write_ep!(w, &o.bias_at_rj, &o.bias_opening_proof);
+fn write_proj_gkr_proof<W: Write>(w: &mut W, p: &ProjectionGKRProof) -> io::Result<()> {
+    write_sumcheck_proof(w, &p.sumcheck)?;
+    write_f(w, &p.x_eval)?;
+    write_ep!(w, &p.w_eval, &p.w_open);
+    write_ep!(w, &p.bias_eval, &p.bias_open);
     Ok(())
 }
-fn read_proj_openings<R: Read>(r: &mut R) -> io::Result<ProjectionOpenings> {
-    let y_eval = read_f(r)?;
+
+fn read_proj_gkr_proof<R: Read>(r: &mut R) -> io::Result<ProjectionGKRProof> {
+    let sumcheck = read_sumcheck_proof(r)?;
     let x_eval = read_f(r)?;
     let (w_eval, w_open) = read_ep!(r);
-    let (bias_at_rj, bias_opening_proof) = read_ep!(r);
-    Ok(ProjectionOpenings {
-        y_eval,
+    let (bias_eval, bias_open) = read_ep!(r);
+    Ok(ProjectionGKRProof {
+        sumcheck,
         x_eval,
         w_eval,
         w_open,
-        bias_at_rj,
-        bias_opening_proof,
-    })
-}
-
-fn write_proj_proof<W: Write>(w: &mut W, p: &ProjectionProof) -> io::Result<()> {
-    write_sumcheck_proof(w, &p.sumcheck)?;
-    write_proj_openings(w, &p.openings)
-}
-fn read_proj_proof<R: Read>(r: &mut R) -> io::Result<ProjectionProof> {
-    Ok(ProjectionProof {
-        sumcheck: read_sumcheck_proof(r)?,
-        openings: read_proj_openings(r)?,
+        bias_eval,
+        bias_open,
     })
 }
 
@@ -1133,10 +1119,9 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     // PROOF_VERSION 13: cross-LN batched proof replaces final_ln_proof + the
     // per-block LN proofs that used to live inside write_block_proof.
     write_ln_batched_proof(w, &p.ln_batched_proof)?;
-    write_proj_proof(w, &p.lm_head_proof)?;
+    write_proj_gkr_proof(w, &p.lm_head_proof)?;
     write_hyrax_commitment(w, &p.final_ln_out_com)?;
-    write_hyrax_commitment(w, &p.logits_com)?;
-    write_hyrax_proof(w, &p.lm_head_logits_open)?;
+    write_hyrax_proof(w, &p.lm_head_input_open)?;
     write_lasso_multi_proof(w, &p.ffn_lasso_proof)?;
     write_lasso_multi_proof(w, &p.all_lasso_proof)?;
     write_quantization_proof(w, &p.ffn_quant_proof)?;
@@ -1217,10 +1202,9 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         x_in_com: read_hyrax_commitment(r)?,
         block_proofs: read_vec(r, read_block_proof)?,
         ln_batched_proof: read_ln_batched_proof(r)?,
-        lm_head_proof: read_proj_proof(r)?,
+        lm_head_proof: read_proj_gkr_proof(r)?,
         final_ln_out_com: read_hyrax_commitment(r)?,
-        logits_com: read_hyrax_commitment(r)?,
-        lm_head_logits_open: read_hyrax_proof(r)?,
+        lm_head_input_open: read_hyrax_proof(r)?,
         ffn_lasso_proof: read_lasso_multi_proof(r)?,
         all_lasso_proof: read_lasso_multi_proof(r)?,
         ffn_quant_proof: read_quantization_proof(r)?,

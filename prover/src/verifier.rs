@@ -15,13 +15,13 @@ use crate::lookup::lasso::{
 use crate::lookup::quantization::{verify_quantization_batch, QuantizationParams};
 use crate::lookup::range::{verify_range_batched, RangeWitnessProof};
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_verify, hyrax_verify_batch, lagrange_basis, params_from_vars,
+    absorb_com, hyrax_commit, hyrax_verify_batch, lagrange_basis, params_from_vars,
     HyraxBatchAccumulator, HyraxCommitment, HyraxParams,
 };
 use crate::poly::utils::{combine, compute_eq_evals, mat_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{
-    eq_poly_eval, verify_sumcheck_cubic_multi_batched, verify_sumcheck_multi_batched,
+    eq_poly_eval, verify_sumcheck_cubic_multi_batched, verify_sumcheck_multi_batched, EvalClaim,
 };
 use crate::transcript::{challenge_vec, Transcript};
 
@@ -30,7 +30,7 @@ use crate::attention::layernorm::{
     verify_layernorms_batched, LayerNormIOCommitments, LayerNormVerifyingKey,
 };
 use crate::attention::projection::{
-    verify_projection, ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
+    verify_projection_gkr, ProjectionProvingKey, ProjectionVerifyingKey,
 };
 use crate::ffn::ffn::{FFNInstance, FFNProvingKey, FFNVerifyingKey};
 use ark_ec::{AffineRepr, CurveGroup};
@@ -299,6 +299,7 @@ pub fn verify(
     }
     let t_bits = t.next_power_of_two().trailing_zeros() as usize;
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
+    let v_bits = v_vocab.next_power_of_two().trailing_zeros() as usize;
     let td_num_vars = t_bits + d_bits;
     let (_, _, params_t) = params_from_vars(t_bits);
     let (_, _, params_td) = params_from_vars(td_num_vars);
@@ -331,9 +332,10 @@ pub fn verify(
     if !commitments_equal(&proof.x_in_com, &expected_x_in_com) {
         return Err("public input does not match x_in commitment".into());
     }
-    let expected_logits_com = commit_public_mat(public_logits, t, v_vocab)?;
-    if !commitments_equal(&proof.logits_com, &expected_logits_com) {
-        return Err("public output does not match logits commitment".into());
+    if public_logits.len() != t || public_logits.iter().any(|row| row.len() != v_vocab) {
+        return Err(format!(
+            "public output shape mismatch: expected {t}x{v_vocab}"
+        ));
     }
 
     let mut ln_acc_t = HyraxBatchAccumulator::new();
@@ -1260,34 +1262,34 @@ pub fn verify(
     // 11. LM Head
     // =========================================================================
     let _t0 = Instant::now();
-    let lm_io = ProjectionIOCommitments {
-        x_com: Some(proof.final_ln_out_com.clone()),
+    let public_logits_mle = mat_to_mle(public_logits, t, v_vocab);
+    let lm_y_point = challenge_vec(transcript, t_bits + v_bits, b"lm_gkr_y");
+    let lm_y_value = public_logits_mle.evaluate(&lm_y_point);
+    let lm_y_claim = EvalClaim {
+        point: lm_y_point,
+        value: lm_y_value,
     };
-    let (lm_y_claim, _) = verify_projection(
+    let lm_x_claim = verify_projection_gkr(
         &proof.lm_head_proof,
         &vk.lm_head_vk,
-        &lm_io,
+        &lm_y_claim,
         transcript,
         &mut lmh_acc_w,
         &mut lmh_acc_b,
-        None,
     )
     .map_err(|e| format!("LM Head: {e}"))?;
+    ln_acc_td
+        .add_verify(
+            &proof.final_ln_out_com,
+            lm_x_claim.value,
+            &lm_x_claim.point,
+            &proof.lm_head_input_open,
+        )
+        .map_err(|e| format!("LM head input opening: {e}"))?;
     eprintln!(
         "[model] lm_head:{:>8.3}ms",
         _t0.elapsed().as_secs_f64() * 1000.0
     );
-
-    let v_bits = v_vocab.next_power_of_two().trailing_zeros() as usize;
-    let (_, _, params_logits) = params_from_vars(t_bits + v_bits);
-    hyrax_verify(
-        &proof.logits_com,
-        lm_y_claim.value,
-        &lm_y_claim.point,
-        &proof.lm_head_logits_open,
-        &params_logits,
-    )
-    .map_err(|e| format!("Logits commit: {e}"))?;
 
     // =========================================================================
     // 12. Finalize accumulators (same order as prover's mu challenge loop)

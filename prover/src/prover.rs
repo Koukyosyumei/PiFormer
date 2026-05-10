@@ -26,8 +26,8 @@ use crate::attention::layernorm::{
     LayerNormsBatchedProof,
 };
 use crate::attention::projection::{
-    prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionProvingKey,
-    ProjectionVerifyingKey, ProjectionWitness,
+    prove_projection_gkr, ProjectionGKRProof, ProjectionProvingKey, ProjectionVerifyingKey,
+    ProjectionWitness,
 };
 use crate::ffn::ffn::{FFNInstance, FFNWitness};
 use crate::lookup::lasso::{
@@ -528,10 +528,9 @@ pub struct TransformerModelProof {
     /// (5 per block: ln1, q_norm, k_norm, attn_out_norm, ln2; plus final_ln).
     /// Replaces the per-block + per-final LN proofs of PROOF_VERSION 12.
     pub ln_batched_proof: LayerNormsBatchedProof,
-    pub lm_head_proof: ProjectionProof,
+    pub lm_head_proof: ProjectionGKRProof,
     pub final_ln_out_com: HyraxCommitment,
-    pub logits_com: HyraxCommitment,
-    pub lm_head_logits_open: HyraxProof,
+    pub lm_head_input_open: HyraxProof,
     pub ffn_lasso_proof: LassoMultiProof,
     pub all_lasso_proof: LassoMultiProof,
     pub ffn_quant_proof: QuantizationProof,
@@ -2160,23 +2159,23 @@ pub fn prove(
     // =========================================================================
     // 12. LM Head
     // =========================================================================
+    let final_ln_out_mle = mat_to_mle(&witness.final_ln_wit.y, t, d);
     let logits_mle = mat_to_mle(&witness.lm_head_wit.y, t, v);
-    let logits_com = commit_mat(&witness.lm_head_wit.y, t, v);
-    let lm_io = ProjectionIOCommitments {
-        x_com: Some(final_ln_out_com.clone()),
+    let v_bits = v.next_power_of_two().trailing_zeros() as usize;
+    let lm_y_point = challenge_vec(transcript, t_bits + v_bits, b"lm_gkr_y");
+    let lm_y_value = logits_mle.evaluate(&lm_y_point);
+    let lm_y_claim = crate::subprotocols::EvalClaim {
+        point: lm_y_point,
+        value: lm_y_value,
     };
-    let (lm_head_proof, lm_y_claim, _) = prove_projection(
+    let (lm_head_proof, lm_x_claim) = prove_projection_gkr(
         &pk.lm_head_pk,
         &witness.lm_head_wit,
-        &lm_io,
+        &lm_y_claim,
         transcript,
-        None,
     )?;
-    let v_bits = v.next_power_of_two().trailing_zeros() as usize;
-    let lm_logits_num_vars = t_bits + v_bits;
-    let (lm_nu, lm_sigma, _) = params_from_vars(lm_logits_num_vars);
-    let lm_head_logits_open =
-        hyrax_open(&logits_mle.evaluations, &lm_y_claim.point, lm_nu, lm_sigma);
+    let lm_head_input_open =
+        hyrax_open(&final_ln_out_mle.evaluations, &lm_x_claim.point, nu_td, sigma_td);
     eprintln!(
         "[prove] lm_head: {:7.3}ms",
         phase_t0.elapsed().as_secs_f64() * 1000.0
@@ -2591,8 +2590,7 @@ pub fn prove(
         ln_batched_proof,
         lm_head_proof,
         final_ln_out_com,
-        logits_com,
-        lm_head_logits_open,
+        lm_head_input_open,
         ffn_lasso_proof,
         all_lasso_proof,
         ffn_quant_proof,
@@ -3234,7 +3232,7 @@ mod tests {
 
         let mut pt = Transcript::new(b"model_tamper_lm");
         let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
-        proof.lm_head_proof.openings.y_eval += F::ONE;
+        proof.lm_head_proof.x_eval += F::ONE;
 
         let mut vt = Transcript::new(b"model_tamper_lm");
         let result = verify(
@@ -3248,6 +3246,32 @@ mod tests {
             &lp,
         );
         assert!(result.is_err(), "Should reject tampered LM head proof");
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_public_output() {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_tamper_public_output");
+        let proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        let mut public_output = model_wit.lm_head_wit.y.clone();
+        public_output[0][0] += F::ONE;
+
+        let mut vt = Transcript::new(b"model_tamper_public_output");
+        let result = verify(
+            &proof,
+            &pk.vk,
+            &inst_attn,
+            &inst_ffn,
+            &model_wit.x_in,
+            &public_output,
+            &mut vt,
+            &lp,
+        );
+        assert!(result.is_err(), "Should reject tampered public output");
     }
 
     #[test]
