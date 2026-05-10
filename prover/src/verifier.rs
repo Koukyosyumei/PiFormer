@@ -62,11 +62,12 @@ pub struct TransformerBlockVerifyingKey {
     pub o_pk: ProjectionProvingKey,
     pub ffn_pk: FFNProvingKey,
     pub attn_pk: AttentionProvingKey,
-    // QK-norm (training-time additions; conventional-mode proofs).
-    // attn_out_norm is in the trained model but bypassed in the proof pipeline
-    // (its post-attention input exceeds the 32-bit range proof capacity).
+    // Sandwich-norm LayerNorms.  attn_out_norm is in the proof pipeline as of
+    // the soundness fix (production range proofs are 64-bit, wide enough for
+    // typical model dimensions).
     pub q_norm_vk: LayerNormVerifyingKey,
     pub k_norm_vk: LayerNormVerifyingKey,
+    pub attn_out_norm_vk: LayerNormVerifyingKey,
 }
 
 // ---------------------------------------------------------------------------
@@ -359,8 +360,8 @@ pub fn verify(
     let mut current_x_com = proof.x_in_com.clone();
     let ln_sigma_n = (2 * t).next_power_of_two().trailing_zeros() as usize;
     let ln_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
-    let mut ln_range_proofs = Vec::with_capacity(8 * num_blocks + 2);
-    let mut ln_range_num_vars = Vec::with_capacity(8 * num_blocks + 2);
+    let mut ln_range_proofs = Vec::with_capacity(10 * num_blocks + 2);
+    let mut ln_range_num_vars = Vec::with_capacity(10 * num_blocks + 2);
     for bp in &proof.block_proofs {
         ln_range_proofs.push(&bp.ln1_proof.sigma_range_proof);
         ln_range_num_vars.push(ln_sigma_n);
@@ -370,7 +371,8 @@ pub fn verify(
         ln_range_num_vars.push(ln_sigma_n);
         ln_range_proofs.push(&bp.ln2_proof.y_range_proof);
         ln_range_num_vars.push(ln_y_n);
-        // QK-norm: order matches prover's ln_range_witnesses push order.
+        // Sandwich-norm range witnesses: order matches prover's push order
+        // (q_norm, k_norm, attn_out_norm).
         ln_range_proofs.push(&bp.q_norm_proof.sigma_range_proof);
         ln_range_num_vars.push(ln_sigma_n);
         ln_range_proofs.push(&bp.q_norm_proof.y_range_proof);
@@ -378,6 +380,10 @@ pub fn verify(
         ln_range_proofs.push(&bp.k_norm_proof.sigma_range_proof);
         ln_range_num_vars.push(ln_sigma_n);
         ln_range_proofs.push(&bp.k_norm_proof.y_range_proof);
+        ln_range_num_vars.push(ln_y_n);
+        ln_range_proofs.push(&bp.attn_out_norm_proof.sigma_range_proof);
+        ln_range_num_vars.push(ln_sigma_n);
+        ln_range_proofs.push(&bp.attn_out_norm_proof.y_range_proof);
         ln_range_num_vars.push(ln_y_n);
     }
     ln_range_proofs.push(&proof.final_ln_proof.sigma_range_proof);
@@ -444,11 +450,11 @@ pub fn verify(
     for i in 0..num_blocks {
         let bp = &proof.block_proofs[i];
         let bvk = &vk.block_vks[i];
-        // 8 sub-witnesses per block in the model-level batched range proof:
+        // 10 sub-witnesses per block in the model-level batched range proof:
         //   [ln1_sigma, ln1_y, ln2_sigma, ln2_y,
-        //    q_norm_sigma, q_norm_y, k_norm_sigma, k_norm_y]
-        // (attn_out_norm is bypassed in the proof pipeline, see Pass-1 notes.)
-        let rv_base = 8 * i;
+        //    q_norm_sigma, q_norm_y, k_norm_sigma, k_norm_y,
+        //    attn_out_norm_sigma, attn_out_norm_y]
+        let rv_base = 10 * i;
         let ln1_sig_rv = &ln_range_r_vs[rv_base];
         let ln1_y_rv = &ln_range_r_vs[rv_base + 1];
         let ln2_sig_rv = &ln_range_r_vs[rv_base + 2];
@@ -457,6 +463,8 @@ pub fn verify(
         let q_norm_y_rv = &ln_range_r_vs[rv_base + 5];
         let k_norm_sig_rv = &ln_range_r_vs[rv_base + 6];
         let k_norm_y_rv = &ln_range_r_vs[rv_base + 7];
+        let aon_sig_rv = &ln_range_r_vs[rv_base + 8];
+        let aon_y_rv = &ln_range_r_vs[rv_base + 9];
 
         // LN1
         let ln1_io = LayerNormIOCommitments {
@@ -534,9 +542,29 @@ pub fn verify(
         )?;
         absorb_com(transcript, b"k_norm_y_com", &bp.k_norm_y_com);
 
-        // Residual: x_mid = x_in + out_attn (raw).  attn_out_norm exists in the
-        // PyTorch model for stabilization but is bypassed in the proof pipeline.
-        let x_mid_com = add_commitments(&current_x_com, &bp.out_attn_com);
+        // attn_out_norm: x = out_attn (out_attn_com), y = post-norm output.
+        let attn_out_norm_io = LayerNormIOCommitments {
+            x_com: bp.out_attn_com.clone(),
+            y_com: Some(bp.attn_out_norm_y_com.clone()),
+        };
+        verify_layernorm(
+            &bp.attn_out_norm_proof,
+            &attn_out_norm_io,
+            &bvk.attn_out_norm_vk,
+            aon_sig_rv,
+            aon_y_rv,
+            transcript,
+            &mut ln_acc_t,
+            &mut ln_acc_td,
+        )?;
+        absorb_com(
+            transcript,
+            b"attn_out_norm_y_com",
+            &bp.attn_out_norm_y_com,
+        );
+
+        // Residual flows through the normalized attention output.
+        let x_mid_com = add_commitments(&current_x_com, &bp.attn_out_norm_y_com);
 
         // LN2
         let ln2_io = LayerNormIOCommitments {
@@ -1162,8 +1190,8 @@ pub fn verify(
         &proof.final_ln_proof,
         &ln_io,
         &vk.final_ln_vk,
-        &ln_range_r_vs[8 * num_blocks],
-        &ln_range_r_vs[8 * num_blocks + 1],
+        &ln_range_r_vs[10 * num_blocks],
+        &ln_range_r_vs[10 * num_blocks + 1],
         transcript,
         &mut ln_acc_t,
         &mut ln_acc_td,

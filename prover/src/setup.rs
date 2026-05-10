@@ -45,9 +45,11 @@ pub struct TransformerBlockWeights {
     pub q_norm_beta: Vec<F>,
     pub k_norm_gamma: Vec<F>,
     pub k_norm_beta: Vec<F>,
-    // NOTE: attn_out_norm exists in the trained PyTorch model for stabilization,
-    // but is bypassed in the proof pipeline because its input (post-attention
-    // out_attn) has magnitude that exceeds the 32-bit range proof capacity.
+    // attn_out_norm: LayerNorm applied to o_proj output before the residual.
+    // Production range proofs are 64-bit (LAYERNORM_RANGE_BITS), wide enough for
+    // typical model dimensions, so this LN is included in the proof pipeline.
+    pub attn_out_norm_gamma: Vec<F>,
+    pub attn_out_norm_beta: Vec<F>,
     // LayerNorm 2
     pub ln2_gamma: Vec<F>,
     pub ln2_beta: Vec<F>,
@@ -124,7 +126,8 @@ pub fn preprocess_transformer_model(
             scale_gamma: F::from(1u64),
             scale_beta: F::from(1u64),
         };
-        // QK-norm VKs.  attn_out_norm is intentionally NOT in the proof pipeline.
+        // QK-norm VKs and attn_out_norm VK.  All three sandwich-norm LayerNorms
+        // are now in the proof pipeline.
         let q_norm_vk = LayerNormVerifyingKey {
             seq_len: t,
             d_head: d,
@@ -138,6 +141,14 @@ pub fn preprocess_transformer_model(
             d_head: d,
             gamma: bw.k_norm_gamma.clone(),
             beta: bw.k_norm_beta.clone(),
+            scale_gamma: F::from(1u64),
+            scale_beta: F::from(1u64),
+        };
+        let attn_out_norm_vk = LayerNormVerifyingKey {
+            seq_len: t,
+            d_head: d,
+            gamma: bw.attn_out_norm_gamma.clone(),
+            beta: bw.attn_out_norm_beta.clone(),
             scale_gamma: F::from(1u64),
             scale_beta: F::from(1u64),
         };
@@ -195,6 +206,7 @@ pub fn preprocess_transformer_model(
             attn_pk,
             q_norm_vk,
             k_norm_vk,
+            attn_out_norm_vk,
         };
 
         block_vks.push(block_vk.clone());

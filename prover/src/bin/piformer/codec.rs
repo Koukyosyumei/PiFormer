@@ -50,8 +50,8 @@ use piformer_prover::{
 const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
-const VERSION: u8 = 4;
-const PROOF_VERSION: u8 = 11;
+const VERSION: u8 = 5;
+const PROOF_VERSION: u8 = 12;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -873,11 +873,13 @@ fn read_proj_proof<R: Read>(r: &mut R) -> io::Result<ProjectionProof> {
 fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Result<()> {
     write_ln_proof(w, &p.ln1_proof)?;
     write_ln_proof(w, &p.ln2_proof)?;
-    // QK-norm proofs (attn_out_norm is bypassed in the proof pipeline).
+    // Sandwich-norm LayerNorms (q_norm, k_norm, attn_out_norm).
     write_ln_proof(w, &p.q_norm_proof)?;
     write_ln_proof(w, &p.k_norm_proof)?;
+    write_ln_proof(w, &p.attn_out_norm_proof)?;
     write_hyrax_commitment(w, &p.q_norm_y_com)?;
     write_hyrax_commitment(w, &p.k_norm_y_com)?;
+    write_hyrax_commitment(w, &p.attn_out_norm_y_com)?;
     // FFN per-block
     write_lasso_proof(w, &p.ffn_lasso_proof)?;
     write_hyrax_commitment(w, &p.ffn_a_com)?;
@@ -923,11 +925,13 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
     Ok(TransformerBlockProof {
         ln1_proof: read_ln_proof(r)?,
         ln2_proof: read_ln_proof(r)?,
-        // QK-norm proofs (attn_out_norm is bypassed in the proof pipeline).
+        // Sandwich-norm LayerNorms (q_norm, k_norm, attn_out_norm).
         q_norm_proof: read_ln_proof(r)?,
         k_norm_proof: read_ln_proof(r)?,
+        attn_out_norm_proof: read_ln_proof(r)?,
         q_norm_y_com: read_hyrax_commitment(r)?,
         k_norm_y_com: read_hyrax_commitment(r)?,
+        attn_out_norm_y_com: read_hyrax_commitment(r)?,
         // FFN per-block
         ffn_lasso_proof: read_lasso_proof(r)?,
         ffn_a_com: read_hyrax_commitment(r)?,
@@ -1389,6 +1393,7 @@ fn write_block_vk<W: Write>(
     // QK-norm VKs (attn_out_norm is bypassed in the proof pipeline).
     write_ln_vk(w, &bvk.q_norm_vk)?;
     write_ln_vk(w, &bvk.k_norm_vk)?;
+    write_ln_vk(w, &bvk.attn_out_norm_vk)?;
     write_bool(w, include_weights)?;
     if include_weights {
         write_proj_pk(w, &bvk.q_pk)?;
@@ -1415,6 +1420,7 @@ fn read_block_vk<R: Read>(r: &mut R) -> io::Result<TransformerBlockVerifyingKey>
     let attn_pk = read_attn_pk(r)?;
     let q_norm_vk = read_ln_vk(r)?;
     let k_norm_vk = read_ln_vk(r)?;
+    let attn_out_norm_vk = read_ln_vk(r)?;
     let has_weights = read_bool(r)?;
     let (q_pk, k_pk, v_pk, o_pk, ffn_pk) = if has_weights {
         (
@@ -1469,6 +1475,7 @@ fn read_block_vk<R: Read>(r: &mut R) -> io::Result<TransformerBlockVerifyingKey>
         attn_pk,
         q_norm_vk,
         k_norm_vk,
+        attn_out_norm_vk,
     })
 }
 

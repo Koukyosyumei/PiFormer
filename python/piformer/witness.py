@@ -435,15 +435,25 @@ def _gen_block_witness(
     )
     out_attn = _add_bias_int(_project(attn_proj_in, w_o_T), o_bias)
 
-    # NOTE: blk.attn_out_norm is intentionally bypassed in the integer witness.
-    # Its input (post-attention out_attn) has magnitude O(d·quant_scale·max(V)·max(φ))
-    # which exceeds the 32-bit range proof capacity used by compute_range_witnesses.
-    # The PyTorch model still applies attn_out_norm during training (to stabilize
-    # the residual stream); the proof pipeline verifies "PiFormer minus attn_out_norm" —
-    # a known architectural mismatch.
+    # ---- attn_out_norm (sandwich norm post-attention LayerNorm) ----
+    # The PyTorch model applies LayerNorm to out_attn before the residual.
+    # Production range proofs are 64-bit (LAYERNORM_RANGE_BITS), which is wide
+    # enough for typical model dimensions; an earlier 32-bit version of the
+    # range proof was the reason this LN was bypassed.
+    aon_gamma_int, aon_beta_int = _prepare_ln_weights(
+        blk.attn_out_norm.weight.detach().tolist(),
+        blk.attn_out_norm.bias.detach().tolist(),
+        out_attn,
+        d,
+        ln_scale,
+        extra_beta_floor,
+    )
+    aon_y, aon_sum_x, aon_var_x, aon_sigma = compute_ln_witness(
+        out_attn, aon_gamma_int, aon_beta_int, d
+    )
 
-    # ---- Residual 1 (raw attention output; attn_out_norm not in proof path) ----
-    x_mid = mat_add_int(x_in, out_attn)
+    # ---- Residual 1 (uses normalized attention output) ----
+    x_mid = mat_add_int(x_in, aon_y)
 
     # ---- LN2 ----
     ln2_gamma_int, ln2_beta_int = _prepare_ln_weights(
@@ -555,6 +565,13 @@ def _gen_block_witness(
             "out": mat_to_json(attn_out),
         },
         "o_proj": {"x": mat_to_json(attn_proj_in), "y": mat_to_json(out_attn)},
+        "attn_out_norm": {
+            "x": mat_to_json(out_attn),
+            "y": mat_to_json(aon_y),
+            "sum_x": vec_to_json(aon_sum_x),
+            "var_x": vec_to_json(aon_var_x),
+            "sigma": vec_to_json(aon_sigma),
+        },
         "x_mid": mat_to_json(x_mid),
         "ln2": {
             "x": mat_to_json(x_mid),
@@ -583,6 +600,7 @@ def _gen_block_witness(
         "ln2": (ln2_gamma_int, ln2_beta_int),
         "q_norm": (qn_gamma_int, qn_beta_int),
         "k_norm": (kn_gamma_int, kn_beta_int),
+        "attn_out_norm": (aon_gamma_int, aon_beta_int),
     }
 
     return block_wit, x_out

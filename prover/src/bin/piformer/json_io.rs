@@ -149,7 +149,7 @@ pub struct JsonBlockWeights {
     pub o_alpha: String,
     #[serde(default)]
     pub o_bias: Vec<String>,
-    // Stabilization LayerNorms (gamma/beta vectors only; conventional-mode VKs).
+    // Sandwich-norm LayerNorms (gamma/beta vectors only).
     #[serde(default)]
     pub q_norm_gamma: Vec<String>,
     #[serde(default)]
@@ -158,6 +158,10 @@ pub struct JsonBlockWeights {
     pub k_norm_gamma: Vec<String>,
     #[serde(default)]
     pub k_norm_beta: Vec<String>,
+    #[serde(default)]
+    pub attn_out_norm_gamma: Vec<String>,
+    #[serde(default)]
+    pub attn_out_norm_beta: Vec<String>,
     pub ln2_gamma: Vec<String>,
     pub ln2_beta: Vec<String>,
     pub ffn_w1: Vec<Vec<i8>>,
@@ -231,6 +235,8 @@ pub fn weights_to_json(w: &TransformerModelWeights) -> JsonWeights {
             q_norm_beta: vec_to_json(&b.q_norm_beta),
             k_norm_gamma: vec_to_json(&b.k_norm_gamma),
             k_norm_beta: vec_to_json(&b.k_norm_beta),
+            attn_out_norm_gamma: vec_to_json(&b.attn_out_norm_gamma),
+            attn_out_norm_beta: vec_to_json(&b.attn_out_norm_beta),
             ln2_gamma: vec_to_json(&b.ln2_gamma),
             ln2_beta: vec_to_json(&b.ln2_beta),
             ffn_w1: ternary_mat_to_json(&b.ffn_w1),
@@ -285,6 +291,8 @@ pub fn weights_from_json(j: JsonWeights) -> Result<TransformerModelWeights, Stri
                 q_norm_beta: vec_from_json(b.q_norm_beta)?,
                 k_norm_gamma: vec_from_json(b.k_norm_gamma)?,
                 k_norm_beta: vec_from_json(b.k_norm_beta)?,
+                attn_out_norm_gamma: vec_from_json(b.attn_out_norm_gamma)?,
+                attn_out_norm_beta: vec_from_json(b.attn_out_norm_beta)?,
                 ln2_gamma: vec_from_json(b.ln2_gamma)?,
                 ln2_beta: vec_from_json(b.ln2_beta)?,
                 ffn_w1: ternary_mat_from_json(b.ffn_w1)?,
@@ -413,6 +421,9 @@ pub struct JsonBlockWitness {
     pub k_norm: JsonLayerNormWitness,
     pub attn: JsonAttnWitness,
     pub o_proj: JsonProjectionWitness,
+    /// LayerNorm on o_proj.y (out_attn -> normalized).  Residual `x_mid =
+    /// x_in + attn_out_norm.y` flows through this LN.
+    pub attn_out_norm: JsonLayerNormWitness,
     pub x_mid: Vec<Vec<String>>,
     pub ln2: JsonLayerNormWitness,
     pub ffn: JsonFFNWitness,
@@ -601,6 +612,7 @@ pub fn witness_to_json(
             k_norm: ln_wit_to_json(&b.k_norm_wit),
             attn: attn_wit_to_json(&b.attn_wit),
             o_proj: proj_wit_to_json(&b.o_proj_wit),
+            attn_out_norm: ln_wit_to_json(&b.attn_out_norm_wit),
             x_mid: mat_to_json(&b.x_mid),
             ln2: ln_wit_to_json(&b.ln2_wit),
             ffn: ffn_wit_to_json(&b.ffn_wit),
@@ -669,6 +681,7 @@ pub fn witness_from_json(
                 k_norm_wit: ln_wit_from_json(b.k_norm)?,
                 attn_wit: attn_wit_from_json(b.attn)?,
                 o_proj_wit: proj_wit_from_json(b.o_proj)?,
+                attn_out_norm_wit: ln_wit_from_json(b.attn_out_norm)?,
                 x_mid: mat_from_json(b.x_mid)?,
                 ln2_wit: ln_wit_from_json(b.ln2)?,
                 ffn_wit: ffn_wit_from_json(b.ffn)?,

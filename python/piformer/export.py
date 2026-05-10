@@ -137,11 +137,10 @@ def export_weights_rust(
         ln_scale:           Integer scale applied to LayerNorm gamma/beta.
         extra_beta_floor:   Extra margin added to the auto-computed beta_floor.
         block_ln_weights:   Pre-computed list of dicts per block, with keys
-                            "ln1", "ln2", "q_norm", "k_norm", each mapping to
-                            (gamma_int, beta_int).  When provided, these are
-                            used directly instead of recomputing.  Note: the
-                            PyTorch model's attn_out_norm exists for training
-                            stabilization but is bypassed in the proof path.
+                            "ln1", "ln2", "q_norm", "k_norm", "attn_out_norm",
+                            each mapping to (gamma_int, beta_int).  When
+                            provided, these are used directly instead of
+                            recomputing.
         final_ln_weights:   Pre-computed (gamma, beta) for the final LN layer.
 
     Raises:
@@ -181,11 +180,13 @@ def export_weights_rust(
             ln2_gamma, ln2_beta = block_lns["ln2"]
             qn_gamma, qn_beta = block_lns["q_norm"]
             kn_gamma, kn_beta = block_lns["k_norm"]
+            aon_gamma, aon_beta = block_lns["attn_out_norm"]
         else:
             ln1_gamma, ln1_beta = _ln(blk.norm1)
             ln2_gamma, ln2_beta = _ln(blk.norm2)
             qn_gamma, qn_beta = _ln(attn.q_norm)
             kn_gamma, kn_beta = _ln(attn.k_norm)
+            aon_gamma, aon_beta = _ln(blk.attn_out_norm)
 
         q_w = _proj_weight_int(attn.q_proj, quant_scale)   # d × d
         k_w = _proj_weight_int(attn.k_proj, quant_scale)
@@ -230,6 +231,10 @@ def export_weights_rust(
             "o_w":  o_w,
             "o_alpha": int_to_field_hex(_proj_alpha_int(attn.out_proj)),
             "o_bias": vec_to_json(_proj_bias_ints(attn.out_proj)),
+            # attn_out_norm: post-attention LayerNorm in the proof path
+            # (sandwich-norm output stabilization).
+            "attn_out_norm_gamma": vec_to_json(aon_gamma),
+            "attn_out_norm_beta":  vec_to_json(aon_beta),
             "ln2_gamma": vec_to_json(ln2_gamma),
             "ln2_beta":  vec_to_json(ln2_beta),
             "ffn_w1": ffn_w1,

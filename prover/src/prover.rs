@@ -56,14 +56,17 @@ pub struct TransformerBlockProof {
     pub ln1_proof: LayerNormProof,
     pub ln2_proof: LayerNormProof,
 
-    // QK-norm (q_norm, k_norm) per block, proved in conventional mode.
-    // (attn_out_norm is bypassed in the proof pipeline — see Pass-1 docs.)
+    // Sandwich-norm LayerNorms (q_norm, k_norm, attn_out_norm) per block.
     pub q_norm_proof: LayerNormProof,
     pub k_norm_proof: LayerNormProof,
+    pub attn_out_norm_proof: LayerNormProof,
 
-    // Committed outputs of q_norm/k_norm (post-norm matrices, kernel inputs to φ).
+    // Committed outputs:
+    //   q_norm_y_com / k_norm_y_com — post-norm Q/K (input to φ Lasso)
+    //   attn_out_norm_y_com — post-norm o_proj output (input to residual)
     pub q_norm_y_com: HyraxCommitment,
     pub k_norm_y_com: HyraxCommitment,
+    pub attn_out_norm_y_com: HyraxCommitment,
 
     // FFN per-block: Lasso for activation + A/M commitments
     pub ffn_lasso_proof: LassoProof,
@@ -132,13 +135,16 @@ pub struct TransformerBlockWitness {
     pub q_proj_wit: ProjectionWitness,
     pub k_proj_wit: ProjectionWitness,
     pub v_proj_wit: ProjectionWitness,
-    /// LayerNorm on the post-q_proj output (q_raw -> q_n). Conventional mode.
+    /// LayerNorm on the post-q_proj output (q_raw -> q_n).
     pub q_norm_wit: LayerNormWitness,
-    /// LayerNorm on the post-k_proj output (k_raw -> k_n). Conventional mode.
+    /// LayerNorm on the post-k_proj output (k_raw -> k_n).
     pub k_norm_wit: LayerNormWitness,
     /// attn_wit.q / attn_wit.k now hold q_n / k_n (post-norm, what φ reads).
     pub attn_wit: LinearAttentionWitness,
     pub o_proj_wit: ProjectionWitness,
+    /// LayerNorm on the post-o_proj output (out_attn -> normalized).  The
+    /// residual `x_mid = x_in + attn_out_norm_wit.y` flows through this LN.
+    pub attn_out_norm_wit: LayerNormWitness,
     pub x_mid: Vec<Vec<F>>,
     pub ln2_wit: LayerNormWitness,
     pub ffn_wit: FFNWitness,
@@ -152,12 +158,13 @@ pub struct TransformerBlockWitness {
 struct BlockPhase1Data {
     ln1_proof: LayerNormProof,
     ln2_proof: LayerNormProof,
-    // QK-norm: per-head LayerNorms applied between projection and φ.
-    // attn_out_norm is bypassed in the proof pipeline (its 32-bit range capacity).
+    // Sandwich-norm LayerNorms.
     q_norm_proof: LayerNormProof,
     k_norm_proof: LayerNormProof,
+    attn_out_norm_proof: LayerNormProof,
     q_norm_y_com: HyraxCommitment,
     k_norm_y_com: HyraxCommitment,
+    attn_out_norm_y_com: HyraxCommitment,
     x_norm1_com: HyraxCommitment,
     q_com: HyraxCommitment,
     k_com: HyraxCommitment,
@@ -189,6 +196,7 @@ struct BlockCommitData {
     out_attn_com: HyraxCommitment,
     q_norm_y_com: HyraxCommitment,
     k_norm_y_com: HyraxCommitment,
+    attn_out_norm_y_com: HyraxCommitment,
     x_norm2_com: HyraxCommitment,
     out_ffn_com: HyraxCommitment,
     x_mid_com: HyraxCommitment,
@@ -210,6 +218,7 @@ struct BlockCommitDataNoResidual {
     out_attn_com: HyraxCommitment,
     q_norm_y_com: HyraxCommitment,
     k_norm_y_com: HyraxCommitment,
+    attn_out_norm_y_com: HyraxCommitment,
     x_norm2_com: HyraxCommitment,
     out_ffn_com: HyraxCommitment,
 }
@@ -264,9 +273,10 @@ fn commit_block_intermediates_no_residual(
         .as_ref()
         .map(|m| commit_mat(m, t, d));
     let out_attn_com = commit_mat(&witness.o_proj_wit.y, t, d);
-    // Post-norm outputs (kernel inputs to φ).
+    // Post-norm outputs (kernel inputs to φ and residual chain input).
     let q_norm_y_com = commit_mat(&witness.q_norm_wit.y, t, d);
     let k_norm_y_com = commit_mat(&witness.k_norm_wit.y, t, d);
+    let attn_out_norm_y_com = commit_mat(&witness.attn_out_norm_wit.y, t, d);
     let x_norm2_com = commit_mat(&witness.ln2_wit.y, t, d);
     let out_ffn_com = commit_mat(&witness.ffn_wit.y, t, d);
 
@@ -283,18 +293,21 @@ fn commit_block_intermediates_no_residual(
         out_attn_com,
         q_norm_y_com,
         k_norm_y_com,
+        attn_out_norm_y_com,
         x_norm2_com,
         out_ffn_com,
     }
 }
 
 /// Finalize the residual chain for one block: produce x_mid_com from the
-/// block's `out_attn_com` and the running input commitment.
+/// block's normalized attention output (post-attn_out_norm) and the running
+/// input commitment.  This makes the residual sum match the PyTorch model's
+/// `x + attn_out_norm(attn(x))` rather than the un-normalized `x + attn(x)`.
 fn finalize_block_commits(
     partial: BlockCommitDataNoResidual,
     x_in_com: &HyraxCommitment,
 ) -> BlockCommitData {
-    let x_mid_com = add_commitments(x_in_com, &partial.out_attn_com);
+    let x_mid_com = add_commitments(x_in_com, &partial.attn_out_norm_y_com);
     BlockCommitData {
         x_norm1_com: partial.x_norm1_com,
         q_com: partial.q_com,
@@ -308,6 +321,7 @@ fn finalize_block_commits(
         out_attn_com: partial.out_attn_com,
         q_norm_y_com: partial.q_norm_y_com,
         k_norm_y_com: partial.k_norm_y_com,
+        attn_out_norm_y_com: partial.attn_out_norm_y_com,
         x_norm2_com: partial.x_norm2_com,
         out_ffn_com: partial.out_ffn_com,
         x_mid_com,
@@ -319,8 +333,8 @@ fn prove_block_layernorms(
     x_in_com: &HyraxCommitment,
     pk: &TransformerBlockVerifyingKey,
     commits: &BlockCommitData,
-    range_proofs: [RangeWitnessProof; 8],
-    range_rvs: [Vec<F>; 8],
+    range_proofs: [RangeWitnessProof; 10],
+    range_rvs: [Vec<F>; 10],
     transcript: &mut Transcript,
 ) -> Result<BlockPhase1Data, String> {
     let [
@@ -332,6 +346,8 @@ fn prove_block_layernorms(
         q_norm_y_rp,
         k_norm_sig_rp,
         k_norm_y_rp,
+        aon_sig_rp,
+        aon_y_rp,
     ] = range_proofs;
     let [
         ln1_sig_rv,
@@ -342,6 +358,8 @@ fn prove_block_layernorms(
         q_norm_y_rv,
         k_norm_sig_rv,
         k_norm_y_rv,
+        aon_sig_rv,
+        aon_y_rv,
     ] = range_rvs;
     // LN1 sub-prover: absorbs x_norm1_com as y_com
     let ln1_io = LayerNormIOCommitments {
@@ -378,9 +396,7 @@ fn prove_block_layernorms(
     }
     absorb_com(transcript, b"out_attn_com", &commits.out_attn_com);
 
-    // q_norm: x = q_raw (q_com), y = q_n (q_norm_y_com).  Conventional mode.
-    // attn_out_norm is bypassed in the proof pipeline (its post-attention input
-    // exceeds the 32-bit range proof capacity).
+    // q_norm: x = q_raw (q_com), y = q_n (q_norm_y_com).
     let q_norm_io = LayerNormIOCommitments {
         x_com: commits.q_com.clone(),
         y_com: Some(commits.q_norm_y_com.clone()),
@@ -395,7 +411,7 @@ fn prove_block_layernorms(
     )?;
     absorb_com(transcript, b"q_norm_y_com", &commits.q_norm_y_com);
 
-    // k_norm: x = k_raw (k_com), y = k_n (k_norm_y_com).  Conventional mode.
+    // k_norm: x = k_raw (k_com), y = k_n (k_norm_y_com).
     let k_norm_io = LayerNormIOCommitments {
         x_com: commits.k_com.clone(),
         y_com: Some(commits.k_norm_y_com.clone()),
@@ -409,6 +425,27 @@ fn prove_block_layernorms(
         transcript,
     )?;
     absorb_com(transcript, b"k_norm_y_com", &commits.k_norm_y_com);
+
+    // attn_out_norm: x = out_attn (out_attn_com), y = post-norm output that
+    // feeds the residual.  Proves x_mid = x_in + attn_out_norm(out_attn) is
+    // computed correctly (the residual itself is homomorphic).
+    let attn_out_norm_io = LayerNormIOCommitments {
+        x_com: commits.out_attn_com.clone(),
+        y_com: Some(commits.attn_out_norm_y_com.clone()),
+    };
+    let attn_out_norm_proof = prove_layernorm(
+        &witness.attn_out_norm_wit,
+        &attn_out_norm_io,
+        &pk.attn_out_norm_vk,
+        (aon_sig_rp, aon_sig_rv),
+        (aon_y_rp, aon_y_rv),
+        transcript,
+    )?;
+    absorb_com(
+        transcript,
+        b"attn_out_norm_y_com",
+        &commits.attn_out_norm_y_com,
+    );
 
     // LN2 sub-prover: absorbs x_norm2_com as y_com
     let ln2_io = LayerNormIOCommitments {
@@ -432,8 +469,10 @@ fn prove_block_layernorms(
         ln2_proof,
         q_norm_proof,
         k_norm_proof,
+        attn_out_norm_proof,
         q_norm_y_com: commits.q_norm_y_com.clone(),
         k_norm_y_com: commits.k_norm_y_com.clone(),
+        attn_out_norm_y_com: commits.attn_out_norm_y_com.clone(),
         x_norm1_com: commits.x_norm1_com.clone(),
         q_com: commits.q_com.clone(),
         k_com: commits.k_com.clone(),
@@ -835,7 +874,7 @@ pub fn prove(
     // =========================================================================
     let mut block_commits: Vec<BlockCommitData> = Vec::with_capacity(num_blocks);
     let mut block_input_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
-    let mut ln_range_witnesses: Vec<RangeProofWitness> = Vec::with_capacity(8 * num_blocks + 2);
+    let mut ln_range_witnesses: Vec<RangeProofWitness> = Vec::with_capacity(10 * num_blocks + 2);
     let mut phase1_data: Vec<BlockPhase1Data> = Vec::with_capacity(num_blocks);
     let mut current_x_com = x_in_com.clone();
 
@@ -844,6 +883,7 @@ pub fn prove(
     // transcript. Compute them concurrently across L blocks.
     let parallel_per_block: Vec<(
         BlockCommitDataNoResidual,
+        LayerNormRangeWitnesses,
         LayerNormRangeWitnesses,
         LayerNormRangeWitnesses,
         LayerNormRangeWitnesses,
@@ -858,15 +898,18 @@ pub fn prove(
             let ln2_rw = compute_range_witnesses(&bw.ln2_wit, &bpk.ln2_vk);
             let q_norm_rw = compute_range_witnesses(&bw.q_norm_wit, &bpk.q_norm_vk);
             let k_norm_rw = compute_range_witnesses(&bw.k_norm_wit, &bpk.k_norm_vk);
-            (partial, ln1_rw, ln2_rw, q_norm_rw, k_norm_rw)
+            let aon_rw =
+                compute_range_witnesses(&bw.attn_out_norm_wit, &bpk.attn_out_norm_vk);
+            (partial, ln1_rw, ln2_rw, q_norm_rw, k_norm_rw, aon_rw)
         })
         .collect();
 
     // Phase 1b (SEQUENTIAL): finalize the residual-chain x_mid_com per block
     // (homomorphic adds, cheap) and accumulate ln_range_witnesses in deterministic order.
-    // Per block: 8 sub-witnesses [ln1_sigma, ln1_y, ln2_sigma, ln2_y,
-    //                              q_norm_sigma, q_norm_y, k_norm_sigma, k_norm_y].
-    for (partial, ln1_rw, ln2_rw, q_norm_rw, k_norm_rw) in parallel_per_block {
+    // Per block: 10 sub-witnesses [ln1_sigma, ln1_y, ln2_sigma, ln2_y,
+    //                              q_norm_sigma, q_norm_y, k_norm_sigma, k_norm_y,
+    //                              attn_out_norm_sigma, attn_out_norm_y].
+    for (partial, ln1_rw, ln2_rw, q_norm_rw, k_norm_rw, aon_rw) in parallel_per_block {
         block_input_coms.push(current_x_com.clone());
         let commits = finalize_block_commits(partial, &current_x_com);
         ln_range_witnesses.push(ln1_rw.sigma_witness);
@@ -877,6 +920,8 @@ pub fn prove(
         ln_range_witnesses.push(q_norm_rw.y_witness);
         ln_range_witnesses.push(k_norm_rw.sigma_witness);
         ln_range_witnesses.push(k_norm_rw.y_witness);
+        ln_range_witnesses.push(aon_rw.sigma_witness);
+        ln_range_witnesses.push(aon_rw.y_witness);
         let next_x_com = add_commitments(&commits.x_mid_com, &commits.out_ffn_com);
         current_x_com = next_x_com;
         block_commits.push(commits);
@@ -954,6 +999,12 @@ pub fn prove(
             ln_range_proofs
                 .next()
                 .expect("missing k_norm y range proof"),
+            ln_range_proofs
+                .next()
+                .expect("missing attn_out_norm sigma range proof"),
+            ln_range_proofs
+                .next()
+                .expect("missing attn_out_norm y range proof"),
         ];
         let range_rvs = [
             ln_range_rvs.next().expect("missing ln1 sigma range point"),
@@ -968,6 +1019,12 @@ pub fn prove(
                 .next()
                 .expect("missing k_norm sigma range point"),
             ln_range_rvs.next().expect("missing k_norm y range point"),
+            ln_range_rvs
+                .next()
+                .expect("missing attn_out_norm sigma range point"),
+            ln_range_rvs
+                .next()
+                .expect("missing attn_out_norm y range point"),
         ];
         let p1 = prove_block_layernorms(
             &witness.block_witnesses[i],
@@ -1861,8 +1918,10 @@ pub fn prove(
             ln2_proof: p1.ln2_proof.clone(),
             q_norm_proof: p1.q_norm_proof.clone(),
             k_norm_proof: p1.k_norm_proof.clone(),
+            attn_out_norm_proof: p1.attn_out_norm_proof.clone(),
             q_norm_y_com: p1.q_norm_y_com.clone(),
             k_norm_y_com: p1.k_norm_y_com.clone(),
+            attn_out_norm_y_com: p1.attn_out_norm_y_com.clone(),
             ffn_lasso_proof: empty_lasso_proof(),
             ffn_a_com: ffn_a_coms[i].clone(),
             ffn_m_com: ffn_m_coms[i].clone(),
@@ -2496,13 +2555,16 @@ mod tests {
             v_bias: vec![F::ZERO; D],
             o_w,
             o_alpha: F::ONE,
-            o_bias: vec![F::ZERO; D],
-            // Stub VKs for the stabilization LayerNorms; tests do not exercise
-            // these proofs end-to-end (witness math may not satisfy LN constraints).
+            // o_bias non-zero so out_attn = W_o·attn_proj_in + bias has non-zero
+            // variance, which attn_out_norm requires for its range proofs.
+            o_bias: vec![F::from(2u64), F::ZERO],
+            // Sandwich-norm LayerNorms (q_norm, k_norm, attn_out_norm).
             q_norm_gamma: vec![F::from(2u64); D],
             q_norm_beta: vec![F::from(5u64); D],
             k_norm_gamma: vec![F::from(2u64); D],
             k_norm_beta: vec![F::from(5u64); D],
+            attn_out_norm_gamma: vec![F::from(2u64); D],
+            attn_out_norm_beta: vec![F::from(5u64); D],
             ln2_gamma: vec![F::from(2u64); D],
             ln2_beta: vec![F::from(5u64); D],
             ffn_w1,
@@ -2563,39 +2625,51 @@ mod tests {
         }
     }
 
+    /// LN2 takes x_mid = x_in + aon.y = [[14+7, 10+3], [20+7, 16+3]]
+    /// = [[21, 13], [27, 19]].  With γ=2, β=5: y = [[7, 3], [7, 3]], σ = [5, 5].
     fn build_ln2_witness() -> LayerNormWitness {
         LayerNormWitness {
             x: vec![
-                vec![F::from(14u64), F::from(10u64)],
-                vec![F::from(20u64), F::from(16u64)],
+                vec![F::from(21u64), F::from(13u64)],
+                vec![F::from(27u64), F::from(19u64)],
             ],
             y: vec![
                 vec![F::from(7u64), F::from(3u64)],
                 vec![F::from(7u64), F::from(3u64)],
             ],
-            sum_x: vec![F::from(24u64), F::from(36u64)],
-            sigma: vec![F::from(2u64), F::from(2u64)],
-            sq_sum_x: vec![F::from(296u64), F::from(656u64)],
-            sum_x_sq: vec![F::from(576u64), F::from(1296u64)],
-            sigma_sq_scaled: vec![F::from(16u64), F::from(16u64)],
+            // sum_x: [21+13, 27+19] = [34, 46]
+            sum_x: vec![F::from(34u64), F::from(46u64)],
+            sigma: vec![F::from(5u64), F::from(5u64)],
+            // sq_sum_x: [21²+13², 27²+19²] = [610, 1090]
+            sq_sum_x: vec![F::from(610u64), F::from(1090u64)],
+            // sum_x_sq: [34², 46²] = [1156, 2116]
+            sum_x_sq: vec![F::from(1156u64), F::from(2116u64)],
+            // (d·σ)² = 10² = 100
+            sigma_sq_scaled: vec![F::from(100u64), F::from(100u64)],
         }
     }
 
+    /// final_ln takes x_out = x_mid + ffn.y = [[21+7, 13+0], [27+7, 19+0]]
+    /// = [[28, 13], [34, 19]].  With γ=2, β=5: y = [[7, 4], [7, 4]], σ = [10, 10].
     fn build_ln_final_witness() -> LayerNormWitness {
         LayerNormWitness {
             x: vec![
-                vec![F::from(21u64), F::from(10u64)],
-                vec![F::from(27u64), F::from(16u64)],
+                vec![F::from(28u64), F::from(13u64)],
+                vec![F::from(34u64), F::from(19u64)],
             ],
             y: vec![
-                vec![F::from(7u64), F::from(3u64)],
-                vec![F::from(7u64), F::from(3u64)],
+                vec![F::from(7u64), F::from(4u64)],
+                vec![F::from(7u64), F::from(4u64)],
             ],
-            sum_x: vec![F::from(31u64), F::from(43u64)],
-            sigma: vec![F::from(7u64), F::from(7u64)],
-            sq_sum_x: vec![F::from(541u64), F::from(985u64)],
-            sum_x_sq: vec![F::from(961u64), F::from(1849u64)],
-            sigma_sq_scaled: vec![F::from(196u64), F::from(196u64)],
+            // sum_x: [28+13, 34+19] = [41, 53]
+            sum_x: vec![F::from(41u64), F::from(53u64)],
+            sigma: vec![F::from(10u64), F::from(10u64)],
+            // sq_sum_x: [28²+13², 34²+19²] = [953, 1517]
+            sq_sum_x: vec![F::from(953u64), F::from(1517u64)],
+            // sum_x_sq: [41², 53²] = [1681, 2809]
+            sum_x_sq: vec![F::from(1681u64), F::from(2809u64)],
+            // (d·σ)² = 20² = 400
+            sigma_sq_scaled: vec![F::from(400u64), F::from(400u64)],
         }
     }
 
@@ -2669,11 +2743,22 @@ mod tests {
             norm_diff: None,
             out: zero_out.clone(),
         };
+        // o_bias = [2, 0], W_o = identity-like with attn_proj_in zero, so
+        // o_proj.y = bias broadcast across rows = [[2, 0], [2, 0]].
+        let aon_raw = vec![
+            vec![F::from(2u64), F::from(0u64)],
+            vec![F::from(2u64), F::from(0u64)],
+        ];
         let o_proj_wit = ProjectionWitness {
             x: zero_out.clone(),
-            y: zero_out.clone(),
+            y: aon_raw.clone(),
         };
-        let x_mid = x_in.clone();
+        // x_mid = x_in + attn_out_norm.y = [[14+7, 10+3], [20+7, 16+3]]
+        //                                = [[21, 13], [27, 19]].
+        let x_mid = vec![
+            vec![F::from(21u64), F::from(13u64)],
+            vec![F::from(27u64), F::from(19u64)],
+        ];
         let ln2_wit = build_ln2_witness();
         let y_norm2 = ln2_wit.y.clone();
         let m_ffn = vec![
@@ -2691,13 +2776,14 @@ mod tests {
             y: ffn_out.clone(),
             activation_query_indices: vec![7, 0, 0, 0, 7, 0, 0, 0],
         };
+        // x_out = x_mid + ffn.y = [[21+7, 13+0], [27+7, 19+0]] = [[28, 13], [34, 19]]
         let x_out = vec![
-            vec![F::from(21u64), F::from(10u64)],
-            vec![F::from(27u64), F::from(16u64)],
+            vec![F::from(28u64), F::from(13u64)],
+            vec![F::from(34u64), F::from(19u64)],
         ];
-        // QK-norm witnesses: x = q_raw (qk_proj_out), y = q_n (qk_norm_out).
-        // attn_out_norm is bypassed in the proof pipeline.
-        // sigma=4, sum_x=7, sq_sum_x=49, sum_x_sq=49 (since x[i] = [7, 0]).
+        // Sandwich-norm LN witnesses: x = [[2, 0], [2, 0]] for attn_out_norm,
+        // x = [[7, 0], [7, 0]] for q/k_norm.  Both produce y = [[7, 3], [7, 3]]
+        // but with different (sigma, sum_x, sq_sum_x, sum_x_sq) statistics.
         let make_qk_norm_wit = || LayerNormWitness {
             x: qk_proj_out.clone(),
             y: qk_norm_out.clone(),
@@ -2707,6 +2793,17 @@ mod tests {
             sum_x_sq: vec![F::from(49u64), F::from(49u64)],
             // sigma_sq_scaled[i] = (d * sigma[i])^2 = (2 * 4)^2 = 64.
             sigma_sq_scaled: vec![F::from(64u64), F::from(64u64)],
+        };
+        // attn_out_norm: same (γ, β) and same y as q/k_norm but x = [[2, 0], [2, 0]],
+        // so smaller σ.  vi = d·(d·sq_sum - sum²) = 2·(8 - 4) = 8 = (2·1)² ≤ 8 ≤ (2·1+2)²-1 = 15.
+        let attn_out_norm_wit = LayerNormWitness {
+            x: aon_raw.clone(),
+            y: qk_norm_out.clone(),
+            sum_x: vec![F::from(2u64), F::from(2u64)],
+            sigma: vec![F::from(1u64), F::from(1u64)],
+            sq_sum_x: vec![F::from(4u64), F::from(4u64)],
+            sum_x_sq: vec![F::from(4u64), F::from(4u64)],
+            sigma_sq_scaled: vec![F::from(4u64), F::from(4u64)],
         };
         let q_norm_wit = make_qk_norm_wit();
         let k_norm_wit = make_qk_norm_wit();
@@ -2720,6 +2817,7 @@ mod tests {
             k_norm_wit,
             attn_wit,
             o_proj_wit,
+            attn_out_norm_wit,
             x_mid,
             ln2_wit,
             ffn_wit,
