@@ -10,7 +10,8 @@
 
 use crate::field::F;
 use crate::lookup::lasso::{
-    verify_lasso_multi_committed_outputs, LassoMultiInstance, LassoMultiVerifyingKey,
+    verify_lasso_multi_committed_outputs, verify_lasso_terminal_eval, LassoMultiInstance,
+    LassoMultiVerifyingKey,
 };
 use crate::lookup::quantization::{verify_quantization_batch, QuantizationParams};
 use crate::lookup::range::{verify_range_batched, RangeWitnessProof};
@@ -1070,13 +1071,6 @@ pub fn verify(
         absorb_com(transcript, b"m_com", &bp.ffn_m_com);
     }
     let _tffn_lasso = Instant::now();
-    if proof.ffn_lasso_proof.all_query_indices.len() != num_blocks {
-        return Err(format!(
-            "FFN Lasso query index count mismatch: got {}, expected {}",
-            proof.ffn_lasso_proof.all_query_indices.len(),
-            num_blocks
-        ));
-    }
     let ffn_lasso_instances = LassoMultiInstance {
         instances: (0..num_blocks)
             .map(|_| inst_ffn.activation_lasso.clone())
@@ -1093,23 +1087,15 @@ pub fn verify(
         instance_table_coms: ffn_instance_table_coms,
         instance_to_group: ffn_instance_to_group,
     };
-    let ffn_output_coms: Vec<(HyraxCommitment, usize)> = proof
-        .block_proofs
-        .iter()
-        .map(|bp| (bp.ffn_a_com.clone(), t_bits + f_bits))
-        .collect();
-    verify_lasso_multi_committed_outputs(
-        &proof.ffn_lasso_proof,
-        &ffn_lasso_instances,
-        &ffn_lasso_vk,
-        &ffn_output_coms,
-        transcript,
-        lasso_params,
-    )
-    .map_err(|e| format!("FFN global Lasso: {e}"))?;
+    if proof.ffn_lasso_query_indices.len() != num_blocks {
+        return Err(format!(
+            "FFN Lasso query index count mismatch: got {}, expected {}",
+            proof.ffn_lasso_query_indices.len(),
+            num_blocks
+        ));
+    }
     let ffn_index_refs: Vec<&[usize]> = proof
-        .ffn_lasso_proof
-        .all_query_indices
+        .ffn_lasso_query_indices
         .iter()
         .map(|v| v.as_slice())
         .collect();
@@ -1172,6 +1158,29 @@ pub fn verify(
         f_bits,
         transcript,
     )?;
+    let ffn_a_terminal_weights: Vec<F> = weights_ffn_y
+        .iter()
+        .zip(proof.batch_ffn_y.final_evals_g.iter())
+        .map(|(w, g)| *w * *g)
+        .collect();
+    let ffn_a_terminal_claim: F = ffn_a_terminal_weights
+        .iter()
+        .zip(proof.batch_ffn_y.final_evals_f.iter())
+        .map(|(w, f)| *w * *f)
+        .sum();
+    let ffn_a_terminal_point = combine(&r_t, &r_k_fy);
+    verify_lasso_terminal_eval(
+        &proof.ffn_a_terminal_proof,
+        &ffn_lasso_instances,
+        &ffn_lasso_vk,
+        &proof.ffn_lasso_query_indices,
+        &ffn_a_terminal_weights,
+        &ffn_a_terminal_point,
+        ffn_a_terminal_claim,
+        transcript,
+        lasso_params,
+    )
+    .map_err(|e| format!("FFN A terminal Lasso: {e}"))?;
 
     eprintln!(
         "[model] batch_ffn_y:{:>8.3}ms",
@@ -1320,7 +1329,11 @@ pub fn verify(
                 || {
                     HyraxBatchAccumulator::finalize_many_with_mus(
                         &params_td,
-                        vec![(inter_acc, mu_inter), (ln_acc_td, mu_ln_td)],
+                        vec![
+                            (inter_acc, mu_inter),
+                            (ln_acc_td, mu_ln_td),
+                            (acc_attn_norm, mu_attn_norm),
+                        ],
                         rho_td,
                     )
                     .map_err(|e| format!("td fused acc: {e}"))
@@ -1377,28 +1390,19 @@ pub fn verify(
             )
         },
     );
-    let ((r8, r9), r10) = rayon::join(
+    let (r8, r9) = rayon::join(
         || {
-            rayon::join(
-                || {
-                    acc_range_y
-                        .finalize_with_mu(&params_range_y, mu_rng_y)
-                        .map_err(|e| format!("acc_range_y: {e}"))
-                },
-                || {
-                    HyraxBatchAccumulator::finalize_many_with_mus(
-                        &params_range_m,
-                        vec![(acc_range_m, mu_rng_m), (acc_quant_m, mu_quant_m)],
-                        rho_range_m,
-                    )
-                    .map_err(|e| format!("range_m fused acc: {e}"))
-                },
-            )
+            acc_range_y
+                .finalize_with_mu(&params_range_y, mu_rng_y)
+                .map_err(|e| format!("acc_range_y: {e}"))
         },
         || {
-            acc_attn_norm
-                .finalize_with_mu(&params_td, mu_attn_norm)
-                .map_err(|e| format!("acc_attn_norm: {e}"))
+            HyraxBatchAccumulator::finalize_many_with_mus(
+                &params_range_m,
+                vec![(acc_range_m, mu_rng_m), (acc_quant_m, mu_quant_m)],
+                rho_range_m,
+            )
+            .map_err(|e| format!("range_m fused acc: {e}"))
         },
     );
     eprintln!(
@@ -1415,7 +1419,6 @@ pub fn verify(
     r7?;
     r8?;
     r9?;
-    r10?;
 
     // =========================================================================
     // 13. Global batch open for 5L intermediate matrices at r_td (inter_batch_open)
@@ -1575,23 +1578,6 @@ pub fn verify(
             transcript,
         )
         .map_err(|e| format!("w2_batch: {e}"))?;
-
-    // A at combine(r_t, r_k_fy)
-    let ffn_a_point = combine(&r_t, &r_k_fy);
-    let ffn_a_coms: Vec<HyraxCommitment> = proof
-        .block_proofs
-        .iter()
-        .map(|bp| bp.ffn_a_com.clone())
-        .collect();
-    acc_cb_mff
-        .add_verify_batch(
-            &ffn_a_coms,
-            &proof.batch_ffn_y.final_evals_f,
-            &ffn_a_point,
-            &proof.ffn_a_batch_open,
-            transcript,
-        )
-        .map_err(|e| format!("ffn_a_batch: {e}"))?;
 
     // w1 at combine(r_k_m, ry_m)
     let w1_point = combine(&r_k_m, &ry_m);

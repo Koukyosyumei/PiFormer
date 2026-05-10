@@ -26,7 +26,7 @@ use piformer_prover::{
         lasso::{
             HighDegreeRoundPoly, LassoIndexProof, LassoInstance, LassoMultiProof,
             LassoMultiProvingKey, LassoProof, LassoProvingKey, LassoVerifyingKey,
-            SelectorBindingProof, SelectorSumcheckProof,
+            LassoTerminalEvalProof, SelectorBindingProof, SelectorSumcheckProof,
         },
         quantization::{QuantizationParams, QuantizationProof},
         range::{GlobalRangeM, LogUpWitnessProof, RangeWitnessProof},
@@ -52,7 +52,7 @@ const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
 const VERSION: u8 = 5;
-const PROOF_VERSION: u8 = 20;
+const PROOF_VERSION: u8 = 22;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -600,6 +600,25 @@ fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
     })
 }
 
+fn write_lasso_terminal_eval_proof<W: Write>(
+    w: &mut W,
+    p: &LassoTerminalEvalProof,
+) -> io::Result<()> {
+    write_sumcheck_proof_multi(w, &p.sumcheck)?;
+    write_vec(w, &p.table_openings, |w, v: &Vec<F>| write_vec_f(w, v))?;
+    write_hyrax_proof(w, &p.hyrax_proof)?;
+    write_vec(w, &p.l_k_evals_multi, |w, v: &Vec<F>| write_vec_f(w, v))
+}
+
+fn read_lasso_terminal_eval_proof<R: Read>(r: &mut R) -> io::Result<LassoTerminalEvalProof> {
+    Ok(LassoTerminalEvalProof {
+        sumcheck: read_sumcheck_proof_multi(r)?,
+        table_openings: read_vec(r, |r| read_vec_f(r))?,
+        hyrax_proof: read_hyrax_proof(r)?,
+        l_k_evals_multi: read_vec(r, |r| read_vec_f(r))?,
+    })
+}
+
 fn write_logup_witness_proof<W: Write>(w: &mut W, p: &LogUpWitnessProof) -> io::Result<()> {
     write_vec(w, &p.h_coms, write_hyrax_commitment)?;
     write_vec_f(w, &p.combined_claims)?;
@@ -1031,7 +1050,6 @@ fn write_block_proof<W: Write>(w: &mut W, p: &TransformerBlockProof) -> io::Resu
     write_hyrax_commitment(w, &p.attn_out_norm_y_com)?;
     // FFN per-block
     write_lasso_proof(w, &p.ffn_lasso_proof)?;
-    write_hyrax_commitment(w, &p.ffn_a_com)?;
     write_hyrax_commitment(w, &p.ffn_m_com)?;
     // Committed intermediate matrices
     write_hyrax_commitment(w, &p.x_norm1_com)?;
@@ -1078,7 +1096,6 @@ fn read_block_proof<R: Read>(r: &mut R) -> io::Result<TransformerBlockProof> {
         attn_out_norm_y_com: read_hyrax_commitment(r)?,
         // FFN per-block
         ffn_lasso_proof: read_lasso_proof(r)?,
-        ffn_a_com: read_hyrax_commitment(r)?,
         ffn_m_com: read_hyrax_commitment(r)?,
         // Committed intermediate matrices
         x_norm1_com: read_hyrax_commitment(r)?,
@@ -1128,7 +1145,10 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_proj_gkr_proof(w, &p.lm_head_proof)?;
     write_hyrax_commitment(w, &p.final_ln_out_com)?;
     write_hyrax_proof(w, &p.lm_head_input_open)?;
-    write_lasso_multi_proof(w, &p.ffn_lasso_proof)?;
+    write_vec(w, &p.ffn_lasso_query_indices, |w, v: &Vec<usize>| {
+        write_packed_vec_usize(w, v)
+    })?;
+    write_lasso_terminal_eval_proof(w, &p.ffn_a_terminal_proof)?;
     write_lasso_multi_proof(w, &p.all_lasso_proof)?;
     write_quantization_proof(w, &p.ffn_quant_proof)?;
     write_quantization_proof(w, &p.qk_quant_proof)?;
@@ -1182,7 +1202,6 @@ fn write_model_proof<W: Write>(w: &mut W, p: &TransformerModelProof) -> io::Resu
     write_hyrax_proof(w, &p.w_o_batch_open)?;
     write_hyrax_proof(w, &p.qkvo_bias_batch_open)?;
     write_hyrax_proof(w, &p.w2_batch_open)?;
-    write_hyrax_proof(w, &p.ffn_a_batch_open)?;
     write_hyrax_proof(w, &p.w1_batch_open)?;
     write_hyrax_proof(w, &p.x_norm2_batch_open)?;
     write_hyrax_proof(w, &p.ffn_m_com_batch_open)?;
@@ -1211,7 +1230,8 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         lm_head_proof: read_proj_gkr_proof(r)?,
         final_ln_out_com: read_hyrax_commitment(r)?,
         lm_head_input_open: read_hyrax_proof(r)?,
-        ffn_lasso_proof: read_lasso_multi_proof(r)?,
+        ffn_lasso_query_indices: read_vec(r, |r| read_packed_vec_usize(r))?,
+        ffn_a_terminal_proof: read_lasso_terminal_eval_proof(r)?,
         all_lasso_proof: read_lasso_multi_proof(r)?,
         ffn_quant_proof: read_quantization_proof(r)?,
         qk_quant_proof: read_quantization_proof(r)?,
@@ -1273,7 +1293,6 @@ fn read_model_proof<R: Read>(r: &mut R) -> io::Result<TransformerModelProof> {
         w_o_batch_open: read_hyrax_proof(r)?,
         qkvo_bias_batch_open: read_hyrax_proof(r)?,
         w2_batch_open: read_hyrax_proof(r)?,
-        ffn_a_batch_open: read_hyrax_proof(r)?,
         w1_batch_open: read_hyrax_proof(r)?,
         x_norm2_batch_open: read_hyrax_proof(r)?,
         ffn_m_com_batch_open: read_hyrax_proof(r)?,
