@@ -324,14 +324,18 @@ pub fn prove_range_batched(
         })
         .collect();
 
-    let mut all_logup_witness: Vec<LogUpWitnessProof> = Vec::with_capacity(witnesses.len());
+    // ---- Pass A (sequential, transcript-bound): per-witness γ draw +
+    // batched sumcheck.  Only field ops over relatively small state — the
+    // heavy hyrax_open MSMs are deferred to Pass B below. ----
+    struct WitnessLogupState {
+        r_k: Vec<F>,
+        batched_sumcheck: SumcheckProofMulti,
+    }
+
+    let mut witness_states: Vec<WitnessLogupState> = Vec::with_capacity(witnesses.len());
     let mut total_lhs_claim = F::ZERO;
 
     for i in 0..witnesses.len() {
-        let n = witnesses[i].values.len();
-        let num_vars = n.next_power_of_two().trailing_zeros() as usize;
-        let (nu_c, sigma_c, _) = params_from_vars(num_vars);
-
         // Draw RLC weights γ_0..γ_{nc-1} for this witness, *after* β and after
         // h_coms have been absorbed (both happened above).  Per-witness drawing
         // keeps a tight binding of γ to this witness's chunks.
@@ -364,32 +368,62 @@ pub fn prove_range_batched(
             transcript,
         );
 
-        // Per-chunk openings at the shared r_k.  Hyrax_open is transcript-free,
-        // so we run them in parallel across chunks.
-        let chunk_at_rk: Vec<F> = all_chunk_mles[i]
-            .par_iter()
-            .map(|m| m.evaluate(&r_k))
-            .collect();
-        let h_open_proofs: Vec<HyraxProof> = all_h_mles[i]
-            .par_iter()
-            .map(|h_mle| hyrax_open(&h_mle.evaluations, &r_k, nu_c, sigma_c))
-            .collect();
-        let chunk_open_proofs: Vec<HyraxProof> = all_chunk_mles[i]
-            .par_iter()
-            .map(|chunk_mle| hyrax_open(&chunk_mle.evaluations, &r_k, nu_c, sigma_c))
-            .collect();
-
-        all_logup_witness.push(LogUpWitnessProof {
-            h_coms: all_h_coms[i].clone(),
+        witness_states.push(WitnessLogupState {
+            r_k,
             batched_sumcheck,
-            combined_claims: pre.combined.clone(),
-            chunk_at_rk,
-            h_open_proofs,
-            chunk_open_proofs,
         });
     }
 
     debug_assert_eq!(total_lhs_claim, logup_rhs_claim, "LogUp grand sum mismatch");
+
+    // ---- Pass B (parallel, transcript-free): chunk_at_rk evaluations and
+    // Hyrax opens for h_c and chunk_c at the shared r_k, across ALL witnesses
+    // and ALL chunks.  None of these touch the transcript, so they can run in
+    // parallel even across witnesses (small σ-witness opens overlap with the
+    // larger y-witness opens).  hyrax_open itself is internally par_iter'd over
+    // its column dimension, so rayon nesting handles work-stealing. ----
+    struct WitnessOpens {
+        chunk_at_rk: Vec<F>,
+        h_open_proofs: Vec<HyraxProof>,
+        chunk_open_proofs: Vec<HyraxProof>,
+    }
+
+    let opens: Vec<WitnessOpens> = (0..witnesses.len())
+        .into_par_iter()
+        .map(|i| {
+            let (nu_c, sigma_c, _) = params_from_vars(all_num_vars[i]);
+            let r_k = &witness_states[i].r_k;
+            let chunk_at_rk: Vec<F> = all_chunk_mles[i].iter().map(|m| m.evaluate(r_k)).collect();
+            let h_open_proofs: Vec<HyraxProof> = all_h_mles[i]
+                .iter()
+                .map(|h_mle| hyrax_open(&h_mle.evaluations, r_k, nu_c, sigma_c))
+                .collect();
+            let chunk_open_proofs: Vec<HyraxProof> = all_chunk_mles[i]
+                .iter()
+                .map(|chunk_mle| hyrax_open(&chunk_mle.evaluations, r_k, nu_c, sigma_c))
+                .collect();
+            WitnessOpens {
+                chunk_at_rk,
+                h_open_proofs,
+                chunk_open_proofs,
+            }
+        })
+        .collect();
+
+    // Assemble per-witness LogUp proofs by zipping Pass-A state with Pass-B opens.
+    let all_logup_witness: Vec<LogUpWitnessProof> = witness_states
+        .into_iter()
+        .zip(opens.into_iter())
+        .enumerate()
+        .map(|(i, (state, ops))| LogUpWitnessProof {
+            h_coms: all_h_coms[i].clone(),
+            batched_sumcheck: state.batched_sumcheck,
+            combined_claims: logup_precomputed[i].combined.clone(),
+            chunk_at_rk: ops.chunk_at_rk,
+            h_open_proofs: ops.h_open_proofs,
+            chunk_open_proofs: ops.chunk_open_proofs,
+        })
+        .collect();
 
     // RHS sumcheck: Σ_j M[j] * g[j] = logup_rhs_claim
     let (logup_rhs_sumcheck, r_m2) = prove_sumcheck(&m_mle, &g_mle, logup_rhs_claim, transcript);
