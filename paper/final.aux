@@ -1,19 +1,5 @@
 \relax 
 \providecommand\hyper@newdestlabel[2]{}
-\providecommand\HyperFirstAtBeginDocument{\AtBeginDocument}
-\HyperFirstAtBeginDocument{\ifx\hyper@anchor\@undefined
-\global\let\oldcontentsline\contentsline
-\gdef\contentsline#1#2#3#4{\oldcontentsline{#1}{#2}{#3}}
-\global\let\oldnewlabel\newlabel
-\gdef\newlabel#1#2{\newlabelxx{#1}#2}
-\gdef\newlabelxx#1#2#3#4#5#6{\oldnewlabel{#1}{{#2}{#3}}}
-\AtEndDocument{\ifx\hyper@anchor\@undefined
-\let\contentsline\oldcontentsline
-\let\newlabel\oldnewlabel
-\fi}
-\fi}
-\global\let\hyper@last\relax 
-\gdef\HyperFirstAtBeginDocument#1{#1}
 \providecommand\HyField@AuxAddToFields[1]{}
 \providecommand\HyField@AuxAddToCoFields[2]{}
 \citation{liu2021zkcnn}
@@ -52,7 +38,7 @@
 \citation{katharopoulos2020transformers}
 \citation{bengio2013estimating}
 \citation{ma2025bitnet}
-\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces A single \ensuremath  {\pi \text  {-Former}}{} block. Boxes are matrices; rounded green nodes are operations the SNARK proves. ``Ternary'' projections contain no field multiplications inside the contraction; ``Lasso'' operations are proved through structured table lookups; residual $+$'s are checked by homomorphic addition of Hyrax commitments and require no proof. The cross-block batching architecture (\S  \ref  {sec:protocol}) collapses each protocol type across all $L$ blocks into a single model-level proof.}}{4}{figure.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces A single \ensuremath  {\pi \text  {-Former}}{} block. Boxes are matrices; rounded green nodes are operations the SNARK proves. ``Ternary'' projections contain no field multiplications inside the contraction; ``Lasso'' operations are proved through structured table lookups; residual $+$'s are checked by homomorphic addition of Hyrax commitments and require no proof. The cross-block batching architecture (\S  \ref {sec:protocol}) collapses each protocol type across all $L$ blocks into a single model-level proof.}}{4}{figure.1}\protected@file@percent }
 \newlabel{fig:block}{{1}{4}{A single \sys {} block. Boxes are matrices; rounded green nodes are operations the SNARK proves. ``Ternary'' projections contain no field multiplications inside the contraction; ``Lasso'' operations are proved through structured table lookups; residual $+$'s are checked by homomorphic addition of Hyrax commitments and require no proof. The cross-block batching architecture (\S \ref {sec:protocol}) collapses each protocol type across all $L$ blocks into a single model-level proof}{figure.1}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Learnable Lookup Attention (LLA)}{4}{subsection.3.1}\protected@file@percent }
 \newlabel{ssec:LLA}{{3.1}{4}{Learnable Lookup Attention (LLA)}{subsection.3.1}{}}
@@ -73,7 +59,7 @@
 \newlabel{alg:prove}{{2}{6}{The model-level prover}{algorithm.2}{}}
 \@writefile{loa}{\contentsline {algorithm}{\numberline {3}{\ignorespaces $\textsc  {Phase1}(W_\ell ,C_{\mathrm  {cur}},\poppk  _\ell ,\mathsf  {FS})$}}{6}{algorithm.3}\protected@file@percent }
 \newlabel{alg:phase1}{{3}{6}{Per-block Phase~1}{algorithm.3}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Per-block Phase\nobreakspace  {}1}{7}{subsection.4.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Per-block Phase~1}{7}{subsection.4.3}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Cross-block batched sumcheck}{7}{subsection.4.4}\protected@file@percent }
 \@writefile{loa}{\contentsline {algorithm}{\numberline {4}{\ignorespaces $\textsc  {CrossBatch}(\{f_\ell ,g_\ell \}_{\ell =1}^L,\mathsf  {FS})$}}{7}{algorithm.4}\protected@file@percent }
 \newlabel{alg:cross-block}{{4}{7}{Cross-block batched sumcheck}{algorithm.4}{}}
@@ -111,7 +97,7 @@
 \@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Verifier per-phase breakdown}{10}{subsection.7.2}\protected@file@percent }
 \citation{qu2025zkgpt}
 \citation{kothapalli2022nova}
-\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Verifier compute breakdown by phase (ms). All values are single-thread wall-clock from the Rust CLI's internal phase timers; the subtotal omits parser, transcript setup, and top-level dispatch overheads included in Table\nobreakspace  {}\ref  {tab:e2e}.}}{11}{table.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Verifier compute breakdown by phase (ms). All values are single-thread wall-clock from the Rust CLI's internal phase timers; the subtotal omits parser, transcript setup, and top-level dispatch overheads included in Table~\ref {tab:e2e}.}}{11}{table.3}\protected@file@percent }
 \newlabel{tab:verify-breakdown}{{3}{11}{Verifier compute breakdown by phase (ms). All values are single-thread wall-clock from the Rust CLI's internal phase timers; the subtotal omits parser, transcript setup, and top-level dispatch overheads included in Table~\ref {tab:e2e}}{table.3}{}}
 \@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Qualitative comparison with prior verifiable-inference systems for transformers. All systems target a non-interactive SNARK.}}{11}{table.4}\protected@file@percent }
 \newlabel{tab:related}{{4}{11}{Qualitative comparison with prior verifiable-inference systems for transformers. All systems target a non-interactive SNARK}{table.4}{}}
