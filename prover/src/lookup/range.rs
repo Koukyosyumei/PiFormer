@@ -446,6 +446,7 @@ pub fn prove_range_batched(
     // g[j] = 1/(α - j) for the RHS sumcheck — batch inversion: O(n) muls + 1 inversion.
     let mut g_evals: Vec<F> = (0..CHUNK_SIZE).map(|j| alpha - F::from(j as u64)).collect();
     batch_inversion(&mut g_evals); // zeros out any entry where α = j (negligible probability)
+    let g_table = g_evals.clone();
     let g_mle = DenseMLPoly::new(g_evals);
     let logup_rhs_claim: F = m_global
         .iter()
@@ -463,9 +464,10 @@ pub fn prove_range_batched(
             let n = witnesses[i].values.len();
             (0..num_chunks)
                 .map(|c| {
-                    let mut h_vals: Vec<F> =
-                        all_chunk_vals[i][c].iter().map(|&cv| alpha - cv).collect();
-                    batch_inversion(&mut h_vals);
+                    let h_vals: Vec<F> = all_chunk_vals[i][c]
+                        .iter()
+                        .map(|cv| g_table[cv.into_bigint().as_ref()[0] as usize])
+                        .collect();
                     vec_to_mle(&h_vals, n)
                 })
                 .collect()
