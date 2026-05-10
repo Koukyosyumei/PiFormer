@@ -9,8 +9,8 @@
 
 use crate::field::F;
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_open_batch_with_eta, params_from_vars, HyraxBatchAccumulator,
-    HyraxCommitment, HyraxProof,
+    hyrax_commit, hyrax_open, hyrax_open_batch_with_eta, params_from_vars, powers_of,
+    HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
 };
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{
@@ -20,6 +20,7 @@ use crate::subprotocols::{
 use crate::transcript::Transcript;
 use ark_ff::{batch_inversion, Field, PrimeField};
 use rayon::prelude::*;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 // 16-bit chunks: table size = 65536. 32-bit values need 2 chunks; 64-bit values
@@ -64,19 +65,17 @@ pub struct RangeProofWitness {
 pub struct LogUpWitnessProof {
     /// Hyrax commitments to h_c = [1/(α - C_c[i]) for each i], one per chunk.
     pub h_coms: Vec<HyraxCommitment>,
-    /// Single batched sumcheck folding all chunks of this witness into one
-    /// reduction at a shared challenge r_k.
-    pub batched_sumcheck: SumcheckProofMulti,
     /// Per-chunk combined claim: combined_claims[c] = claim_c + β * n_padded.
-    /// The verifier sums Σ_c γ_c · combined_claims[c] to get the batched claim,
-    /// and recovers each claim_c for the grand-sum check.
+    /// The verifier sums Σ_c γ_c · combined_claims[c] for the bucket-level
+    /// batched claim, and recovers each claim_c for the grand-sum check.
     pub combined_claims: Vec<F>,
-    /// C_c(r_k) — opening of chunk_com[c] at the shared sumcheck challenge.
-    /// (h_c(r_k) lives inside batched_sumcheck.final_evals_f.)
+    /// C_c(r_k_bucket) — opening of chunk_com[c] at the bucket's shared sumcheck
+    /// challenge. (h_c(r_k_bucket) is recovered from the bucket sumcheck's
+    /// final_evals_f at index witness_offset_in_bucket * num_chunks + c.)
     pub chunk_at_rk: Vec<F>,
-    /// Hyrax opening proofs for h_c at r_k.
+    /// Hyrax opening proofs for h_c at the bucket's r_k.
     pub h_open_proofs: Vec<HyraxProof>,
-    /// Hyrax opening proofs for chunk_com[c] at r_k.
+    /// Hyrax opening proofs for chunk_com[c] at the bucket's r_k.
     pub chunk_open_proofs: Vec<HyraxProof>,
 }
 
@@ -110,6 +109,14 @@ pub struct GlobalRangeM {
     /// M(r_m2) — opening of m_com at the RHS sumcheck challenge.
     pub logup_m_at_rm2: F,
     pub logup_m_open_rm2: HyraxProof,
+    /// Super-batched LogUp Pass-A sumchecks, one per witness-size bucket.
+    /// Witnesses are bucketed by `num_vars` (n_padded.trailing_zeros()) and the
+    /// buckets are ordered ascending. Each bucket's sumcheck folds all
+    /// (witness, chunk) pairs in the bucket via FS-RLC weights eta^w · γ_c at
+    /// a shared challenge r_k_bucket. final_evals_f/g have length
+    /// bucket_size · num_chunks; element at index w·num_chunks + c is the
+    /// (witness, chunk) pair's reduced eval.
+    pub bucket_sumchecks: Vec<SumcheckProofMulti>,
 }
 
 /// Prove that every value in every witness is in [0, 2^bits) using a single
@@ -220,10 +227,22 @@ pub fn prove_range_batched(
         all_sigma_c.push(item.sigma_c);
     }
 
+    eprintln!(
+        "[range bits={bits}]   p1_absorb_loop:        {:7.3}ms",
+        t_section.elapsed().as_secs_f64() * 1000.0
+    );
+    t_section = Instant::now();
+
     // ---- Commit merged m ----
     let m_mle = vec_to_mle(&m_global, CHUNK_SIZE);
     let m_com = hyrax_commit(&m_mle.evaluations, nu_m, &params_m);
     absorb_com(transcript, b"logup_m_com", &m_com);
+
+    eprintln!(
+        "[range bits={bits}]   m_com_commit:          {:7.3}ms",
+        t_section.elapsed().as_secs_f64() * 1000.0
+    );
+    t_section = Instant::now();
 
     // ---- Phase 2: per-witness chunk opening at r_v ----
     // Pre-draw all (r_v_i, eta_i) sequentially via FS so the heavy O(num_chunks·N)
@@ -268,10 +287,22 @@ pub fn prove_range_batched(
         })
         .collect();
 
+    eprintln!(
+        "[range bits={bits}]   p2_chunk_opens:        {:7.3}ms",
+        t_section.elapsed().as_secs_f64() * 1000.0
+    );
+    t_section = Instant::now();
+
     // ---- Open shared m (old commitment, kept for LayerNorm accumulator) ----
     let r_m = challenge_vec(transcript, CHUNK_BITS, b"logup_rm");
     let m_eval = m_mle.evaluate(&r_m);
     let m_open = hyrax_open(&m_mle.evaluations, &r_m, nu_m, sigma_m);
+
+    eprintln!(
+        "[range bits={bits}]   m_open:                {:7.3}ms",
+        t_section.elapsed().as_secs_f64() * 1000.0
+    );
+    t_section = Instant::now();
 
     // ---- Phase 3: LogUp consistency proof ----
     // α drawn after m_com — prover cannot pick α to cheat on M.
@@ -313,6 +344,12 @@ pub fn prove_range_batched(
         })
         .collect();
 
+    eprintln!(
+        "[range bits={bits}]   p3_h_commits_par:      {:7.3}ms",
+        t_section.elapsed().as_secs_f64() * 1000.0
+    );
+    t_section = Instant::now();
+
     for (h_mles_w, h_coms_w) in h_precomputed {
         for h_com in &h_coms_w {
             absorb_com(transcript, b"logup_h_com", h_com);
@@ -320,6 +357,12 @@ pub fn prove_range_batched(
         all_h_mles.push(h_mles_w);
         all_h_coms.push(h_coms_w);
     }
+
+    eprintln!(
+        "[range bits={bits}]   p3_h_absorb_loop:      {:7.3}ms",
+        t_section.elapsed().as_secs_f64() * 1000.0
+    );
+    t_section = Instant::now();
 
     // β drawn after h_coms — used to combine the two LogUp checks into one sumcheck per chunk.
     let beta = transcript.challenge_field::<F>(b"logup_beta");
@@ -361,57 +404,81 @@ pub fn prove_range_batched(
         })
         .collect();
 
-    // ---- Pass A (sequential, transcript-bound): per-witness γ draw +
-    // batched sumcheck.  Only field ops over relatively small state — the
-    // heavy hyrax_open MSMs are deferred to Pass B below. ----
-    struct WitnessLogupState {
-        r_k: Vec<F>,
-        batched_sumcheck: SumcheckProofMulti,
+    eprintln!(
+        "[range bits={bits}]   p3_logup_precompute:   {:7.3}ms",
+        t_section.elapsed().as_secs_f64() * 1000.0
+    );
+    t_section = Instant::now();
+
+    // ---- Pass A: ONE super-batched sumcheck per (num_vars) bucket. ----
+    // All witnesses with the same num_vars share an FS challenge eta_b and
+    // a single sumcheck that folds bucket_size · num_chunks triples via
+    // weight[w·nc + c] = eta_b^w · γ_c. Buckets are processed in ascending
+    // num_vars order (deterministic FS path; verifier mirrors).
+    let mut buckets_by_num_vars: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, &nv) in all_num_vars.iter().enumerate() {
+        buckets_by_num_vars.entry(nv).or_default().push(i);
     }
 
-    let mut witness_states: Vec<WitnessLogupState> = Vec::with_capacity(witnesses.len());
     let mut total_lhs_claim = F::ZERO;
+    let mut witness_r_k: Vec<Vec<F>> = vec![Vec::new(); witnesses.len()];
+    let mut bucket_sumchecks: Vec<SumcheckProofMulti> =
+        Vec::with_capacity(buckets_by_num_vars.len());
 
-    for i in 0..witnesses.len() {
-        // Draw RLC weights γ_0..γ_{nc-1} for this witness, *after* β and after
-        // h_coms have been absorbed (both happened above).  Per-witness drawing
-        // keeps a tight binding of γ to this witness's chunks.
+    for (_num_vars, indices) in buckets_by_num_vars.iter() {
+        let bucket_size = indices.len();
+        let total_triples = bucket_size * num_chunks;
+
+        // Bucket-shared FS challenges: one eta + num_chunks γ's per bucket.
+        let eta = transcript.challenge_field::<F>(b"logup_bucket_eta");
+        let eta_pows = powers_of(eta, bucket_size);
         let gammas: Vec<F> = (0..num_chunks)
             .map(|_| transcript.challenge_field::<F>(b"logup_gamma"))
             .collect();
 
-        let pre = &logup_precomputed[i];
-        for &claim_c in &pre.claims {
-            total_lhs_claim += claim_c;
+        let mut weights = Vec::with_capacity(total_triples);
+        let mut fs = Vec::with_capacity(total_triples);
+        let mut gs = Vec::with_capacity(total_triples);
+        let mut bucket_claim = F::ZERO;
+
+        for (w, &i) in indices.iter().enumerate() {
+            let pre = &logup_precomputed[i];
+            for &claim_c in &pre.claims {
+                total_lhs_claim += claim_c;
+            }
+            for c in 0..num_chunks {
+                let weight = eta_pows[w] * gammas[c];
+                weights.push(weight);
+                // Move-clone h/q mles (sumcheck mutates in place). h_mles
+                // are still needed in Pass B for h_open_proofs.
+                fs.push(all_h_mles[i][c].clone());
+                gs.push(pre.q_mles[c].clone());
+                bucket_claim += weight * pre.combined[c];
+            }
         }
 
-        // Batched claim Σ_c γ_c · combined_c.
-        let batched_claim: F = gammas
-            .iter()
-            .zip(pre.combined.iter())
-            .map(|(&g, &c)| g * c)
-            .sum();
-
-        // Single sumcheck across all chunks at shared challenge r_k.
-        // We move-clone the h_mles + q_mles so the multi-batched sumcheck can
-        // own them (it mutates in place per round).
-        let h_mles_owned: Vec<DenseMLPoly> = all_h_mles[i].clone();
-        let q_mles_owned: Vec<DenseMLPoly> = pre.q_mles.clone();
-        let (batched_sumcheck, r_k) = prove_sumcheck_multi_batched_owned(
-            h_mles_owned,
-            q_mles_owned,
-            &gammas,
-            batched_claim,
+        let (super_sumcheck, r_k) = prove_sumcheck_multi_batched_owned(
+            fs,
+            gs,
+            &weights,
+            bucket_claim,
             transcript,
         );
 
-        witness_states.push(WitnessLogupState {
-            r_k,
-            batched_sumcheck,
-        });
+        // Every witness in this bucket shares r_k_bucket for Pass B.
+        for &i in indices {
+            witness_r_k[i] = r_k.clone();
+        }
+        bucket_sumchecks.push(super_sumcheck);
     }
 
     debug_assert_eq!(total_lhs_claim, logup_rhs_claim, "LogUp grand sum mismatch");
+
+    eprintln!(
+        "[range bits={bits}]   p3_pass_a_sumchecks:   {:7.3}ms",
+        t_section.elapsed().as_secs_f64() * 1000.0
+    );
+    t_section = Instant::now();
 
     // ---- Pass B (parallel, transcript-free): chunk_at_rk evaluations and
     // Hyrax opens for h_c and chunk_c at the shared r_k, across ALL witnesses
@@ -429,7 +496,7 @@ pub fn prove_range_batched(
         .into_par_iter()
         .map(|i| {
             let (nu_c, sigma_c, _) = params_from_vars(all_num_vars[i]);
-            let r_k = &witness_states[i].r_k;
+            let r_k = &witness_r_k[i];
             let chunk_at_rk: Vec<F> = all_chunk_mles[i].iter().map(|m| m.evaluate(r_k)).collect();
             let h_open_proofs: Vec<HyraxProof> = all_h_mles[i]
                 .iter()
@@ -447,14 +514,18 @@ pub fn prove_range_batched(
         })
         .collect();
 
-    // Assemble per-witness LogUp proofs by zipping Pass-A state with Pass-B opens.
-    let all_logup_witness: Vec<LogUpWitnessProof> = witness_states
+    eprintln!(
+        "[range bits={bits}]   p3_pass_b_opens_par:   {:7.3}ms",
+        t_section.elapsed().as_secs_f64() * 1000.0
+    );
+    t_section = Instant::now();
+
+    // Assemble per-witness LogUp proofs (the bucket sumchecks live in GlobalRangeM).
+    let all_logup_witness: Vec<LogUpWitnessProof> = opens
         .into_iter()
-        .zip(opens.into_iter())
         .enumerate()
-        .map(|(i, (state, ops))| LogUpWitnessProof {
+        .map(|(i, ops)| LogUpWitnessProof {
             h_coms: all_h_coms[i].clone(),
-            batched_sumcheck: state.batched_sumcheck,
             combined_claims: logup_precomputed[i].combined.clone(),
             chunk_at_rk: ops.chunk_at_rk,
             h_open_proofs: ops.h_open_proofs,
@@ -462,10 +533,21 @@ pub fn prove_range_batched(
         })
         .collect();
 
+    eprintln!(
+        "[range bits={bits}]   assemble_witnesses:    {:7.3}ms",
+        t_section.elapsed().as_secs_f64() * 1000.0
+    );
+    t_section = Instant::now();
+
     // RHS sumcheck: Σ_j M[j] * g[j] = logup_rhs_claim
     let (logup_rhs_sumcheck, r_m2) = prove_sumcheck(&m_mle, &g_mle, logup_rhs_claim, transcript);
     let logup_m_at_rm2 = m_mle.evaluate(&r_m2);
     let logup_m_open_rm2 = hyrax_open(&m_mle.evaluations, &r_m2, nu_m, sigma_m);
+
+    eprintln!(
+        "[range bits={bits}]   rhs_sumcheck_m_open:   {:7.3}ms",
+        t_section.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Assemble final witness proofs
     let witness_proofs: Vec<RangeWitnessProof> = witness_proofs_partial
@@ -489,6 +571,7 @@ pub fn prove_range_batched(
         logup_rhs_claim,
         logup_m_at_rm2,
         logup_m_open_rm2,
+        bucket_sumchecks,
     };
 
     Ok((witness_proofs, global_m, r_vs))
@@ -594,18 +677,24 @@ pub fn verify_range_batched(
     }
     let beta = transcript.challenge_field::<F>(b"logup_beta");
 
-    // Per-witness: verify ONE batched sumcheck folding all chunks via γ weights,
-    // then per-chunk algebraic consistency: q_c(r_k) == 1 + β(α - chunk_c(r_k)).
-    // Hyrax openings are deferred to the existing batch accumulators — inner-product
-    // checks happen immediately (field ops only); G1 MSMs are batched at finalize.
-    let mut total_lhs_claim = F::ZERO;
-    for (i, proof) in witness_proofs.iter().enumerate() {
-        let num_vars = num_vars_list[i];
-        let n_padded = 1usize << num_vars;
-        // Route LogUp opens to the same accumulator as Phase-2 chunk opens
-        // (h_c and chunk_c live at the same Hyrax param size as chunk_coms).
-        let acc_logup: &mut HyraxBatchAccumulator = &mut *chunk_accs[acc_indices[i]].1;
+    // Bucket-level verification: mirror the prover's BTreeMap grouping by num_vars.
+    // For each bucket: draw eta + gammas, verify ONE super-batched sumcheck
+    // covering all (witness, chunk) pairs, then per-witness check the q(r_k)
+    // algebra and defer Hyrax opens for h_c and chunk_c.
+    let mut buckets_by_num_vars: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, &nv) in num_vars_list.iter().enumerate() {
+        buckets_by_num_vars.entry(nv).or_default().push(i);
+    }
+    if buckets_by_num_vars.len() != global_m.bucket_sumchecks.len() {
+        return Err(format!(
+            "GlobalRange: bucket count mismatch (got {}, expected {})",
+            global_m.bucket_sumchecks.len(),
+            buckets_by_num_vars.len()
+        ));
+    }
 
+    // Cardinality checks per witness (no longer holds batched_sumcheck).
+    for (i, proof) in witness_proofs.iter().enumerate() {
         if proof.logup.combined_claims.len() != num_chunks
             || proof.logup.chunk_at_rk.len() != num_chunks
             || proof.logup.h_coms.len() != num_chunks
@@ -616,74 +705,92 @@ pub fn verify_range_batched(
                 "LogUp witness {i}: chunk-cardinality mismatch in proof structure"
             ));
         }
+    }
 
-        // Mirror prover: draw γ_0..γ_{nc-1} for this witness, then verify the
-        // batched sumcheck.
+    let mut total_lhs_claim = F::ZERO;
+    for ((num_vars, indices), super_sumcheck) in buckets_by_num_vars
+        .iter()
+        .zip(global_m.bucket_sumchecks.iter())
+    {
+        let bucket_size = indices.len();
+        let total_triples = bucket_size * num_chunks;
+        let n_padded = 1usize << num_vars;
+        let beta_n_padded = beta * F::from(n_padded as u64);
+
+        // Bucket-shared FS challenges: eta then gammas (mirror prover order).
+        let eta = transcript.challenge_field::<F>(b"logup_bucket_eta");
+        let eta_pows = powers_of(eta, bucket_size);
         let gammas: Vec<F> = (0..num_chunks)
             .map(|_| transcript.challenge_field::<F>(b"logup_gamma"))
             .collect();
 
-        let batched_claim: F = gammas
-            .iter()
-            .zip(proof.logup.combined_claims.iter())
-            .map(|(&g, &c)| g * c)
-            .sum();
-
-        // Recover per-chunk claim_c and accumulate the LogUp grand sum.
-        let beta_n_padded = beta * F::from(n_padded as u64);
-        for &combined in &proof.logup.combined_claims {
-            total_lhs_claim += combined - beta_n_padded;
+        // Build flat weights and bucket claim from per-witness combined_claims.
+        let mut weights = Vec::with_capacity(total_triples);
+        let mut bucket_claim = F::ZERO;
+        for (w, &i) in indices.iter().enumerate() {
+            let logup = &witness_proofs[i].logup;
+            for c in 0..num_chunks {
+                let weight = eta_pows[w] * gammas[c];
+                weights.push(weight);
+                bucket_claim += weight * logup.combined_claims[c];
+                total_lhs_claim += logup.combined_claims[c] - beta_n_padded;
+            }
         }
 
-        let (r_k, final_combination) = verify_sumcheck_multi_batched(
-            &proof.logup.batched_sumcheck,
-            &gammas,
-            batched_claim,
-            num_vars,
+        let (r_k, _final_combination) = verify_sumcheck_multi_batched(
+            super_sumcheck,
+            &weights,
+            bucket_claim,
+            *num_vars,
             transcript,
         )
-        .map_err(|e| format!("LogUp witness {i} batched sumcheck: {e}"))?;
+        .map_err(|e| format!("LogUp bucket nv={num_vars} sumcheck: {e}"))?;
 
-        // verify_sumcheck_multi_batched also asserts
-        //   final_combination == Σ_c γ_c · final_evals_f[c] · final_evals_g[c]
-        // so we just need to: (a) bind final_evals_g[c] to the algebraic relation
-        // q_c(r_k) = 1 + β(α - chunk_c(r_k)), and (b) defer Hyrax opens for h_c
-        // (eval = final_evals_f[c]) and chunk_c (eval = chunk_at_rk[c]).
-        let _ = final_combination; // already enforced inside verify_sumcheck_multi_batched
-
-        let final_evals_f = &proof.logup.batched_sumcheck.final_evals_f;
-        let final_evals_g = &proof.logup.batched_sumcheck.final_evals_g;
-        if final_evals_f.len() != num_chunks || final_evals_g.len() != num_chunks {
+        // verify_sumcheck_multi_batched already enforces
+        //   final_combination == Σ_k weights[k] · final_evals_f[k] · final_evals_g[k]
+        // We additionally bind each final_evals_g[w·nc + c] to the algebraic relation
+        // q_c(r_k) = 1 + β(α - chunk_c(r_k)) and defer Hyrax opens.
+        let final_evals_f = &super_sumcheck.final_evals_f;
+        let final_evals_g = &super_sumcheck.final_evals_g;
+        if final_evals_f.len() != total_triples || final_evals_g.len() != total_triples {
             return Err(format!(
-                "LogUp witness {i}: batched sumcheck final-evals length mismatch"
+                "LogUp bucket nv={num_vars}: super-sumcheck final-evals length mismatch (got f={}, g={}, expected={})",
+                final_evals_f.len(),
+                final_evals_g.len(),
+                total_triples
             ));
         }
 
-        for c in 0..num_chunks {
-            let chunk_val = proof.logup.chunk_at_rk[c];
-            let expected_q = F::ONE + beta * (alpha - chunk_val);
-            if final_evals_g[c] != expected_q {
-                return Err(format!(
-                    "LogUp witness {i} chunk {c}: q(r_k) algebra mismatch"
-                ));
-            }
+        for (w, &i) in indices.iter().enumerate() {
+            let logup = &witness_proofs[i].logup;
+            let acc_logup: &mut HyraxBatchAccumulator = &mut *chunk_accs[acc_indices[i]].1;
+            for c in 0..num_chunks {
+                let idx = w * num_chunks + c;
+                let chunk_val = logup.chunk_at_rk[c];
+                let expected_q = F::ONE + beta * (alpha - chunk_val);
+                if final_evals_g[idx] != expected_q {
+                    return Err(format!(
+                        "LogUp witness {i} chunk {c}: q(r_k) algebra mismatch"
+                    ));
+                }
 
-            acc_logup
-                .add_verify(
-                    &proof.logup.h_coms[c],
-                    final_evals_f[c],
-                    &r_k,
-                    &proof.logup.h_open_proofs[c],
-                )
-                .map_err(|e| format!("LogUp witness {i} chunk {c} h opening: {e}"))?;
-            acc_logup
-                .add_verify(
-                    &proof.chunk_coms[c],
-                    chunk_val,
-                    &r_k,
-                    &proof.logup.chunk_open_proofs[c],
-                )
-                .map_err(|e| format!("LogUp witness {i} chunk {c} chunk opening: {e}"))?;
+                acc_logup
+                    .add_verify(
+                        &logup.h_coms[c],
+                        final_evals_f[idx],
+                        &r_k,
+                        &logup.h_open_proofs[c],
+                    )
+                    .map_err(|e| format!("LogUp witness {i} chunk {c} h opening: {e}"))?;
+                acc_logup
+                    .add_verify(
+                        &witness_proofs[i].chunk_coms[c],
+                        chunk_val,
+                        &r_k,
+                        &logup.chunk_open_proofs[c],
+                    )
+                    .map_err(|e| format!("LogUp witness {i} chunk {c} chunk opening: {e}"))?;
+            }
         }
     }
 

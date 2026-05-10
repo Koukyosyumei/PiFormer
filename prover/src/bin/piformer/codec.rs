@@ -602,7 +602,6 @@ fn read_lasso_multi_proof<R: Read>(r: &mut R) -> io::Result<LassoMultiProof> {
 
 fn write_logup_witness_proof<W: Write>(w: &mut W, p: &LogUpWitnessProof) -> io::Result<()> {
     write_vec(w, &p.h_coms, write_hyrax_commitment)?;
-    write_sumcheck_proof_multi(w, &p.batched_sumcheck)?;
     write_vec_f(w, &p.combined_claims)?;
     write_vec_f(w, &p.chunk_at_rk)?;
     write_vec(w, &p.h_open_proofs, write_hyrax_proof)?;
@@ -611,7 +610,6 @@ fn write_logup_witness_proof<W: Write>(w: &mut W, p: &LogUpWitnessProof) -> io::
 fn read_logup_witness_proof<R: Read>(r: &mut R) -> io::Result<LogUpWitnessProof> {
     Ok(LogUpWitnessProof {
         h_coms: read_vec(r, read_hyrax_commitment)?,
-        batched_sumcheck: read_sumcheck_proof_multi(r)?,
         combined_claims: read_vec_f(r)?,
         chunk_at_rk: read_vec_f(r)?,
         h_open_proofs: read_vec(r, read_hyrax_proof)?,
@@ -641,7 +639,8 @@ fn write_global_range_m<W: Write>(w: &mut W, m: &GlobalRangeM) -> io::Result<()>
     write_sumcheck_proof(w, &m.logup_rhs_sumcheck)?;
     write_f(w, &m.logup_rhs_claim)?;
     write_f(w, &m.logup_m_at_rm2)?;
-    write_hyrax_proof(w, &m.logup_m_open_rm2)
+    write_hyrax_proof(w, &m.logup_m_open_rm2)?;
+    write_vec(w, &m.bucket_sumchecks, write_sumcheck_proof_multi)
 }
 
 fn write_range_batch_m<W: Write>(w: &mut W, b: &RangeBatchM) -> io::Result<()> {
@@ -679,6 +678,7 @@ fn read_global_range_m<R: Read>(r: &mut R) -> io::Result<GlobalRangeM> {
         logup_rhs_claim: read_f(r)?,
         logup_m_at_rm2: read_f(r)?,
         logup_m_open_rm2: read_hyrax_proof(r)?,
+        bucket_sumchecks: read_vec(r, read_sumcheck_proof_multi)?,
     })
 }
 
