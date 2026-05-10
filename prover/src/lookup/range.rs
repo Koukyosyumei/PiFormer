@@ -21,10 +21,13 @@ use crate::transcript::Transcript;
 use ark_ff::{batch_inversion, Field, PrimeField};
 use rayon::prelude::*;
 
-// 8-bit chunks: table size = 256 (was 65536 with 16-bit chunks).
-// 16-bit values need 2 chunks; 32-bit values need 4 chunks.
-// This shrinks m_com MSM, RHS sumcheck, and g_mle_eval by 256× vs 16-bit chunks.
-pub const CHUNK_BITS: usize = 8;
+// 16-bit chunks: table size = 65536. 32-bit values need 2 chunks; 64-bit values
+// need 4 chunks. The fixed m_com / RHS-sumcheck / g_mle overhead grows by 256×
+// vs 8-bit chunks, but per-witness chunk commits + LogUp h commits + per-witness
+// sumcheck rounds all halve. With many range witnesses (large LN y_witnesses
+// at 2·T·D entries × tens of LNs), the per-witness savings dominate the fixed
+// overhead by orders of magnitude.
+pub const CHUNK_BITS: usize = 16;
 pub const CHUNK_SIZE: usize = 1 << CHUNK_BITS;
 
 // ---------------------------------------------------------------------------
