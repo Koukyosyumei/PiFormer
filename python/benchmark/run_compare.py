@@ -121,19 +121,30 @@ def _qat_schedule(step: int, total_steps: int, warmup_frac: float, ramp_frac: fl
 
 
 class ActivationRangeTracker:
-    """Soft auxiliary loss that pushes StructuredLookupActivation inputs into
-    the lookup window before they overflow.
+    """Training-time safety net for ``StructuredLookupActivation``.
 
     The Rust prover refuses to prove witnesses where the quantized lookup
     index is outside ``[0, 2^num_bits - 1]``; ``StructuredLookupActivation``
-    mirrors that contract with a hard ``RuntimeError``. This tracker registers
-    a forward pre-hook on every activation, computing per-step
+    mirrors that contract with a hard ``RuntimeError`` — fatal mid-training.
 
-        relu(lo - x).pow(2).mean() + relu(x - hi).pow(2).mean()
+    This tracker installs a forward pre-hook on every activation that:
 
-    where ``[lo, hi] = [-zp*scale, (max_idx-zp)*scale]`` is the input range
-    that maps inside the lookup window. Penalties accumulate on each module
-    as a tensor attribute; ``pop()`` sums and clears them.
+      1. **Clips** the incoming tensor to the lookup window
+         ``[lo, hi] = [-zp*scale, (max_idx-zp)*scale]`` *before* it reaches
+         ``StructuredLookupActivation.forward``. Clipping is what prevents
+         the crash — the lookup never sees an out-of-range value.
+
+      2. Records the squared clip distance ``mean((x - clip(x))**2)`` on the
+         module; ``pop()`` sums these into a single auxiliary-loss tensor.
+         The clip distance is positive only when clipping was needed, so
+         adding ``λ * pop()`` to the training loss provides gradient
+         pressure to reduce clipping over time and steer the model toward
+         producing naturally in-range activations.
+
+    With a positive penalty weight, the model converges toward not needing
+    the clip; without it, training still doesn't crash but activations may
+    saturate at the boundary indefinitely (the model has no incentive to
+    pull back). Either way, training never raises.
     """
 
     def __init__(self, model: nn.Module):
@@ -152,12 +163,15 @@ class ActivationRangeTracker:
 
             def hook(mod, args, _kwargs=None):
                 x = args[0]
-                pen = (
-                    torch.nn.functional.relu(mod._range_lo - x).pow(2).mean()
-                    + torch.nn.functional.relu(x - mod._range_hi).pow(2).mean()
-                )
-                mod._range_penalty = pen
-                return None
+                # Clip first so the activation kernel never sees an
+                # out-of-range value; record the (squared, mean) clip
+                # distance for the auxiliary loss.
+                clipped = x.clamp(min=mod._range_lo, max=mod._range_hi)
+                mod._range_penalty = (x - clipped).pow(2).mean()
+                # `with_kwargs=True` requires returning (args, kwargs) when
+                # we want to replace the inputs. The activation takes a
+                # single positional tensor.
+                return ((clipped,), {})
 
             self._handles.append(
                 module.register_forward_pre_hook(hook, with_kwargs=True)
@@ -597,12 +611,17 @@ def parse_args():
     p.add_argument("--max_exp", type=int, default=4)
     p.add_argument(
         "--act_range_penalty", type=float, default=0.0,
-        help="Auxiliary loss weight that pushes StructuredLookupActivation "
-             "inputs into the lookup window before they overflow. Only applied "
-             "to PiFormer. The Rust prover refuses witnesses with out-of-range "
-             "lookup indices, so a positive value here keeps trained models "
-             "provable. Recommended: 1e-3 to 1e-2 for tinyshakespeare-scale "
-             "runs. 0 disables the penalty (matches the previous behavior).",
+        help="Enable the StructuredLookupActivation training-time safety net "
+             "(value > 0). When enabled, a forward pre-hook on every PiFormer "
+             "lookup activation (a) clips the input to the lookup window "
+             "BEFORE the kernel sees it — preventing the hard 'index outside "
+             "[0, 2^num_bits]' RuntimeError that otherwise kills training mid-run "
+             "— and (b) adds `weight * mean((x - clip(x))**2)` to the loss so "
+             "the model is pushed toward producing naturally in-range activations "
+             "and stops needing the clip. Recommended: 1e-3 to 1e-2 for "
+             "tinyshakespeare-scale runs. Default 0 disables both clip AND "
+             "penalty (training will crash on overflow, matching the previous "
+             "behavior).",
     )
 
     # Training
