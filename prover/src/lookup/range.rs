@@ -9,14 +9,15 @@
 
 use crate::field::F;
 use crate::pcs::{
-    hyrax_commit, hyrax_open, hyrax_open_batch_with_eta, params_from_vars, powers_of,
+    hyrax_commit, hyrax_open, hyrax_open_batch_with_eta, hyrax_verify, params_from_vars, powers_of,
     HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
 };
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{
-    prove_sumcheck, prove_sumcheck_multi_batched_owned, verify_sumcheck,
-    verify_sumcheck_multi_batched, RoundPoly, SumcheckProof, SumcheckProofMulti,
+    prove_sumcheck, verify_sumcheck, verify_sumcheck_cubic_multi_batched, SumcheckCubicProofMulti,
+    SumcheckProof,
 };
+use crate::subprotocols::sumcheck::CubicRoundPoly;
 use crate::transcript::Transcript;
 use ark_ff::{batch_inversion, Field, PrimeField};
 use rayon::prelude::*;
@@ -109,143 +110,145 @@ pub struct GlobalRangeM {
     /// M(r_m2) — opening of m_com at the RHS sumcheck challenge.
     pub logup_m_at_rm2: F,
     pub logup_m_open_rm2: HyraxProof,
-    /// Super-batched LogUp Pass-A sumchecks, one per witness-size bucket.
-    /// Witnesses are bucketed by `num_vars` (n_padded.trailing_zeros()) and the
-    /// buckets are ordered ascending. Each bucket's sumcheck folds all
-    /// (witness, chunk) pairs in the bucket via FS-RLC weights eta^w · γ_c at
-    /// a shared challenge r_k_bucket. final_evals_f/g have length
-    /// bucket_size · num_chunks; element at index w·num_chunks + c is the
-    /// (witness, chunk) pair's reduced eval.
-    pub bucket_sumchecks: Vec<SumcheckProofMulti>,
+    /// Cubic LogUp Pass-A sumchecks, one per witness-size bucket. Each bucket
+    /// fuses all inverse polynomials into H_bucket(pair, x), and proves
+    /// H_bucket(pair, x) · W_bucket(pair) · (1 + β(α - C_bucket(pair, x))).
+    pub bucket_sumchecks: Vec<SumcheckCubicProofMulti>,
+    /// One fused commitment to all LogUp inverse polynomials per `num_vars`
+    /// bucket, ordered like `bucket_sumchecks`.
+    pub bucket_h_coms: Vec<HyraxCommitment>,
+    pub bucket_h_opens: Vec<HyraxProof>,
 }
 
-fn prove_logup_bucket_sumcheck_affine_q(
-    all_h_mles: &[Vec<DenseMLPoly>],
-    all_chunk_mles: &[Vec<DenseMLPoly>],
-    pairs: &[(usize, usize)],
-    weights: &[F],
+fn prove_fused_logup_sumcheck_affine_q(
+    mut h_cur: Vec<F>,
+    mut c_cur: Vec<F>,
+    mut w_cur: Vec<F>,
     alpha: F,
     beta: F,
     claim: F,
     transcript: &mut Transcript,
-) -> (SumcheckProofMulti, Vec<F>) {
-    assert_eq!(pairs.len(), weights.len());
-    let num_pairs = pairs.len();
-    let n = all_h_mles[pairs[0].0][pairs[0].1].num_vars;
+) -> (SumcheckCubicProofMulti, Vec<F>) {
+    assert_eq!(h_cur.len(), c_cur.len());
+    assert_eq!(h_cur.len(), w_cur.len());
+    let n = h_cur.len().trailing_zeros() as usize;
     transcript.append_field(b"sc_claim", &claim);
-
-    let mut h_cur: Vec<Vec<F>> = pairs
-        .iter()
-        .map(|&(i, c)| all_h_mles[i][c].evaluations.clone())
-        .collect();
-    let mut chunk_cur: Vec<Vec<F>> = pairs
-        .iter()
-        .map(|&(i, c)| all_chunk_mles[i][c].evaluations.clone())
-        .collect();
 
     let mut round_polys = Vec::with_capacity(n);
     let mut challenges = Vec::with_capacity(n);
     let two = F::from(2u64);
 
     for _ in 0..n {
-        let half = h_cur[0].len() >> 1;
+        let half = h_cur.len() >> 1;
         const PAR_THRESHOLD: usize = 512;
-        let (e0, e1, e2) = if half >= PAR_THRESHOLD {
+        let e = if half >= PAR_THRESHOLD {
             (0..half)
                 .into_par_iter()
                 .map(|idx| {
-                    let mut r0 = F::ZERO;
-                    let mut r1 = F::ZERO;
-                    let mut r2 = F::ZERO;
-                    for k in 0..num_pairs {
-                        let h0 = h_cur[k][idx];
-                        let h1 = h_cur[k][idx + half];
-                        let c0 = chunk_cur[k][idx];
-                        let c1 = chunk_cur[k][idx + half];
-                        let h2 = two * h1 - h0;
-                        let c2 = two * c1 - c0;
-                        let q0 = F::ONE + beta * (alpha - c0);
-                        let q1 = F::ONE + beta * (alpha - c1);
-                        let q2 = F::ONE + beta * (alpha - c2);
-                        let w = weights[k];
-                        r0 += w * h0 * q0;
-                        r1 += w * h1 * q1;
-                        r2 += w * h2 * q2;
-                    }
-                    (r0, r1, r2)
+                    let mut local = [F::ZERO; 4];
+                    let h0 = h_cur[idx];
+                    let h1 = h_cur[idx + half];
+                    let c0 = c_cur[idx];
+                    let c1 = c_cur[idx + half];
+                    let w0 = w_cur[idx];
+                    let w1 = w_cur[idx + half];
+                    let h2 = two * h1 - h0;
+                    let w2 = two * w1 - w0;
+                    let c2 = two * c1 - c0;
+                    let h3 = h2 + h1 - h0;
+                    let w3 = w2 + w1 - w0;
+                    let c3 = c2 + c1 - c0;
+                    let r0 = F::ONE + beta * (alpha - c0);
+                    let r1 = F::ONE + beta * (alpha - c1);
+                    let r2 = F::ONE + beta * (alpha - c2);
+                    let r3 = F::ONE + beta * (alpha - c3);
+                    local[0] = h0 * w0 * r0;
+                    local[1] = h1 * w1 * r1;
+                    local[2] = h2 * w2 * r2;
+                    local[3] = h3 * w3 * r3;
+                    local
                 })
                 .reduce(
-                    || (F::ZERO, F::ZERO, F::ZERO),
-                    |(a0, a1, a2), (b0, b1, b2)| (a0 + b0, a1 + b1, a2 + b2),
+                    || [F::ZERO; 4],
+                    |mut a, b| {
+                        for i in 0..4 {
+                            a[i] += b[i];
+                        }
+                        a
+                    },
                 )
         } else {
-            (0..half).fold((F::ZERO, F::ZERO, F::ZERO), |(a0, a1, a2), idx| {
-                let mut r0 = F::ZERO;
-                let mut r1 = F::ZERO;
-                let mut r2 = F::ZERO;
-                for k in 0..num_pairs {
-                    let h0 = h_cur[k][idx];
-                    let h1 = h_cur[k][idx + half];
-                    let c0 = chunk_cur[k][idx];
-                    let c1 = chunk_cur[k][idx + half];
-                    let h2 = two * h1 - h0;
-                    let c2 = two * c1 - c0;
-                    let q0 = F::ONE + beta * (alpha - c0);
-                    let q1 = F::ONE + beta * (alpha - c1);
-                    let q2 = F::ONE + beta * (alpha - c2);
-                    let w = weights[k];
-                    r0 += w * h0 * q0;
-                    r1 += w * h1 * q1;
-                    r2 += w * h2 * q2;
-                }
-                (a0 + r0, a1 + r1, a2 + r2)
-            })
+            let mut e = [F::ZERO; 4];
+            for idx in 0..half {
+                let h0 = h_cur[idx];
+                let h1 = h_cur[idx + half];
+                let c0 = c_cur[idx];
+                let c1 = c_cur[idx + half];
+                let w0 = w_cur[idx];
+                let w1 = w_cur[idx + half];
+                let h2 = two * h1 - h0;
+                let w2 = two * w1 - w0;
+                let c2 = two * c1 - c0;
+                let h3 = h2 + h1 - h0;
+                let w3 = w2 + w1 - w0;
+                let c3 = c2 + c1 - c0;
+                let r0 = F::ONE + beta * (alpha - c0);
+                let r1 = F::ONE + beta * (alpha - c1);
+                let r2 = F::ONE + beta * (alpha - c2);
+                let r3 = F::ONE + beta * (alpha - c3);
+                e[0] += h0 * w0 * r0;
+                e[1] += h1 * w1 * r1;
+                e[2] += h2 * w2 * r2;
+                e[3] += h3 * w3 * r3;
+            }
+            e
         };
 
-        let rp = RoundPoly {
-            evals: [e0, e1, e2],
-        };
+        let rp = CubicRoundPoly { evals: e };
         for e in &rp.evals {
             transcript.append_field(b"sc_round", e);
         }
         let r_i = transcript.challenge_field::<F>(b"sc_challenge");
         challenges.push(r_i);
 
-        h_cur.par_iter_mut().for_each(|evals| {
-            let next: Vec<F> = (0..half)
-                .map(|idx| {
-                    let lo = evals[idx];
-                    let hi = evals[idx + half];
-                    lo + r_i * (hi - lo)
-                })
-                .collect();
-            *evals = next;
-        });
-        chunk_cur.par_iter_mut().for_each(|evals| {
-            let next: Vec<F> = (0..half)
-                .map(|idx| {
-                    let lo = evals[idx];
-                    let hi = evals[idx + half];
-                    lo + r_i * (hi - lo)
-                })
-                .collect();
-            *evals = next;
-        });
+        h_cur = (0..half)
+            .into_par_iter()
+            .map(|idx| {
+                let lo = h_cur[idx];
+                let hi = h_cur[idx + half];
+                lo + r_i * (hi - lo)
+            })
+            .collect();
+        c_cur = (0..half)
+            .into_par_iter()
+            .map(|idx| {
+                let lo = c_cur[idx];
+                let hi = c_cur[idx + half];
+                lo + r_i * (hi - lo)
+            })
+            .collect();
+        w_cur = (0..half)
+            .into_par_iter()
+            .map(|idx| {
+                let lo = w_cur[idx];
+                let hi = w_cur[idx + half];
+                lo + r_i * (hi - lo)
+            })
+            .collect();
 
         round_polys.push(rp);
     }
 
-    let final_evals_f: Vec<F> = h_cur.iter().map(|evals| evals[0]).collect();
-    let final_evals_g: Vec<F> = chunk_cur
-        .iter()
-        .map(|evals| F::ONE + beta * (alpha - evals[0]))
-        .collect();
+    let final_evals_f = vec![h_cur[0]];
+    let final_evals_g = vec![w_cur[0]];
+    let final_evals_h = vec![F::ONE + beta * (alpha - c_cur[0])];
 
     (
-        SumcheckProofMulti {
+        SumcheckCubicProofMulti {
             round_polys,
             final_evals_f,
             final_evals_g,
+            final_evals_h,
         },
         challenges,
     )
@@ -450,45 +453,69 @@ pub fn prove_range_batched(
         .map(|(m, g)| *m * *g)
         .sum();
 
-    // Commit all h_k = [1/(α - C_k[i])] BEFORE drawing β so β binds the h commitments.
+    // Build all h_k = [1/(α - C_k[i])] BEFORE drawing β. We bind them via one
+    // fused H_bucket(pair, x) commitment per witness-size bucket.
     let mut all_h_mles: Vec<Vec<DenseMLPoly>> = Vec::with_capacity(witnesses.len());
-    let mut all_h_coms: Vec<Vec<HyraxCommitment>> = Vec::with_capacity(witnesses.len());
 
-    let h_precomputed: Vec<(Vec<DenseMLPoly>, Vec<HyraxCommitment>)> = (0..witnesses.len())
+    let h_precomputed: Vec<Vec<DenseMLPoly>> = (0..witnesses.len())
         .into_par_iter()
         .map(|i| {
             let n = witnesses[i].values.len();
-            let num_vars = n.next_power_of_two().trailing_zeros() as usize;
-            let (nu_c, _, params_c) = params_from_vars(num_vars);
-            let h_mles_w: Vec<DenseMLPoly> = (0..num_chunks)
+            (0..num_chunks)
                 .map(|c| {
                     let mut h_vals: Vec<F> =
                         all_chunk_vals[i][c].iter().map(|&cv| alpha - cv).collect();
                     batch_inversion(&mut h_vals);
                     vec_to_mle(&h_vals, n)
                 })
-                .collect();
-            let h_coms_w: Vec<HyraxCommitment> = h_mles_w
-                .par_iter()
-                .map(|h_mle| hyrax_commit(&h_mle.evaluations, nu_c, &params_c))
-                .collect();
-            (h_mles_w, h_coms_w)
+                .collect()
         })
         .collect();
+
+    for h_mles_w in h_precomputed {
+        all_h_mles.push(h_mles_w);
+    }
+
+    let mut buckets_by_num_vars: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, &nv) in all_num_vars.iter().enumerate() {
+        buckets_by_num_vars.entry(nv).or_default().push(i);
+    }
+
+    let mut bucket_h_mles: Vec<DenseMLPoly> = Vec::with_capacity(buckets_by_num_vars.len());
+    let mut bucket_c_mles: Vec<DenseMLPoly> = Vec::with_capacity(buckets_by_num_vars.len());
+    let mut bucket_h_coms: Vec<HyraxCommitment> = Vec::with_capacity(buckets_by_num_vars.len());
+    for (&num_vars, indices) in buckets_by_num_vars.iter() {
+        let pair_count = indices.len() * num_chunks;
+        let pair_bits = pair_count.next_power_of_two().trailing_zeros() as usize;
+        let pair_padded = 1usize << pair_bits;
+        let n_elem = 1usize << num_vars;
+        let total_vars = pair_bits + num_vars;
+        let mut h_evals = vec![F::ZERO; pair_padded * n_elem];
+        let mut c_evals = vec![F::ZERO; pair_padded * n_elem];
+        for (w, &i) in indices.iter().enumerate() {
+            for c in 0..num_chunks {
+                let pair_idx = w * num_chunks + c;
+                let offset = pair_idx << num_vars;
+                h_evals[offset..offset + n_elem].copy_from_slice(&all_h_mles[i][c].evaluations);
+                c_evals[offset..offset + n_elem]
+                    .copy_from_slice(&all_chunk_mles[i][c].evaluations);
+            }
+        }
+        let h_mle = DenseMLPoly::new(h_evals);
+        let c_mle = DenseMLPoly::new(c_evals);
+        let (nu_h, _, params_h) = params_from_vars(total_vars);
+        let h_com = hyrax_commit(&h_mle.evaluations, nu_h, &params_h);
+        absorb_com(transcript, b"logup_h_bucket_com", &h_com);
+        bucket_h_mles.push(h_mle);
+        bucket_c_mles.push(c_mle);
+        bucket_h_coms.push(h_com);
+    }
 
     eprintln!(
         "[range bits={bits}]   p3_h_commits_par:      {:7.3}ms",
         t_section.elapsed().as_secs_f64() * 1000.0
     );
     t_section = Instant::now();
-
-    for (h_mles_w, h_coms_w) in h_precomputed {
-        for h_com in &h_coms_w {
-            absorb_com(transcript, b"logup_h_com", h_com);
-        }
-        all_h_mles.push(h_mles_w);
-        all_h_coms.push(h_coms_w);
-    }
 
     eprintln!(
         "[range bits={bits}]   p3_h_absorb_loop:      {:7.3}ms",
@@ -498,17 +525,11 @@ pub fn prove_range_batched(
 
     // β drawn after h_coms — used to combine the two LogUp checks into one sumcheck per chunk.
     let beta = transcript.challenge_field::<F>(b"logup_beta");
-    let use_affine_q_sumcheck = witnesses
-        .iter()
-        .enumerate()
-        .all(|(i, w)| w.values.len() == (1usize << all_num_vars[i]));
-
     // Per-witness: one batched sumcheck folding all `num_chunks` per-chunk
     // combined sumchecks via verifier-supplied weights γ_0..γ_{nc-1}.
     //   Σ_c γ_c · Σ_i h_c[i] · q_c[i] = Σ_c γ_c · combined_c
     // where q_c[i] = 1 + β*(α - C_c[i]) and combined_c = claim_c + β * n_padded.
     struct LogupWitnessPrecompute {
-        q_mles: Vec<DenseMLPoly>,
         claims: Vec<F>,    // claim_c per chunk
         combined: Vec<F>,  // combined_c per chunk = claim_c + β*n_padded
     }
@@ -519,26 +540,14 @@ pub fn prove_range_batched(
             let n = witnesses[i].values.len();
             let num_vars = n.next_power_of_two().trailing_zeros() as usize;
             let n_padded = F::from((1usize << num_vars) as u64);
-            let mut q_mles = Vec::with_capacity(num_chunks);
             let mut claims = Vec::with_capacity(num_chunks);
             let mut combined = Vec::with_capacity(num_chunks);
             for c in 0..num_chunks {
-                if !use_affine_q_sumcheck {
-                    let q_vals: Vec<F> = all_chunk_vals[i][c]
-                        .iter()
-                        .map(|&cv| F::ONE + beta * (alpha - cv))
-                        .collect();
-                    q_mles.push(vec_to_mle(&q_vals, n));
-                }
                 let claim_c: F = all_h_mles[i][c].evaluations.iter().sum();
                 claims.push(claim_c);
                 combined.push(claim_c + beta * n_padded);
             }
-            LogupWitnessPrecompute {
-                q_mles,
-                claims,
-                combined,
-            }
+            LogupWitnessPrecompute { claims, combined }
         })
         .collect();
 
@@ -548,24 +557,21 @@ pub fn prove_range_batched(
     );
     t_section = Instant::now();
 
-    // ---- Pass A: ONE super-batched sumcheck per (num_vars) bucket. ----
+    // ---- Pass A: ONE fused sumcheck per (num_vars) bucket. ----
     // All witnesses with the same num_vars share an FS challenge eta_b and
     // a single sumcheck that folds bucket_size · num_chunks triples via
     // weight[w·nc + c] = eta_b^w · γ_c. Buckets are processed in ascending
     // num_vars order (deterministic FS path; verifier mirrors).
-    let mut buckets_by_num_vars: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (i, &nv) in all_num_vars.iter().enumerate() {
-        buckets_by_num_vars.entry(nv).or_default().push(i);
-    }
-
     let mut total_lhs_claim = F::ZERO;
     let mut witness_r_k: Vec<Vec<F>> = vec![Vec::new(); witnesses.len()];
-    let mut bucket_sumchecks: Vec<SumcheckProofMulti> =
+    let mut bucket_sumchecks: Vec<SumcheckCubicProofMulti> =
         Vec::with_capacity(buckets_by_num_vars.len());
+    let mut bucket_h_opens: Vec<HyraxProof> = Vec::with_capacity(buckets_by_num_vars.len());
 
-    for (_num_vars, indices) in buckets_by_num_vars.iter() {
+    for (bucket_idx, (&num_vars, indices)) in buckets_by_num_vars.iter().enumerate() {
         let bucket_size = indices.len();
         let total_triples = bucket_size * num_chunks;
+        let pair_bits = total_triples.next_power_of_two().trailing_zeros() as usize;
 
         // Bucket-shared FS challenges: one eta + num_chunks γ's per bucket.
         let eta = transcript.challenge_field::<F>(b"logup_bucket_eta");
@@ -575,17 +581,6 @@ pub fn prove_range_batched(
             .collect();
 
         let mut weights = Vec::with_capacity(total_triples);
-        let mut pairs = Vec::with_capacity(total_triples);
-        let mut fs = if use_affine_q_sumcheck {
-            Vec::new()
-        } else {
-            Vec::with_capacity(total_triples)
-        };
-        let mut gs = if use_affine_q_sumcheck {
-            Vec::new()
-        } else {
-            Vec::with_capacity(total_triples)
-        };
         let mut bucket_claim = F::ZERO;
 
         for (w, &i) in indices.iter().enumerate() {
@@ -596,36 +591,43 @@ pub fn prove_range_batched(
             for c in 0..num_chunks {
                 let weight = eta_pows[w] * gammas[c];
                 weights.push(weight);
-                pairs.push((i, c));
-                if !use_affine_q_sumcheck {
-                    // Move-clone h/q mles (sumcheck mutates in place). h_mles
-                    // are still needed in Pass B for h_open_proofs.
-                    fs.push(all_h_mles[i][c].clone());
-                    gs.push(pre.q_mles[c].clone());
-                }
                 bucket_claim += weight * pre.combined[c];
             }
         }
 
-        let (super_sumcheck, r_k) = if use_affine_q_sumcheck {
-            prove_logup_bucket_sumcheck_affine_q(
-                &all_h_mles,
-                &all_chunk_mles,
-                &pairs,
-                &weights,
-                alpha,
-                beta,
-                bucket_claim,
-                transcript,
-            )
-        } else {
-            prove_sumcheck_multi_batched_owned(fs, gs, &weights, bucket_claim, transcript)
-        };
+        let h_evals = bucket_h_mles[bucket_idx].evaluations.clone();
+        let c_evals = bucket_c_mles[bucket_idx].evaluations.clone();
+        let n_elem = 1usize << num_vars;
+        let mut w_evals = vec![F::ZERO; h_evals.len()];
+        for p in 0..total_triples {
+            let offset = p * n_elem;
+            for x in 0..n_elem {
+                w_evals[offset + x] = weights[p];
+            }
+        }
+
+        let (super_sumcheck, r_k_full) = prove_fused_logup_sumcheck_affine_q(
+            h_evals,
+            c_evals,
+            w_evals,
+            alpha,
+            beta,
+            bucket_claim,
+            transcript,
+        );
+        let r_k = r_k_full[pair_bits..].to_vec();
 
         // Every witness in this bucket shares r_k_bucket for Pass B.
         for &i in indices {
             witness_r_k[i] = r_k.clone();
         }
+        let (nu_h, sigma_h, _) = params_from_vars(pair_bits + num_vars);
+        bucket_h_opens.push(hyrax_open(
+            &bucket_h_mles[bucket_idx].evaluations,
+            &r_k_full,
+            nu_h,
+            sigma_h,
+        ));
         bucket_sumchecks.push(super_sumcheck);
     }
 
@@ -638,14 +640,13 @@ pub fn prove_range_batched(
     t_section = Instant::now();
 
     // ---- Pass B (parallel, transcript-free): chunk_at_rk evaluations and
-    // Hyrax opens for h_c and chunk_c at the shared r_k, across ALL witnesses
-    // and ALL chunks.  None of these touch the transcript, so they can run in
+    // Hyrax opens for chunk_c at the shared r_k, across ALL witnesses and ALL
+    // chunks.  None of these touch the transcript, so they can run in
     // parallel even across witnesses (small σ-witness opens overlap with the
     // larger y-witness opens).  hyrax_open itself is internally par_iter'd over
     // its column dimension, so rayon nesting handles work-stealing. ----
     struct WitnessOpens {
         chunk_at_rk: Vec<F>,
-        h_open_proofs: Vec<HyraxProof>,
         chunk_open_proofs: Vec<HyraxProof>,
     }
 
@@ -655,17 +656,12 @@ pub fn prove_range_batched(
             let (nu_c, sigma_c, _) = params_from_vars(all_num_vars[i]);
             let r_k = &witness_r_k[i];
             let chunk_at_rk: Vec<F> = all_chunk_mles[i].iter().map(|m| m.evaluate(r_k)).collect();
-            let h_open_proofs: Vec<HyraxProof> = all_h_mles[i]
-                .iter()
-                .map(|h_mle| hyrax_open(&h_mle.evaluations, r_k, nu_c, sigma_c))
-                .collect();
             let chunk_open_proofs: Vec<HyraxProof> = all_chunk_mles[i]
                 .iter()
                 .map(|chunk_mle| hyrax_open(&chunk_mle.evaluations, r_k, nu_c, sigma_c))
                 .collect();
             WitnessOpens {
                 chunk_at_rk,
-                h_open_proofs,
                 chunk_open_proofs,
             }
         })
@@ -682,10 +678,10 @@ pub fn prove_range_batched(
         .into_iter()
         .enumerate()
         .map(|(i, ops)| LogUpWitnessProof {
-            h_coms: all_h_coms[i].clone(),
+            h_coms: Vec::new(),
             combined_claims: logup_precomputed[i].combined.clone(),
             chunk_at_rk: ops.chunk_at_rk,
-            h_open_proofs: ops.h_open_proofs,
+            h_open_proofs: Vec::new(),
             chunk_open_proofs: ops.chunk_open_proofs,
         })
         .collect();
@@ -729,6 +725,8 @@ pub fn prove_range_batched(
         logup_m_at_rm2,
         logup_m_open_rm2,
         bucket_sumchecks,
+        bucket_h_coms,
+        bucket_h_opens,
     };
 
     Ok((witness_proofs, global_m, r_vs))
@@ -826,26 +824,30 @@ pub fn verify_range_batched(
     // ---- Phase 3: LogUp consistency verification ----
     let alpha = transcript.challenge_field::<F>(b"logup_alpha");
 
-    // Absorb all h_coms before drawing β (mirrors prover ordering)
-    for proof in witness_proofs.iter() {
-        for com in &proof.logup.h_coms {
-            absorb_com(transcript, b"logup_h_com", com);
-        }
+    // Absorb fused H_bucket commitments before drawing β (mirrors prover ordering).
+    for com in &global_m.bucket_h_coms {
+        absorb_com(transcript, b"logup_h_bucket_com", com);
     }
     let beta = transcript.challenge_field::<F>(b"logup_beta");
 
     // Bucket-level verification: mirror the prover's BTreeMap grouping by num_vars.
-    // For each bucket: draw eta + gammas, verify ONE super-batched sumcheck
-    // covering all (witness, chunk) pairs, then per-witness check the q(r_k)
-    // algebra and defer Hyrax opens for h_c and chunk_c.
+    // For each bucket: draw eta + gammas, verify ONE fused cubic sumcheck
+    // covering all (witness, chunk) pairs, then check W/R algebra and defer
+    // Hyrax openings for chunk_c. H_bucket is verified directly with its own
+    // larger Hyrax parameters.
     let mut buckets_by_num_vars: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (i, &nv) in num_vars_list.iter().enumerate() {
         buckets_by_num_vars.entry(nv).or_default().push(i);
     }
-    if buckets_by_num_vars.len() != global_m.bucket_sumchecks.len() {
+    if buckets_by_num_vars.len() != global_m.bucket_sumchecks.len()
+        || buckets_by_num_vars.len() != global_m.bucket_h_coms.len()
+        || buckets_by_num_vars.len() != global_m.bucket_h_opens.len()
+    {
         return Err(format!(
-            "GlobalRange: bucket count mismatch (got {}, expected {})",
+            "GlobalRange: bucket count mismatch (sumchecks={}, h_coms={}, h_opens={}, expected={})",
             global_m.bucket_sumchecks.len(),
+            global_m.bucket_h_coms.len(),
+            global_m.bucket_h_opens.len(),
             buckets_by_num_vars.len()
         ));
     }
@@ -854,8 +856,6 @@ pub fn verify_range_batched(
     for (i, proof) in witness_proofs.iter().enumerate() {
         if proof.logup.combined_claims.len() != num_chunks
             || proof.logup.chunk_at_rk.len() != num_chunks
-            || proof.logup.h_coms.len() != num_chunks
-            || proof.logup.h_open_proofs.len() != num_chunks
             || proof.logup.chunk_open_proofs.len() != num_chunks
         {
             return Err(format!(
@@ -865,12 +865,14 @@ pub fn verify_range_batched(
     }
 
     let mut total_lhs_claim = F::ZERO;
-    for ((num_vars, indices), super_sumcheck) in buckets_by_num_vars
+    for (bucket_idx, ((num_vars, indices), super_sumcheck)) in buckets_by_num_vars
         .iter()
         .zip(global_m.bucket_sumchecks.iter())
+        .enumerate()
     {
         let bucket_size = indices.len();
         let total_triples = bucket_size * num_chunks;
+        let pair_bits = total_triples.next_power_of_two().trailing_zeros() as usize;
         let n_padded = 1usize << num_vars;
         let beta_n_padded = beta * F::from(n_padded as u64);
 
@@ -894,51 +896,45 @@ pub fn verify_range_batched(
             }
         }
 
-        let (r_k, _final_combination) = verify_sumcheck_multi_batched(
+        let (r_k_full, _final_combination) = verify_sumcheck_cubic_multi_batched(
             super_sumcheck,
-            &weights,
+            &[F::ONE],
             bucket_claim,
-            *num_vars,
+            pair_bits + *num_vars,
             transcript,
         )
         .map_err(|e| format!("LogUp bucket nv={num_vars} sumcheck: {e}"))?;
+        let r_pair = &r_k_full[..pair_bits];
+        let r_k = r_k_full[pair_bits..].to_vec();
 
-        // verify_sumcheck_multi_batched already enforces
-        //   final_combination == Σ_k weights[k] · final_evals_f[k] · final_evals_g[k]
-        // We additionally bind each final_evals_g[w·nc + c] to the algebraic relation
-        // q_c(r_k) = 1 + β(α - chunk_c(r_k)) and defer Hyrax opens.
+        // verify_sumcheck_cubic_multi_batched already enforces final =
+        // H_bucket(r_pair,r_k) * W_bucket(r_pair) * R_bucket(r_pair,r_k).
+        // We bind W and R locally from FS weights and chunk openings, then
+        // open H_bucket once.
         let final_evals_f = &super_sumcheck.final_evals_f;
         let final_evals_g = &super_sumcheck.final_evals_g;
-        if final_evals_f.len() != total_triples || final_evals_g.len() != total_triples {
+        let final_evals_h = &super_sumcheck.final_evals_h;
+        if final_evals_f.len() != 1 || final_evals_g.len() != 1 || final_evals_h.len() != 1 {
             return Err(format!(
-                "LogUp bucket nv={num_vars}: super-sumcheck final-evals length mismatch (got f={}, g={}, expected={})",
+                "LogUp bucket nv={num_vars}: fused sumcheck final-evals length mismatch (got f={}, g={}, h={}, expected=1)",
                 final_evals_f.len(),
                 final_evals_g.len(),
-                total_triples
+                final_evals_h.len(),
             ));
         }
 
+        let mut expected_w = F::ZERO;
+        let mut expected_c = F::ZERO;
         for (w, &i) in indices.iter().enumerate() {
             let logup = &witness_proofs[i].logup;
             let acc_logup: &mut HyraxBatchAccumulator = &mut *chunk_accs[acc_indices[i]].1;
             for c in 0..num_chunks {
                 let idx = w * num_chunks + c;
                 let chunk_val = logup.chunk_at_rk[c];
-                let expected_q = F::ONE + beta * (alpha - chunk_val);
-                if final_evals_g[idx] != expected_q {
-                    return Err(format!(
-                        "LogUp witness {i} chunk {c}: q(r_k) algebra mismatch"
-                    ));
-                }
+                let pair_weight = eq_basis_eval(idx, pair_bits, r_pair);
+                expected_w += pair_weight * weights[idx];
+                expected_c += pair_weight * chunk_val;
 
-                acc_logup
-                    .add_verify(
-                        &logup.h_coms[c],
-                        final_evals_f[idx],
-                        &r_k,
-                        &logup.h_open_proofs[c],
-                    )
-                    .map_err(|e| format!("LogUp witness {i} chunk {c} h opening: {e}"))?;
                 acc_logup
                     .add_verify(
                         &witness_proofs[i].chunk_coms[c],
@@ -949,6 +945,26 @@ pub fn verify_range_batched(
                     .map_err(|e| format!("LogUp witness {i} chunk {c} chunk opening: {e}"))?;
             }
         }
+        if final_evals_g[0] != expected_w {
+            return Err(format!(
+                "LogUp bucket nv={num_vars}: fused weight W(r) algebra mismatch"
+            ));
+        }
+        let expected_r = F::ONE + beta * (alpha - expected_c);
+        if final_evals_h[0] != expected_r {
+            return Err(format!(
+                "LogUp bucket nv={num_vars}: fused R(r) algebra mismatch"
+            ));
+        }
+        let (_, _, params_h) = params_from_vars(pair_bits + *num_vars);
+        hyrax_verify(
+            &global_m.bucket_h_coms[bucket_idx],
+            final_evals_f[0],
+            &r_k_full,
+            &global_m.bucket_h_opens[bucket_idx],
+            &params_h,
+        )
+        .map_err(|e| format!("LogUp bucket nv={num_vars} fused H opening: {e}"))?;
     }
 
     // RHS sumcheck: Σ_j M[j] * g[j] = logup_rhs_claim, g[j] = 1/(α - j)
@@ -1001,6 +1017,15 @@ fn vec_to_mle(v: &[F], len: usize) -> DenseMLPoly {
         evals[i] = x;
     }
     DenseMLPoly::new(evals)
+}
+fn eq_basis_eval(index: usize, bits: usize, r: &[F]) -> F {
+    debug_assert_eq!(bits, r.len());
+    let mut acc = F::ONE;
+    for (j, &rj) in r.iter().enumerate() {
+        let bit = (index >> (bits - 1 - j)) & 1;
+        acc *= if bit == 1 { rj } else { F::ONE - rj };
+    }
+    acc
 }
 fn challenge_vec(transcript: &mut Transcript, len: usize, label: &[u8]) -> Vec<F> {
     (0..len)

@@ -52,7 +52,7 @@ const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
 const VERSION: u8 = 5;
-const PROOF_VERSION: u8 = 18;
+const PROOF_VERSION: u8 = 19;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -640,7 +640,9 @@ fn write_global_range_m<W: Write>(w: &mut W, m: &GlobalRangeM) -> io::Result<()>
     write_f(w, &m.logup_rhs_claim)?;
     write_f(w, &m.logup_m_at_rm2)?;
     write_hyrax_proof(w, &m.logup_m_open_rm2)?;
-    write_vec(w, &m.bucket_sumchecks, write_sumcheck_proof_multi)
+    write_vec(w, &m.bucket_sumchecks, write_sumcheck_cubic_proof_multi)?;
+    write_vec(w, &m.bucket_h_coms, write_hyrax_commitment)?;
+    write_vec(w, &m.bucket_h_opens, write_hyrax_proof)
 }
 
 fn write_range_batch_m<W: Write>(w: &mut W, b: &RangeBatchM) -> io::Result<()> {
@@ -678,7 +680,9 @@ fn read_global_range_m<R: Read>(r: &mut R) -> io::Result<GlobalRangeM> {
         logup_rhs_claim: read_f(r)?,
         logup_m_at_rm2: read_f(r)?,
         logup_m_open_rm2: read_hyrax_proof(r)?,
-        bucket_sumchecks: read_vec(r, read_sumcheck_proof_multi)?,
+        bucket_sumchecks: read_vec(r, read_sumcheck_cubic_proof_multi)?,
+        bucket_h_coms: read_vec(r, read_hyrax_commitment)?,
+        bucket_h_opens: read_vec(r, read_hyrax_proof)?,
     })
 }
 
