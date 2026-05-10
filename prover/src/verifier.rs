@@ -13,7 +13,7 @@ use crate::lookup::lasso::{
     verify_lasso_multi_committed_outputs, LassoMultiInstance, LassoMultiVerifyingKey,
 };
 use crate::lookup::quantization::{verify_quantization_batch, QuantizationParams};
-use crate::lookup::range::verify_range_batched;
+use crate::lookup::range::{verify_range_batched, RangeWitnessProof};
 use crate::pcs::{
     absorb_com, hyrax_commit, hyrax_verify, hyrax_verify_batch, hyrax_verify_batch_with_eta,
     lagrange_basis, params_from_vars, HyraxBatchAccumulator, HyraxCommitment, HyraxParams,
@@ -27,7 +27,8 @@ use crate::transcript::{challenge_vec, Transcript};
 
 use crate::attention::attention::{AttentionProvingKey, LinearAttentionInstance};
 use crate::attention::layernorm::{
-    verify_layernorm, LayerNormIOCommitments, LayerNormVerifyingKey, LAYERNORM_RANGE_BITS,
+    verify_layernorms_batched, LayerNormIOCommitments, LayerNormVerifyingKey,
+    LAYERNORM_RANGE_BITS,
 };
 use crate::attention::projection::{
     verify_projection, ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
@@ -355,40 +356,60 @@ pub fn verify(
     let inter_acc = HyraxBatchAccumulator::new();
 
     // =========================================================================
-    // 2. Phase 1: verify range proofs + LN1 + LN2 for all blocks
+    // 2. Phase 1: verify range proofs (LN sumchecks/openings deferred to the
+    //    cross-LN batched proof at end of model verification).
     // =========================================================================
     let mut current_x_com = proof.x_in_com.clone();
     let ln_sigma_n = (2 * t).next_power_of_two().trailing_zeros() as usize;
     let ln_y_n = (2 * t * d).next_power_of_two().trailing_zeros() as usize;
-    let mut ln_range_proofs = Vec::with_capacity(10 * num_blocks + 2);
-    let mut ln_range_num_vars = Vec::with_capacity(10 * num_blocks + 2);
-    for bp in &proof.block_proofs {
-        ln_range_proofs.push(&bp.ln1_proof.sigma_range_proof);
-        ln_range_num_vars.push(ln_sigma_n);
-        ln_range_proofs.push(&bp.ln1_proof.y_range_proof);
-        ln_range_num_vars.push(ln_y_n);
-        ln_range_proofs.push(&bp.ln2_proof.sigma_range_proof);
-        ln_range_num_vars.push(ln_sigma_n);
-        ln_range_proofs.push(&bp.ln2_proof.y_range_proof);
-        ln_range_num_vars.push(ln_y_n);
-        // Sandwich-norm range witnesses: order matches prover's push order
-        // (q_norm, k_norm, attn_out_norm).
-        ln_range_proofs.push(&bp.q_norm_proof.sigma_range_proof);
-        ln_range_num_vars.push(ln_sigma_n);
-        ln_range_proofs.push(&bp.q_norm_proof.y_range_proof);
-        ln_range_num_vars.push(ln_y_n);
-        ln_range_proofs.push(&bp.k_norm_proof.sigma_range_proof);
-        ln_range_num_vars.push(ln_sigma_n);
-        ln_range_proofs.push(&bp.k_norm_proof.y_range_proof);
-        ln_range_num_vars.push(ln_y_n);
-        ln_range_proofs.push(&bp.attn_out_norm_proof.sigma_range_proof);
-        ln_range_num_vars.push(ln_sigma_n);
-        ln_range_proofs.push(&bp.attn_out_norm_proof.y_range_proof);
-        ln_range_num_vars.push(ln_y_n);
+
+    // Range proofs live in `ln_batched_proof.{sigma,y}_range_proofs` in the
+    // SAME order as the prover collected them (per block: ln1, ln2, q_norm,
+    // k_norm, attn_out_norm — interleaved sigma/y; then final_ln sigma + y).
+    if proof.ln_batched_proof.sigma_range_proofs.len() != 5 * num_blocks + 1
+        || proof.ln_batched_proof.y_range_proofs.len() != 5 * num_blocks + 1
+    {
+        return Err("LN range proof count mismatch (expected 5L+1 each)".into());
     }
-    ln_range_proofs.push(&proof.final_ln_proof.sigma_range_proof);
+    let mut ln_range_proofs: Vec<&RangeWitnessProof> =
+        Vec::with_capacity(10 * num_blocks + 2);
+    let mut ln_range_num_vars: Vec<usize> = Vec::with_capacity(10 * num_blocks + 2);
+    // Build the global range batch input in the SAME order the prover used:
+    //   per block i: ln1_sig, ln1_y, ln2_sig, ln2_y, q_norm_sig, q_norm_y,
+    //                k_norm_sig, k_norm_y, aon_sig, aon_y
+    //   then: final_sig, final_y.
+    // This must match the `ln_witnesses.push` ordering in the cross-LN batched
+    // proof for the rv mapping below.
+    let sig_rps = &proof.ln_batched_proof.sigma_range_proofs;
+    let y_rps = &proof.ln_batched_proof.y_range_proofs;
+    // Index mapping: for block i, the LN order in the *batched proof* is
+    // (ln1, q_norm, k_norm, aon, ln2) == sig_rps positions (5i+0..5i+4).
+    // We want global range input in (ln1, ln2, q_norm, k_norm, aon) order.
+    let ln_idx_in_batched = |block_i: usize, slot: usize| -> usize {
+        // slot: 0=ln1, 1=ln2, 2=q_norm, 3=k_norm, 4=aon
+        let in_block = match slot {
+            0 => 0, // ln1
+            1 => 4, // ln2
+            2 => 1, // q_norm
+            3 => 2, // k_norm
+            4 => 3, // aon
+            _ => unreachable!(),
+        };
+        5 * block_i + in_block
+    };
+    for i in 0..num_blocks {
+        for slot in 0..5 {
+            let k = ln_idx_in_batched(i, slot);
+            ln_range_proofs.push(&sig_rps[k]);
+            ln_range_num_vars.push(ln_sigma_n);
+            ln_range_proofs.push(&y_rps[k]);
+            ln_range_num_vars.push(ln_y_n);
+        }
+    }
+    let final_idx = 5 * num_blocks;
+    ln_range_proofs.push(&sig_rps[final_idx]);
     ln_range_num_vars.push(ln_sigma_n);
-    ln_range_proofs.push(&proof.final_ln_proof.y_range_proof);
+    ln_range_proofs.push(&y_rps[final_idx]);
     ln_range_num_vars.push(ln_y_n);
 
     let _t0 = Instant::now();
@@ -447,6 +468,16 @@ pub fn verify(
         return Err("unexpected attention normalization range proof".into());
     }
 
+    // Collect per-LN IO commitments for the cross-LN batched verify call at
+    // the end. For each block we push 5 LNs in the same order the prover used:
+    //   ln1, q_norm, k_norm, attn_out_norm, ln2.
+    let mut ln_io_coms_owned: Vec<LayerNormIOCommitments> =
+        Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_vks_refs: Vec<&LayerNormVerifyingKey> =
+        Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_sigma_r_vs_idx: Vec<usize> = Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_y_r_vs_idx: Vec<usize> = Vec::with_capacity(5 * num_blocks + 1);
+
     for i in 0..num_blocks {
         let bp = &proof.block_proofs[i];
         let bvk = &vk.block_vks[i];
@@ -455,38 +486,17 @@ pub fn verify(
         //    q_norm_sigma, q_norm_y, k_norm_sigma, k_norm_y,
         //    attn_out_norm_sigma, attn_out_norm_y]
         let rv_base = 10 * i;
-        let ln1_sig_rv = &ln_range_r_vs[rv_base];
-        let ln1_y_rv = &ln_range_r_vs[rv_base + 1];
-        let ln2_sig_rv = &ln_range_r_vs[rv_base + 2];
-        let ln2_y_rv = &ln_range_r_vs[rv_base + 3];
-        let q_norm_sig_rv = &ln_range_r_vs[rv_base + 4];
-        let q_norm_y_rv = &ln_range_r_vs[rv_base + 5];
-        let k_norm_sig_rv = &ln_range_r_vs[rv_base + 6];
-        let k_norm_y_rv = &ln_range_r_vs[rv_base + 7];
-        let aon_sig_rv = &ln_range_r_vs[rv_base + 8];
-        let aon_y_rv = &ln_range_r_vs[rv_base + 9];
 
-        // LN1
-        let ln1_io = LayerNormIOCommitments {
+        // LN1: absorb x_in_com (current_x_com) + x_norm1_com.
+        absorb_com(transcript, b"x_com", &current_x_com);
+        absorb_com(transcript, b"y_com", &bp.x_norm1_com);
+        ln_io_coms_owned.push(LayerNormIOCommitments {
             x_com: current_x_com.clone(),
             y_com: Some(bp.x_norm1_com.clone()),
-        };
-        let _t0 = Instant::now();
-        verify_layernorm(
-            &bp.ln1_proof,
-            &ln1_io,
-            &bvk.ln1_vk,
-            ln1_sig_rv,
-            ln1_y_rv,
-            transcript,
-            &mut ln_acc_t,
-            &mut ln_acc_td,
-        )?;
-        eprintln!(
-            "[block {}] ln1:{:>8.3}ms",
-            i,
-            _t0.elapsed().as_secs_f64() * 1000.0
-        );
+        });
+        ln_vks_refs.push(&bvk.ln1_vk);
+        ln_sigma_r_vs_idx.push(rv_base);
+        ln_y_r_vs_idx.push(rv_base + 1);
 
         absorb_com(transcript, b"q_com", &bp.q_com);
         absorb_com(transcript, b"k_com", &bp.k_com);
@@ -508,55 +518,40 @@ pub fn verify(
         }
         absorb_com(transcript, b"out_attn_com", &bp.out_attn_com);
 
-        // q_norm: x = q_raw (q_com), y = q_n (q_norm_y_com).
-        let q_norm_io = LayerNormIOCommitments {
+        // q_norm: x = q_raw, y = q_n.
+        absorb_com(transcript, b"x_com", &bp.q_com);
+        absorb_com(transcript, b"y_com", &bp.q_norm_y_com);
+        ln_io_coms_owned.push(LayerNormIOCommitments {
             x_com: bp.q_com.clone(),
             y_com: Some(bp.q_norm_y_com.clone()),
-        };
-        verify_layernorm(
-            &bp.q_norm_proof,
-            &q_norm_io,
-            &bvk.q_norm_vk,
-            q_norm_sig_rv,
-            q_norm_y_rv,
-            transcript,
-            &mut ln_acc_t,
-            &mut ln_acc_td,
-        )?;
+        });
+        ln_vks_refs.push(&bvk.q_norm_vk);
+        ln_sigma_r_vs_idx.push(rv_base + 4);
+        ln_y_r_vs_idx.push(rv_base + 5);
         absorb_com(transcript, b"q_norm_y_com", &bp.q_norm_y_com);
 
-        // k_norm: x = k_raw (k_com), y = k_n (k_norm_y_com).
-        let k_norm_io = LayerNormIOCommitments {
+        // k_norm: x = k_raw, y = k_n.
+        absorb_com(transcript, b"x_com", &bp.k_com);
+        absorb_com(transcript, b"y_com", &bp.k_norm_y_com);
+        ln_io_coms_owned.push(LayerNormIOCommitments {
             x_com: bp.k_com.clone(),
             y_com: Some(bp.k_norm_y_com.clone()),
-        };
-        verify_layernorm(
-            &bp.k_norm_proof,
-            &k_norm_io,
-            &bvk.k_norm_vk,
-            k_norm_sig_rv,
-            k_norm_y_rv,
-            transcript,
-            &mut ln_acc_t,
-            &mut ln_acc_td,
-        )?;
+        });
+        ln_vks_refs.push(&bvk.k_norm_vk);
+        ln_sigma_r_vs_idx.push(rv_base + 6);
+        ln_y_r_vs_idx.push(rv_base + 7);
         absorb_com(transcript, b"k_norm_y_com", &bp.k_norm_y_com);
 
-        // attn_out_norm: x = out_attn (out_attn_com), y = post-norm output.
-        let attn_out_norm_io = LayerNormIOCommitments {
+        // attn_out_norm: x = out_attn, y = post-norm output.
+        absorb_com(transcript, b"x_com", &bp.out_attn_com);
+        absorb_com(transcript, b"y_com", &bp.attn_out_norm_y_com);
+        ln_io_coms_owned.push(LayerNormIOCommitments {
             x_com: bp.out_attn_com.clone(),
             y_com: Some(bp.attn_out_norm_y_com.clone()),
-        };
-        verify_layernorm(
-            &bp.attn_out_norm_proof,
-            &attn_out_norm_io,
-            &bvk.attn_out_norm_vk,
-            aon_sig_rv,
-            aon_y_rv,
-            transcript,
-            &mut ln_acc_t,
-            &mut ln_acc_td,
-        )?;
+        });
+        ln_vks_refs.push(&bvk.attn_out_norm_vk);
+        ln_sigma_r_vs_idx.push(rv_base + 8);
+        ln_y_r_vs_idx.push(rv_base + 9);
         absorb_com(
             transcript,
             b"attn_out_norm_y_com",
@@ -567,26 +562,15 @@ pub fn verify(
         let x_mid_com = add_commitments(&current_x_com, &bp.attn_out_norm_y_com);
 
         // LN2
-        let ln2_io = LayerNormIOCommitments {
+        absorb_com(transcript, b"x_com", &x_mid_com);
+        absorb_com(transcript, b"y_com", &bp.x_norm2_com);
+        ln_io_coms_owned.push(LayerNormIOCommitments {
             x_com: x_mid_com.clone(),
             y_com: Some(bp.x_norm2_com.clone()),
-        };
-        let _t0 = Instant::now();
-        verify_layernorm(
-            &bp.ln2_proof,
-            &ln2_io,
-            &bvk.ln2_vk,
-            ln2_sig_rv,
-            ln2_y_rv,
-            transcript,
-            &mut ln_acc_t,
-            &mut ln_acc_td,
-        )?;
-        eprintln!(
-            "[block {}] ln2:{:>8.3}ms",
-            i,
-            _t0.elapsed().as_secs_f64() * 1000.0
-        );
+        });
+        ln_vks_refs.push(&bvk.ln2_vk);
+        ln_sigma_r_vs_idx.push(rv_base + 2);
+        ln_y_r_vs_idx.push(rv_base + 3);
 
         absorb_com(transcript, b"y_com", &bp.out_ffn_com);
 
@@ -1179,26 +1163,50 @@ pub fn verify(
     );
 
     // =========================================================================
-    // 10. Final LayerNorm
+    // 10. Final LayerNorm — absorb IO commitments only; the cross-LN batched
+    //     verify call below covers the actual sumchecks/openings.
     // =========================================================================
     let _t0 = Instant::now();
-    let ln_io = LayerNormIOCommitments {
+    absorb_com(transcript, b"x_com", &current_x_com);
+    absorb_com(transcript, b"y_com", &proof.final_ln_out_com);
+    ln_io_coms_owned.push(LayerNormIOCommitments {
         x_com: current_x_com.clone(),
         y_com: Some(proof.final_ln_out_com.clone()),
-    };
-    verify_layernorm(
-        &proof.final_ln_proof,
-        &ln_io,
-        &vk.final_ln_vk,
-        &ln_range_r_vs[10 * num_blocks],
-        &ln_range_r_vs[10 * num_blocks + 1],
+    });
+    ln_vks_refs.push(&vk.final_ln_vk);
+    ln_sigma_r_vs_idx.push(10 * num_blocks);
+    ln_y_r_vs_idx.push(10 * num_blocks + 1);
+    eprintln!(
+        "[model] final_ln_absorb:{:>8.3}ms",
+        _t0.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // =========================================================================
+    // 10b. Cross-LN batched verify — covers every LN in the model (5L + 1).
+    // =========================================================================
+    let _t0 = Instant::now();
+    let ln_io_coms_refs: Vec<&LayerNormIOCommitments> = ln_io_coms_owned.iter().collect();
+    let ln_sigma_r_vs: Vec<&[F]> = ln_sigma_r_vs_idx
+        .iter()
+        .map(|&i| ln_range_r_vs[i].as_slice())
+        .collect();
+    let ln_y_r_vs: Vec<&[F]> = ln_y_r_vs_idx
+        .iter()
+        .map(|&i| ln_range_r_vs[i].as_slice())
+        .collect();
+    verify_layernorms_batched(
+        &proof.ln_batched_proof,
+        &ln_io_coms_refs,
+        &ln_vks_refs,
+        &ln_sigma_r_vs,
+        &ln_y_r_vs,
         transcript,
         &mut ln_acc_t,
         &mut ln_acc_td,
     )
-    .map_err(|e| format!("Final LN: {e}"))?;
+    .map_err(|e| format!("LN batched: {e}"))?;
     eprintln!(
-        "[model] final_ln:{:>8.3}ms",
+        "[model] ln_batched:{:>8.3}ms",
         _t0.elapsed().as_secs_f64() * 1000.0
     );
 

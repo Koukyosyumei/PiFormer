@@ -21,8 +21,9 @@ use ark_ff::{Field, PrimeField};
 
 use crate::attention::attention::{LinearAttentionInstance, LinearAttentionWitness};
 use crate::attention::layernorm::{
-    compute_range_witnesses, prove_layernorm, LayerNormIOCommitments, LayerNormProof,
-    LayerNormRangeWitnesses, LayerNormVerifyingKey, LayerNormWitness, LAYERNORM_RANGE_BITS,
+    compute_range_witnesses, prove_layernorms_batched, LayerNormIOCommitments,
+    LayerNormRangeWitnesses, LayerNormVerifyingKey, LayerNormWitness, LayerNormsBatchedInput,
+    LayerNormsBatchedProof, LAYERNORM_RANGE_BITS,
 };
 use crate::attention::projection::{
     prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionProvingKey,
@@ -52,15 +53,10 @@ use std::time::Instant;
 /// ZK Proof for one Transformer Block (per-block data only).
 ///
 /// The cross-block sumchecks and batch opens live in TransformerModelProof.
+/// As of PROOF_VERSION 13, all per-LayerNorm proofs are bundled into the
+/// model-level `ln_batched_proof` (one cross-LN GKR-style protocol covering
+/// every LN in the model); the per-block container only holds commitments.
 pub struct TransformerBlockProof {
-    pub ln1_proof: LayerNormProof,
-    pub ln2_proof: LayerNormProof,
-
-    // Sandwich-norm LayerNorms (q_norm, k_norm, attn_out_norm) per block.
-    pub q_norm_proof: LayerNormProof,
-    pub k_norm_proof: LayerNormProof,
-    pub attn_out_norm_proof: LayerNormProof,
-
     // Committed outputs:
     //   q_norm_y_com / k_norm_y_com — post-norm Q/K (input to φ Lasso)
     //   attn_out_norm_y_com — post-norm o_proj output (input to residual)
@@ -156,12 +152,6 @@ pub struct TransformerBlockWitness {
 // ---------------------------------------------------------------------------
 
 struct BlockPhase1Data {
-    ln1_proof: LayerNormProof,
-    ln2_proof: LayerNormProof,
-    // Sandwich-norm LayerNorms.
-    q_norm_proof: LayerNormProof,
-    k_norm_proof: LayerNormProof,
-    attn_out_norm_proof: LayerNormProof,
     q_norm_y_com: HyraxCommitment,
     k_norm_y_com: HyraxCommitment,
     attn_out_norm_y_com: HyraxCommitment,
@@ -328,15 +318,106 @@ fn finalize_block_commits(
     }
 }
 
+/// Per-block LayerNorm input bundle collected for the model-level batched proof.
+#[derive(Clone)]
+pub(crate) struct BlockLnInputs {
+    pub ln1_io: LayerNormIOCommitments,
+    pub q_norm_io: LayerNormIOCommitments,
+    pub k_norm_io: LayerNormIOCommitments,
+    pub aon_io: LayerNormIOCommitments,
+    pub ln2_io: LayerNormIOCommitments,
+    /// Per-LN range artefacts in fixed order:
+    /// [ln1_sig, ln1_y, ln2_sig, ln2_y, q_norm_sig, q_norm_y,
+    ///  k_norm_sig, k_norm_y, aon_sig, aon_y].
+    pub ranges: [(RangeWitnessProof, Vec<F>); 10],
+}
+
 fn prove_block_layernorms(
-    witness: &TransformerBlockWitness,
+    _witness: &TransformerBlockWitness,
     x_in_com: &HyraxCommitment,
-    pk: &TransformerBlockVerifyingKey,
+    _pk: &TransformerBlockVerifyingKey,
     commits: &BlockCommitData,
     range_proofs: [RangeWitnessProof; 10],
     range_rvs: [Vec<F>; 10],
     transcript: &mut Transcript,
-) -> Result<BlockPhase1Data, String> {
+) -> Result<(BlockPhase1Data, BlockLnInputs), String> {
+    // PROOF_VERSION 13: LN sumchecks/openings are deferred to a single
+    // `prove_layernorms_batched` call at model end. Here we (a) preserve the
+    // transcript absorption pattern so subsequent sub-proofs still bind to
+    // each LN's IO commitments, and (b) collect per-LN inputs for the batched
+    // call.
+
+    // LN1: x = x_in_com, y = x_norm1_com.
+    absorb_com(transcript, b"x_com", x_in_com);
+    absorb_com(transcript, b"y_com", &commits.x_norm1_com);
+    let ln1_io = LayerNormIOCommitments {
+        x_com: x_in_com.clone(),
+        y_com: Some(commits.x_norm1_com.clone()),
+    };
+
+    // Explicitly absorb q/k/v_com with the same labels attention uses.
+    absorb_com(transcript, b"q_com", &commits.q_com);
+    absorb_com(transcript, b"k_com", &commits.k_com);
+    absorb_com(transcript, b"v_com", &commits.v_com);
+    if let Some(ref c) = commits.attn_norm_com {
+        absorb_com(transcript, b"attn_norm_com", c);
+    }
+    if let Some(ref c) = commits.attn_num_com {
+        absorb_com(transcript, b"attn_num_com", c);
+    }
+    if let Some(ref c) = commits.attn_z_com {
+        absorb_com(transcript, b"attn_z_com", c);
+    }
+    if let Some(ref c) = commits.attn_rem_com {
+        absorb_com(transcript, b"attn_rem_com", c);
+    }
+    if let Some(ref c) = commits.attn_diff_com {
+        absorb_com(transcript, b"attn_diff_com", c);
+    }
+    absorb_com(transcript, b"out_attn_com", &commits.out_attn_com);
+
+    // q_norm: x = q_raw (q_com), y = q_n (q_norm_y_com).
+    absorb_com(transcript, b"x_com", &commits.q_com);
+    absorb_com(transcript, b"y_com", &commits.q_norm_y_com);
+    let q_norm_io = LayerNormIOCommitments {
+        x_com: commits.q_com.clone(),
+        y_com: Some(commits.q_norm_y_com.clone()),
+    };
+    absorb_com(transcript, b"q_norm_y_com", &commits.q_norm_y_com);
+
+    // k_norm: x = k_raw (k_com), y = k_n (k_norm_y_com).
+    absorb_com(transcript, b"x_com", &commits.k_com);
+    absorb_com(transcript, b"y_com", &commits.k_norm_y_com);
+    let k_norm_io = LayerNormIOCommitments {
+        x_com: commits.k_com.clone(),
+        y_com: Some(commits.k_norm_y_com.clone()),
+    };
+    absorb_com(transcript, b"k_norm_y_com", &commits.k_norm_y_com);
+
+    // attn_out_norm: x = out_attn, y = post-norm output that feeds the residual.
+    absorb_com(transcript, b"x_com", &commits.out_attn_com);
+    absorb_com(transcript, b"y_com", &commits.attn_out_norm_y_com);
+    let aon_io = LayerNormIOCommitments {
+        x_com: commits.out_attn_com.clone(),
+        y_com: Some(commits.attn_out_norm_y_com.clone()),
+    };
+    absorb_com(
+        transcript,
+        b"attn_out_norm_y_com",
+        &commits.attn_out_norm_y_com,
+    );
+
+    // LN2: x = x_mid_com, y = x_norm2_com.
+    absorb_com(transcript, b"x_com", &commits.x_mid_com);
+    absorb_com(transcript, b"y_com", &commits.x_norm2_com);
+    let ln2_io = LayerNormIOCommitments {
+        x_com: commits.x_mid_com.clone(),
+        y_com: Some(commits.x_norm2_com.clone()),
+    };
+
+    // Absorb out_ffn_com so transcript stays consistent with Phase 1.
+    absorb_com(transcript, b"y_com", &commits.out_ffn_com);
+
     let [
         ln1_sig_rp,
         ln1_y_rp,
@@ -361,115 +442,27 @@ fn prove_block_layernorms(
         aon_sig_rv,
         aon_y_rv,
     ] = range_rvs;
-    // LN1 sub-prover: absorbs x_norm1_com as y_com
-    let ln1_io = LayerNormIOCommitments {
-        x_com: x_in_com.clone(),
-        y_com: Some(commits.x_norm1_com.clone()),
+    let ln_inputs = BlockLnInputs {
+        ln1_io: ln1_io.clone(),
+        q_norm_io: q_norm_io.clone(),
+        k_norm_io: k_norm_io.clone(),
+        aon_io: aon_io.clone(),
+        ln2_io: ln2_io.clone(),
+        ranges: [
+            (ln1_sig_rp, ln1_sig_rv),
+            (ln1_y_rp, ln1_y_rv),
+            (ln2_sig_rp, ln2_sig_rv),
+            (ln2_y_rp, ln2_y_rv),
+            (q_norm_sig_rp, q_norm_sig_rv),
+            (q_norm_y_rp, q_norm_y_rv),
+            (k_norm_sig_rp, k_norm_sig_rv),
+            (k_norm_y_rp, k_norm_y_rv),
+            (aon_sig_rp, aon_sig_rv),
+            (aon_y_rp, aon_y_rv),
+        ],
     };
-    let ln1_proof = prove_layernorm(
-        &witness.ln1_wit,
-        &ln1_io,
-        &pk.ln1_vk,
-        (ln1_sig_rp, ln1_sig_rv),
-        (ln1_y_rp, ln1_y_rv),
-        transcript,
-    )?;
 
-    // Explicitly absorb q/k/v_com with the same labels attention uses.
-    absorb_com(transcript, b"q_com", &commits.q_com);
-    absorb_com(transcript, b"k_com", &commits.k_com);
-    absorb_com(transcript, b"v_com", &commits.v_com);
-    if let Some(ref c) = commits.attn_norm_com {
-        absorb_com(transcript, b"attn_norm_com", c);
-    }
-    if let Some(ref c) = commits.attn_num_com {
-        absorb_com(transcript, b"attn_num_com", c);
-    }
-    if let Some(ref c) = commits.attn_z_com {
-        absorb_com(transcript, b"attn_z_com", c);
-    }
-    if let Some(ref c) = commits.attn_rem_com {
-        absorb_com(transcript, b"attn_rem_com", c);
-    }
-    if let Some(ref c) = commits.attn_diff_com {
-        absorb_com(transcript, b"attn_diff_com", c);
-    }
-    absorb_com(transcript, b"out_attn_com", &commits.out_attn_com);
-
-    // q_norm: x = q_raw (q_com), y = q_n (q_norm_y_com).
-    let q_norm_io = LayerNormIOCommitments {
-        x_com: commits.q_com.clone(),
-        y_com: Some(commits.q_norm_y_com.clone()),
-    };
-    let q_norm_proof = prove_layernorm(
-        &witness.q_norm_wit,
-        &q_norm_io,
-        &pk.q_norm_vk,
-        (q_norm_sig_rp, q_norm_sig_rv),
-        (q_norm_y_rp, q_norm_y_rv),
-        transcript,
-    )?;
-    absorb_com(transcript, b"q_norm_y_com", &commits.q_norm_y_com);
-
-    // k_norm: x = k_raw (k_com), y = k_n (k_norm_y_com).
-    let k_norm_io = LayerNormIOCommitments {
-        x_com: commits.k_com.clone(),
-        y_com: Some(commits.k_norm_y_com.clone()),
-    };
-    let k_norm_proof = prove_layernorm(
-        &witness.k_norm_wit,
-        &k_norm_io,
-        &pk.k_norm_vk,
-        (k_norm_sig_rp, k_norm_sig_rv),
-        (k_norm_y_rp, k_norm_y_rv),
-        transcript,
-    )?;
-    absorb_com(transcript, b"k_norm_y_com", &commits.k_norm_y_com);
-
-    // attn_out_norm: x = out_attn (out_attn_com), y = post-norm output that
-    // feeds the residual.  Proves x_mid = x_in + attn_out_norm(out_attn) is
-    // computed correctly (the residual itself is homomorphic).
-    let attn_out_norm_io = LayerNormIOCommitments {
-        x_com: commits.out_attn_com.clone(),
-        y_com: Some(commits.attn_out_norm_y_com.clone()),
-    };
-    let attn_out_norm_proof = prove_layernorm(
-        &witness.attn_out_norm_wit,
-        &attn_out_norm_io,
-        &pk.attn_out_norm_vk,
-        (aon_sig_rp, aon_sig_rv),
-        (aon_y_rp, aon_y_rv),
-        transcript,
-    )?;
-    absorb_com(
-        transcript,
-        b"attn_out_norm_y_com",
-        &commits.attn_out_norm_y_com,
-    );
-
-    // LN2 sub-prover: absorbs x_norm2_com as y_com
-    let ln2_io = LayerNormIOCommitments {
-        x_com: commits.x_mid_com.clone(),
-        y_com: Some(commits.x_norm2_com.clone()),
-    };
-    let ln2_proof = prove_layernorm(
-        &witness.ln2_wit,
-        &ln2_io,
-        &pk.ln2_vk,
-        (ln2_sig_rp, ln2_sig_rv),
-        (ln2_y_rp, ln2_y_rv),
-        transcript,
-    )?;
-
-    // Absorb out_ffn_com so transcript stays consistent with Phase 1.
-    absorb_com(transcript, b"y_com", &commits.out_ffn_com);
-
-    Ok(BlockPhase1Data {
-        ln1_proof,
-        ln2_proof,
-        q_norm_proof,
-        k_norm_proof,
-        attn_out_norm_proof,
+    let phase1 = BlockPhase1Data {
         q_norm_y_com: commits.q_norm_y_com.clone(),
         k_norm_y_com: commits.k_norm_y_com.clone(),
         attn_out_norm_y_com: commits.attn_out_norm_y_com.clone(),
@@ -485,7 +478,8 @@ fn prove_block_layernorms(
         out_attn_com: commits.out_attn_com.clone(),
         x_norm2_com: commits.x_norm2_com.clone(),
         out_ffn_com: commits.out_ffn_com.clone(),
-    })
+    };
+    Ok((phase1, ln_inputs))
 }
 
 // ---------------------------------------------------------------------------
@@ -520,7 +514,10 @@ pub struct TransformerModelWitness {
 pub struct TransformerModelProof {
     pub x_in_com: HyraxCommitment,
     pub block_proofs: Vec<TransformerBlockProof>,
-    pub final_ln_proof: LayerNormProof,
+    /// Cross-LN GKR-style batched proof for every LayerNorm in the model
+    /// (5 per block: ln1, q_norm, k_norm, attn_out_norm, ln2; plus final_ln).
+    /// Replaces the per-block + per-final LN proofs of PROOF_VERSION 12.
+    pub ln_batched_proof: LayerNormsBatchedProof,
     pub lm_head_proof: ProjectionProof,
     pub final_ln_out_com: HyraxCommitment,
     pub logits_com: HyraxCommitment,
@@ -876,6 +873,7 @@ pub fn prove(
     let mut block_input_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
     let mut ln_range_witnesses: Vec<RangeProofWitness> = Vec::with_capacity(10 * num_blocks + 2);
     let mut phase1_data: Vec<BlockPhase1Data> = Vec::with_capacity(num_blocks);
+    let mut block_ln_inputs: Vec<BlockLnInputs> = Vec::with_capacity(num_blocks);
     let mut current_x_com = x_in_com.clone();
 
     // Phase 1a (PARALLEL): Per-block witness commits and LN range witnesses are
@@ -1026,7 +1024,7 @@ pub fn prove(
                 .next()
                 .expect("missing attn_out_norm y range point"),
         ];
-        let p1 = prove_block_layernorms(
+        let (p1, ln_inputs) = prove_block_layernorms(
             &witness.block_witnesses[i],
             &block_input_coms[i],
             &pk.block_pks[i],
@@ -1036,6 +1034,7 @@ pub fn prove(
             transcript,
         )?;
         phase1_data.push(p1);
+        block_ln_inputs.push(ln_inputs);
     }
     let final_sig_rp = ln_range_proofs
         .next()
@@ -1914,11 +1913,6 @@ pub fn prove(
         let p1 = &phase1_data[i];
 
         block_proofs.push(TransformerBlockProof {
-            ln1_proof: p1.ln1_proof.clone(),
-            ln2_proof: p1.ln2_proof.clone(),
-            q_norm_proof: p1.q_norm_proof.clone(),
-            k_norm_proof: p1.k_norm_proof.clone(),
-            attn_out_norm_proof: p1.attn_out_norm_proof.clone(),
             q_norm_y_com: p1.q_norm_y_com.clone(),
             k_norm_y_com: p1.k_norm_y_com.clone(),
             attn_out_norm_y_com: p1.attn_out_norm_y_com.clone(),
@@ -1959,23 +1953,92 @@ pub fn prove(
     }
 
     // =========================================================================
-    // 11. Final LayerNorm
+    // 11. Final LayerNorm — absorb IO commitments at the original transcript
+    //     position so the LM-head proof binds to final_ln_out_com just like
+    //     under PROOF_VERSION 12. The actual LN sumchecks/openings are emitted
+    //     by the cross-LN batched proof at the end of the model.
     // =========================================================================
     let final_ln_out_com = commit_mat(&witness.final_ln_wit.y, t, d);
-    let ln_io = LayerNormIOCommitments {
+    absorb_com(transcript, b"x_com", &current_x_com);
+    absorb_com(transcript, b"y_com", &final_ln_out_com);
+    let final_ln_io = LayerNormIOCommitments {
         x_com: current_x_com.clone(),
         y_com: Some(final_ln_out_com.clone()),
     };
-    let final_ln_proof = prove_layernorm(
-        &witness.final_ln_wit,
-        &ln_io,
-        &pk.vk.final_ln_vk,
+    let final_ln_ranges = [
         (final_sig_rp, final_sig_rv),
         (final_y_rp, final_y_rv),
-        transcript,
-    )?;
+    ];
     eprintln!(
-        "[prove] final_ln: {:7.3}ms",
+        "[prove] final_ln_absorb: {:7.3}ms",
+        phase_t0.elapsed().as_secs_f64() * 1000.0
+    );
+    phase_t0 = Instant::now();
+
+    // =========================================================================
+    // 11b. Cross-LN batched proof — covers every LN in the model (5L + 1).
+    //      Order matches the verifier's mirrored collection in verifier.rs.
+    // =========================================================================
+    let mut ln_witnesses: Vec<&LayerNormWitness> = Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_io_coms_local: Vec<&LayerNormIOCommitments> =
+        Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_vks: Vec<&LayerNormVerifyingKey> = Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_sigma_ranges: Vec<(RangeWitnessProof, Vec<F>)> =
+        Vec::with_capacity(5 * num_blocks + 1);
+    let mut ln_y_ranges: Vec<(RangeWitnessProof, Vec<F>)> =
+        Vec::with_capacity(5 * num_blocks + 1);
+    for i in 0..num_blocks {
+        let bw = &witness.block_witnesses[i];
+        let bpk = &pk.block_pks[i];
+        let li = &block_ln_inputs[i];
+        // Order: ln1, q_norm, k_norm, attn_out_norm, ln2.
+        ln_witnesses.push(&bw.ln1_wit);
+        ln_io_coms_local.push(&li.ln1_io);
+        ln_vks.push(&bpk.ln1_vk);
+        ln_sigma_ranges.push(li.ranges[0].clone());
+        ln_y_ranges.push(li.ranges[1].clone());
+
+        ln_witnesses.push(&bw.q_norm_wit);
+        ln_io_coms_local.push(&li.q_norm_io);
+        ln_vks.push(&bpk.q_norm_vk);
+        ln_sigma_ranges.push(li.ranges[4].clone());
+        ln_y_ranges.push(li.ranges[5].clone());
+
+        ln_witnesses.push(&bw.k_norm_wit);
+        ln_io_coms_local.push(&li.k_norm_io);
+        ln_vks.push(&bpk.k_norm_vk);
+        ln_sigma_ranges.push(li.ranges[6].clone());
+        ln_y_ranges.push(li.ranges[7].clone());
+
+        ln_witnesses.push(&bw.attn_out_norm_wit);
+        ln_io_coms_local.push(&li.aon_io);
+        ln_vks.push(&bpk.attn_out_norm_vk);
+        ln_sigma_ranges.push(li.ranges[8].clone());
+        ln_y_ranges.push(li.ranges[9].clone());
+
+        ln_witnesses.push(&bw.ln2_wit);
+        ln_io_coms_local.push(&li.ln2_io);
+        ln_vks.push(&bpk.ln2_vk);
+        ln_sigma_ranges.push(li.ranges[2].clone());
+        ln_y_ranges.push(li.ranges[3].clone());
+    }
+    ln_witnesses.push(&witness.final_ln_wit);
+    ln_io_coms_local.push(&final_ln_io);
+    ln_vks.push(&pk.vk.final_ln_vk);
+    let [final_sig_pair, final_y_pair] = final_ln_ranges;
+    ln_sigma_ranges.push(final_sig_pair);
+    ln_y_ranges.push(final_y_pair);
+
+    let ln_batched_input = LayerNormsBatchedInput {
+        witnesses: ln_witnesses,
+        io_coms: ln_io_coms_local,
+        vks: ln_vks,
+        sigma_ranges: ln_sigma_ranges,
+        y_ranges: ln_y_ranges,
+    };
+    let ln_batched_proof = prove_layernorms_batched(&ln_batched_input, transcript)?;
+    eprintln!(
+        "[prove] ln_batched: {:7.3}ms",
         phase_t0.elapsed().as_secs_f64() * 1000.0
     );
     phase_t0 = Instant::now();
@@ -2424,7 +2487,7 @@ pub fn prove(
     Ok(TransformerModelProof {
         x_in_com,
         block_proofs,
-        final_ln_proof,
+        ln_batched_proof,
         lm_head_proof,
         final_ln_out_com,
         logits_com,
@@ -2965,7 +3028,9 @@ mod tests {
 
         let mut pt = Transcript::new(b"model_tamper_ln1");
         let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
-        proof.block_proofs[0].ln1_proof.openings.sum_x_at_rt += F::ONE;
+        // PROOF_VERSION 13: per-LN proofs are bundled. Tamper the first LN's
+        // sum_x_at_rt opening within the batched proof's first group.
+        proof.ln_batched_proof.groups[0].openings.sum_x_at_rt[0] += F::ONE;
 
         let mut vt = Transcript::new(b"model_tamper_ln1");
         let result = verify(
@@ -3041,7 +3106,13 @@ mod tests {
 
         let mut pt = Transcript::new(b"model_tamper_final_ln");
         let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
-        proof.final_ln_proof.openings.sum_x_at_rt += F::ONE;
+        // PROOF_VERSION 13: tamper the FINAL LN inside the batched proof.
+        // The final LN sits at index `5*num_blocks` in input order (single block
+        // here -> 5 LNs of d_model + 1 final). All d_model-shaped LNs land in
+        // the same group; the final-LN slot within that group is the last one.
+        let g0 = &mut proof.ln_batched_proof.groups[0];
+        let last = g0.openings.sum_x_at_rt.len() - 1;
+        g0.openings.sum_x_at_rt[last] += F::ONE;
 
         let mut vt = Transcript::new(b"model_tamper_final_ln");
         let result = verify(
