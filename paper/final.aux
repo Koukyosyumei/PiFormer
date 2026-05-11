@@ -80,20 +80,25 @@
 \newlabel{thm:range}{{5}{6}{Globally batched range proof is sound}{theorem.5}{}}
 \newlabel{thm:lnbatch}{{6}{6}{Model-level batched LayerNorm is sound}{theorem.6}{}}
 \newlabel{thm:attnnorm}{{7}{6}{Attention-normalisation sumcheck is sound}{theorem.7}{}}
+\citation{sun2024zkllm}
+\citation{qu2025zkgpt}
 \citation{qu2025zkgpt}
 \citation{kothapalli2022nova}
-\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces \ensuremath  {\pi \text  {-Former}}{} Rust implementation, lines of code per module.}}{7}{table.1}\protected@file@percent }
-\newlabel{tab:loc}{{1}{7}{\sys {} Rust implementation, lines of code per module}{table.1}{}}
 \newlabel{thm:end-to-end}{{8}{7}{\sys {} end-to-end soundness}{theorem.8}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Zero knowledge}{7}{subsection.5.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {6}Implementation}{7}{section.6}\protected@file@percent }
 \newlabel{sec:impl}{{6}{7}{Implementation}{section.6}{}}
-\@writefile{toc}{\contentsline {paragraph}{PyTorch pipeline.}{7}{section*.17}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Single-head, causal supported, no ZK.}{7}{section*.18}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {7}Discussion and Limitations}{7}{section.7}\protected@file@percent }
-\newlabel{sec:disc}{{7}{7}{Discussion and Limitations}{section.7}{}}
-\@writefile{toc}{\contentsline {paragraph}{What is and is not in the SNARK.}{7}{section*.19}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Model-quality evaluation.}{7}{section*.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Preliminary Evaluation}{7}{section.7}\protected@file@percent }
+\newlabel{sec:eval}{{7}{7}{Preliminary Evaluation}{section.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{Setup.}{7}{section*.17}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Preliminary prover-side breakdown for the 2-layer prototype. Phase numbering matches Alg.~\ref {alg:prove}. The zerocheck-folded range proof reduces the LN bucket from $435.9$\,ms to $389.2$\,ms ($-10.7\%$) by eliminating $B\!\cdot \!C$ Hyrax commitments per bucket.}}{7}{table.1}\protected@file@percent }
+\newlabel{tab:eval-small}{{1}{7}{Preliminary prover-side breakdown for the 2-layer prototype. Phase numbering matches Alg.~\ref {alg:prove}. The zerocheck-folded range proof reduces the LN bucket from $435.9$\,ms to $389.2$\,ms ($-10.7\%$) by eliminating $B\!\cdot \!C$ Hyrax commitments per bucket}{table.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Zerocheck fold ablation.}{7}{section*.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Verifier.}{7}{section*.19}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Discussion and Limitations}{7}{section.8}\protected@file@percent }
+\newlabel{sec:disc}{{8}{7}{Discussion and Limitations}{section.8}{}}
+\@writefile{toc}{\contentsline {paragraph}{What is and is not in the SNARK.}{7}{section*.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{From prototype to deployment.}{7}{section*.21}\protected@file@percent }
 \citation{liu2021zkcnn}
 \citation{abbaszadeh2024zero}
 \citation{sun2024zkllm}
@@ -102,9 +107,7 @@
 \citation{setty2024unlocking,arun2024jolt,fomenko2025understanding}
 \citation{habo2024logup}
 \citation{wahby2018doubly}
-\citation{katharopoulos2020transformers}
-\citation{wang2020linformer}
-\citation{kitaev2020reformer}
+\citation{katharopoulos2020transformers,wang2020linformer,kitaev2020reformer}
 \citation{ma2025bitnet}
 \bibstyle{plain}
 \bibdata{ref}
@@ -114,21 +117,19 @@
 \bibcite{bengio2013estimating}{4}
 \bibcite{fomenko2025understanding}{5}
 \bibcite{habo2024logup}{6}
-\@writefile{toc}{\contentsline {paragraph}{From prototype to deployment.}{8}{section*.21}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Beyond \ensuremath  {\pi \text  {-Former}}{}.}{8}{section*.22}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {8}Related Work}{8}{section.8}\protected@file@percent }
-\newlabel{sec:related}{{8}{8}{Related Work}{section.8}{}}
-\@writefile{toc}{\contentsline {paragraph}{Verifiable ML.}{8}{section*.23}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Sumcheck and lookup arguments.}{8}{section*.24}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Linear attention and ternary networks.}{8}{section*.25}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {9}Conclusion}{8}{section.9}\protected@file@percent }
-\newlabel{sec:conclusion}{{9}{8}{Conclusion}{section.9}{}}
 \bibcite{katharopoulos2020transformers}{7}
 \bibcite{kitaev2020reformer}{8}
 \bibcite{kothapalli2022nova}{9}
 \bibcite{liu2021zkcnn}{10}
 \bibcite{ma2025bitnet}{11}
 \bibcite{qu2025zkgpt}{12}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Related Work}{8}{section.9}\protected@file@percent }
+\newlabel{sec:related}{{9}{8}{Related Work}{section.9}{}}
+\@writefile{toc}{\contentsline {paragraph}{Verifiable ML.}{8}{section*.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Sumcheck and lookup arguments.}{8}{section*.23}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Linear attention and ternary networks.}{8}{section*.24}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Conclusion}{8}{section.10}\protected@file@percent }
+\newlabel{sec:conclusion}{{10}{8}{Conclusion}{section.10}{}}
 \bibcite{setty2020spartan}{13}
 \bibcite{setty2024unlocking}{14}
 \bibcite{sun2024zkllm}{15}
@@ -136,4 +137,25 @@
 \bibcite{vaswani2017attention}{17}
 \bibcite{wahby2018doubly}{18}
 \bibcite{wang2020linformer}{19}
-\gdef \@abspage@last{9}
+\@writefile{toc}{\contentsline {section}{\numberline {A}Detailed algorithms}{9}{appendix.A}\protected@file@percent }
+\newlabel{app:full-algorithms}{{A}{9}{Detailed algorithms}{appendix.A}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {A.1}Per-block Phase~1}{9}{subsection.A.1}\protected@file@percent }
+\newlabel{app:phase1}{{A.1}{9}{Per-block Phase~1}{subsection.A.1}{}}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {5}{\ignorespaces $\textsc  {Phase1}(W_\ell ,C_{\mathrm  {cur}},\poppk  _\ell ,\mathsf  {FS})$}}{9}{algorithm.5}\protected@file@percent }
+\newlabel{alg:phase1}{{5}{9}{Per-block Phase~1}{algorithm.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {A.2}Constraint-fused LayerNorm prover (one LN witness)}{9}{subsection.A.2}\protected@file@percent }
+\newlabel{app:ln-prover}{{A.2}{9}{Constraint-fused LayerNorm prover (one LN witness)}{subsection.A.2}{}}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {6}{\ignorespaces $\textsc  {ProveLN}(W,\{C_\mathbf  {x},C_\mathbf  {y}\},(\mathsf  {rps}_\sigma ,\mathsf  {rps}_y),\mathsf  {FS})$}}{9}{algorithm.6}\protected@file@percent }
+\newlabel{alg:layernorm}{{6}{9}{Constraint-fused LayerNorm prover (one LN witness)}{algorithm.6}{}}
+\citation{habo2024logup}
+\@writefile{toc}{\contentsline {subsection}{\numberline {A.3}Full verifier algorithm}{10}{subsection.A.3}\protected@file@percent }
+\newlabel{app:verifier}{{A.3}{10}{Full verifier algorithm}{subsection.A.3}{}}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {7}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Verify  (\popvk  ,\pi ,\mathsf  {inst},\mathbf  {x}_{\mathrm  {in}},\mathbf  {y})$}}{10}{algorithm.7}\protected@file@percent }
+\newlabel{alg:verify-full}{{7}{10}{Full verifier algorithm}{algorithm.7}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {B}Full soundness proofs}{10}{appendix.B}\protected@file@percent }
+\newlabel{app:proofs}{{B}{10}{Full soundness proofs}{appendix.B}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.1}Cross-block batching}{10}{subsection.B.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.2}Homomorphic residuals}{10}{subsection.B.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.3}Range proof with zerocheck fold}{10}{subsection.B.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.4}End-to-end}{10}{subsection.B.4}\protected@file@percent }
+\gdef \@abspage@last{10}
