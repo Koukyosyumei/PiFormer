@@ -52,7 +52,7 @@ const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
 const VERSION: u8 = 5;
-const PROOF_VERSION: u8 = 22;
+const PROOF_VERSION: u8 = 23;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -667,6 +667,8 @@ fn write_quantization_proof<W: Write>(w: &mut W, p: &QuantizationProof) -> io::R
     write_vec(w, &p.rem_coms, write_hyrax_commitment)?;
     write_vec(w, &p.rem_range_proofs, write_range_witness_proof)?;
     write_global_range_m(w, &p.rem_range_m)?;
+    write_vec_f(w, &p.rem_range_evals)?;
+    write_vec(w, &p.rem_range_opens, write_hyrax_proof)?;
     write_vec_f(w, &p.raw_evals)?;
     write_vec_f(w, &p.rem_evals)?;
     write_hyrax_proof(w, &p.raw_open)?;
@@ -678,6 +680,8 @@ fn read_quantization_proof<R: Read>(r: &mut R) -> io::Result<QuantizationProof> 
         rem_coms: read_vec(r, read_hyrax_commitment)?,
         rem_range_proofs: read_vec(r, read_range_witness_proof)?,
         rem_range_m: read_global_range_m(r)?,
+        rem_range_evals: read_vec_f(r)?,
+        rem_range_opens: read_vec(r, read_hyrax_proof)?,
         raw_evals: read_vec_f(r)?,
         rem_evals: read_vec_f(r)?,
         raw_open: read_hyrax_proof(r)?,

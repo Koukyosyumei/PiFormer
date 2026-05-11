@@ -3369,6 +3369,13 @@ mod tests {
     }
 
     #[test]
+    fn test_model_rejects_tampered_ffn_quant_range_remainder_binding() {
+        assert_tampered_model_rejected(b"model_tamper_ffn_quant_range_rem_bind", |proof, _| {
+            proof.ffn_quant_proof.rem_range_evals[0] += F::ONE;
+        });
+    }
+
+    #[test]
     fn test_model_rejects_tampered_ffn_quant_remainder_commitment() {
         assert_tampered_model_rejected(b"model_tamper_ffn_quant_rem_com", |proof, _| {
             proof.ffn_quant_proof.rem_coms[0] = proof.block_proofs[0].ffn_m_com.clone();
@@ -3394,6 +3401,13 @@ mod tests {
         // See note on test_model_rejects_tampered_ffn_quant_range_claim.
         assert_tampered_model_rejected(b"model_tamper_qk_quant_range_claim", |proof, _| {
             proof.qk_quant_proof.rem_range_proofs[0].chunk_evals[0] += F::ONE;
+        });
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_qk_quant_range_remainder_binding() {
+        assert_tampered_model_rejected(b"model_tamper_qk_quant_range_rem_bind", |proof, _| {
+            proof.qk_quant_proof.rem_range_evals[0] += F::ONE;
         });
     }
 

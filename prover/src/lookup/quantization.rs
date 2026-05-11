@@ -3,7 +3,7 @@ use crate::lookup::range::{
     prove_range_batched, verify_range_batched, GlobalRangeM, RangeProofWitness, RangeWitnessProof,
 };
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_open_batch, hyrax_verify_batch, params_from_vars,
+    absorb_com, hyrax_commit, hyrax_open, hyrax_open_batch, hyrax_verify_batch, params_from_vars,
     HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
 };
 use crate::poly::DenseMLPoly;
@@ -26,6 +26,8 @@ pub struct QuantizationProof {
     pub rem_coms: Vec<HyraxCommitment>,
     pub rem_range_proofs: Vec<RangeWitnessProof>,
     pub rem_range_m: GlobalRangeM,
+    pub rem_range_evals: Vec<F>,
+    pub rem_range_opens: Vec<HyraxProof>,
     pub raw_evals: Vec<F>,
     pub rem_evals: Vec<F>,
     pub raw_open: HyraxProof,
@@ -232,11 +234,21 @@ pub fn prove_quantization_batch(
     }
 
     let rem_refs: Vec<&RangeProofWitness> = rem_witnesses.iter().collect();
-    let (rem_range_proofs, rem_range_m, _) = prove_range_batched(
+    let (rem_range_proofs, rem_range_m, rem_range_points) = prove_range_batched(
         &rem_refs,
         range_bits_for_scale_num(params.scale_num),
         transcript,
     )?;
+    let rem_range_evals: Vec<F> = rem_mles
+        .iter()
+        .zip(rem_range_points.iter())
+        .map(|(mle, r)| mle.evaluate(r))
+        .collect();
+    let rem_range_opens: Vec<HyraxProof> = rem_mles
+        .iter()
+        .zip(rem_range_points.iter())
+        .map(|(mle, r)| hyrax_open(&mle.evaluations, r, nu, sigma))
+        .collect();
 
     let r = challenge_vec(transcript, num_vars, b"quant_r");
     let raw_refs: Vec<&[F]> = raw_mles.iter().map(|m| m.evaluations.as_slice()).collect();
@@ -249,6 +261,8 @@ pub fn prove_quantization_batch(
         rem_coms,
         rem_range_proofs,
         rem_range_m,
+        rem_range_evals,
+        rem_range_opens,
         raw_evals,
         rem_evals,
         raw_open,
@@ -272,6 +286,9 @@ pub fn verify_quantization_batch(
 ) -> Result<(), String> {
     validate_quant_params(params)?;
     if proof.rem_coms.len() != raw_coms.len()
+        || proof.rem_range_proofs.len() != raw_coms.len()
+        || proof.rem_range_evals.len() != raw_coms.len()
+        || proof.rem_range_opens.len() != raw_coms.len()
         || proof.raw_evals.len() != raw_coms.len()
         || proof.rem_evals.len() != raw_coms.len()
         || index_vectors.len() != raw_coms.len()
@@ -286,7 +303,7 @@ pub fn verify_quantization_batch(
     }
     let range_proof_refs: Vec<&RangeWitnessProof> = proof.rem_range_proofs.iter().collect();
     let rem_n_vars = n.next_power_of_two().trailing_zeros() as usize;
-    verify_range_batched(
+    let (rem_range_points, _) = verify_range_batched(
         &range_proof_refs,
         &proof.rem_range_m,
         &vec![rem_n_vars; proof.rem_range_proofs.len()],
@@ -295,6 +312,28 @@ pub fn verify_quantization_batch(
         &mut [(rem_n_vars, acc_range_chunk)],
         acc_range_m,
     )?;
+    let shift_mult = F::from(1u64 << crate::lookup::range::CHUNK_BITS);
+    for (i, range_proof) in proof.rem_range_proofs.iter().enumerate() {
+        let mut expected_eval = F::from(0u64);
+        let mut shift = F::from(1u64);
+        for &chunk_eval in &range_proof.chunk_evals {
+            expected_eval += chunk_eval * shift;
+            shift *= shift_mult;
+        }
+        if proof.rem_range_evals[i] != expected_eval {
+            return Err(format!(
+                "quantization range/remainder eval mismatch at batch item {i}"
+            ));
+        }
+        acc_range_chunk
+            .add_verify(
+                &proof.rem_coms[i],
+                proof.rem_range_evals[i],
+                &rem_range_points[i],
+                &proof.rem_range_opens[i],
+            )
+            .map_err(|e| format!("quant remainder range-point opening (deferred): {e}"))?;
+    }
     let r = challenge_vec(transcript, num_vars, b"quant_r");
     let (_, _, params_h) = params_from_vars(num_vars);
     if num_vars == rem_n_vars {

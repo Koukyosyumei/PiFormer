@@ -104,43 +104,32 @@ Columbia University\\
 %-------------------------------------------------------------------------------
 \begin{abstract}
 %-------------------------------------------------------------------------------
-We present \sys{}, a succinct argument system for verifiable
-transformer inference whose central design choice is to make the
-\emph{model} SNARK-friendly rather than to make the proof system
-absorb expensive operations. Three architectural changes drive the
-design: (i) softmax attention is replaced by a kernel attention whose
-feature map $\bphi$ is parametrised as an additively decomposed
-lookup table, so the only non-arithmetic operation in a block is a
-structured Lasso lookup; (ii) every projection matrix is constrained
-to ternary entries $\{-1,0,+1\}$ scaled by a single learnable
-$\alpha$ per layer, which removes \emph{all} field multiplications
-from sumcheck-time weight contractions; and (iii) the lookup tables
-themselves are \emph{learnable}, so model expressivity is recovered
-through training rather than through a larger circuit~--- a free
-substitution under Lasso, whose prover/verifier cost depends only on
-table size and query count, not on table contents.
+Verifiable transformer inference lets an untrusted operator prove
+that a posted output was produced by a committed model, without
+revealing the weights. The obstacle is that a transformer block is
+built from exactly the operations that finite-field SNARKs find
+expensive: softmax, GeLU, LayerNorm, and dense projections. Prior
+systems leave the model untouched and pay this cost on every block.
 
-On top of this architecture we build a transparent SNARK over BN254
-with the Hyrax polynomial commitment scheme. The block uses
-\emph{sandwich normalisation}~--- five LayerNorms per block (LN$_1$, QK-norm
-on $\bQ$ and $\bK$, post-attention LN before the residual, LN$_2$)~---
-to keep linear-attention activations and lookup inputs in range, and the
-prover handles all $5L\!+\!1$ LNs in a \emph{single model-level batched
-LN proof}. The proof system batches all per-block sub-protocols into six
-cross-block sumchecks (QKV, output projection, attention out, attention
-context, FFN-Y, FFN-M; the attention out/ctx pair swaps in cubic
-multi-batched variants under causal masking), one global Lasso proof for
-$\bphi(\bQ^{\mathrm n}),\bphi(\bK^{\mathrm n})$, a Lasso terminal-eval proof
-for the FFN activation $\bA$, two integer-quantization sub-proofs that bind
-public lookup indices to the committed signed inputs, one shared
-range-multiplicity commitment per width bucket across the entire model,
-an in-circuit floor-division proof for the row-normaliser $Z$, and roughly
-two dozen cross-cutting Hyrax accumulators, finalised via MSM-fused
-\texttt{finalize\_many\_with\_mus} into one MSM pair per group of shared
-Hyrax parameters. Residual connections cost no proof at all~--- they are checked by
-homomorphic addition of Hyrax commitments. We give cross-block /
-cross-LN batching soundness theorems and an end-to-end soundness
-reduction to discrete log on BN254 G1.
+We present \sys{}, a succinct argument whose central design choice
+is to co-design the \emph{model} so the proof system has nothing
+expensive to absorb. Three architectural changes drive the design:
+(i) softmax attention is replaced by a kernel attention whose feature
+map is realised as an additively decomposed learnable lookup, so the
+only non-arithmetic operation is a structured Lasso table look-up;
+(ii) every projection is constrained to ternary entries scaled by a
+per-layer scalar, eliminating all field multiplications from weight
+contractions; and (iii) LayerNorm is reformulated as an integer
+protocol provable through sumcheck and chunked range proofs. We build
+a transparent BN254 SNARK on top with Hyrax commitments, batching
+every per-block sub-protocol into a constant number of model-level
+sumchecks, a globally shared range-multiplicity commitment, and a
+zerocheck-folded inverse polynomial that removes $B\!\cdot\!C$ Hyrax
+commitments per range bucket. Residual connections require no proof:
+they are verified by linearity of the commitment scheme. We prove
+end-to-end soundness under discrete log on BN254 G1 and implement a
+complete prototype in $\sim$19k lines of Rust with a bit-identical
+PyTorch training pipeline.
 \end{abstract}
 
 %-------------------------------------------------------------------------------
@@ -148,212 +137,166 @@ reduction to discrete log on BN254 G1.
 \label{sec:intro}
 %-------------------------------------------------------------------------------
 
-Large language models are increasingly deployed as black-box services:
-the user submits a prompt, a remote operator runs a proprietary model,
-and the user has no cryptographic guarantee that the returned output
-came from the advertised model. Verifiable inference~\cite{liu2021zkcnn,
-sun2024zkllm,qu2025zkgpt,abbaszadeh2024zero} addresses this gap
-through a succinct non-interactive argument: the operator commits
-to model weights once, then for every input produces a small proof
-that the verifier can check without re-executing the model and without
-learning the weights.
+Large language models are increasingly deployed as black-box
+services. The user submits a prompt, an opaque operator runs a
+proprietary model, and the user has no cryptographic guarantee that
+the returned output came from the advertised model. Verifiable
+inference~\cite{liu2021zkcnn,sun2024zkllm,qu2025zkgpt,abbaszadeh2024zero}
+closes this gap with a succinct non-interactive argument: the
+operator commits to the weights once, and for every input produces a
+small proof that the verifier checks without re-executing the model
+and without learning the weights.
 
-The core difficulty is that a transformer block is built from exactly
-the operations that finite-field arithmetic circuits find expensive.
-Softmax requires exponentials and a row-wise division; GeLU is
-transcendental; LayerNorm contains a square root and a division by a
-running variance; and a single dense projection costs one field
-multiplication per weight entry. Prior work tackles these on the
-\emph{proof-system} side: zkLLM~\cite{sun2024zkllm} introduces
-\texttt{tlookup}, a parallelised lookup argument tailored to softmax
-and SwiGLU; zkGPT~\cite{qu2025zkgpt} pairs Plonky2 with constraint
-fusion and circuit squeezing to drive down the cost of approximating
-softmax. Both keep the model architecture fixed and pay an
-``unfriendly-operation tax'' on every transformer block.
+The core difficulty is that a transformer block is built from
+operations that finite-field SNARKs find expensive. Softmax requires
+exponentials and a row-wise division; GeLU is transcendental;
+LayerNorm contains a square root and a division by a running
+variance; a dense projection costs one field multiplication per
+weight entry. Prior work attacks this on the proof-system side:
+zkLLM~\cite{sun2024zkllm} introduces \texttt{tlookup}, a parallelised
+lookup argument tailored to softmax and SwiGLU; zkGPT~\cite{qu2025zkgpt}
+pairs Plonky2 with constraint fusion to drive down the cost of
+approximating softmax. Both keep the model fixed and pay an
+``unfriendly-operation tax'' on every block.
 
 \paragraph{Our approach.}
-\sys{} starts from a different premise: we change the
-\emph{model} so that the proof system has nothing expensive to absorb.
-The design follows three principles, chosen in this order:
-\begin{enumerate}
-  \item \emph{SNARK-friendly architecture.}
-        Replace every operation that has no compact arithmetic
-        representation. In particular, replace softmax attention by a
-        kernel attention whose only non-arithmetic component is a
-        structured table lookup, and replace LayerNorm's division
-        and square root by an integer reformulation provable through
-        sumcheck and chunked range proofs.
-  \item \emph{Ternary weights for free contractions.}
-        Constrain every projection to ternary entries
-        $\{-1,0,+1\}$ scaled by a per-layer scalar $\alpha$.
-        A degree-$2$ sumcheck against a ternary weight matrix
-        materialises only the cheap row $\alpha\!\cdot\!\bW(\cdot,r)$
-        and folds the equality polynomial against the ternary
-        entries with $+\!=$/$-\!=$/skip~--- no field multiplications
-        appear in the contraction~\cite{ma2025bitnet}.
-  \item \emph{Recover accuracy through learnable lookup, not larger
-        circuits.}
-        The element-wise non-linearity $\bphi$ is itself
-        \emph{learnable}: it is parametrised as a sum of small
-        sub-tables, all entries of which are trained end-to-end.
-        Under Lasso~\cite{setty2024unlocking}, the prover and
-        verifier cost depends on the table size and the query count
-        but is otherwise \emph{independent of the table contents}.
-        Letting training adapt the table values therefore restores
-        expressivity at zero proving cost.
-\end{enumerate}
-The first principle eliminates the worst offenders; the second turns
-linear contractions into addition-only loops; the third gives the
-model the freedom to recover accuracy through training rather than
-through a larger circuit. Together they reduce a transformer block
-to operations that map directly to a low-degree sumcheck claim or to
-a Lasso lookup over a small structured table.
+\sys{} starts from a different premise: change the \emph{model} so
+that the proof system has nothing expensive to absorb. Three
+architectural principles drive the design:
+\begin{itemize}
+  \item \textbf{SNARK-friendly operators.} Replace every operation
+        without a compact arithmetic representation. Softmax becomes
+        a kernel attention whose only non-arithmetic component is a
+        structured table lookup; LayerNorm becomes an integer
+        protocol provable by sumcheck plus chunked range proofs.
+  \item \textbf{Ternary projections for free contractions.}
+        Constrain every projection matrix to entries
+        $\{-1,0,+1\}$ scaled by a per-layer scalar
+        $\alpha$~\cite{ma2025bitnet}. A degree-$2$ sumcheck against
+        a ternary weight folds the equality polynomial against
+        ternary entries with $+\!=$/$-\!=$/skip; no field
+        multiplications appear in the contraction.
+  \item \textbf{Learnable lookup tables.} The element-wise
+        non-linearity $\bphi$ is itself learnable: it is parametrised
+        as a sum of small sub-tables and trained end-to-end. Under
+        Lasso~\cite{setty2024unlocking}, prover cost depends only on
+        table size and query count, not on table contents, so
+        training adapts table values at zero proving cost.
+\end{itemize}
+Together these reduce a transformer block to operations that map
+directly to a low-degree sumcheck or to a Lasso lookup over a small
+structured table.
 
-\paragraph{Cross-block batching.}
-On top of the SNARK-friendly architecture we build a proof system
-engineered around a single observation: \emph{the same protocol is run
-once per block, with independent inputs but identical structure}.
-\sys{} runs six \emph{model-level} batched sumchecks (one per
-protocol type) that fold all $L$ per-block claims via a Fiat--Shamir
-random linear combination in an independent challenge $\eta$; the
-inner sumcheck transcript is shared across all blocks. The same idea
-applies to Lasso (one global multi-instance proof per lookup family),
-to range checks (one shared multiplicity commitment per block, plus
-one for the final layer), to residuals (homomorphic addition of Hyrax
-commitments; no proof at all), and to the final stage of opening (ten
-cross-cutting deferred Hyrax accumulators, each finalising in one
-MSM pair). Each batching step is a standard random-linear-combination
-argument whose error is dominated by the inner sumcheck error.
+\paragraph{Model-level batching.}
+On top of this architecture we build a proof system around a single
+observation: the same protocol runs once per block with independent
+inputs but identical structure. \sys{} runs six model-level
+sumchecks (one per protocol type) that fold all $L$ per-block claims
+via a Fiat--Shamir random linear combination; the inner sumcheck
+transcript is shared across blocks. The same idea applies to Lasso
+(one global multi-instance proof per lookup family), to range checks
+(one shared multiplicity commitment per width bucket spanning the
+entire model), to residuals (homomorphic Hyrax addition; no proof at
+all), and to the final opening stage (deferred batch accumulators
+finalised in one MSM pair per parameter group). For the range proof
+specifically, we replace the explicit Hyrax commitment to each LogUp
+inverse polynomial by a zerocheck folded into the bucket sumcheck;
+this removes $B\cdot C$ commitments per bucket without changing the
+per-round prover cost.
 
 \paragraph{Contributions.}
 \begin{enumerate}
-  \item A SNARK-friendly transformer block (\S\ref{sec:arch}) in
-        which every operation~--- attention, normalisation,
-        projection~--- has a sub-linear verifier circuit, by combining
+  \item A SNARK-friendly transformer block
+        (\S\ref{sec:arch}) in which attention, normalisation, and
+        projection each map to a sumcheck or a Lasso lookup, combining
         learnable lookup attention, ternary projections, and a
-        constraint-fused LayerNorm.
-  \item A complete end-to-end SNARK protocol (\S\ref{sec:protocol})
-        that batches all $L$ per-block sub-proofs into six
-        model-level cross-block sumchecks, one global multi-instance
-        Lasso for $\bphi(\bQ^{\mathrm n}),\bphi(\bK^{\mathrm n})$, a
-        Lasso terminal-eval proof for the FFN activation, two
-        quantization sub-proofs bridging signed-field inputs to
-        unsigned-integer lookup indices, and an MSM-fused pool of
-        deferred Hyrax accumulators.
-  \item Cross-block batching soundness theorems
-        (\S\ref{sec:soundness}, Theorem~\ref{thm:cross-block}) and
-        an end-to-end soundness bound (Theorem~\ref{thm:end-to-end}).
-  \item A complete prototype implemented in $\sim$19\,k lines of
-        Rust over BN254 with a matched PyTorch training pipeline
-        whose integer forward pass is bit-identical to the Rust
-        circuit (\S\ref{sec:impl}).
+        constraint-fused integer LayerNorm.
+  \item A complete protocol (\S\ref{sec:protocol}) batching all
+        $L$ per-block sub-proofs into six model-level cross-block
+        sumchecks, one global Lasso for the $\bphi$ family, and a
+        bucket-batched range proof shared across the whole model.
+  \item A zerocheck-folded LogUp range proof (\S\ref{ssec:range},
+        Theorem~\ref{thm:range}) that eliminates $B\cdot C$
+        Hyrax commitments per width bucket while keeping the
+        bucket sumcheck cubic and soundness within $O(n/|\FF|)$.
+  \item End-to-end soundness (\S\ref{sec:soundness},
+        Theorem~\ref{thm:end-to-end}) reducing to discrete log on
+        BN254 G1, and a working prototype in $\sim$19k Rust LoC with
+        a bit-identical PyTorch training pipeline
+        (\S\ref{sec:impl}).
 \end{enumerate}
 
 \paragraph{Threat model.}
 We target the standard non-interactive argument-of-knowledge setting
 in the random-oracle model. The verifier holds a verifying key
-$\popvk$ binding the model weights and lookup tables, a public input
-$\bx_{\mathrm{in}}$, and a claimed output $\by$. The prover is
-computationally bounded; its goal is to convince the verifier that
-$\calM_\theta(\bx_{\mathrm{in}})=\by$ for the model committed in
-$\popvk$. Soundness is computational under the discrete-log
-assumption on BN254 G1, the standard assumption for the Hyrax
-PCS~\cite{wahby2018doubly}. The current implementation is not
-zero-knowledge: weight commitments are public VK entries and
-intermediate sumcheck evaluations are revealed. We use ``verifiable
-inference'' to refer to integrity, not witness privacy, and outline
-the standard masking extension in \S\ref{sec:disc}.
+$\popvk$ binding the weights and lookup tables, a public input
+$\bx_{\mathrm{in}}$, and a claimed output $\by$, and accepts iff
+$\calM_\theta(\bx_{\mathrm{in}})\!=\!\by$ for the committed model.
+Soundness is computational under discrete log on BN254 G1, the
+standard assumption for the Hyrax PCS~\cite{wahby2018doubly}. The
+current implementation is not zero-knowledge: weight commitments are
+public and intermediate sumcheck evaluations are revealed. The
+standard masking extension is discussed in \S\ref{sec:disc}.
 
 %-------------------------------------------------------------------------------
-\section{Background}
+\section{Preliminaries}
 \label{sec:bg}
 %-------------------------------------------------------------------------------
 
-\subsection{Notation}
-We work over the BN254 scalar field $\FF=\FF_r$ with $r\!\approx\!2^{254}$,
-and instantiate the Hyrax PCS on the BN254 G1 group $\GG$ of the
-same prime order. We write $L$ for the number of transformer blocks,
-$T$ for the sequence length, $d$ for the embedding dimension, and
-$d_{ff}$ for the FFN width; the prototype is single-head ($d_h=d$).
-A multilinear polynomial $\widetilde f$ on $n$ variables is identified
-with its $2^n$ evaluations on $\{0,1\}^n$; its evaluation at
-$r\!\in\!\FF^n$ is denoted $\widetilde f(r)$. The equality polynomial
-$\eq(r,x)\!=\!\prod_i (r_ix_i+(1-r_i)(1-x_i))$ satisfies
-$\sum_x \eq(r,x)\widetilde f(x)=\widetilde f(r)$. Capital bold
-$\bX,\bW,\dots$ denote matrices represented as multilinear
-polynomials over $\FF$ after fixed-point quantisation
-(\S\ref{ssec:fixed-point}).
+\paragraph{Notation.}
+We work over the BN254 scalar field $\FF$ ($r\!\approx\!2^{254}$) and
+the BN254 G1 group $\GG$. We use $L$ for the number of blocks, $T$
+for the sequence length, $d$ for the embedding dimension, and $d_{ff}$
+for the FFN width; the prototype is single-head ($d_h\!=\!d$). A
+multilinear polynomial $\widetilde f$ on $n$ variables is identified
+with its $2^n$ evaluations on $\{0,1\}^n$, and the equality polynomial
+$\eq(r,x)\!=\!\prod_i(r_i x_i+(1\!-\!r_i)(1\!-\!x_i))$ satisfies
+$\sum_x\eq(r,x)\widetilde f(x)=\widetilde f(r)$. Real-valued tensors are
+quantised to integers and embedded in $\FF$ before commitment; our
+training pipeline runs the same integer arithmetic, so the exported
+witness matches the field circuit bit-for-bit.
 
-\subsection{The transformer block}
-A standard pre-norm transformer block~\cite{vaswani2017attention}
-computes
-\begin{align*}
-  \bX_{\mathrm{mid}} &= \bX_{\mathrm{in}} + \Att\bigl(\LN(\bX_{\mathrm{in}})\bigr),\\
-  \bX_{\mathrm{out}} &= \bX_{\mathrm{mid}} + \mathrm{FFN}\bigl(\LN(\bX_{\mathrm{mid}})\bigr),
-\end{align*}
-where standard self-attention is
-$\Att(\bQ,\bK,\bV)=\softmax(\bQ\bK^\top\!/\sqrt{d})\,\bV$ and
-LayerNorm~\cite{ba2016layer} is
-$\LN(\bx)=\bgamma\!\odot\!(\bx-\mu)/\sqrt{\sigma^2+\epsilon}+\bbeta$.
-Each of softmax, GeLU and LayerNorm contains operations (exp,
-division, square root) without compact polynomial representations,
-so they dominate SNARK complexity in prior work.
+\paragraph{Transformer block.}
+A pre-norm block~\cite{vaswani2017attention} computes
+$\bX_{\mathrm{mid}}\!=\!\bX_{\mathrm{in}}+\Att(\LN(\bX_{\mathrm{in}}))$ and
+$\bX_{\mathrm{out}}\!=\!\bX_{\mathrm{mid}}+\mathrm{FFN}(\LN(\bX_{\mathrm{mid}}))$,
+with softmax attention $\softmax(\bQ\bK^\top\!/\sqrt d)\bV$ and
+LayerNorm~\cite{ba2016layer}
+$\bgamma\!\odot\!(\bx-\mu)/\sqrt{\sigma^2+\epsilon}+\bbeta$. The
+non-arithmetic primitives (exp, division, square root) dominate SNARK
+complexity in prior work.
 
-\subsection{Sumcheck}
-For an MLE $f\!:\!\FF^n\!\to\!\FF$ of individual degree
-$\delta$, the sumcheck protocol~\cite{setty2020spartan,thaler2022proofs}
-reduces a claim $H=\sum_{x\in\{0,1\}^n}f(x)$ to a single evaluation
-$f(r)$ at random $r\!\in\!\FF^n$ in $n$ rounds. Soundness error is
-$\le n\delta/|\FF|$ and verifier cost is $O(n\delta)$ field
-operations. \sys{} uses the degree-2 variant for products of two
-MLEs, the cubic variant for LayerNorm variance, and a multi-batched
-variant $\sum_k\lambda_k\sum_x f_k(x)g_k(x)$ for cross-block
-batching.
+\paragraph{Sumcheck.}
+The sumcheck protocol~\cite{setty2020spartan,thaler2022proofs} reduces a
+claim $H\!=\!\sum_{x\in\{0,1\}^n}\!f(x)$ for an MLE $f$ of individual
+degree $\delta$ to a single evaluation $f(r)$ at random $r$, with
+soundness error $\le n\delta/|\FF|$ and verifier cost $O(n\delta)$.
+\sys{} uses the degree-2 variant for products of two MLEs, the cubic
+variant for LayerNorm variance and our zerocheck-folded range proof,
+and a multi-batched variant $\sum_k\lambda_k\sum_x f_k(x)g_k(x)$ for
+cross-block batching.
 
-\subsection{Hyrax PCS}
-For a multilinear polynomial of $2^n=2^{\nu+\sigma}$ evaluations
-arranged as a $2^\nu\!\times\!2^\sigma$ matrix $M$, Hyrax commits to
-each row as a vector Pedersen commitment
-$C_i=\mathrm{MSM}(\mathbf g, M[i])$ over public ``nothing-up-my-sleeve''
-generators $g_j=\mathrm{SHA3}(\texttt{"piformer-hyrax-gen"}\Vert j)\cdot G$,
-and opens at $r=(r_L\Vert r_R)$ by sending the row-collapsed vector
-$w'_j=\sum_i L_i(r_L)M[i][j]$, where $L_i$ are multilinear Lagrange
-bases. The verifier checks (i) a homomorphic commitment identity
-$\sum_i L_i(r_L)C_i=\mathrm{MSM}(\mathbf g, w')$ and (ii) an inner
-product identity $\langle R(r_R),w'\rangle=v$~\cite{wahby2018doubly}.
-Hyrax is transparent (no trusted setup), computationally binding under
-DL on $\GG$, and has $O(\sqrt N)$ commitments, openings, and proof
-size.
+\paragraph{Hyrax PCS.}
+Hyrax~\cite{wahby2018doubly} arranges $2^n\!=\!2^{\nu+\sigma}$ MLE
+evaluations as a $2^\nu\!\times\!2^\sigma$ matrix and commits to each
+row via a vector Pedersen commitment over transparent generators. The
+scheme is computationally binding under DL on $\GG$, requires no trusted
+setup, and gives $O(\sqrt N)$ commitments, openings, and proof size.
+Crucially, the row-Pedersen structure is linear:
+$\Com(\bA)\!+\!\Com(\bB)\!=\!\Com(\bA\!+\!\bB)$, which \sys{} exploits to
+verify residual connections without any proof.
 
-\subsection{Lasso}
+\paragraph{Lasso.}
 \label{ssec:lasso}
-Given a sub-table $T\!\in\!\FF^{2^m}$ and queries
-$\{(\mathrm{idx}_j,v_j)\}_{j=1}^N$ with
-$v_j=T[\mathrm{chunk}(\mathrm{idx}_j)]$,
 Lasso~\cite{setty2024unlocking,arun2024jolt,fomenko2025understanding}
-proves all queries are consistent with $T$ via a single batched
-sumcheck for
-$\sum_x \widetilde T(x)L(x)=\sum_j \rho^j T[\mathrm{ch}_j]$ where
-$L(x)=\sum_j \rho^j \eq(\mathrm{bin}(\mathrm{ch}_j),x)$ and $\rho$ is
-Fiat--Shamir-derived. A composite table that decomposes
-\emph{additively} into $\chunks$ sub-tables (the canonical Lasso
-``structured'' condition) is committed as $\chunks$ small tables of
-size $2^{B/\chunks}$ rather than one monolithic table of size $2^B$.
-Critically for our design, the prover/verifier cost depends on the
-table size and the query count, but is otherwise \emph{independent
-of the table contents}: changing the values of $T$ does not change
-the cost of proving lookups against $T$.
-
-\subsection{Fixed-point encoding}
-\label{ssec:fixed-point}
-Real-valued tensors are quantised to integers and embedded in $\FF$
-by $x_\FF=\lfloor x/s\rfloor\bmod r$, with the scale $s$ chosen so
-that no intermediate value overflows $r$ (e.g., for $\bits$-bit
-activations and $k$-bit weights, $T\!\cdot\!d_h\!\cdot\!2^\bits\!\cdot\!2^k\!\ll\!r$).
-The PyTorch training pipeline applies the \emph{same} integer
-arithmetic in its forward pass, so the exported witness exactly
-matches the field arithmetic in the Rust circuit, eliminating the
-train--prove gap.
+proves that $N$ queries are consistent with a public sub-table
+$T\!\in\!\FF^{2^m}$ via one batched sumcheck. A composite table that
+decomposes \emph{additively} into $c$ sub-tables (Lasso's structured
+condition) is committed as $c$ small tables of size $2^{B/c}$. Lasso's
+defining property for our design is that prover and verifier cost
+depend on table size and query count, but are independent of table
+\emph{contents}: training the entries of $T$ has zero proving-cost
+impact.
 
 %-------------------------------------------------------------------------------
 \section{The \sys{} Architecture}
@@ -439,56 +382,36 @@ commitments and requires no proof.}
 \label{fig:block}
 \end{figure*}
 
-A \sys{} block (Figure~\ref{fig:block}) is a sandwich-normalised linear-
-attention block. Let $\bX_{\mathrm{in}}\!\in\!\FF^{T\times d}$ denote the
-input hidden state; the block computes
-\begin{align}
-  \bX_{\mathrm{n1}}      &= \LN_1(\bX_{\mathrm{in}}), \\
-  \bQ,\bK,\bV           &= \bX_{\mathrm{n1}}\bW_{Q,K,V} \;\;\text{(ternary)}, \\
-  \bQ^{\mathrm{n}}      &= \LN_Q(\bQ),\;\; \bK^{\mathrm{n}}=\LN_K(\bK)
-                              \;\;\text{(QK-norm)}, \\
-  \bN                   &= \bphi(\bQ^{\mathrm{n}})\bigl(\bphi(\bK^{\mathrm{n}})^\top\bV\bigr)
-                              \;\;\text{(LLA numerator)}, \\
-  Z_t                   &= \bphi(\bq_t^{\mathrm{n}})^{\!\top}\!{\textstyle\sum_s}\bphi(\bk_s^{\mathrm{n}})
-                              \;\;\text{(per-row denominator)}, \\
-  \bY^{\mathrm{att}}_{tj}&= \lfloor S\!\cdot\!\bN_{tj}/Z_t\rfloor
-                              \;\;\text{(fixed-point row norm)}, \\
-  \bO_{\mathrm{att}}    &= \bY^{\mathrm{att}}\bW_O + \bb_O \;\;\text{(ternary)}, \\
-  \bX_{\mathrm{mid}}    &= \bX_{\mathrm{in}} + \LN_{\mathrm{aon}}(\bO_{\mathrm{att}})
-                              \;\;\text{(sandwich norm)}, \\
-  \bX_{\mathrm{n2}}     &= \LN_2(\bX_{\mathrm{mid}}), \\
-  \bO_{\mathrm{ffn}}    &= \bphi(\bX_{\mathrm{n2}}\bW_1)\,\bW_2
-                              \;\;\text{(structured-lookup FFN)}, \\
-  \bX_{\mathrm{out}}    &= \bX_{\mathrm{mid}} + \bO_{\mathrm{ffn}}.
-\end{align}
-After $L$ such blocks the model applies one final LayerNorm and a ternary
-language-model head, so the model contains $5L\!+\!1$ LayerNorms in total.
-The constant $S=\mathrm{ATTN\_NORM\_SCALE}=64$ re-introduces fractional
-precision before the floor division.
+A \sys{} block (Figure~\ref{fig:block}) is a sandwich-normalised
+linear-attention block. With $\bX_{\mathrm{in}}\!\in\!\FF^{T\times d}$,
+the block computes
+\begin{align*}
+  \bX_{\mathrm{n1}}      &= \LN_1(\bX_{\mathrm{in}}),\\
+  \bQ,\bK,\bV           &= \bX_{\mathrm{n1}}\bW_{Q,K,V} \;\;\text{(ternary)},\\
+  \bQ^{\mathrm{n}},\bK^{\mathrm{n}} &= \LN_Q(\bQ),\;\LN_K(\bK),\\
+  \bN                   &= \bphi(\bQ^{\mathrm{n}})\bigl(\bphi(\bK^{\mathrm{n}})^\top\bV\bigr),\\
+  Z_t                   &= \bphi(\bq_t^{\mathrm{n}})^{\!\top}\!{\textstyle\sum_s}\bphi(\bk_s^{\mathrm{n}}),\\
+  \bY^{\mathrm{att}}_{tj}&= \lfloor S\!\cdot\!\bN_{tj}/Z_t\rfloor,\\
+  \bX_{\mathrm{mid}}    &= \bX_{\mathrm{in}} + \LN_{\mathrm{aon}}(\bY^{\mathrm{att}}\bW_O+\bb_O),\\
+  \bX_{\mathrm{out}}    &= \bX_{\mathrm{mid}} + \bphi(\LN_2(\bX_{\mathrm{mid}})\bW_1)\bW_2.
+\end{align*}
+After $L$ such blocks the model applies a final LayerNorm and a
+ternary LM head; the model contains $5L\!+\!1$ LayerNorms in total.
+The scale $S$ re-introduces fractional precision before the integer
+floor division.
 
-The two LayerNorms that are not present in a textbook pre-norm transformer
-are essential for our integer pipeline:
-\begin{itemize}
-  \item \emph{QK-norm} ($\LN_Q,\LN_K$) pins the dynamic range of $\bQ,\bK$ so
-        the kernel features $\bphi(\bQ^{\mathrm{n}}),\bphi(\bK^{\mathrm{n}})$
-        and the denominator $Z$ stay inside the lookup-table range
-        regardless of the single-$\alpha$ ternary projection scale.
-  \item \emph{Sandwich norm} ($\LN_{\mathrm{aon}}$) absorbs the unbounded
-        magnitude of linear attention before the residual sum. Softmax
-        attention is row-stochastic and naturally bounded; the linear
-        numerator $\bphi(\bQ)(\bphi(\bK)^\top\bV)$ has no such bound, and
-        without normalisation the residual stream drifts in magnitude and
-        destabilises downstream LayerNorms.
-\end{itemize}
-Both are LayerNorms over the same primitive (\S\ref{ssec:ln}); the only
-SNARK-side cost is more LN witnesses, which the model-level batched LN proof
-of \S\ref{sec:protocol} folds into a single transcript and the bucketed
-range batch (\S\ref{ssec:range}) folds into a shared multiplicity commitment.
-The SNARK now also proves the row-normalisation step
-$\bY^{\mathrm{att}}=\lfloor S\!\cdot\!\bN/Z\rfloor$ end-to-end via the
-attention-normalisation sub-protocol of \S\ref{ssec:LLA}.
-
-The three architectural ingredients are described below.
+Two of the five LayerNorms per block are not in a textbook
+transformer but are essential for our integer pipeline.
+\emph{QK-norm} ($\LN_Q,\LN_K$) pins the range of $\bQ,\bK$ so that
+$\bphi(\bQ^{\mathrm n}),\bphi(\bK^{\mathrm n})$ and $Z$ stay in the
+lookup-table range under any per-layer ternary scale.
+\emph{Sandwich norm} ($\LN_{\mathrm{aon}}$) absorbs the unbounded
+magnitude of linear attention before the residual: softmax is
+row-stochastic and naturally bounded, but
+$\bphi(\bQ)(\bphi(\bK)^\top\bV)$ is not, and an unnormalised residual
+destabilises downstream LayerNorms. Both share one LN sub-protocol
+(\S\ref{ssec:ln}); their only cost is extra LN witnesses, folded into
+the model-level batched LN proof and the bucketed range batch.
 
 \subsection{Learnable Lookup Attention (LLA)}
 \label{ssec:LLA}
@@ -693,6 +616,42 @@ $T_{\mathrm{id}}[i]\!=\!i$. The transcript-ordering invariant
 (Theorem~\ref{thm:range}) is that $m_{\mathrm{com}}$ is absorbed before
 any Phase~2 sumcheck challenge is sampled.
 
+\paragraph{Zerocheck-folded inverse polynomial.}
+The LogUp identity requires per-chunk inverse polynomials
+$h_{c}[i]\!=\!1/(\alpha-V_{c}[i])$ for a Fiat--Shamir challenge $\alpha$.
+A na\"ive implementation Hyrax-commits each $h_{c}$ and opens it
+alongside the chunk commitments, costing $B\!\cdot\!C$ extra Pedersen
+MSMs per bucket. We avoid those commitments by folding a zerocheck of
+\[
+  h(x)\cdot(\alpha-V(x))\,-\,1\;\equiv\;0\qquad(x\!\in\!\{0,1\}^{n})
+\]
+into the bucket's existing cubic sumcheck. Concretely, after the
+bucket claim
+$\Lambda\!=\!\sum_p w_p\!\cdot\!\bigl(\sum_i h_p[i]+\beta\!\cdot\!n_{\mathrm{pad}}\bigr)$
+is absorbed, the verifier samples $\gamma_{\mathrm{fold}}\!\in\!\mathbb{F}$
+and $r_{zc}\!\in\!\mathbb{F}^{n}$, and the prover proves
+\[
+  \sum_{x}\Bigl[\;
+     w(x)\!\cdot\!h(x)\!\cdot\!\bigl(1+\beta(\alpha-V(x))\bigr)
+     \;+\;\gamma_{\mathrm{fold}}\!\cdot\!\mathrm{eq}(r_{zc},x)\!\cdot\!\bigl(h(x)(\alpha-V(x))-1\bigr)
+  \Bigr]\;=\;\Lambda.
+\]
+The first term is the standard LogUp bucket claim; the second is the
+zerocheck term, which sums to zero on the boolean hypercube iff
+$h\!=\!1/(\alpha-V)$ pointwise. The integrand remains cubic in
+$(h,V,w,\mathrm{eq})$, so per-round prover cost is unchanged. We
+pre-fill $h$'s pair-padding slots with $\alpha^{-1}$ so that the
+zerocheck term vanishes there ($\alpha^{-1}\!\cdot\!\alpha-1\!=\!0$),
+keeping the bucket claim well-formed without an indicator mask.
+
+Crucially, $\Lambda$ is absorbed into the transcript \emph{before}
+$\gamma_{\mathrm{fold}}$ and $r_{zc}$ are sampled. The terminal
+$h(r_{\mathrm{full}})$ is sent as a scalar (not opened against any
+commitment) and is bound only by the sumcheck's round-polynomial
+consistency together with the combined-identity check; the chunk
+evaluation $V(r_{\mathrm{full}})$ remains bound to the Hyrax-committed
+$V_c$ via the per-chunk openings at the bucket challenge $r_k$.
+
 The model-level prover collects \emph{all} range witnesses across the
 entire model into a single bucket-routed list: $10L+2$ LN witnesses
 ($\sigma,y$ for the five LNs per block plus the final LN's two), and
@@ -700,7 +659,9 @@ $2L$ extra witnesses ($\mathrm{rem},\mathrm{diff}$ per block) when
 normalised attention is enabled. Sharing one $m_{\mathrm{com}}$ per
 bucket therefore saves $(B\!-\!1)\!\times\!\sqrt{2^{16}}$ G1 MSMs per
 bucket, and the savings scale with $L$ rather than being capped at the
-per-block level.
+per-block level. The zerocheck fold further eliminates $B\!\cdot\!C$
+Hyrax commitments and as many Hyrax openings per bucket compared with
+the na\"ive LogUp scheme.
 
 %-------------------------------------------------------------------------------
 \section{The \sys{} Protocol}
@@ -1132,20 +1093,57 @@ Sharing one $m_{\mathrm{com}}$ per width bucket across all range witnesses
 in the bucket (LN $\sigma$/$y$ across all blocks plus the final LN, plus
 the optional attention-normalisation residuals) is sound: a cheating
 prover cannot supply chunk values outside $[0,2^{16})$ for any single
-witness.
+witness. Moreover, the zerocheck-folded inverse polynomial binds $h$ to
+$1/(\alpha-V)$ on the boolean hypercube without committing $h$, with
+soundness error $O(n/|\FF|)$ per bucket where $n$ is the bucket variable
+count.
 \end{theorem}
 \begin{proof}
 Each bucket is processed independently and the argument applies per bucket.
-The transcript-ordering invariant is that $m_{\mathrm{com}}$ is absorbed
-before any per-witness sumcheck challenge $r_v^{(b)}$ in the bucket is
-sampled. Since $m$ aggregates all chunk occurrences across all witnesses
-and all $C\!=\!\lceil\mathrm{bits}/16\rceil$ chunks per witness, the
-prover must commit to $m$ before seeing any sumcheck challenge. If the
-prover supplied a chunk value $v^*\!\geq\!2^{16}$, the LogUp
+
+\emph{Chunk-value binding.} The transcript-ordering invariant is that
+$m_{\mathrm{com}}$ is absorbed before any per-witness sumcheck challenge
+$r_v^{(b)}$ in the bucket is sampled. Since $m$ aggregates all chunk
+occurrences across all witnesses and all
+$C\!=\!\lceil\mathrm{bits}/16\rceil$ chunks per witness, the prover must
+commit to $m$ before seeing any sumcheck challenge. If the prover
+supplied a chunk value $v^*\!\geq\!2^{16}$, the LogUp
 identity~\cite{habo2024logup} would require
 $m[v^*]\!\cdot\!T_{\mathrm{id}}[v^*]$ to balance, but $T_{\mathrm{id}}$
 has no entry for $v^*$, contradicting the committed $m$
 (Lemma~\ref{lem:hyrax}).
+
+\emph{Inverse-polynomial binding (zerocheck fold).} Let
+$\tilde h$ be a (possibly malicious) prover's choice of inverse-polynomial
+MLE, $V$ the (committed) chunk MLE, and define
+$\tilde s(x)\!:=\!\tilde h(x)(\alpha-V(x))\!-\!1$. The bucket sumcheck
+proves
+\[
+  \sum_x\!\bigl[\,w(x)\tilde h(x)(1+\beta(\alpha\!-\!V(x)))
+   + \gamma_{\mathrm{fold}}\!\cdot\!\mathrm{eq}(r_{zc},x)\tilde s(x)\bigr]=\Lambda,
+\]
+where $\Lambda$ is computed from the prover-supplied per-chunk sums and
+absorbed into the transcript \emph{before} $\gamma_{\mathrm{fold}}$ and
+$r_{zc}$ are sampled. If $\tilde h\!\neq\!1/(\alpha\!-\!V)$ on the
+boolean hypercube, then $\tilde s$ is non-zero on at least one boolean
+point, hence non-zero as a polynomial of total degree $\le\!2n$, and by
+Schwartz--Zippel
+$\Pr_{r_{zc}}[\tilde s(r_{zc})\!=\!0]\!\le\!2n/|\FF|$. Conditioning on
+$\tilde s(r_{zc})\!\neq\!0$, the true integrand value is linear in
+$\gamma_{\mathrm{fold}}$ with non-zero slope, so the probability it
+equals $\Lambda$ over a fresh $\gamma_{\mathrm{fold}}$ is at most
+$1/|\FF|$. If the sum differs from $\Lambda$, standard sumcheck
+soundness rejects with probability $\ge 1\!-\!3n/|\FF|$. Union-bounding
+yields $\le 6n/|\FF|$ soundness error per bucket. The pair-padding
+positions are filled with $\tilde h\!=\!\alpha^{-1}$, on which both the
+main term ($w\!=\!0$) and the zerocheck term ($\alpha^{-1}\alpha\!-\!1\!=\!0$)
+vanish, so padding contributes nothing to either side of the identity.
+
+Once $\tilde h$ is forced to the unique inverse on the hypercube, the
+per-chunk claims $\sum_i\tilde h_p[i]$ recover the true LogUp LHS, and
+the model-level grand-sum check
+$\sum_p\mathrm{claim}_p\!=\!\mathrm{rhs\_claim}$ closes the argument
+against the multiplicity-table side.
 \end{proof}
 
 \begin{theorem}[Model-level batched LayerNorm is sound]
