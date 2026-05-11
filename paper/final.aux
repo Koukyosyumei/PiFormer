@@ -52,60 +52,52 @@
 \@writefile{toc}{\contentsline {paragraph}{Zerocheck-folded inverse polynomial.}{4}{section*.13}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {4}The \ensuremath  {\pi \text  {-Former}}{} Protocol}{5}{section.4}\protected@file@percent }
 \newlabel{sec:protocol}{{4}{5}{The \sys {} Protocol}{section.4}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Preprocessing}{5}{subsection.4.1}\protected@file@percent }
-\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Setup  (\theta ;\,\text  {params})$}}{5}{algorithm.1}\protected@file@percent }
-\newlabel{alg:setup}{{1}{5}{Preprocessing}{algorithm.1}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}The model-level prover}{6}{subsection.4.2}\protected@file@percent }
-\@writefile{loa}{\contentsline {algorithm}{\numberline {2}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Prove  (\poppk  ,W,\mathsf  {inst})$}}{6}{algorithm.2}\protected@file@percent }
-\newlabel{alg:prove}{{2}{6}{The model-level prover}{algorithm.2}{}}
-\newlabel{ssec:quant}{{4.2}{7}{Quantization-proof binding}{section*.14}{}}
-\@writefile{toc}{\contentsline {paragraph}{Quantization-proof binding.}{7}{section*.14}\protected@file@percent }
-\newlabel{eq:quant}{{2}{7}{Quantization-proof binding}{equation.4.2}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Per-block Phase~1}{7}{subsection.4.3}\protected@file@percent }
-\@writefile{loa}{\contentsline {algorithm}{\numberline {3}{\ignorespaces $\textsc  {Phase1}(W_\ell ,C_{\mathrm  {cur}},\poppk  _\ell ,\mathsf  {FS})$}}{7}{algorithm.3}\protected@file@percent }
-\newlabel{alg:phase1}{{3}{7}{Per-block Phase~1}{algorithm.3}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Cross-block batched sumcheck}{8}{subsection.4.4}\protected@file@percent }
-\@writefile{loa}{\contentsline {algorithm}{\numberline {4}{\ignorespaces $\textsc  {CrossBatch}(\{f_\ell ,g_\ell ,H_\ell \}_{\ell =1}^L,\mathsf  {FS})$}}{8}{algorithm.4}\protected@file@percent }
-\newlabel{alg:cross-block}{{4}{8}{Cross-block batched sumcheck}{algorithm.4}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.5}Constraint-fused LayerNorm prover}{8}{subsection.4.5}\protected@file@percent }
-\@writefile{loa}{\contentsline {algorithm}{\numberline {5}{\ignorespaces $\textsc  {ProveLN}(W,\{C_\mathbf  {x},C_\mathbf  {y}\},(\mathsf  {rps}_\sigma ,\mathsf  {rps}_y),\mathsf  {FS})$}}{8}{algorithm.5}\protected@file@percent }
-\newlabel{alg:layernorm}{{5}{8}{Constraint-fused LayerNorm prover}{algorithm.5}{}}
-\citation{habo2024logup}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.6}The verifier}{9}{subsection.4.6}\protected@file@percent }
-\@writefile{loa}{\contentsline {algorithm}{\numberline {6}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Verify  (\popvk  ,\pi ,\mathsf  {inst},\mathbf  {x}_{\mathrm  {in}},\mathbf  {y})$}}{9}{algorithm.6}\protected@file@percent }
-\newlabel{alg:verify}{{6}{9}{The verifier}{algorithm.6}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {5}Soundness}{9}{section.5}\protected@file@percent }
-\newlabel{sec:soundness}{{5}{9}{Soundness}{section.5}{}}
-\newlabel{lem:sumcheck}{{1}{9}{Sumcheck soundness}{theorem.1}{}}
-\newlabel{lem:hyrax}{{2}{9}{Hyrax binding}{theorem.2}{}}
-\newlabel{thm:cross-block}{{3}{9}{Cross-block batching is sound}{theorem.3}{}}
-\newlabel{thm:residual}{{4}{9}{Homomorphic residuals}{theorem.4}{}}
-\newlabel{thm:range}{{5}{9}{Globally batched range proof is sound}{theorem.5}{}}
-\newlabel{thm:lnbatch}{{6}{10}{Model-level batched LayerNorm is sound}{theorem.6}{}}
-\newlabel{thm:attnnorm}{{7}{10}{Attention-normalisation sumcheck is sound}{theorem.7}{}}
-\newlabel{thm:end-to-end}{{8}{10}{\sys {} end-to-end soundness}{theorem.8}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Zero knowledge}{10}{subsection.5.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {6}Implementation}{10}{section.6}\protected@file@percent }
-\newlabel{sec:impl}{{6}{10}{Implementation}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Setup}{5}{subsection.4.1}\protected@file@percent }
+\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Setup  (\theta )$}}{5}{algorithm.1}\protected@file@percent }
+\newlabel{alg:setup}{{1}{5}{Setup}{algorithm.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Model-level prover}{5}{subsection.4.2}\protected@file@percent }
+\newlabel{ssec:prover}{{4.2}{5}{Model-level prover}{subsection.4.2}{}}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {2}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Prove  (\poppk  ,W,\mathsf  {inst})$ outline}}{5}{algorithm.2}\protected@file@percent }
+\newlabel{alg:prove}{{2}{5}{Model-level prover}{algorithm.2}{}}
+\newlabel{ssec:cross-block}{{4.2}{5}{Cross-block batched sumcheck}{section*.14}{}}
+\@writefile{toc}{\contentsline {paragraph}{Cross-block batched sumcheck.}{5}{section*.14}\protected@file@percent }
+\@writefile{loa}{\contentsline {algorithm}{\numberline {3}{\ignorespaces $\textsc  {CrossBatch}(\{f_\ell ,g_\ell ,H_\ell \}_\ell ,\mathsf  {FS})$}}{5}{algorithm.3}\protected@file@percent }
+\newlabel{alg:cross-block}{{3}{5}{Cross-block batched sumcheck}{algorithm.3}{}}
+\newlabel{ssec:quant}{{4.2}{6}{Quantisation binding}{section*.15}{}}
+\@writefile{toc}{\contentsline {paragraph}{Quantisation binding.}{6}{section*.15}\protected@file@percent }
+\newlabel{eq:quant}{{2}{6}{Quantisation binding}{equation.4.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Lasso instances.}{6}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Verifier}{6}{subsection.4.3}\protected@file@percent }
+\newlabel{ssec:verifier}{{4.3}{6}{Verifier}{subsection.4.3}{}}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {4}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Verify  (\popvk  ,\pi ,\mathsf  {inst},\mathbf  {x}_{\mathrm  {in}},\mathbf  {y})$ outline}}{6}{algorithm.4}\protected@file@percent }
+\newlabel{alg:verify}{{4}{6}{Verifier}{algorithm.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Soundness}{6}{section.5}\protected@file@percent }
+\newlabel{sec:soundness}{{5}{6}{Soundness}{section.5}{}}
+\newlabel{lem:sumcheck}{{1}{6}{Sumcheck soundness}{theorem.1}{}}
+\newlabel{lem:hyrax}{{2}{6}{Hyrax binding}{theorem.2}{}}
+\newlabel{thm:cross-block}{{3}{6}{Cross-block batching is sound}{theorem.3}{}}
+\newlabel{thm:residual}{{4}{6}{Homomorphic residuals}{theorem.4}{}}
+\newlabel{thm:range}{{5}{6}{Globally batched range proof is sound}{theorem.5}{}}
+\newlabel{thm:lnbatch}{{6}{6}{Model-level batched LayerNorm is sound}{theorem.6}{}}
+\newlabel{thm:attnnorm}{{7}{6}{Attention-normalisation sumcheck is sound}{theorem.7}{}}
 \citation{qu2025zkgpt}
 \citation{kothapalli2022nova}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces \ensuremath  {\pi \text  {-Former}}{} Rust implementation, lines of code per module.}}{7}{table.1}\protected@file@percent }
+\newlabel{tab:loc}{{1}{7}{\sys {} Rust implementation, lines of code per module}{table.1}{}}
+\newlabel{thm:end-to-end}{{8}{7}{\sys {} end-to-end soundness}{theorem.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Zero knowledge}{7}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Implementation}{7}{section.6}\protected@file@percent }
+\newlabel{sec:impl}{{6}{7}{Implementation}{section.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{PyTorch pipeline.}{7}{section*.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Single-head, causal supported, no ZK.}{7}{section*.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Discussion and Limitations}{7}{section.7}\protected@file@percent }
+\newlabel{sec:disc}{{7}{7}{Discussion and Limitations}{section.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{What is and is not in the SNARK.}{7}{section*.19}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Model-quality evaluation.}{7}{section*.20}\protected@file@percent }
 \citation{liu2021zkcnn}
 \citation{abbaszadeh2024zero}
 \citation{sun2024zkllm}
 \citation{qu2025zkgpt}
-\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces \ensuremath  {\pi \text  {-Former}}{} Rust implementation, lines of code per module.}}{11}{table.1}\protected@file@percent }
-\newlabel{tab:loc}{{1}{11}{\sys {} Rust implementation, lines of code per module}{table.1}{}}
-\@writefile{toc}{\contentsline {paragraph}{PyTorch pipeline.}{11}{section*.15}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Single-head, causal supported, no ZK.}{11}{section*.16}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {7}Discussion and Limitations}{11}{section.7}\protected@file@percent }
-\newlabel{sec:disc}{{7}{11}{Discussion and Limitations}{section.7}{}}
-\@writefile{toc}{\contentsline {paragraph}{What is and is not in the SNARK.}{11}{section*.17}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Model-quality evaluation.}{11}{section*.18}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{From prototype to deployment.}{11}{section*.19}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Beyond \ensuremath  {\pi \text  {-Former}}{}.}{11}{section*.20}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {8}Related Work}{11}{section.8}\protected@file@percent }
-\newlabel{sec:related}{{8}{11}{Related Work}{section.8}{}}
-\@writefile{toc}{\contentsline {paragraph}{Verifiable ML.}{11}{section*.21}\protected@file@percent }
 \citation{setty2020spartan,thaler2022proofs}
 \citation{setty2024unlocking,arun2024jolt,fomenko2025understanding}
 \citation{habo2024logup}
@@ -122,6 +114,15 @@
 \bibcite{bengio2013estimating}{4}
 \bibcite{fomenko2025understanding}{5}
 \bibcite{habo2024logup}{6}
+\@writefile{toc}{\contentsline {paragraph}{From prototype to deployment.}{8}{section*.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Beyond \ensuremath  {\pi \text  {-Former}}{}.}{8}{section*.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Related Work}{8}{section.8}\protected@file@percent }
+\newlabel{sec:related}{{8}{8}{Related Work}{section.8}{}}
+\@writefile{toc}{\contentsline {paragraph}{Verifiable ML.}{8}{section*.23}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Sumcheck and lookup arguments.}{8}{section*.24}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Linear attention and ternary networks.}{8}{section*.25}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Conclusion}{8}{section.9}\protected@file@percent }
+\newlabel{sec:conclusion}{{9}{8}{Conclusion}{section.9}{}}
 \bibcite{katharopoulos2020transformers}{7}
 \bibcite{kitaev2020reformer}{8}
 \bibcite{kothapalli2022nova}{9}
@@ -130,13 +131,9 @@
 \bibcite{qu2025zkgpt}{12}
 \bibcite{setty2020spartan}{13}
 \bibcite{setty2024unlocking}{14}
-\@writefile{toc}{\contentsline {paragraph}{Sumcheck and lookup arguments.}{12}{section*.22}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Linear attention and ternary networks.}{12}{section*.23}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {9}Conclusion}{12}{section.9}\protected@file@percent }
-\newlabel{sec:conclusion}{{9}{12}{Conclusion}{section.9}{}}
 \bibcite{sun2024zkllm}{15}
 \bibcite{thaler2022proofs}{16}
 \bibcite{vaswani2017attention}{17}
 \bibcite{wahby2018doubly}{18}
 \bibcite{wang2020linformer}{19}
-\gdef \@abspage@last{13}
+\gdef \@abspage@last{9}

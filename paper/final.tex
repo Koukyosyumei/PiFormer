@@ -611,582 +611,304 @@ many opens, with savings scaling with $L$ rather than capped at the
 per-block level.
 
 %-------------------------------------------------------------------------------
+%-------------------------------------------------------------------------------
 \section{The \sys{} Protocol}
 \label{sec:protocol}
 %-------------------------------------------------------------------------------
 
-This section gives the protocol. Algorithm~\ref{alg:setup} describes
-preprocessing; Algorithm~\ref{alg:prove} the model-level prover;
-Algorithm~\ref{alg:phase1} the per-block ``Phase~1'' that commits
-intermediate matrices and proves both LayerNorms;
-Algorithm~\ref{alg:cross-block} the cross-block batched sumcheck
-primitive; and Algorithm~\ref{alg:verify} the verifier. The LayerNorm
-sub-prover (Algorithm~\ref{alg:layernorm}) and the globally batched
-range proof are described in \S\ref{ssec:ln} and \S\ref{ssec:range}.
+This section describes the setup, prover, and verifier at the level of
+the cross-block protocol structure. Detailed per-block and per-LN
+pseudocode is in Appendix~\ref{app:full-algorithms}.
 
-\subsection{Preprocessing}
+\subsection{Setup}
 
 \begin{algorithm}[H]
-\caption{$\sys{}.\Setup(\theta;\,\text{params})$}
+\caption{$\sys{}.\Setup(\theta)$}
 \label{alg:setup}
 \begin{algorithmic}[1]
-\Require model weights
-$\theta\!=\!\{\bW_Q^\ell,\bW_K^\ell,\bW_V^\ell,\bW_O^\ell,\bW_1^\ell,\bW_2^\ell,\bgamma^\ell,\bbeta^\ell\}_{\ell=1}^L$,
-final-LN params, LM head $\bW_h$;
-params $(T,d,d_{ff},d_h,\bits,\chunks)$.
-\Ensure proving key $\poppk$, verifying key $\popvk$.
-\State derive Hyrax generators $g_j\!\gets\!\mathrm{SHA3}(\texttt{"piformer-hyrax-gen"}\!\Vert\! j)\cdot G$.
-\For{each weight matrix $\bW\!\in\!\theta\cup\{\bW_h\}$}
-  \State $C_\bW\gets\Com(\bW)$ \Comment{Hyrax commit to ternary entries}
-\EndFor
-\For{each lookup sub-table $T_0,\dots,T_{\chunks-1}$}
-  \State $C_{T_i}\gets\Com(T_i)$
-\EndFor
-\State $\popvk\gets\{C_\bW\}\cup\{C_{T_i}\}\cup\{\bgamma^\ell,\bbeta^\ell\}\cup\{g_j\}$
-\State $\poppk\gets\popvk\cup\{\text{raw ternary arrays, sub-tables}\}$
-\State \Return $(\poppk,\popvk)$
+\Require ternary weights and biases $\theta$, lookup sub-tables
+$T_0,\dots,T_{\chunks-1}$, dimensions.
+\Ensure $(\poppk,\popvk)$.
+\State derive transparent Hyrax generators $g_j$ from SHA3 of public seeds
+\State $C_\bW\!\gets\!\Com(\bW)$ for each weight matrix;\;
+       $C_{T_i}\!\gets\!\Com(T_i)$ for each sub-table
+\State $\popvk\!\gets\!\{C_\bW\}\cup\{C_{T_i}\}\cup\{\bgamma,\bbeta\}\cup\{g_j\}$
+\State $\poppk\!\gets\!\popvk\cup\{\text{raw ternary arrays and sub-tables}\}$
 \end{algorithmic}
 \end{algorithm}
 
-The verifying key contains \emph{no} raw weights, only commitments.
-The proving key additionally carries the ternary $\{-1,0,+1\}$
-arrays and the lookup sub-tables so the prover can fold the equality
-polynomial against them in $O(Td)$ time without any field
+The verifying key contains no raw weights, only commitments. The
+proving key additionally carries the ternary arrays so the prover can
+fold the equality polynomial against them in $O(Td)$ without field
 multiplications.
 
-\subsection{The model-level prover}
+\subsection{Model-level prover}
+\label{ssec:prover}
 
 \begin{algorithm}[H]
-\caption{$\sys{}.\Prove(\poppk,W,\mathsf{inst})$}
+\caption{$\sys{}.\Prove(\poppk,W,\mathsf{inst})$ outline}
 \label{alg:prove}
 \begin{algorithmic}[1]
-\Require proving key $\poppk$, witness $W$, instance $\mathsf{inst}$
-(Lasso queries for $\bphi(\bQ),\bphi(\bK),\bphi(\bM)$ at every block).
-\Ensure model proof $\piproof$.
-
-\State $\mathsf{FS}.\mathsf{init}(\texttt{"piformer"})$;\;
-       $C_{\bx_{\mathrm{in}}}\!\gets\!\Com(\bx_{\mathrm{in}})$;\;
-       $\mathsf{FS}.\mathsf{absorb}(C_{\bx_{\mathrm{in}}})$
-\Phase{1: per-block commit $+$ LN IO absorption}
-\State $C_{\mathrm{cur}}\!\gets\!C_{\bx_{\mathrm{in}}}$
-\For{$\ell\!=\!1,\dots,L$}
-  \State $p_\ell\!\gets\!\textsc{Phase1}(W_\ell,C_{\mathrm{cur}},\poppk_\ell,\mathsf{FS})$
-  \Comment{commits 5 LN IO matrices, $\bphi$ inputs, optional attn-norm aux}
-  \State $C_{\bX_{\mathrm{mid}}^\ell}\!\gets\!C_{\mathrm{cur}}+p_\ell.C_{\LN_{\mathrm{aon}}.y}$
-         \Comment{sandwich-norm residual}
-  \State $C_{\mathrm{cur}}\!\gets\!C_{\bX_{\mathrm{mid}}^\ell}+p_\ell.C_{\bO_{\mathrm{ffn}}}$
-\EndFor
-\Phase{2: global random point}
-\State $r_{td}\!=\!(r_t\!\Vert\!r_{\mathrm{out}})\gets\!\mathsf{FS}.\mathsf{challenge}(t_{\mathrm{bits}}+d_{\mathrm{bits}})$
-\Phase{3: four cross-block sumchecks}
-\State $\pi_{qkv}\!\gets\!\textsc{CrossBatch}(\{f^{qkv}_\ell,g^{qkv}_\ell\}_\ell,\mathsf{FS})$
-\State $\pi_{op}\!\gets\!\textsc{CrossBatch}(\{f^{op}_\ell,g^{op}_\ell\}_\ell,\mathsf{FS})$
-\State $\pi_{ao}\!\gets\!\textsc{CrossBatch}(\{f^{ao}_\ell,g^{ao}_\ell\}_\ell,\mathsf{FS})$
-\State $\pi_{ac}\!\gets\!\textsc{CrossBatch}(\{f^{ac}_\ell,g^{ac}_\ell\}_\ell,\mathsf{FS})$
-\Phase{4: attention normalisation sumcheck (when normalised mode)}
-\State $r_{\mathrm{norm}}\!\gets\!\mathsf{FS}.\mathsf{challenge}(t_{\mathrm{bits}}+d_{\mathrm{bits}})$;\;
-       $\lambda\!\gets\!\mathsf{FS}.\mathsf{challenge}$
-\State $\pi_{\mathrm{atn}}\!\gets\!\textsc{ProveCubicMulti}\bigl(
-        \{\bN_\ell,Z_\ell,\bY^{\mathrm{att}}_\ell,\mathrm{rem}_\ell,\mathrm{diff}_\ell\}_\ell,\,\lambda,\,\mathsf{FS}\bigr)$
-\State $\pi_{Z}\!\gets\!\textsc{CrossBatch}(\{\bphi(\bQ^{\mathrm{n}})_\ell,\sum_s\bphi(\bK^{\mathrm{n}})_\ell\}_\ell,\mathsf{FS})$
-\Phase{5: global FFN Lasso $+$ FFN-Y/M sumchecks}
-\State commit $\{\bA_\ell,\bM_\ell\}_\ell$;\;
-       $\pi_{\mathrm{lasso}}^{\mathrm{ffn}}\!\gets\!\Prove\text{-}\mathrm{LassoMulti}\bigl(\{\mathsf{inst}_\ell.\bphi(\bM)\}_\ell,\{(C_{\bA_\ell},\bA_\ell)\}_\ell,\mathsf{FS}\bigr)$
-\State bind FFN indices to $\{C_{\bM_\ell}\}_\ell$ via one Hyrax batch open
-\State $\pi_{ffy}\!\gets\!\textsc{CrossBatch}(\{f^{ffy}_\ell,g^{ffy}_\ell\}_\ell,\mathsf{FS})$
-\State $\pi_{ffm}\!\gets\!\textsc{CrossBatch}(\{f^{ffm}_\ell,g^{ffm}_\ell\}_\ell,\mathsf{FS})$
-\Phase{6: bucketed range batch + model-level batched LN proof}
-\For{$\mathrm{bits}\!\in\!\{32,64\}$}
-  \State $\pi_{\mathrm{rng},\mathrm{bits}}\!\gets\!\textsc{ProveRangeBatched}(\text{all witnesses in bucket},\mathrm{bits},\mathsf{FS})$
-\EndFor
-\State $\pi_{\mathrm{ln}}\!\gets\!\textsc{ProveLNsBatched}(\text{all $5L\!+\!1$ LNs},\mathsf{FS})$
-\Phase{7: LM head $+$ $\mu$-challenges $+$ batch opens}
-\State $\pi_{\mathrm{head}}\!\gets\!\Prove\text{-}\mathrm{Proj}(W.\text{LM-head},\mathsf{FS})$
-\State drain 13 deferred-accumulator $\mu$-challenges plus 2 read-only $\rho$
-fuse challenges; finalise via \texttt{finalize\_many\_with\_mus} (one MSM
-pair per Hyrax-params group)
-\State $\pi_{\mathrm{inter}}\!\gets\!\Open\text{-}\mathrm{Batch}\bigl(\{\bQ_\ell,\bK_\ell,\bV_\ell,\bO_{\mathrm{att}}^\ell,\bO_{\mathrm{ffn}}^\ell\}_{\ell=1}^L,\,r_{td}\bigr)$
-\State $\{\pi_{\mathrm{open}}^{(j)}\}\!\gets\!\Open\text{-}\mathrm{Batch}(\{\bX_{\mathrm{n1}}^\ell,\bW_Q^\ell,\dots,C_{\bphi(\bQ^{\mathrm{n}})_\ell},C_{\bphi(\bK^{\mathrm{n}})_\ell}\}_\ell,\,r^{(j)})$
-\State (when normalised) $\Open\text{-}\mathrm{Batch}([\bN\!\mid\!\bY^{\mathrm{att}}\!\mid\!\mathrm{rem}\!\mid\!\mathrm{diff}]_\ell,\,r_{\mathrm{norm}})$
-\Phase{8: global $\bphi(\bQ^{\mathrm{n}}),\bphi(\bK^{\mathrm{n}})$ Lasso}
-\State commit $\{\bphi(\bQ^{\mathrm{n}})_\ell,\bphi(\bK^{\mathrm{n}})_\ell\}_\ell$;\;
-       bind indices to $\{C_{\bQ^{\mathrm{n}}_\ell},C_{\bK^{\mathrm{n}}_\ell}\}$
-\State $\pi_{\mathrm{lasso}}^{\mathrm{qk}}\!\gets\!\Prove\text{-}\mathrm{LassoMulti}\bigl(\{\mathsf{inst}_\ell.\bphi(\bQ^{\mathrm{n}}),\mathsf{inst}_\ell.\bphi(\bK^{\mathrm{n}})\}_\ell,\dots,\mathsf{FS}\bigr)$
-\State \Return $\piproof$
+\State \emph{Phase 1.} For each block $\ell$: commit intermediates
+        (per-block LN IO, $\bphi$ inputs, attention auxiliaries);
+        absorb in fixed order; chain residuals by Hyrax addition.
+\State \emph{Phase 2.} Draw one global random point
+        $r_{td}\!\gets\!\mathsf{FS}.\mathsf{challenge}$ shared by all
+        cross-block sumchecks.
+\State \emph{Phase 3.} Run four cross-block sumchecks (QKV, output
+        projection, attention out, attention context) via
+        \textsc{CrossBatch}.
+\State \emph{Phase 4.} (When normalised attention is enabled) prove
+        $S\bN-\mathrm{rem}-Z\bY^{\mathrm{att}}\!=\!0$ and
+        $Z\!-\!1\!-\!\mathrm{rem}\!-\!\mathrm{diff}\!=\!0$ in one
+        cubic multi-batched sumcheck; bind $Z$ to
+        $\bphi(\bQ^{\mathrm n}),\bphi(\bK^{\mathrm n})$.
+\State \emph{Phase 5.} Commit FFN activations; prove the global
+        $\bphi(\bM)$ Lasso (committed-output) and two FFN cross-block
+        sumchecks.
+\State \emph{Phase 6.} Run \textsc{ProveRangeBatched} once per width
+        bucket over all witnesses, and \textsc{ProveLNsBatched} once
+        over all $5L\!+\!1$ LNs.
+\State \emph{Phase 7.} Prove the LM head; drain deferred-accumulator
+        batching challenges and finalise in one MSM pair per
+        Hyrax-parameter group; emit grouped batched opens at $r_{td}$,
+        the per-protocol terminal points, and (when normalised)
+        $r_{\mathrm{norm}}$.
+\State \emph{Phase 8.} Prove the global
+        $\bphi(\bQ^{\mathrm n}),\bphi(\bK^{\mathrm n})$ Lasso, binding
+        indices to the committed post-norm tensors.
 \end{algorithmic}
 \end{algorithm}
 
-The key structural choices are:
-\emph{(i) one global random point $r_{td}$ is drawn after all per-block
-commitments are absorbed}, so all six cross-block sumchecks can share
-it; \emph{(ii) roughly two dozen cross-cutting Hyrax accumulators}
-(LayerNorm row / $td$, projection W/b, LM-head W/b, range $\sigma$/Y/$m$,
-intermediate, quantization-FFN / -QK / -$m$, attn-norm, five cross-block
-batch-open groups) are pushed by every claim and finalised once at the end
-of the \emph{verifier}, with one MSM pair per group of shared Hyrax
-parameters (MSM-fused across same-params groups via
-\texttt{finalize\_many\_with\_mus}); \emph{(iii) residuals
-are verified by linearity of the Hyrax PCS:}
-$C_{\bX_{\mathrm{mid}}}=C_{\bX_{\mathrm{in}}}+C_{\bO_{\mathrm{att}}}$
-is computed by the verifier from the existing commitments and
-requires no proof.
+Three structural choices drive the design. \emph{(i)} A single global
+random point $r_{td}$ is drawn after all per-block commitments are
+absorbed, so the six cross-block sumchecks share it. \emph{(ii)} All
+final Hyrax openings flow through deferred batch accumulators (one per
+Hyrax-parameter group), each finalised in one MSM pair via
+random-linear-combination batching. \emph{(iii)} Residual connections
+require no proof: by linearity of Hyrax (Theorem~\ref{thm:residual}),
+$C_{\bX_{\mathrm{mid}}}\!=\!C_{\bX_{\mathrm{in}}}+C_{\LN_{\mathrm{aon}}.y}$
+is computed by the verifier from the existing commitments.
 
-\paragraph{Quantization-proof binding.}
-\label{ssec:quant}
-The Lasso protocol works over integer indices $\mathsf{idx}_j\!\in\![0,2^B)$,
-but the committed input tensors $C_{\bM_\ell},C_{\bQ^{\mathrm{n}}_\ell},C_{\bK^{\mathrm{n}}_\ell}$
-carry \emph{signed} field-element values. \sys{} bridges this gap with two
-quantization sub-proofs, $\pi_{\mathrm{quant}}^{\mathrm{ffn}}$ and
-$\pi_{\mathrm{quant}}^{\mathrm{qk}}$. Per layer the verifier knows the
-quantization parameters $(s_{\mathrm{num}},s_{\mathrm{den}})$ from the VK
-(with $s_{\mathrm{num}}$ a power of two) and the centred zero-point
-$\mathsf{zp}=2^{B-1}$. The prover commits a remainder tensor
-$\mathsf{rem}_j\!=\!r_j s_{\mathrm{den}}+\lfloor s_{\mathrm{num}}/2\rfloor
--s_{\mathrm{num}}(\mathsf{idx}_j-\mathsf{zp})$ via Hyrax, adds $\mathsf{rem}$
-to the global range batch with bit-width $\log_2 s_{\mathrm{num}}$, and at a
-Fiat--Shamir random point $\mathbf r$ opens both $\widetilde r$ and
-$\widetilde{\mathsf{rem}}$ via batched Hyrax. The verifier evaluates the
-\emph{public} index list $\widetilde{\mathsf{idx}}(\mathbf r)$ directly and
-checks
-\begin{equation}
-  \widetilde r(\mathbf r)\,s_{\mathrm{den}} + \tfrac{s_{\mathrm{num}}}{2}\widetilde 1(\mathbf r)
-  \;\stackrel{?}{=}\; s_{\mathrm{num}}\bigl(\widetilde{\mathsf{idx}}(\mathbf r)-\mathsf{zp}\,\widetilde 1(\mathbf r)\bigr) + \widetilde{\mathsf{rem}}(\mathbf r).
-  \label{eq:quant}
-\end{equation}
-Combined with the remainder range proof, this argument pins every public
-$\mathsf{idx}_j$ to the unique integer
-$\lfloor (r_j s_{\mathrm{den}}+s_{\mathrm{num}}/2)/s_{\mathrm{num}}\rfloor+\mathsf{zp}$
-consistent with the committed raw value $r_j$. A second, redundant
-self-consistency check (the $\Open\text{-}\mathrm{Batch}$ over
-\texttt{ffn\_lasso\_bind\_open} / \texttt{qk\_lasso\_bind\_open}) verifies
-that the proof's index-MLE opening vector matches what the verifier
-reconstructs from the public indices.
-
-The two model-level Lasso families have a slight structural asymmetry.
-The attention $\bphi(\bQ^{\mathrm n}),\bphi(\bK^{\mathrm n})$ proof is a
-single committed-output \texttt{LassoMultiProof} (\texttt{all\_lasso\_proof})
-that absorbs every $C_{\bphi(\bQ^{\mathrm n})_\ell},C_{\bphi(\bK^{\mathrm n})_\ell}$
-before drawing batching challenges, then a second sumcheck inside the
-multi-proof binds the combined lookup grand sum to the committed outputs.
-The FFN family is rotated: a single cross-block $\pi_{ffy}$ degree-2
-sumcheck reduces all $\bA_\ell$ leaves to one terminal claim
-$\sum_\ell w_\ell\,\widetilde\bA_\ell(r_t,r_{k_{fy}})\!=\!c$, and a separate
-\emph{Lasso terminal-eval proof}
-($\pi_{ffn}^{\mathrm{term}}\!=\!\texttt{ffn\_a\_terminal\_proof}$) proves $c$
-is the Lasso evaluation of the activation tables at the same terminal
-point. This fuses the equivalent of a separate $C_{\bA_\ell}$ commitment,
-a Lasso multi-proof output binding, and a Hyrax batch open of
-$\{\bA_\ell\}$ into one sub-protocol with no proof-carried $\bA_\ell$.
-
-\medskip
-
-The two model-level Lasso instances merit separate mention. Each is a
-\emph{committed-output} Lasso: before sampling the multi-Lasso batching
-challenges, the prover absorbs the Hyrax commitments to the lookup
-outputs ($C_{\bA_\ell}$ for FFN, $C_{\bphi(\bQ^{\mathrm{n}})_\ell}$ and
-$C_{\bphi(\bK^{\mathrm{n}})_\ell}$ for attention). A second sumcheck inside
-the Lasso multi-proof binds the combined lookup grand sum to the committed
-output polynomials at the sumcheck terminal point. Lookup indices are
-likewise bound to the committed \emph{post-norm} input tensors
-($C_{\bM_\ell},C_{\bQ^{\mathrm{n}}_\ell},C_{\bK^{\mathrm{n}}_\ell}$) via
-one shared Hyrax batch opening, so a cheating prover cannot pick query
-indices independently of the committed inputs and cannot mix pre-norm and
-post-norm tensors.
-
-\subsection{Per-block Phase~1}
+\paragraph{Cross-block batched sumcheck.}
+\label{ssec:cross-block}
+The primitive that powers Phases~3--5 reduces $L$ per-block claims
+$\{H_\ell\}$ over per-block MLEs $\{f_\ell,g_\ell\}$ on $\FF^n$ to a
+single sumcheck on
+$P(x)\!=\!\sum_\ell\eta^{\ell-1}f_\ell(x)g_\ell(x)$ at a Fiat--Shamir
+challenge $\eta$ drawn after every per-block constant is absorbed.
 
 \begin{algorithm}[H]
-\caption{$\textsc{Phase1}(W_\ell,C_{\mathrm{cur}},\poppk_\ell,\mathsf{FS})$}
-\label{alg:phase1}
-\begin{algorithmic}[1]
-\Require block witness, current input commitment, block PK.
-\Ensure intermediate commitments; \emph{no} LN sumcheck or range proof
-emitted at this stage.
-\State commit pre-/post-QK-norm $\bQ,\bK,\bV$:\;
-       $C_\bQ,C_\bK,C_\bV,C_{\bQ^{\mathrm{n}}},C_{\bK^{\mathrm{n}}}$
-\State commit LN outputs:\;
-       $C_{\bX_{\mathrm{n1}}},C_{\LN_{\mathrm{aon}}.y},C_{\bX_{\mathrm{n2}}}$
-\State commit O-projection / FFN outputs:\;
-       $C_{\bO_{\mathrm{att}}},C_{\bO_{\mathrm{ffn}}}$
-\State (when normalised attention) commit
-       $C_{\bN},C_{\bY^{\mathrm{att}}},C_Z,C_{\mathrm{rem}},C_{\mathrm{diff}}$
-\State absorb $\LN_1$ IO:\;
-       $\mathsf{FS}.\mathsf{absorb}(C_{\mathrm{cur}},C_{\bX_{\mathrm{n1}}})$
-\State absorb $C_\bQ,C_\bK,C_\bV$ and (when normalised) attn-norm aux commits
-\State absorb $\LN_Q$ IO:\;
-       $\mathsf{FS}.\mathsf{absorb}(C_\bQ,C_{\bQ^{\mathrm{n}}})$
-\State absorb $\LN_K$ IO:\;
-       $\mathsf{FS}.\mathsf{absorb}(C_\bK,C_{\bK^{\mathrm{n}}})$
-\State $\mathsf{FS}.\mathsf{absorb}(C_{\bO_{\mathrm{att}}})$
-\State absorb $\LN_{\mathrm{aon}}$ IO:\;
-       $\mathsf{FS}.\mathsf{absorb}(C_{\bO_{\mathrm{att}}},C_{\LN_{\mathrm{aon}}.y})$
-\State $C_{\bX_{\mathrm{mid}}^\ell}\!\gets\!C_{\mathrm{cur}}+C_{\LN_{\mathrm{aon}}.y}$
-\Comment{sandwich-norm residual~1}
-\State absorb $\LN_2$ IO:\;
-       $\mathsf{FS}.\mathsf{absorb}(C_{\bX_{\mathrm{mid}}^\ell},C_{\bX_{\mathrm{n2}}})$
-\State $\mathsf{FS}.\mathsf{absorb}(C_{\bO_{\mathrm{ffn}}})$
-\State \Return all commitments
-\end{algorithmic}
-\end{algorithm}
-
-The only truly per-block step is Phase~1: it commits the per-block
-intermediate matrices and absorbs all five LN IO commitments (plus the
-optional attention-normalisation aux commits) into the transcript in a
-fixed order. \emph{No per-block LN sumcheck and no per-block range proof
-are emitted at this stage}; both are deferred to model-level batched
-calls (Phase~6 of Algorithm~\ref{alg:prove}). The remaining sub-protocols
-(QKV, output projection, attention, FFN) are \emph{not} run independently
-per block either; they are batched cross-block in Phases~3--5 of
-Algorithm~\ref{alg:prove}. Each per-block proof carries the intermediate
-Hyrax commitments, the FFN $C_{\bA_\ell},C_{\bM_\ell}$, the per-block
-$C_{\bphi(\bQ^{\mathrm{n}})_\ell},C_{\bphi(\bK^{\mathrm{n}})_\ell}$, the
-optional attention-normalisation aux commits, and the per-block scalar
-evaluations consumed by the cross-block batch sumchecks.
-
-\subsection{Cross-block batched sumcheck}
-
-\begin{algorithm}[H]
-\caption{$\textsc{CrossBatch}(\{f_\ell,g_\ell,H_\ell\}_{\ell=1}^L,\mathsf{FS})$}
+\caption{$\textsc{CrossBatch}(\{f_\ell,g_\ell,H_\ell\}_\ell,\mathsf{FS})$}
 \label{alg:cross-block}
 \begin{algorithmic}[1]
-\Require per-block MLEs $f_\ell,g_\ell\!:\!\FF^n\!\to\!\FF$ and per-block
-targets $H_\ell$.
-\Ensure batched proof $\piproof_{\mathrm{batch}}$ and shared random
-point $r\!\in\!\FF^n$.
-\For{$\ell\!=\!1,\dots,L$} absorb $H_\ell$ and per-block constants
-into $\mathsf{FS}$ \EndFor
-\State $\eta\!\gets\!\mathsf{FS}.\mathsf{challenge}(\texttt{"batch\_eta"})$
-\State $H^\star\!\gets\!\sum_\ell \eta^{\ell-1}H_\ell$;\;
-       $P(x)\!\gets\!\sum_\ell \eta^{\ell-1}f_\ell(x)g_\ell(x)$
-\For{$i\!=\!1,\dots,n$}
-  \State send $s_i(X)\!=\!\sum_{x\in\{0,1\}^{n-i}}P_i(X,x)$ at
-         $X\!\in\!\{0,1,2\}$
-  \State $r_i\!\gets\!\mathsf{FS}.\mathsf{challenge}$
-\EndFor
-\State \Return $(\eta,(s_i)_{i=1}^n)$,\,$r=(r_1,\dots,r_n)$
+\State absorb $\{H_\ell\}$ and per-block constants;\;
+       $\eta\!\gets\!\mathsf{FS}.\mathsf{challenge}$
+\State $H^\star\!\gets\!\sum_\ell\eta^{\ell-1}H_\ell$;\;
+       run standard sumcheck on $P$ to a final point $r\!\in\!\FF^n$
+\State verifier checks
+       $P(r)\!=\!\sum_\ell\eta^{\ell-1}f_\ell(r)g_\ell(r)$ against
+       per-block evaluations opened later in a batched open
 \end{algorithmic}
 \end{algorithm}
 
-The verifier recovers $H^\star$ from the per-block claims and $\eta$,
-then runs the standard sumcheck verifier on
-$\piproof_{\mathrm{batch}}$ to a final point $r$. From $r$ the
-verifier checks the terminal claim
-$P(r)=\sum_\ell \eta^{\ell-1}f_\ell(r)g_\ell(r)$ against the per-block
-evaluations opened later via the cross-block batch opens. By
-Theorem~\ref{thm:cross-block} this protocol replaces $L$ independent
-sumcheck transcripts with one of length $n$ at a soundness cost of
-an additive $(L-1)/|\FF|$.
+By Theorem~\ref{thm:cross-block} this replaces $L$ independent
+sumcheck transcripts with one of length $n$ at an additive
+$(L\!-\!1)/|\FF|$ soundness cost.
 
-\subsection{Constraint-fused LayerNorm prover}
+\paragraph{Quantisation binding.}
+\label{ssec:quant}
+Lasso queries are integer indices $\mathsf{idx}_j\!\in\![0,2^B)$, while
+committed input tensors carry signed field elements. Two quantisation
+sub-proofs bridge this gap. With public scales
+$(s_{\mathrm{num}},s_{\mathrm{den}})$ and zero-point
+$\mathsf{zp}\!=\!2^{B-1}$, the prover commits the remainder
+$\mathsf{rem}_j\!=\!r_j s_{\mathrm{den}}+\lfloor s_{\mathrm{num}}/2\rfloor-s_{\mathrm{num}}(\mathsf{idx}_j-\mathsf{zp})$,
+adds $\mathsf{rem}$ to the global range batch with bit-width
+$\log_2 s_{\mathrm{num}}$, and at a Fiat--Shamir point $\mathbf r$
+opens $\widetilde r$ and $\widetilde{\mathsf{rem}}$ via batched Hyrax.
+The verifier evaluates the public index MLE
+$\widetilde{\mathsf{idx}}(\mathbf r)$ directly and checks
+\begin{equation}
+  \widetilde r(\mathbf r)\,s_{\mathrm{den}}
+  + \tfrac{s_{\mathrm{num}}}{2}\widetilde 1(\mathbf r)
+  \;\stackrel{?}{=}\;
+  s_{\mathrm{num}}\bigl(\widetilde{\mathsf{idx}}(\mathbf r)-\mathsf{zp}\widetilde 1(\mathbf r)\bigr)
+  + \widetilde{\mathsf{rem}}(\mathbf r).
+  \label{eq:quant}
+\end{equation}
+Combined with the remainder range proof, this pins every public
+$\mathsf{idx}_j$ to the unique integer consistent with the committed
+raw value $r_j$.
 
-The pseudocode below describes the LayerNorm protocol \emph{for one LN
-witness}. The end-to-end prover does not invoke it once per LN; instead, it
-collects all $5L+1$ LN witnesses (in fixed order: per block $\LN_1,\LN_Q,\LN_K,\LN_{\mathrm{aon}},\LN_2$;
-then the final LN) and runs a single $\textsc{ProveLNsBatched}$ call as
-Phase~6 of Algorithm~\ref{alg:prove}. That batched call shares the row
-challenge $r_t$, the variance / Y-fusion sumchecks, and the deferred Hyrax
-accumulator pushes across all LN instances, with per-LN claims combined by
-Fiat--Shamir powers of an independent challenge.
+\paragraph{Lasso instances.}
+Both model-level Lasso instances are \emph{committed-output} Lassos:
+the prover absorbs every Hyrax commitment to a lookup output before
+batching challenges are drawn, and an inner sumcheck binds the
+combined grand sum to the committed outputs at the sumcheck terminal.
+Lookup indices are bound to the committed post-norm input tensors via
+one shared Hyrax batch open, so a cheating prover can neither pick
+query indices independently of the inputs nor mix pre- and post-norm
+tensors.
 
-\begin{algorithm}[H]
-\caption{$\textsc{ProveLN}(W,\{C_\bx,C_\by\},(\mathsf{rps}_\sigma,\mathsf{rps}_y),\mathsf{FS})$}
-\label{alg:layernorm}
-\begin{algorithmic}[1]
-\Require witness
-$W=\{\bx,\by,\mathrm{sum\_x},\mathrm{sq\_sum\_x},\mathrm{sum\_x\_sq},
-\sigma,\sigma\mathrm{\_sq\_scaled}\}$, where
-$\mathrm{sum\_x\_sq}\!=\!\mathrm{sum\_x}^2$ and
-$\sigma\mathrm{\_sq\_scaled}\!=\!(d\sigma)^2$ are square-witness fields
-introduced so each algebraic identity collapses to a degree-${\le}3$
-multilinear sumcheck.
-\State commit $C_{\mathrm{sum\_x}},C_{\mathrm{sq\_sum\_x}},C_\sigma$;\;
-       absorb IO and internals into $\mathsf{FS}$
-\State $r_t\!\gets\!\mathsf{FS}.\mathsf{challenge}(t_{\mathrm{bits}})$
-\State \emph{// 1. Mean sumcheck (degree-2)}
-\State $(\pi^{\mathrm{mean}},r_d^{\mathrm{m}})\!\gets\!\Prove\text{-}\mathrm{Sumcheck}_2(\widetilde\bx_{\mathrm{col}},\mathbbm 1,\widetilde{\mathrm{sum\_x}}(r_t),\mathsf{FS})$
-\State \emph{// 2. Square-sum sumcheck (cubic): $\widetilde{\mathrm{sq\_sum\_x}}(r_t)=\sum_j \widetilde\bx_{\mathrm{col}}(j)^3$ via three copies of $\widetilde\bx_{\mathrm{col}}$}
-\State $(\pi^{\mathrm{sqs}},r_d^{\mathrm{v}})\!\gets\!\Prove\text{-}\mathrm{Sumcheck}_3(\widetilde\bx_{\mathrm{col}},\widetilde\bx_{\mathrm{col}},\widetilde\bx_{\mathrm{col}},\widetilde{\mathrm{sq\_sum\_x}}(r_t),\mathsf{FS})$
-\State \emph{// 3. Sigma-residual sumcheck (cubic multi-batched, \texttt{sigma\_residual\_batch\_lambda})}
-\State $r_{\sigma_t}\!\gets\!\mathsf{rps}_\sigma.r[..t_{\mathrm{bits}}]$;\;
-       $\lambda_{\mathrm{sig}}\!\gets\!\mathsf{FS}.\mathsf{challenge}$
-\State bind $\widetilde{\mathrm{sum\_x\_sq}}(r_{\sigma_t})=\sum_i\!\eq(r_{\sigma_t},i)\widetilde{\mathrm{sum\_x}}(i)^2$ and
-       $\widetilde{\sigma\mathrm{\_sq}}(r_{\sigma_t})=\sum_i\!\eq(r_{\sigma_t},i)(d\widetilde\sigma(i))^2$
-       in one cubic multi-batched sumcheck $\pi^{\mathrm{sig}}$
-\State \emph{// 4. Sigma range proof (consumes $\mathsf{rps}_\sigma$)}
-\State recover $\mathrm{var}(r_{\sigma_t})\!=\!d\bigl(d\widetilde{\mathrm{sq\_sum\_x}}(r_{\sigma_t})-\widetilde{\mathrm{sum\_x\_sq}}(r_{\sigma_t})\bigr)$;\;
-       check $\mathrm{var}-(d\sigma)^2\!\geq\!0$ and $(d\sigma+d)^2-1-\mathrm{var}\!\geq\!0$ via $\mathsf{rps}_\sigma$
-\State \emph{// 5. Y constraint fusion: $\gamma\bX$ + $\sigma\bY$ legs (multi-cubic)}
-\State $r_y\!\gets\!\mathsf{rps}_y.r$;\;
-       $\alpha\!\gets\!\mathsf{FS}.\mathsf{challenge}(\texttt{"layernorm\_alpha"})$
-\State $(\pi^{\gamma\sigma},r_f)\!\gets\!\Prove\text{-}\mathrm{Sumcheck}_3^{\mathrm{multi}}\bigl([\bgamma\!\odot\!\widetilde\bx_{\mathrm{ry}},\widetilde\sigma_{\mathrm{ry}}\!\odot\!\widetilde\by_{\mathrm{ry}}],\alpha,\mathsf{FS}\bigr)$
-\State push Hyrax claims into deferred accumulators
-$\mathsf{acc}_t,\mathsf{acc}_{td}$ (the model-level batched LN proof groups
-LNs by shape and folds all per-LN claims under one extra batching $\eta$)
-\State \Return $\{\pi^{\mathrm{mean}},\pi^{\mathrm{sqs}},\pi^{\mathrm{sig}},\pi^{\gamma\sigma},\text{evaluations}\}$
-\end{algorithmic}
-\end{algorithm}
-
-\subsection{The verifier}
+\subsection{Verifier}
+\label{ssec:verifier}
 
 \begin{algorithm}[H]
-\caption{$\sys{}.\Verify(\popvk,\piproof,\mathsf{inst},\bx_{\mathrm{in}},\by)$}
+\caption{$\sys{}.\Verify(\popvk,\piproof,\mathsf{inst},\bx_{\mathrm{in}},\by)$ outline}
 \label{alg:verify}
 \begin{algorithmic}[1]
-\State \textbf{check} $\Com(\bx_{\mathrm{in}})\!=\!\piproof.C_{\bx_{\mathrm{in}}}$
-\Comment{public input is bound by re-commitment; the public output is bound below by evaluating $\widetilde\by$ at a transcript-derived random point and chaining through the LM-head proof}
-\State $\mathsf{FS}.\mathsf{init}(\texttt{"piformer"})$;\;
-       absorb $\piproof.C_{\bx_{\mathrm{in}}}$;\;
-       initialise the ${\sim}20$ deferred Hyrax accumulators (one per
-       claim-class~/~Hyrax-params group)
-\State $C_{\mathrm{cur}}\!\gets\!\piproof.C_{\bx_{\mathrm{in}}}$
-\For{$\ell=1,\dots,L$} \Comment{Phase~1 lockstep: absorb all 5 LN IO + aux}
-  \State absorb LN$_1$ IO; absorb $C_\bQ,C_\bK,C_\bV$ + (opt.) attn-norm aux
-  \State absorb $\LN_Q$ IO ($C_\bQ,C_{\bQ^{\mathrm{n}}}$),
-                $\LN_K$ IO ($C_\bK,C_{\bK^{\mathrm{n}}}$), $C_{\bO_{\mathrm{att}}}$
-  \State absorb $\LN_{\mathrm{aon}}$ IO; $C_{\bX_{\mathrm{mid}}}\!\gets\!C_{\mathrm{cur}}+p_\ell.C_{\LN_{\mathrm{aon}}.y}$
-  \State absorb $\LN_2$ IO; $C_{\mathrm{cur}}\!\gets\!C_{\bX_{\mathrm{mid}}}+p_\ell.C_{\bO_{\mathrm{ffn}}}$
-\EndFor
-\State $r_{td}\!\gets\!\mathsf{FS}.\mathsf{challenge}(t_{\mathrm{bits}}+d_{\mathrm{bits}})$
-\State \textbf{verify} four cross-block sumchecks
-$\pi_{qkv},\pi_{op},\pi_{ao},\pi_{ac}$
-\State (when normalised) \textbf{verify}
-$\pi_{\mathrm{atn}}$ at $r_{\mathrm{norm}}$ and $\pi_Z$
-\State \textbf{verify} global FFN Lasso, then $\pi_{ffy},\pi_{ffm}$
-\State \textbf{verify} bucketed range batch (one $m_{\mathrm{com}}$ per width)
-\State \textbf{verify} model-level batched LN proof (all $5L+1$ LNs)
-\State sample $r_{\mathrm{lm}}\!\gets\!\mathsf{FS}.\mathsf{challenge}(t_{\mathrm{bits}}\!+\!v_{\mathrm{bits}})$;\;
-       compute $v_{\mathrm{lm}}\!\gets\!\widetilde\by(r_{\mathrm{lm}})$ from the public output
-\State \textbf{verify} LM-head sumcheck under the claim
-$(r_{\mathrm{lm}},v_{\mathrm{lm}})$;\;
-       chain the resulting input-side claim into $\mathsf{acc}_{td}$ against $\piproof.C_{\mathrm{final\_ln\_out}}$
-\State drain 13 deferred-accumulator $\mu$-challenges plus 2 read-only $\rho$
-fuse challenges; finalise via \texttt{finalize\_many\_with\_mus} (one MSM
-pair per Hyrax-params group)
-\State \textbf{verify} global intermediate batch open at $r_{td}$
-\State \textbf{verify} cross-block matrix-type batch opens
-\State (when normalised) \textbf{verify} batch opens at $r_{\mathrm{norm}}$
-\State $\textsc{Finalise}(\text{the ${\sim}20$ deferred accumulators})$
-\Comment{one MSM pair per group}
-\State \textbf{verify} global $\bphi(\bQ^{\mathrm{n}}),\bphi(\bK^{\mathrm{n}})$ Lasso
-\State \Return $\mathsf{ACCEPT}$
+\State re-commit $\bx_{\mathrm{in}}$ and check against
+       $\piproof.C_{\bx_{\mathrm{in}}}$; initialise deferred Hyrax
+       accumulators
+\State mirror Phase~1 transcript absorption, computing residual
+       commitments by Hyrax addition
+\State draw $r_{td}$; verify the four cross-block sumchecks
+\State (when normalised) verify the attention-normalisation sumcheck
+       and the auxiliary $Z$ sumcheck
+\State verify the global FFN Lasso and the two FFN cross-block sumchecks
+\State verify the bucketed range batch (one $m_{\mathrm{com}}$ per width)
+\State verify the model-level batched LN proof over all $5L\!+\!1$ LNs
+\State draw $r_{\mathrm{lm}}$, evaluate $\widetilde\by(r_{\mathrm{lm}})$
+       from the public output, verify the LM-head sumcheck; chain
+       its input-side claim into the $td$ accumulator against
+       $\piproof.C_{\mathrm{final\_ln\_out}}$
+\State drain deferred-accumulator batching challenges and finalise
+       in one MSM pair per Hyrax-params group; verify all grouped
+       batched openings
+\State verify the global
+       $\bphi(\bQ^{\mathrm n}),\bphi(\bK^{\mathrm n})$ Lasso; return
+       $\mathsf{ACCEPT}$
 \end{algorithmic}
 \end{algorithm}
 
-%-------------------------------------------------------------------------------
 \section{Soundness}
 \label{sec:soundness}
 %-------------------------------------------------------------------------------
 
-We sketch the soundness analysis; the full proofs follow standard
-Schwartz--Zippel and PCS-binding arguments.
+We state the main soundness theorems and outline the arguments here;
+full proofs appear in Appendix~\ref{app:proofs}.
 
 \begin{lemma}[Sumcheck soundness]
 \label{lem:sumcheck}
-For an MLE $f$ of individual degree $\le\delta$, a cheating prover
-can make the sumcheck for $H=\sum_{x\in\{0,1\}^n}f(x)$ accept a false
-claim $H'\!\neq\!H$ with probability at most $n\delta/|\FF|$.
+A sumcheck for an MLE of individual degree $\le\delta$ over
+$\{0,1\}^n$ has soundness error $\le n\delta/|\FF|$.
 \end{lemma}
 
 \begin{lemma}[Hyrax binding]
 \label{lem:hyrax}
-Under the discrete-log assumption on $\GG$, the Hyrax PCS is
-computationally binding: no PPT adversary can open a single commitment
-to two different evaluations at the same point with non-negligible
-advantage.
+Under discrete log on $\GG$, the Hyrax PCS is computationally binding.
 \end{lemma}
 
 \begin{theorem}[Cross-block batching is sound]
 \label{thm:cross-block}
-Let $\textsc{CrossBatch}$ (Algorithm~\ref{alg:cross-block}) reduce
-$L$ per-block claims $\{H_\ell\}$ to one batched claim
-$H^\star\!=\!\sum_\ell \eta^{\ell-1}H_\ell$, and let the inner sumcheck
-be sound with error $\le n\delta/|\FF|$. Then $\textsc{CrossBatch}$
-is sound with total error
-\[
-  \varepsilon_{\mathrm{batch}}\;\leq\;\frac{L-1}{|\FF|}+\frac{n\delta}{|\FF|}.
-\]
+$\textsc{CrossBatch}$ (Alg.~\ref{alg:cross-block}) reduces $L$
+per-block claims to one batched claim
+$\sum_\ell\eta^{\ell-1}H_\ell$ with total soundness error
+$\le (L\!-\!1)/|\FF| + n\delta/|\FF|$.
 \end{theorem}
-\begin{proof}
-The challenge $\eta$ is drawn from $\mathsf{FS}$ \emph{after} every
-per-block claim and per-block witness commitment is absorbed. The
-prover is therefore committed to $\{H_\ell\}$ before learning $\eta$.
-If any single claim is false, $\hat H_{\ell^\star}\!\neq\!H_{\ell^\star}$,
-then $P(\eta)=\sum_\ell \eta^{\ell-1}(\hat H_\ell-H_\ell)$ is a
-non-zero polynomial in $\eta$ of degree $\le L-1$. By Schwartz--Zippel,
-$P(\eta)=0$ holds for at most $L-1$ values of $\eta$, so a uniformly
-random $\eta$ catches the false claim with probability
-$\geq 1-(L-1)/|\FF|$. Conditional on the combined claim being honest,
-the inner sumcheck has soundness $n\delta/|\FF|$. A union bound gives
-the stated error.
+\begin{proof}[Sketch]
+$\eta$ is drawn after every per-block claim is absorbed, so the prover
+is committed to $\{H_\ell\}$ before seeing $\eta$. If any claim is
+false, the difference polynomial in $\eta$ has degree $\le L\!-\!1$
+and is caught by Schwartz--Zippel with probability $\ge 1\!-\!(L\!-\!1)/|\FF|$;
+the inner sumcheck adds $n\delta/|\FF|$.
 \end{proof}
 
 \begin{theorem}[Homomorphic residuals]
 \label{thm:residual}
-Let $C_\bA\!=\!\Com(\bA)$, $C_\bB\!=\!\Com(\bB)$. The verifier-computed
-commitment $C_\bA+C_\bB$ binds $\bA+\bB$ unconditionally given Hyrax
-binding (Lemma~\ref{lem:hyrax}).
+For Hyrax commitments $C_\bA,C_\bB$, the verifier-computed commitment
+$C_\bA\!+\!C_\bB$ binds $\bA\!+\!\bB$.
 \end{theorem}
-\begin{proof}
-Hyrax commits row-by-row as MSMs over public generators
-$\mathbf g$. By bilinearity of MSM,
-$C_\bA+C_\bB=(\mathrm{MSM}(\mathbf g,A_i)+\mathrm{MSM}(\mathbf g,B_i))_i
-=(\mathrm{MSM}(\mathbf g,A_i+B_i))_i=\Com(\bA+\bB)$. Binding of
-$\bA+\bB$ then follows from binding of $\bA$ and $\bB$.
+\begin{proof}[Sketch]
+By bilinearity of MSM over public generators,
+$C_\bA\!+\!C_\bB\!=\!\Com(\bA\!+\!\bB)$; binding follows from
+Lemma~\ref{lem:hyrax}.
 \end{proof}
 
 \begin{theorem}[Globally batched range proof is sound]
 \label{thm:range}
-Sharing one $m_{\mathrm{com}}$ per width bucket across all range witnesses
-in the bucket (LN $\sigma$/$y$ across all blocks plus the final LN, plus
-the optional attention-normalisation residuals) is sound: a cheating
-prover cannot supply chunk values outside $[0,2^{16})$ for any single
-witness. Moreover, the zerocheck-folded inverse polynomial binds $h$ to
-$1/(\alpha-V)$ on the boolean hypercube without committing $h$, with
-soundness error $O(n/|\FF|)$ per bucket where $n$ is the bucket variable
-count.
+Sharing one $m_{\mathrm{com}}$ per width bucket across all range
+witnesses prevents any chunk value outside $[0,2^{16})$. The
+zerocheck-folded inverse polynomial binds $h$ to $1/(\alpha\!-\!V)$
+on the boolean hypercube \emph{without} committing $h$, with
+soundness error $O(n/|\FF|)$ per bucket where $n$ is the bucket
+variable count.
 \end{theorem}
-\begin{proof}
-Each bucket is processed independently and the argument applies per bucket.
-
-\emph{Chunk-value binding.} The transcript-ordering invariant is that
-$m_{\mathrm{com}}$ is absorbed before any per-witness sumcheck challenge
-$r_v^{(b)}$ in the bucket is sampled. Since $m$ aggregates all chunk
-occurrences across all witnesses and all
-$C\!=\!\lceil\mathrm{bits}/16\rceil$ chunks per witness, the prover must
-commit to $m$ before seeing any sumcheck challenge. If the prover
-supplied a chunk value $v^*\!\geq\!2^{16}$, the LogUp
-identity~\cite{habo2024logup} would require
-$m[v^*]\!\cdot\!T_{\mathrm{id}}[v^*]$ to balance, but $T_{\mathrm{id}}$
-has no entry for $v^*$, contradicting the committed $m$
-(Lemma~\ref{lem:hyrax}).
-
-\emph{Inverse-polynomial binding (zerocheck fold).} Let
-$\tilde h$ be a (possibly malicious) prover's choice of inverse-polynomial
-MLE, $V$ the (committed) chunk MLE, and define
-$\tilde s(x)\!:=\!\tilde h(x)(\alpha-V(x))\!-\!1$. The bucket sumcheck
-proves
-\[
-  \sum_x\!\bigl[\,w(x)\tilde h(x)(1+\beta(\alpha\!-\!V(x)))
-   + \gamma_{\mathrm{fold}}\!\cdot\!\mathrm{eq}(r_{zc},x)\tilde s(x)\bigr]=\Lambda,
-\]
-where $\Lambda$ is computed from the prover-supplied per-chunk sums and
-absorbed into the transcript \emph{before} $\gamma_{\mathrm{fold}}$ and
-$r_{zc}$ are sampled. If $\tilde h\!\neq\!1/(\alpha\!-\!V)$ on the
-boolean hypercube, then $\tilde s$ is non-zero on at least one boolean
-point, hence non-zero as a polynomial of total degree $\le\!2n$, and by
-Schwartz--Zippel
-$\Pr_{r_{zc}}[\tilde s(r_{zc})\!=\!0]\!\le\!2n/|\FF|$. Conditioning on
-$\tilde s(r_{zc})\!\neq\!0$, the true integrand value is linear in
-$\gamma_{\mathrm{fold}}$ with non-zero slope, so the probability it
-equals $\Lambda$ over a fresh $\gamma_{\mathrm{fold}}$ is at most
-$1/|\FF|$. If the sum differs from $\Lambda$, standard sumcheck
-soundness rejects with probability $\ge 1\!-\!3n/|\FF|$. Union-bounding
-yields $\le 6n/|\FF|$ soundness error per bucket. The pair-padding
-positions are filled with $\tilde h\!=\!\alpha^{-1}$, on which both the
-main term ($w\!=\!0$) and the zerocheck term ($\alpha^{-1}\alpha\!-\!1\!=\!0$)
-vanish, so padding contributes nothing to either side of the identity.
-
-Once $\tilde h$ is forced to the unique inverse on the hypercube, the
-per-chunk claims $\sum_i\tilde h_p[i]$ recover the true LogUp LHS, and
-the model-level grand-sum check
-$\sum_p\mathrm{claim}_p\!=\!\mathrm{rhs\_claim}$ closes the argument
-against the multiplicity-table side.
+\begin{proof}[Sketch]
+Two parts. \emph{Chunk-value binding:} $m_{\mathrm{com}}$ is absorbed
+before any sumcheck challenge, so any chunk $v^*\!\ge\!2^{16}$ has no
+matching $T_{\mathrm{id}}$ entry, breaking the LogUp identity.
+\emph{Inverse-polynomial binding:} for malicious
+$\tilde h\!\ne\!1/(\alpha\!-\!V)$, the zerocheck residual
+$\tilde s(x)\!=\!\tilde h(x)(\alpha\!-\!V(x))\!-\!1$ is non-zero on
+the hypercube, hence non-zero as a polynomial of degree $\le 2n$;
+Schwartz--Zippel gives $\Pr_{r_{zc}}[\tilde s(r_{zc})\!=\!0]\!\le\!2n/|\FF|$,
+the linear-in-$\gamma_{\mathrm{fold}}$ check adds $1/|\FF|$, and
+sumcheck adds $3n/|\FF|$. Pair-padding $\tilde h\!=\!\alpha^{-1}$
+keeps padding contributions zero in both terms. Full proof in
+Appendix~\ref{app:proofs}.
 \end{proof}
 
 \begin{theorem}[Model-level batched LayerNorm is sound]
 \label{thm:lnbatch}
-The single $\textsc{ProveLNsBatched}$ call covering all $5L+1$ LNs in the
-model (per block: $\LN_1,\LN_Q,\LN_K,\LN_{\mathrm{aon}},\LN_2$; plus the
-final LN) is as sound as $5L+1$ independent LN sub-proofs run with
-independent challenges.
+The single $\textsc{ProveLNsBatched}$ call covering all $5L\!+\!1$
+LNs is as sound as $5L\!+\!1$ independent LN sub-proofs.
 \end{theorem}
-\begin{proof}
-The batched LN proof folds the $5L+1$ per-LN claims via Fiat--Shamir
-powers of an independent batching challenge $\eta$, drawn after every
-per-LN IO commitment ($\bx,\by,\mathrm{sum\_x},\mathrm{sq\_sum},\sigma$)
-has been absorbed into the transcript and after the bucketed range batch
-has committed to all $\sigma$/$y$ chunks. The same Schwartz--Zippel
-argument as Theorem~\ref{thm:cross-block} applies (with $L$ replaced by
-$5L+1$): a single false LN claim makes the combined polynomial in $\eta$
-non-zero of degree $\le 5L$, caught with probability $\ge 1-5L/|\FF|$.
-The shared inner sumchecks (mean, variance, Y-fusion) inherit
-Lemma~\ref{lem:sumcheck} soundness on the combined claim.
+\begin{proof}[Sketch]
+Apply Theorem~\ref{thm:cross-block} with $L$ replaced by $5L\!+\!1$.
 \end{proof}
 
 \begin{theorem}[Attention-normalisation sumcheck is sound]
 \label{thm:attnnorm}
-When normalised attention is enabled, the cubic multi-batched sumcheck
-for $S\!\cdot\!\bN-\mathrm{rem}-Z\!\cdot\!\bY^{\mathrm{att}}=0$ and
-$\lambda(Z-1-\mathrm{rem}-\mathrm{diff})=0$, combined with the range proofs
-on $\mathrm{rem},\mathrm{diff}$ (Theorem~\ref{thm:range}) and the auxiliary
-$Z$ sumcheck, soundly enforces the floor-division identity
-$\bY^{\mathrm{att}}_{tj}=\lfloor S\!\cdot\!\bN_{tj}/Z_t\rfloor$ at every
-$(t,j)$.
+The cubic multi-batched sumcheck for
+$S\bN\!-\!\mathrm{rem}\!-\!Z\bY^{\mathrm{att}}\!=\!0$ and
+$\lambda(Z\!-\!1\!-\!\mathrm{rem}\!-\!\mathrm{diff})\!=\!0$ combined
+with range proofs on $\mathrm{rem},\mathrm{diff}$ and the auxiliary
+$Z$ sumcheck soundly enforces
+$\bY^{\mathrm{att}}_{tj}\!=\!\lfloor S\bN_{tj}/Z_t\rfloor$ pointwise.
 \end{theorem}
-\begin{proof}[Proof sketch]
-Range proofs constrain $\mathrm{rem}\!\geq\!0$ and $\mathrm{diff}\!\geq\!0$.
-The second identity then gives $\mathrm{rem}\!\leq\!Z\!-\!1$, i.e.\
-$0\!\leq\!\mathrm{rem}\!<\!Z$. The first identity expresses
-$Z\!\cdot\!\bY^{\mathrm{att}}=S\!\cdot\!\bN-\mathrm{rem}$ with the unique
-quotient given $0\!\leq\!\mathrm{rem}\!<\!Z$. Both identities are checked
-at one Fiat--Shamir random point of $t_{\mathrm{bits}}\!+\!d_{\mathrm{bits}}$
-variables with cubic-sumcheck error and a $\lambda$-batching error of
-$O(1)/|\FF|$. The auxiliary $Z$ sumcheck binds $Z_t$ to
-$\bphi(\bq_t^{\mathrm{n}})\!\cdot\!\sum_s\bphi(\bk_s^{\mathrm{n}})$ via the
-already-committed $\bphi(\bQ^{\mathrm{n}}),\bphi(\bK^{\mathrm{n}})$ MLEs.
-Hyrax binding closes the loop.
+\begin{proof}[Sketch]
+Range proofs give $0\!\le\!\mathrm{rem}\!<\!Z$ via the second identity;
+the first identity then expresses $Z\bY^{\mathrm{att}}$ as the unique
+floor-division quotient. Both checks at one random point cost cubic
+sumcheck error plus $O(1)/|\FF|$ batching error; the auxiliary $Z$
+sumcheck binds $Z_t$ to the committed
+$\bphi(\bQ^{\mathrm n}),\bphi(\bK^{\mathrm n})$.
 \end{proof}
 
 \begin{theorem}[\sys{} end-to-end soundness]
 \label{thm:end-to-end}
-For any PPT adversary $\calA$, the probability that
-$\Verify(\popvk,\piproof,\mathsf{inst},\bx_{\mathrm{in}},\by)=\mathsf{ACCEPT}$
-but $\calM_\theta(\bx_{\mathrm{in}})\!\neq\!\by$ is at most
+For any PPT adversary $\calA$,
 \[
-  \varepsilon_{\mathrm{sound}}\;\leq\;
-  \frac{m_{\mathrm{sc}}\,n_{\max}\delta_{\max}+m_{\mathrm{batch}}(L-1)+m_{\mathrm{open}}}{|\FF|}
+  \Pr[\,\Verify\!=\!\mathsf{ACCEPT}\,\wedge\,\calM_\theta(\bx_{\mathrm{in}})\!\ne\!\by\,]
+  \le
+  \frac{m_{\mathrm{sc}}\,n_{\max}\delta_{\max}+m_{\mathrm{batch}}(L\!-\!1)+m_{\mathrm{open}}}{|\FF|}
   +\varepsilon_{\mathrm{DL}},
 \]
-where $m_{\mathrm{sc}}$ is the number of sumcheck invocations after
-batching, $m_{\mathrm{batch}}\!=\!6$ is the number of cross-block
-batches, $m_{\mathrm{open}}$ covers the random-linear-combination
-checks used in batched openings and lookups, $n_{\max}$ is the
-maximum number of sumcheck variables, $\delta_{\max}\!\leq\!3$ is the
-maximum round-polynomial degree, and $\varepsilon_{\mathrm{DL}}$ is
-the DL advantage of $\calA$ on $\GG$.
+where $m_{\mathrm{sc}}$ is the post-batching sumcheck count,
+$m_{\mathrm{batch}}\!=\!6$, $m_{\mathrm{open}}$ covers RLC checks,
+$n_{\max}\!\le\!64$, $\delta_{\max}\!\le\!3$, and
+$\varepsilon_{\mathrm{DL}}$ is $\calA$'s DL advantage on $\GG$. For
+typical parameters the statistical term is below $2^{-240}$.
 \end{theorem}
-\begin{proof}[Proof sketch]
-By hybrid argument over the $L$ blocks. (i) By Lemma~\ref{lem:hyrax},
-any forged Hyrax opening yields a DL solution. (ii) Block-level chaining is
-sound by Theorem~\ref{thm:residual}, with the sandwich-norm residual
-$C_{\bX_{\mathrm{mid}}}=C_{\bx_{\mathrm{in}}}+C_{\LN_{\mathrm{aon}}.y}$
-inheriting binding from $C_{\LN_{\mathrm{aon}}.y}$. (iii) Within each block,
-the bucketed global range batch over all witnesses is sound by
-Theorem~\ref{thm:range}; the model-level batched LN proof covering all
-$5L\!+\!1$ LNs is sound by Theorem~\ref{thm:lnbatch}; when normalised
-attention is enabled, the floor-division identity is sound by
-Theorem~\ref{thm:attnnorm}; the cross-block sumchecks are sound by
-Theorem~\ref{thm:cross-block}; the committed-output Lasso is sound by
-Lemma~\ref{lem:hyrax} plus Lemma~\ref{lem:sumcheck}. The Lasso
-index-binding step ties the lookup queries to the post-QK-norm tensors
-$C_{\bQ^{\mathrm{n}}},C_{\bK^{\mathrm{n}}}$, which are themselves bound to
-$C_\bQ,C_\bK$ through the LN-batched proof for $\LN_Q,\LN_K$. (iv) The
-final layer plus LM head reduce to one LN plus one projection. A union
-bound over all sub-protocols gives the bound. For typical parameters
-($L\!\le\!12$, $n_{\max}\!\le\!64$, $\delta_{\max}\!\le\!3$) over BN254,
-the statistical term is below $2^{-240}$ and is dominated by the DL term.
+\begin{proof}[Sketch]
+Hybrid argument over the $L$ blocks: any forged Hyrax open yields a DL
+solution (Lemma~\ref{lem:hyrax}); residual chaining is sound by
+Theorem~\ref{thm:residual}; per-block algebra is sound by
+Theorems~\ref{thm:range}, \ref{thm:lnbatch}, \ref{thm:attnnorm},
+and~\ref{thm:cross-block}; the committed-output Lasso is sound by
+Lemmas~\ref{lem:hyrax}--\ref{lem:sumcheck}. A union bound over all
+sub-protocols yields the stated error.
 \end{proof}
 
 \subsection{Zero knowledge}
-The current implementation is \emph{not} zero-knowledge: weight
-commitments are public VK entries, and intermediate evaluation claims
-(e.g., $\bX_{\mathrm{n1}}(r_t,r_d)$) are revealed in the sumcheck
-transcripts. Standard techniques apply: blinding all witness
-polynomials with random masking terms before commitment, and using
-zero-knowledge variants of sumcheck and Hyrax. We discuss this
-further in \S\ref{sec:disc}.
+The current implementation is not zero-knowledge: weight commitments
+are public VK entries and intermediate sumcheck evaluations are
+revealed. Standard techniques apply~--- blinding witness polynomials
+before commitment, and zero-knowledge variants of sumcheck and
+Hyrax~--- which we leave to future work.
 
-%-------------------------------------------------------------------------------
 \section{Implementation}
 \label{sec:impl}
 %-------------------------------------------------------------------------------
