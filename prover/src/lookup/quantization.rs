@@ -297,24 +297,39 @@ pub fn verify_quantization_batch(
     )?;
     let r = challenge_vec(transcript, num_vars, b"quant_r");
     let (_, _, params_h) = params_from_vars(num_vars);
-    hyrax_verify_batch(
-        raw_coms,
-        &proof.raw_evals,
-        &r,
-        &proof.raw_open,
-        &params_h,
-        transcript,
-    )
-    .map_err(|e| format!("quant raw opening: {e}"))?;
-    hyrax_verify_batch(
-        &proof.rem_coms,
-        &proof.rem_evals,
-        &r,
-        &proof.rem_open,
-        &params_h,
-        transcript,
-    )
-    .map_err(|e| format!("quant remainder opening: {e}"))?;
+    if num_vars == rem_n_vars {
+        acc_range_chunk
+            .add_verify_batch(raw_coms, &proof.raw_evals, &r, &proof.raw_open, transcript)
+            .map_err(|e| format!("quant raw opening (deferred): {e}"))?;
+        acc_range_chunk
+            .add_verify_batch(
+                &proof.rem_coms,
+                &proof.rem_evals,
+                &r,
+                &proof.rem_open,
+                transcript,
+            )
+            .map_err(|e| format!("quant remainder opening (deferred): {e}"))?;
+    } else {
+        hyrax_verify_batch(
+            raw_coms,
+            &proof.raw_evals,
+            &r,
+            &proof.raw_open,
+            &params_h,
+            transcript,
+        )
+        .map_err(|e| format!("quant raw opening: {e}"))?;
+        hyrax_verify_batch(
+            &proof.rem_coms,
+            &proof.rem_evals,
+            &r,
+            &proof.rem_open,
+            &params_h,
+            transcript,
+        )
+        .map_err(|e| format!("quant remainder opening: {e}"))?;
+    }
 
     let one = indicator_eval(&r, n);
     let zp = F::from(lookup_zero_point_u64(table_count, bits_per_chunk)?);

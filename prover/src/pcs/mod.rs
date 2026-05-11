@@ -305,20 +305,28 @@ pub fn hyrax_open_batch(
     sigma: usize,
     transcript: &mut Transcript,
 ) -> HyraxProof {
+    let eta = transcript.challenge_field::<F>(b"hyrax_batch_eta");
+    hyrax_open_batch_with_eta(evals_list, point, nu, sigma, eta)
+}
+
+/// Same as `hyrax_open_batch` but accepts a pre-drawn batching challenge `eta`
+/// instead of pulling it from the transcript. Pure computation — no transcript
+/// access — so multiple independent calls can run concurrently after the
+/// caller has serialized the necessary FS draws upfront.
+pub fn hyrax_open_batch_with_eta(
+    evals_list: &[&[F]],
+    point: &[F],
+    nu: usize,
+    sigma: usize,
+    eta: F,
+) -> HyraxProof {
     let count = evals_list.len();
     let num_cols = 1 << sigma;
-
-    // 1. バッチ化用のチャレンジ η を生成
-    let eta = transcript.challenge_field::<F>(b"hyrax_batch_eta");
     let eta_pows = powers_of(eta, count);
 
-    // 2. ラグランジュ基底の計算 (row部分)
     let r_l_rev: Vec<F> = point[..nu].iter().rev().copied().collect();
     let l_vec = lagrange_basis(&r_l_rev);
 
-    // 3. 統合された w' ベクトルを計算: w'_batch = Σ_k η^k * (Σ_i L_i * Row_{k,i})
-    // Parallelize over the polynomial axis k. Each task computes its η^k-scaled
-    // contribution into a local accumulator, then a reduce sums them.
     let w_prime_batched: Vec<F> = evals_list
         .par_iter()
         .enumerate()

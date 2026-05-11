@@ -397,28 +397,67 @@ pub fn prove_sumcheck_cubic_multi_batched_owned(
 
     for _ in 0..n {
         let half = fs_cur[0].evaluations.len() >> 1;
-        let mut e = [F::ZERO; 4];
-
-        for i in 0..half {
-            for k in 0..num_triples {
-                let f0 = fs_cur[k].evaluations[i];
-                let f1 = fs_cur[k].evaluations[i + half];
-                let g0 = gs_cur[k].evaluations[i];
-                let g1 = gs_cur[k].evaluations[i + half];
-                let h0 = hs_cur[k].evaluations[i];
-                let h1 = hs_cur[k].evaluations[i + half];
-                let f2 = f1 + f1 - f0;
-                let f3 = f2 + f1 - f0;
-                let g2 = g1 + g1 - g0;
-                let g3 = g2 + g1 - g0;
-                let h2 = h1 + h1 - h0;
-                let h3 = h2 + h1 - h0;
-                e[0] += weights[k] * (f0 * g0 * h0);
-                e[1] += weights[k] * (f1 * g1 * h1);
-                e[2] += weights[k] * (f2 * g2 * h2);
-                e[3] += weights[k] * (f3 * g3 * h3);
+        const PAR_THRESHOLD: usize = 512;
+        let e = if half >= PAR_THRESHOLD {
+            (0..half)
+                .into_par_iter()
+                .map(|i| {
+                    let mut local = [F::ZERO; 4];
+                    for k in 0..num_triples {
+                        let f0 = fs_cur[k].evaluations[i];
+                        let f1 = fs_cur[k].evaluations[i + half];
+                        let g0 = gs_cur[k].evaluations[i];
+                        let g1 = gs_cur[k].evaluations[i + half];
+                        let h0 = hs_cur[k].evaluations[i];
+                        let h1 = hs_cur[k].evaluations[i + half];
+                        let f2 = f1 + f1 - f0;
+                        let f3 = f2 + f1 - f0;
+                        let g2 = g1 + g1 - g0;
+                        let g3 = g2 + g1 - g0;
+                        let h2 = h1 + h1 - h0;
+                        let h3 = h2 + h1 - h0;
+                        let w = weights[k];
+                        local[0] += w * (f0 * g0 * h0);
+                        local[1] += w * (f1 * g1 * h1);
+                        local[2] += w * (f2 * g2 * h2);
+                        local[3] += w * (f3 * g3 * h3);
+                    }
+                    local
+                })
+                .reduce(
+                    || [F::ZERO; 4],
+                    |mut a, b| {
+                        for i in 0..4 {
+                            a[i] += b[i];
+                        }
+                        a
+                    },
+                )
+        } else {
+            let mut e = [F::ZERO; 4];
+            for i in 0..half {
+                for k in 0..num_triples {
+                    let f0 = fs_cur[k].evaluations[i];
+                    let f1 = fs_cur[k].evaluations[i + half];
+                    let g0 = gs_cur[k].evaluations[i];
+                    let g1 = gs_cur[k].evaluations[i + half];
+                    let h0 = hs_cur[k].evaluations[i];
+                    let h1 = hs_cur[k].evaluations[i + half];
+                    let f2 = f1 + f1 - f0;
+                    let f3 = f2 + f1 - f0;
+                    let g2 = g1 + g1 - g0;
+                    let g3 = g2 + g1 - g0;
+                    let h2 = h1 + h1 - h0;
+                    let h3 = h2 + h1 - h0;
+                    let w = weights[k];
+                    e[0] += w * (f0 * g0 * h0);
+                    e[1] += w * (f1 * g1 * h1);
+                    e[2] += w * (f2 * g2 * h2);
+                    e[3] += w * (f3 * g3 * h3);
+                }
             }
-        }
+            e
+        };
 
         let rp = CubicRoundPoly { evals: e };
         for val in &rp.evals {
@@ -427,11 +466,15 @@ pub fn prove_sumcheck_cubic_multi_batched_owned(
         let r_i = transcript.challenge_field::<F>(b"sc_challenge");
         challenges.push(r_i);
 
-        for k in 0..num_triples {
-            fs_cur[k] = fs_cur[k].fix_first_variable(r_i);
-            gs_cur[k] = gs_cur[k].fix_first_variable(r_i);
-            hs_cur[k] = hs_cur[k].fix_first_variable(r_i);
-        }
+        fs_cur
+            .par_iter_mut()
+            .for_each(|poly| *poly = poly.fix_first_variable(r_i));
+        gs_cur
+            .par_iter_mut()
+            .for_each(|poly| *poly = poly.fix_first_variable(r_i));
+        hs_cur
+            .par_iter_mut()
+            .for_each(|poly| *poly = poly.fix_first_variable(r_i));
         round_polys.push(rp);
     }
 

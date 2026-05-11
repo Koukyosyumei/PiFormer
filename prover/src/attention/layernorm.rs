@@ -19,7 +19,8 @@ use crate::pcs::{
 use crate::poly::utils::{combine, eval_rows, mat_to_mle, vec_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::sumcheck::{
-    prove_sumcheck_cubic, prove_sumcheck_cubic_multi_batched, prove_sumcheck_multi_batched,
+    prove_sumcheck_cubic, prove_sumcheck_cubic_multi_batched,
+    prove_sumcheck_cubic_multi_batched_owned, prove_sumcheck_multi_batched_owned,
     verify_sumcheck_cubic, verify_sumcheck_cubic_multi_batched, verify_sumcheck_multi_batched,
     SumcheckCubicProof, SumcheckCubicProofMulti, SumcheckProofMulti,
 };
@@ -1039,7 +1040,7 @@ fn prove_layernorm_group(
         mean_gs.push(DenseMLPoly::from_vec_padded(vec![F::one(); d]));
     }
     let (mean_sumcheck, r_d_mean) =
-        prove_sumcheck_multi_batched(&mean_fs, &mean_gs, &mean_weights, mean_claim, transcript);
+        prove_sumcheck_multi_batched_owned(mean_fs, mean_gs, &mean_weights, mean_claim, transcript);
 
     let rt_rmean = combine(&r_t, &r_d_mean);
     let x_at_rt_rmean: Vec<F> = x_mles.iter().map(|p| p.evaluate(&rt_rmean)).collect();
@@ -1065,10 +1066,10 @@ fn prove_layernorm_group(
     let sq_fs: Vec<DenseMLPoly> = (0..n).map(|_| eq_t_ext.clone()).collect();
     let sq_gs: Vec<DenseMLPoly> = x_mles.clone();
     let sq_hs: Vec<DenseMLPoly> = x_mles.clone();
-    let (sq_sum_sumcheck, r_final_q) = prove_sumcheck_cubic_multi_batched(
-        &sq_fs,
-        &sq_gs,
-        &sq_hs,
+    let (sq_sum_sumcheck, r_final_q) = prove_sumcheck_cubic_multi_batched_owned(
+        sq_fs,
+        sq_gs,
+        sq_hs,
         &sq_weights,
         sq_claim,
         transcript,
@@ -1126,10 +1127,10 @@ fn prove_layernorm_group(
             lns_pows[k] * (sum_x_sq_at_rsig[k] + lambda_sig * sigma_sq_at_rsig[k]);
     }
 
-    let (sigma_residual_sumcheck, r_f_sig) = prove_sumcheck_cubic_multi_batched(
-        &sig_fs,
-        &sig_gs,
-        &sig_hs,
+    let (sigma_residual_sumcheck, r_f_sig) = prove_sumcheck_cubic_multi_batched_owned(
+        sig_fs,
+        sig_gs,
+        sig_hs,
         &sig_weights,
         sigma_residual_claim,
         transcript,
@@ -1240,10 +1241,10 @@ fn prove_layernorm_group(
         gamma_sigma_claim += gs_lns_pows[k] * (gamma_x_at_ry[k] + lambda_gs * sigma_y_at_ry[k]);
     }
 
-    let (gamma_sigma_sumcheck, r_f) = prove_sumcheck_cubic_multi_batched(
-        &gs_fs,
-        &gs_gs,
-        &gs_hs,
+    let (gamma_sigma_sumcheck, r_f) = prove_sumcheck_cubic_multi_batched_owned(
+        gs_fs,
+        gs_gs,
+        gs_hs,
         &gs_weights,
         gamma_sigma_claim,
         transcript,

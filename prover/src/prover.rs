@@ -26,13 +26,13 @@ use crate::attention::layernorm::{
     LayerNormsBatchedProof,
 };
 use crate::attention::projection::{
-    prove_projection, ProjectionIOCommitments, ProjectionProof, ProjectionProvingKey,
-    ProjectionVerifyingKey, ProjectionWitness,
+    prove_projection_gkr, ProjectionGKRProof, ProjectionProvingKey, ProjectionVerifyingKey,
+    ProjectionWitness,
 };
 use crate::ffn::ffn::{FFNInstance, FFNWitness};
 use crate::lookup::lasso::{
-    prove_lasso_multi, LassoMultiInstance, LassoMultiProof, LassoMultiProvingKey,
-    LassoOutputBinding, LassoProof,
+    prove_lasso_multi, prove_lasso_terminal_eval, LassoMultiInstance, LassoMultiProof,
+    LassoMultiProvingKey, LassoOutputBinding, LassoProof, LassoTerminalEvalProof,
 };
 use crate::lookup::quantization::{prove_quantization_batch, QuantizationProof};
 use crate::lookup::range::{
@@ -64,9 +64,8 @@ pub struct TransformerBlockProof {
     pub k_norm_y_com: HyraxCommitment,
     pub attn_out_norm_y_com: HyraxCommitment,
 
-    // FFN per-block: Lasso for activation + A/M commitments
+    // FFN per-block: committed raw activation input.
     pub ffn_lasso_proof: LassoProof,
-    pub ffn_a_com: HyraxCommitment,
     pub ffn_m_com: HyraxCommitment,
 
     // Committed intermediate matrices (7 per block).
@@ -528,11 +527,11 @@ pub struct TransformerModelProof {
     /// (5 per block: ln1, q_norm, k_norm, attn_out_norm, ln2; plus final_ln).
     /// Replaces the per-block + per-final LN proofs of PROOF_VERSION 12.
     pub ln_batched_proof: LayerNormsBatchedProof,
-    pub lm_head_proof: ProjectionProof,
+    pub lm_head_proof: ProjectionGKRProof,
     pub final_ln_out_com: HyraxCommitment,
-    pub logits_com: HyraxCommitment,
-    pub lm_head_logits_open: HyraxProof,
-    pub ffn_lasso_proof: LassoMultiProof,
+    pub lm_head_input_open: HyraxProof,
+    pub ffn_lasso_query_indices: Vec<Vec<usize>>,
+    pub ffn_a_terminal_proof: LassoTerminalEvalProof,
     pub all_lasso_proof: LassoMultiProof,
     pub ffn_quant_proof: QuantizationProof,
     pub qk_quant_proof: QuantizationProof,
@@ -580,7 +579,6 @@ pub struct TransformerModelProof {
     pub w_o_batch_open: HyraxProof,
     pub qkvo_bias_batch_open: HyraxProof,
     pub w2_batch_open: HyraxProof,
-    pub ffn_a_batch_open: HyraxProof,
     pub w1_batch_open: HyraxProof,
     pub x_norm2_batch_open: HyraxProof,
     pub ffn_m_com_batch_open: HyraxProof,
@@ -1789,13 +1787,11 @@ pub fn prove(
     // =========================================================================
     // 7. Per-block FFN: Lasso + M commit + absorb coms
     // =========================================================================
-    let mut ffn_a_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
     let mut ffn_a_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut ffn_m_coms: Vec<HyraxCommitment> = Vec::with_capacity(num_blocks);
     let mut ffn_m_mles: Vec<DenseMLPoly> = Vec::with_capacity(num_blocks);
     let mut ffn_lasso_instances = Vec::with_capacity(num_blocks);
     let mut ffn_query_indices_all: Vec<Vec<usize>> = Vec::with_capacity(num_blocks);
-    let mut ffn_output_bindings = Vec::with_capacity(num_blocks);
     let mut ffn_instance_coms = Vec::with_capacity(num_blocks);
     let mut ffn_lasso_nu = 0usize;
 
@@ -1816,12 +1812,10 @@ pub fn prove(
         };
         let ffn_lasso_instance = crate::lookup::lasso::LassoInstance {
             tables: inst_ffn.activation_lasso.tables.clone(),
-            outputs: flatten_mat_values(&bw.ffn_wit.a),
+            outputs: Vec::new(),
             bits_per_chunk: inst_ffn.activation_lasso.bits_per_chunk,
         };
         let a_mle = mat_to_mle(&bw.ffn_wit.a, t, d_ff);
-        let (nu_a, _, params_a) = params_from_vars(t_bits + f_bits);
-        let ffn_a_com = hyrax_commit(&a_mle.evaluations, nu_a, &params_a);
         let m_mle = mat_to_mle(&bw.ffn_wit.m, t, d_ff);
         let (nu_m, _, params_m) = params_from_vars(t_bits + f_bits);
         let ffn_m_com = hyrax_commit(&m_mle.evaluations, nu_m, &params_m);
@@ -1831,12 +1825,6 @@ pub fn prove(
         ffn_lasso_nu = bpk.ffn_pk.activation_lasso_pk.nu;
         ffn_lasso_instances.push(ffn_lasso_instance);
         ffn_query_indices_all.push(ffn_query_indices);
-        ffn_output_bindings.push(LassoOutputBinding {
-            com: ffn_a_com.clone(),
-            num_vars: t_bits + f_bits,
-            mle_evals: a_mle.evaluations.clone(),
-        });
-        ffn_a_coms.push(ffn_a_com);
         ffn_a_mles.push(a_mle);
         ffn_m_coms.push(ffn_m_com);
         ffn_m_mles.push(m_mle);
@@ -1851,17 +1839,7 @@ pub fn prove(
         instance_to_group: ffn_instance_to_group,
         nu: ffn_lasso_nu,
     };
-    let ffn_lasso_proof = prove_lasso_multi(
-        &global_ffn_lasso_inst,
-        &ffn_query_indices_all,
-        &global_ffn_lasso_pk,
-        &ffn_output_bindings,
-        transcript,
-        lasso_params,
-    );
-
-    let ffn_index_refs: Vec<&[usize]> = ffn_lasso_proof
-        .all_query_indices
+    let ffn_index_refs: Vec<&[usize]> = ffn_query_indices_all
         .iter()
         .map(|v| v.as_slice())
         .collect();
@@ -1870,7 +1848,7 @@ pub fn prove(
         b"ffn_quant_rem_com",
         &ffn_m_mles,
         &ffn_m_coms,
-        &ffn_lasso_proof.all_query_indices,
+        &ffn_query_indices_all,
         inst_ffn.activation_lasso.tables.len(),
         inst_ffn.activation_lasso.bits_per_chunk,
         t,
@@ -1879,8 +1857,7 @@ pub fn prove(
         transcript,
     )?;
     let ffn_lasso_bind_point = challenge_vec(transcript, t_bits + f_bits, b"ffn_lasso_bind_r");
-    let ffn_bind_evals_vecs: Vec<Vec<F>> = ffn_lasso_proof
-        .all_query_indices
+    let ffn_bind_evals_vecs: Vec<Vec<F>> = ffn_query_indices_all
         .iter()
         .map(|indices| indices_to_mle_evals(indices))
         .collect();
@@ -1945,6 +1922,27 @@ pub fn prove(
         claim_ffn_y,
         transcript,
     );
+    let ffn_a_terminal_weights: Vec<F> = weights_ffn_y
+        .iter()
+        .zip(batch_ffn_y.final_evals_g.iter())
+        .map(|(w, g)| *w * *g)
+        .collect();
+    let ffn_a_terminal_claim: F = ffn_a_terminal_weights
+        .iter()
+        .zip(batch_ffn_y.final_evals_f.iter())
+        .map(|(w, f)| *w * *f)
+        .sum();
+    let ffn_a_terminal_point = combine(&r_t, &r_k_fy);
+    let ffn_a_terminal_proof = prove_lasso_terminal_eval(
+        &global_ffn_lasso_inst,
+        &ffn_query_indices_all,
+        &ffn_a_terminal_weights,
+        &ffn_a_terminal_point,
+        ffn_a_terminal_claim,
+        &global_ffn_lasso_pk,
+        transcript,
+        lasso_params,
+    )?;
     eprintln!(
         "[prove] batch_ffn_y: {:7.3}ms",
         phase_t0.elapsed().as_secs_f64() * 1000.0
@@ -2019,7 +2017,6 @@ pub fn prove(
             k_norm_y_com: p1.k_norm_y_com.clone(),
             attn_out_norm_y_com: p1.attn_out_norm_y_com.clone(),
             ffn_lasso_proof: empty_lasso_proof(),
-            ffn_a_com: ffn_a_coms[i].clone(),
             ffn_m_com: ffn_m_coms[i].clone(),
             x_norm1_com: p1.x_norm1_com.clone(),
             q_com: p1.q_com.clone(),
@@ -2160,23 +2157,23 @@ pub fn prove(
     // =========================================================================
     // 12. LM Head
     // =========================================================================
+    let final_ln_out_mle = mat_to_mle(&witness.final_ln_wit.y, t, d);
     let logits_mle = mat_to_mle(&witness.lm_head_wit.y, t, v);
-    let logits_com = commit_mat(&witness.lm_head_wit.y, t, v);
-    let lm_io = ProjectionIOCommitments {
-        x_com: Some(final_ln_out_com.clone()),
+    let v_bits = v.next_power_of_two().trailing_zeros() as usize;
+    let lm_y_point = challenge_vec(transcript, t_bits + v_bits, b"lm_gkr_y");
+    let lm_y_value = logits_mle.evaluate(&lm_y_point);
+    let lm_y_claim = crate::subprotocols::EvalClaim {
+        point: lm_y_point,
+        value: lm_y_value,
     };
-    let (lm_head_proof, lm_y_claim, _) = prove_projection(
+    let (lm_head_proof, lm_x_claim) = prove_projection_gkr(
         &pk.lm_head_pk,
         &witness.lm_head_wit,
-        &lm_io,
+        &lm_y_claim,
         transcript,
-        None,
     )?;
-    let v_bits = v.next_power_of_two().trailing_zeros() as usize;
-    let lm_logits_num_vars = t_bits + v_bits;
-    let (lm_nu, lm_sigma, _) = params_from_vars(lm_logits_num_vars);
-    let lm_head_logits_open =
-        hyrax_open(&logits_mle.evaluations, &lm_y_claim.point, lm_nu, lm_sigma);
+    let lm_head_input_open =
+        hyrax_open(&final_ln_out_mle.evaluations, &lm_x_claim.point, nu_td, sigma_td);
     eprintln!(
         "[prove] lm_head: {:7.3}ms",
         phase_t0.elapsed().as_secs_f64() * 1000.0
@@ -2257,15 +2254,6 @@ pub fn prove(
         .map(|m| m.w2.evaluations.as_slice())
         .collect();
     let w2_batch_open = hyrax_open_batch(&w2_refs, &w2_point, nu_wff, sigma_wff, transcript);
-
-    // ffn_a_batch: L A_i at combine(r_t, r_k_fy) [t_bits + f_bits]
-    let ffn_a_point = combine(&r_t, &r_k_fy);
-    let ffn_a_refs: Vec<&[F]> = ffn_a_mles
-        .iter()
-        .map(|m| m.evaluations.as_slice())
-        .collect();
-    let ffn_a_batch_open =
-        hyrax_open_batch(&ffn_a_refs, &ffn_a_point, nu_mff, sigma_mff, transcript);
 
     // w1_batch: L W1_i at combine(r_k_m, ry_m) [d_bits + f_bits]
     let w1_point = combine(&r_k_m, &ry_m);
@@ -2591,9 +2579,9 @@ pub fn prove(
         ln_batched_proof,
         lm_head_proof,
         final_ln_out_com,
-        logits_com,
-        lm_head_logits_open,
-        ffn_lasso_proof,
+        lm_head_input_open,
+        ffn_lasso_query_indices: ffn_query_indices_all,
+        ffn_a_terminal_proof,
         all_lasso_proof,
         ffn_quant_proof,
         qk_quant_proof,
@@ -2620,7 +2608,6 @@ pub fn prove(
         w_o_batch_open,
         qkvo_bias_batch_open,
         w2_batch_open,
-        ffn_a_batch_open,
         w1_batch_open,
         x_norm2_batch_open,
         ffn_m_com_batch_open,
@@ -3234,7 +3221,7 @@ mod tests {
 
         let mut pt = Transcript::new(b"model_tamper_lm");
         let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
-        proof.lm_head_proof.openings.y_eval += F::ONE;
+        proof.lm_head_proof.x_eval += F::ONE;
 
         let mut vt = Transcript::new(b"model_tamper_lm");
         let result = verify(
@@ -3248,6 +3235,32 @@ mod tests {
             &lp,
         );
         assert!(result.is_err(), "Should reject tampered LM head proof");
+    }
+
+    #[test]
+    fn test_model_rejects_tampered_public_output() {
+        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
+        let model_wit = build_model_witness(block_wit);
+        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
+        let lp = lasso_params();
+
+        let mut pt = Transcript::new(b"model_tamper_public_output");
+        let proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
+        let mut public_output = model_wit.lm_head_wit.y.clone();
+        public_output[0][0] += F::ONE;
+
+        let mut vt = Transcript::new(b"model_tamper_public_output");
+        let result = verify(
+            &proof,
+            &pk.vk,
+            &inst_attn,
+            &inst_ffn,
+            &model_wit.x_in,
+            &public_output,
+            &mut vt,
+            &lp,
+        );
+        assert!(result.is_err(), "Should reject tampered public output");
     }
 
     #[test]
@@ -3291,7 +3304,7 @@ mod tests {
 
         let mut pt = Transcript::new(b"model_tamper_lasso_indices");
         let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
-        proof.ffn_lasso_proof.all_query_indices[0][0] += 1;
+        proof.ffn_lasso_query_indices[0][0] += 1;
 
         let mut vt = Transcript::new(b"model_tamper_lasso_indices");
         let result = verify(
@@ -3385,6 +3398,13 @@ mod tests {
     }
 
     #[test]
+    fn test_model_rejects_tampered_range_h_terminal_claim() {
+        assert_tampered_model_rejected(b"model_tamper_range_h_terminal", |proof, _| {
+            proof.ffn_quant_proof.rem_range_proofs[0].logup.h_at_rk[0] += F::ONE;
+        });
+    }
+
+    #[test]
     fn test_model_rejects_tampered_qk_quant_remainder_commitment() {
         assert_tampered_model_rejected(b"model_tamper_qk_quant_rem_com", |proof, _| {
             proof.qk_quant_proof.rem_coms[0] = proof.block_proofs[0].q_com.clone();
@@ -3435,48 +3455,20 @@ mod tests {
     }
 
     #[test]
-    fn test_model_rejects_tampered_ffn_a_com() {
+    fn test_model_rejects_tampered_ffn_a_terminal_sumcheck() {
         let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
         let model_wit = build_model_witness(block_wit);
         let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
         let lp = lasso_params();
 
-        let mut pt = Transcript::new(b"model_tamper_ffn_a_com");
-        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
-        proof.block_proofs[0].ffn_a_com =
-            commit_mat_test(&vec![vec![F::from(3u64); D_FF]; T], T, D_FF);
-
-        let mut vt = Transcript::new(b"model_tamper_ffn_a_com");
-        let result = verify(
-            &proof,
-            &pk.vk,
-            &inst_attn,
-            &inst_ffn,
-            &model_wit.x_in,
-            &model_wit.lm_head_wit.y,
-            &mut vt,
-            &lp,
-        );
-        assert!(result.is_err(), "Should reject tampered FFN A commitment");
-    }
-
-    #[test]
-    fn test_model_rejects_tampered_ffn_lasso_output_sumcheck() {
-        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let model_wit = build_model_witness(block_wit);
-        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
-        let lp = lasso_params();
-
-        let mut pt = Transcript::new(b"model_tamper_ffn_lasso_output_sc");
+        let mut pt = Transcript::new(b"model_tamper_ffn_a_terminal_sc");
         let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
         proof
-            .ffn_lasso_proof
-            .output_sumcheck
-            .as_mut()
-            .expect("FFN Lasso must use committed outputs")
+            .ffn_a_terminal_proof
+            .sumcheck
             .final_evals_f[0] += F::ONE;
 
-        let mut vt = Transcript::new(b"model_tamper_ffn_lasso_output_sc");
+        let mut vt = Transcript::new(b"model_tamper_ffn_a_terminal_sc");
         let result = verify(
             &proof,
             &pk.vk,
@@ -3489,36 +3481,7 @@ mod tests {
         );
         assert!(
             result.is_err(),
-            "Should reject tampered FFN Lasso committed-output sumcheck"
-        );
-    }
-
-    #[test]
-    fn test_model_rejects_missing_ffn_lasso_output_binding() {
-        let (block_wit, inst_attn, inst_ffn) = build_block_witness_and_instances();
-        let model_wit = build_model_witness(block_wit);
-        let pk = preprocess_transformer_model(build_test_weights(), T, &lasso_params());
-        let lp = lasso_params();
-
-        let mut pt = Transcript::new(b"model_missing_ffn_lasso_output_binding");
-        let mut proof = prove(&pk, &model_wit, &inst_attn, &inst_ffn, &mut pt, &lp).unwrap();
-        proof.ffn_lasso_proof.output_sumcheck = None;
-        proof.ffn_lasso_proof.output_batch_open = None;
-
-        let mut vt = Transcript::new(b"model_missing_ffn_lasso_output_binding");
-        let result = verify(
-            &proof,
-            &pk.vk,
-            &inst_attn,
-            &inst_ffn,
-            &model_wit.x_in,
-            &model_wit.lm_head_wit.y,
-            &mut vt,
-            &lp,
-        );
-        assert!(
-            result.is_err(),
-            "Should reject missing FFN Lasso committed-output binding"
+            "Should reject tampered FFN A terminal sumcheck"
         );
     }
 

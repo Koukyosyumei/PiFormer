@@ -10,18 +10,19 @@
 
 use crate::field::F;
 use crate::lookup::lasso::{
-    verify_lasso_multi_committed_outputs, LassoMultiInstance, LassoMultiVerifyingKey,
+    verify_lasso_multi_committed_outputs, verify_lasso_terminal_eval, LassoMultiInstance,
+    LassoMultiVerifyingKey,
 };
 use crate::lookup::quantization::{verify_quantization_batch, QuantizationParams};
 use crate::lookup::range::{verify_range_batched, RangeWitnessProof};
 use crate::pcs::{
-    absorb_com, hyrax_commit, hyrax_verify, hyrax_verify_batch, lagrange_basis, params_from_vars,
+    absorb_com, hyrax_commit, hyrax_verify_batch, lagrange_basis, params_from_vars,
     HyraxBatchAccumulator, HyraxCommitment, HyraxParams,
 };
 use crate::poly::utils::{combine, compute_eq_evals, mat_to_mle};
 use crate::poly::DenseMLPoly;
 use crate::subprotocols::{
-    eq_poly_eval, verify_sumcheck_cubic_multi_batched, verify_sumcheck_multi_batched,
+    eq_poly_eval, verify_sumcheck_cubic_multi_batched, verify_sumcheck_multi_batched, EvalClaim,
 };
 use crate::transcript::{challenge_vec, Transcript};
 
@@ -30,7 +31,7 @@ use crate::attention::layernorm::{
     verify_layernorms_batched, LayerNormIOCommitments, LayerNormVerifyingKey,
 };
 use crate::attention::projection::{
-    verify_projection, ProjectionIOCommitments, ProjectionProvingKey, ProjectionVerifyingKey,
+    verify_projection_gkr, ProjectionProvingKey, ProjectionVerifyingKey,
 };
 use crate::ffn::ffn::{FFNInstance, FFNProvingKey, FFNVerifyingKey};
 use ark_ec::{AffineRepr, CurveGroup};
@@ -299,6 +300,7 @@ pub fn verify(
     }
     let t_bits = t.next_power_of_two().trailing_zeros() as usize;
     let d_bits = d.next_power_of_two().trailing_zeros() as usize;
+    let v_bits = v_vocab.next_power_of_two().trailing_zeros() as usize;
     let td_num_vars = t_bits + d_bits;
     let (_, _, params_t) = params_from_vars(t_bits);
     let (_, _, params_td) = params_from_vars(td_num_vars);
@@ -331,9 +333,10 @@ pub fn verify(
     if !commitments_equal(&proof.x_in_com, &expected_x_in_com) {
         return Err("public input does not match x_in commitment".into());
     }
-    let expected_logits_com = commit_public_mat(public_logits, t, v_vocab)?;
-    if !commitments_equal(&proof.logits_com, &expected_logits_com) {
-        return Err("public output does not match logits commitment".into());
+    if public_logits.len() != t || public_logits.iter().any(|row| row.len() != v_vocab) {
+        return Err(format!(
+            "public output shape mismatch: expected {t}x{v_vocab}"
+        ));
     }
 
     let mut ln_acc_t = HyraxBatchAccumulator::new();
@@ -351,8 +354,9 @@ pub fn verify(
     let mut acc_attn_norm = HyraxBatchAccumulator::new();
     let mut acc_quant_ffn = HyraxBatchAccumulator::new();
     let mut acc_quant_m = HyraxBatchAccumulator::new();
-    // inter_acc: per-block v_attn opens (different eval point per block)
-    let inter_acc = HyraxBatchAccumulator::new();
+    // inter_acc: global intermediate opening at r_td; mu is drawn before the
+    // opening eta to match the prover's transcript schedule.
+    let mut inter_acc = HyraxBatchAccumulator::new();
 
     // =========================================================================
     // 2. Phase 1: verify range proofs (LN sumchecks/openings deferred to the
@@ -1068,13 +1072,6 @@ pub fn verify(
         absorb_com(transcript, b"m_com", &bp.ffn_m_com);
     }
     let _tffn_lasso = Instant::now();
-    if proof.ffn_lasso_proof.all_query_indices.len() != num_blocks {
-        return Err(format!(
-            "FFN Lasso query index count mismatch: got {}, expected {}",
-            proof.ffn_lasso_proof.all_query_indices.len(),
-            num_blocks
-        ));
-    }
     let ffn_lasso_instances = LassoMultiInstance {
         instances: (0..num_blocks)
             .map(|_| inst_ffn.activation_lasso.clone())
@@ -1091,23 +1088,15 @@ pub fn verify(
         instance_table_coms: ffn_instance_table_coms,
         instance_to_group: ffn_instance_to_group,
     };
-    let ffn_output_coms: Vec<(HyraxCommitment, usize)> = proof
-        .block_proofs
-        .iter()
-        .map(|bp| (bp.ffn_a_com.clone(), t_bits + f_bits))
-        .collect();
-    verify_lasso_multi_committed_outputs(
-        &proof.ffn_lasso_proof,
-        &ffn_lasso_instances,
-        &ffn_lasso_vk,
-        &ffn_output_coms,
-        transcript,
-        lasso_params,
-    )
-    .map_err(|e| format!("FFN global Lasso: {e}"))?;
+    if proof.ffn_lasso_query_indices.len() != num_blocks {
+        return Err(format!(
+            "FFN Lasso query index count mismatch: got {}, expected {}",
+            proof.ffn_lasso_query_indices.len(),
+            num_blocks
+        ));
+    }
     let ffn_index_refs: Vec<&[usize]> = proof
-        .ffn_lasso_proof
-        .all_query_indices
+        .ffn_lasso_query_indices
         .iter()
         .map(|v| v.as_slice())
         .collect();
@@ -1170,6 +1159,29 @@ pub fn verify(
         f_bits,
         transcript,
     )?;
+    let ffn_a_terminal_weights: Vec<F> = weights_ffn_y
+        .iter()
+        .zip(proof.batch_ffn_y.final_evals_g.iter())
+        .map(|(w, g)| *w * *g)
+        .collect();
+    let ffn_a_terminal_claim: F = ffn_a_terminal_weights
+        .iter()
+        .zip(proof.batch_ffn_y.final_evals_f.iter())
+        .map(|(w, f)| *w * *f)
+        .sum();
+    let ffn_a_terminal_point = combine(&r_t, &r_k_fy);
+    verify_lasso_terminal_eval(
+        &proof.ffn_a_terminal_proof,
+        &ffn_lasso_instances,
+        &ffn_lasso_vk,
+        &proof.ffn_lasso_query_indices,
+        &ffn_a_terminal_weights,
+        &ffn_a_terminal_point,
+        ffn_a_terminal_claim,
+        transcript,
+        lasso_params,
+    )
+    .map_err(|e| format!("FFN A terminal Lasso: {e}"))?;
 
     eprintln!(
         "[model] batch_ffn_y:{:>8.3}ms",
@@ -1260,39 +1272,38 @@ pub fn verify(
     // 11. LM Head
     // =========================================================================
     let _t0 = Instant::now();
-    let lm_io = ProjectionIOCommitments {
-        x_com: Some(proof.final_ln_out_com.clone()),
+    let public_logits_mle = mat_to_mle(public_logits, t, v_vocab);
+    let lm_y_point = challenge_vec(transcript, t_bits + v_bits, b"lm_gkr_y");
+    let lm_y_value = public_logits_mle.evaluate(&lm_y_point);
+    let lm_y_claim = EvalClaim {
+        point: lm_y_point,
+        value: lm_y_value,
     };
-    let (lm_y_claim, _) = verify_projection(
+    let lm_x_claim = verify_projection_gkr(
         &proof.lm_head_proof,
         &vk.lm_head_vk,
-        &lm_io,
+        &lm_y_claim,
         transcript,
         &mut lmh_acc_w,
         &mut lmh_acc_b,
-        None,
     )
     .map_err(|e| format!("LM Head: {e}"))?;
+    ln_acc_td
+        .add_verify(
+            &proof.final_ln_out_com,
+            lm_x_claim.value,
+            &lm_x_claim.point,
+            &proof.lm_head_input_open,
+        )
+        .map_err(|e| format!("LM head input opening: {e}"))?;
     eprintln!(
         "[model] lm_head:{:>8.3}ms",
         _t0.elapsed().as_secs_f64() * 1000.0
     );
 
-    let v_bits = v_vocab.next_power_of_two().trailing_zeros() as usize;
-    let (_, _, params_logits) = params_from_vars(t_bits + v_bits);
-    hyrax_verify(
-        &proof.logits_com,
-        lm_y_claim.value,
-        &lm_y_claim.point,
-        &proof.lm_head_logits_open,
-        &params_logits,
-    )
-    .map_err(|e| format!("Logits commit: {e}"))?;
-
     // =========================================================================
-    // 12. Finalize accumulators (same order as prover's mu challenge loop)
+    // 12. Draw accumulator challenges (same order as prover's mu challenge loop)
     // =========================================================================
-    let _tacc = Instant::now();
     let mu_inter = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_ln_t = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_ln_td = transcript.challenge_field::<F>(b"hyrax_group_mu");
@@ -1312,109 +1323,6 @@ pub fn verify(
     let rho_td = transcript.challenge_field_readonly::<F>(b"hyrax_fuse_td");
     let rho_range_m = transcript.challenge_field_readonly::<F>(b"hyrax_fuse_range_m");
 
-    let ((r0, r1), (r2, r3)) = rayon::join(
-        || {
-            rayon::join(
-                || {
-                    HyraxBatchAccumulator::finalize_many_with_mus(
-                        &params_td,
-                        vec![(inter_acc, mu_inter), (ln_acc_td, mu_ln_td)],
-                        rho_td,
-                    )
-                    .map_err(|e| format!("td fused acc: {e}"))
-                },
-                || {
-                    ln_acc_t
-                        .finalize_with_mu(&params_t, mu_ln_t)
-                        .map_err(|e| format!("ln_acc_t: {e}"))
-                },
-            )
-        },
-        || {
-            rayon::join(
-                || {
-                    proj_acc_w
-                        .finalize_with_mu(&params_qkvo_w, mu_proj_w)
-                        .map_err(|e| format!("proj_acc_w: {e}"))
-                },
-                || {
-                    acc_quant_ffn
-                        .finalize_with_mu(&params_mff, mu_quant_ffn)
-                        .map_err(|e| format!("acc_quant_ffn: {e}"))
-                },
-            )
-        },
-    );
-    let ((r4, r5), (r6, r7)) = rayon::join(
-        || {
-            rayon::join(
-                || {
-                    proj_acc_b
-                        .finalize_with_mu(&params_qkvo_b, mu_proj_b)
-                        .map_err(|e| format!("proj_acc_b: {e}"))
-                },
-                || {
-                    lmh_acc_w
-                        .finalize_with_mu(&params_lmh_w, mu_lmh_w)
-                        .map_err(|e| format!("lmh_acc_w: {e}"))
-                },
-            )
-        },
-        || {
-            rayon::join(
-                || {
-                    lmh_acc_b
-                        .finalize_with_mu(&params_lmh_b, mu_lmh_b)
-                        .map_err(|e| format!("lmh_acc_b: {e}"))
-                },
-                || {
-                    acc_range_sig
-                        .finalize_with_mu(&params_range_sig, mu_rng_sig)
-                        .map_err(|e| format!("acc_range_sig: {e}"))
-                },
-            )
-        },
-    );
-    let ((r8, r9), r10) = rayon::join(
-        || {
-            rayon::join(
-                || {
-                    acc_range_y
-                        .finalize_with_mu(&params_range_y, mu_rng_y)
-                        .map_err(|e| format!("acc_range_y: {e}"))
-                },
-                || {
-                    HyraxBatchAccumulator::finalize_many_with_mus(
-                        &params_range_m,
-                        vec![(acc_range_m, mu_rng_m), (acc_quant_m, mu_quant_m)],
-                        rho_range_m,
-                    )
-                    .map_err(|e| format!("range_m fused acc: {e}"))
-                },
-            )
-        },
-        || {
-            acc_attn_norm
-                .finalize_with_mu(&params_td, mu_attn_norm)
-                .map_err(|e| format!("acc_attn_norm: {e}"))
-        },
-    );
-    eprintln!(
-        "[model] acc_finalize:{:>8.3}ms",
-        _tacc.elapsed().as_secs_f64() * 1000.0
-    );
-    r0?;
-    r1?;
-    r2?;
-    r3?;
-    r4?;
-    r5?;
-    r6?;
-    r7?;
-    r8?;
-    r9?;
-    r10?;
-
     // =========================================================================
     // 13. Global batch open for 5L intermediate matrices at r_td (inter_batch_open)
     // =========================================================================
@@ -1433,19 +1341,135 @@ pub fn verify(
         all_evals.push(bp.out_attn_eval);
         all_evals.push(bp.out_ffn_eval);
     }
-    hyrax_verify_batch(
-        &all_coms,
-        &all_evals,
-        &r_td,
-        &proof.inter_batch_open,
-        &params_td,
-        transcript,
-    )
-    .map_err(|e| format!("Global inter_batch: {e}"))?;
+    inter_acc
+        .add_verify_batch(
+            &all_coms,
+            &all_evals,
+            &r_td,
+            &proof.inter_batch_open,
+            transcript,
+        )
+        .map_err(|e| format!("Global inter_batch (deferred): {e}"))?;
     eprintln!(
         "[model] inter_batch:{:>8.3}ms",
         _t0.elapsed().as_secs_f64() * 1000.0
     );
+
+    let _tacc = Instant::now();
+    let params_td_ref = &params_td;
+    let params_t_ref = &params_t;
+    let params_qkvo_w_ref = &params_qkvo_w;
+    let params_qkvo_b_ref = &params_qkvo_b;
+    let params_lmh_w_ref = &params_lmh_w;
+    let params_lmh_b_ref = &params_lmh_b;
+    let params_range_sig_ref = &params_range_sig;
+    let params_range_y_ref = &params_range_y;
+    let params_range_m_ref = &params_range_m;
+    let params_mff_ref = &params_mff;
+    let (finalize_tx, finalize_rx) = std::sync::mpsc::channel();
+    rayon::scope(|s| {
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = HyraxBatchAccumulator::finalize_many_with_mus(
+                params_td_ref,
+                vec![
+                    (inter_acc, mu_inter),
+                    (ln_acc_td, mu_ln_td),
+                    (acc_attn_norm, mu_attn_norm),
+                ],
+                rho_td,
+            )
+            .map_err(|e| format!("td fused acc: {e}"));
+            let _ = tx.send((0usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = ln_acc_t
+                .finalize_with_mu(params_t_ref, mu_ln_t)
+                .map_err(|e| format!("ln_acc_t: {e}"));
+            let _ = tx.send((1usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = proj_acc_w
+                .finalize_with_mu(params_qkvo_w_ref, mu_proj_w)
+                .map_err(|e| format!("proj_acc_w: {e}"));
+            let _ = tx.send((2usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = acc_quant_ffn
+                .finalize_with_mu(params_mff_ref, mu_quant_ffn)
+                .map_err(|e| format!("acc_quant_ffn: {e}"));
+            let _ = tx.send((3usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = proj_acc_b
+                .finalize_with_mu(params_qkvo_b_ref, mu_proj_b)
+                .map_err(|e| format!("proj_acc_b: {e}"));
+            let _ = tx.send((4usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = lmh_acc_w
+                .finalize_with_mu(params_lmh_w_ref, mu_lmh_w)
+                .map_err(|e| format!("lmh_acc_w: {e}"));
+            let _ = tx.send((5usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = lmh_acc_b
+                .finalize_with_mu(params_lmh_b_ref, mu_lmh_b)
+                .map_err(|e| format!("lmh_acc_b: {e}"));
+            let _ = tx.send((6usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = acc_range_sig
+                .finalize_with_mu(params_range_sig_ref, mu_rng_sig)
+                .map_err(|e| format!("acc_range_sig: {e}"));
+            let _ = tx.send((7usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = acc_range_y
+                .finalize_with_mu(params_range_y_ref, mu_rng_y)
+                .map_err(|e| format!("acc_range_y: {e}"));
+            let _ = tx.send((8usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = HyraxBatchAccumulator::finalize_many_with_mus(
+                params_range_m_ref,
+                vec![(acc_range_m, mu_rng_m), (acc_quant_m, mu_quant_m)],
+                rho_range_m,
+            )
+            .map_err(|e| format!("range_m fused acc: {e}"));
+            let _ = tx.send((9usize, result));
+        });
+    });
+    drop(finalize_tx);
+    let mut finalize_results: Vec<Option<Result<(), String>>> = vec![None; 10];
+    for (idx, result) in finalize_rx {
+        finalize_results[idx] = Some(result);
+    }
+    eprintln!(
+        "[model] acc_finalize:{:>8.3}ms",
+        _tacc.elapsed().as_secs_f64() * 1000.0
+    );
+    for result in finalize_results {
+        result.expect("missing accumulator finalize result")?;
+    }
 
     // =========================================================================
     // 14. 13 cross-block weight/activation batch opens
@@ -1573,23 +1597,6 @@ pub fn verify(
             transcript,
         )
         .map_err(|e| format!("w2_batch: {e}"))?;
-
-    // A at combine(r_t, r_k_fy)
-    let ffn_a_point = combine(&r_t, &r_k_fy);
-    let ffn_a_coms: Vec<HyraxCommitment> = proof
-        .block_proofs
-        .iter()
-        .map(|bp| bp.ffn_a_com.clone())
-        .collect();
-    acc_cb_mff
-        .add_verify_batch(
-            &ffn_a_coms,
-            &proof.batch_ffn_y.final_evals_f,
-            &ffn_a_point,
-            &proof.ffn_a_batch_open,
-            transcript,
-        )
-        .map_err(|e| format!("ffn_a_batch: {e}"))?;
 
     // w1 at combine(r_k_m, ry_m)
     let w1_point = combine(&r_k_m, &ry_m);

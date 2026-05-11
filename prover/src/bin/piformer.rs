@@ -408,8 +408,7 @@ fn run_inspect(path: &Path) -> io::Result<()> {
                     .sum::<usize>()
             );
             let ffn_queries: usize = proof
-                .ffn_lasso_proof
-                .all_query_indices
+                .ffn_lasso_query_indices
                 .iter()
                 .map(|indices| indices.len())
                 .sum();

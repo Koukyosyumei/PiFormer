@@ -790,6 +790,19 @@ pub struct LassoMultiProof {
     pub l_k_evals_multi: Vec<Vec<F>>,
 }
 
+#[derive(Clone)]
+pub struct LassoTerminalEvalProof {
+    pub sumcheck: SumcheckProofMulti,
+    pub table_openings: Vec<Vec<F>>,
+    pub hyrax_proof: HyraxProof,
+    pub l_k_evals_multi: Vec<Vec<F>>,
+}
+
+fn eq_evals_msb(r: &[F], n: usize) -> Vec<F> {
+    let r_rev: Vec<F> = r.iter().rev().copied().collect();
+    crate::poly::utils::compute_eq_evals(&r_rev, n)
+}
+
 pub fn prove_lasso_multi(
     multi_instance: &LassoMultiInstance,
     // One slice of query_indices per instance (private witness, same order as multi_instance.instances).
@@ -1043,6 +1056,115 @@ pub fn prove_lasso_multi(
     }
 }
 
+pub fn prove_lasso_terminal_eval(
+    multi_instance: &LassoMultiInstance,
+    all_query_indices: &[Vec<usize>],
+    weights: &[F],
+    point: &[F],
+    claim: F,
+    pk: &LassoMultiProvingKey,
+    transcript: &mut Transcript,
+    _params: &HyraxParams,
+) -> Result<LassoTerminalEvalProof, String> {
+    let t_count = multi_instance.instances.len();
+    if all_query_indices.len() != t_count {
+        return Err(format!(
+            "terminal Lasso query index count mismatch: got {}, expected {t_count}",
+            all_query_indices.len()
+        ));
+    }
+    if weights.len() != t_count {
+        return Err(format!(
+            "terminal Lasso weight count mismatch: got {}, expected {t_count}",
+            weights.len()
+        ));
+    }
+    if t_count == 0 {
+        return Err("terminal Lasso needs at least one instance".into());
+    }
+    let m = multi_instance.instances[0].bits_per_chunk;
+    let n = all_query_indices[0].len();
+    let eq_at_point = eq_evals_msb(point, n);
+
+    let mut all_t_polys = Vec::new();
+    let mut all_l_polys = Vec::new();
+    let mut flatten_tables = Vec::new();
+    for (t, instance) in multi_instance.instances.iter().enumerate() {
+        if instance.bits_per_chunk != m {
+            return Err("terminal Lasso instances must share bits_per_chunk".into());
+        }
+        if all_query_indices[t].len() != n {
+            return Err(format!(
+                "terminal Lasso query index length mismatch at instance {t}"
+            ));
+        }
+        validate_query_indices_bound(&all_query_indices[t], instance.tables.len(), m)
+            .map_err(|e| format!("terminal Lasso query index out of range at instance {t}: {e}"))?;
+        let size = 1usize << m;
+        let mask = size - 1;
+        for (k, table_evals) in instance.tables.iter().enumerate() {
+            let mut l_hist = vec![F::ZERO; size];
+            for (j, &eq_j) in eq_at_point.iter().take(n).enumerate() {
+                let ch = chunk(all_query_indices[t][j], k, m, mask);
+                l_hist[ch] += weights[t] * eq_j;
+            }
+            all_t_polys.push(DenseMLPoly::new(table_evals.clone()));
+            all_l_polys.push(DenseMLPoly::new(l_hist));
+            flatten_tables.push(table_evals);
+        }
+    }
+
+    for inst_coms in &pk.instance_table_coms {
+        for com in inst_coms {
+            absorb_com(transcript, b"lasso_terminal_com", com);
+        }
+    }
+
+    let sc_weights = vec![F::ONE; all_t_polys.len()];
+    let (sumcheck, r_vec) =
+        prove_sumcheck_multi_batched(&all_t_polys, &all_l_polys, &sc_weights, claim, transcript);
+
+    let mut table_openings = Vec::with_capacity(t_count);
+    let mut l_k_evals_multi = Vec::with_capacity(t_count);
+    let mut flat_idx = 0usize;
+    for instance in &multi_instance.instances {
+        let mut inst_openings = Vec::with_capacity(instance.tables.len());
+        let mut inst_l_evals = Vec::with_capacity(instance.tables.len());
+        for _ in 0..instance.tables.len() {
+            inst_openings.push(all_t_polys[flat_idx].evaluate(&r_vec));
+            inst_l_evals.push(all_l_polys[flat_idx].evaluate(&r_vec));
+            flat_idx += 1;
+        }
+        table_openings.push(inst_openings);
+        l_k_evals_multi.push(inst_l_evals);
+    }
+
+    let unique_flatten_tables: Vec<&[F]> = {
+        let mut seen: Vec<bool> = vec![false; pk.instance_table_coms.len()];
+        let mut out: Vec<&[F]> = Vec::new();
+        let mut idx = 0usize;
+        for (t, instance) in multi_instance.instances.iter().enumerate() {
+            let g = pk.instance_to_group[t];
+            for _ in 0..instance.tables.len() {
+                if !seen[g] {
+                    out.push(flatten_tables[idx]);
+                }
+                idx += 1;
+            }
+            seen[g] = true;
+        }
+        out
+    };
+    let hyrax_proof = hyrax_open_batch(&unique_flatten_tables, &r_vec, pk.nu, m - pk.nu, transcript);
+
+    Ok(LassoTerminalEvalProof {
+        sumcheck,
+        table_openings,
+        hyrax_proof,
+        l_k_evals_multi,
+    })
+}
+
 pub fn verify_lasso_multi(
     proof: &LassoMultiProof,
     multi_instance: &LassoMultiInstance,
@@ -1067,6 +1189,143 @@ pub fn verify_lasso_multi(
         transcript,
         params,
     )
+}
+
+pub fn verify_lasso_terminal_eval(
+    proof: &LassoTerminalEvalProof,
+    multi_instance: &LassoMultiInstance,
+    vk: &LassoMultiVerifyingKey,
+    all_query_indices: &[Vec<usize>],
+    weights: &[F],
+    point: &[F],
+    claim: F,
+    transcript: &mut Transcript,
+    params: &HyraxParams,
+) -> Result<(), String> {
+    let t_count = multi_instance.instances.len();
+    if t_count == 0 {
+        return Err("terminal Lasso needs at least one instance".into());
+    }
+    if all_query_indices.len() != t_count {
+        return Err(format!(
+            "terminal Lasso query index count mismatch: got {}, expected {t_count}",
+            all_query_indices.len()
+        ));
+    }
+    if weights.len() != t_count {
+        return Err(format!(
+            "terminal Lasso weight count mismatch: got {}, expected {t_count}",
+            weights.len()
+        ));
+    }
+    let m = multi_instance.instances[0].bits_per_chunk;
+    let n = all_query_indices[0].len();
+
+    for inst_coms in &vk.instance_table_coms {
+        for com in inst_coms {
+            absorb_com(transcript, b"lasso_terminal_com", com);
+        }
+    }
+
+    let total_tables: usize = multi_instance
+        .instances
+        .iter()
+        .map(|i| i.tables.len())
+        .sum();
+    let sc_weights = vec![F::ONE; total_tables];
+    let (r_vec, sumcheck_final_val) = verify_sumcheck_multi_batched(
+        &proof.sumcheck,
+        &sc_weights,
+        claim,
+        m,
+        transcript,
+    )
+    .map_err(|e| format!("terminal Lasso sumcheck: {e}"))?;
+
+    if proof.table_openings.len() != t_count || proof.l_k_evals_multi.len() != t_count {
+        return Err("terminal Lasso proof instance count mismatch".into());
+    }
+    let eq_at_point = eq_evals_msb(point, n);
+    let mut expected_final_eval = F::ZERO;
+    let mut table_idx = 0usize;
+    for (t, instance) in multi_instance.instances.iter().enumerate() {
+        if instance.bits_per_chunk != m {
+            return Err("terminal Lasso instances must share bits_per_chunk".into());
+        }
+        if all_query_indices[t].len() != n {
+            return Err(format!(
+                "terminal Lasso query index length mismatch at instance {t}"
+            ));
+        }
+        validate_query_indices_bound(&all_query_indices[t], instance.tables.len(), m)
+            .map_err(|e| format!("terminal Lasso query index out of range at instance {t}: {e}"))?;
+        if proof.table_openings[t].len() != instance.tables.len()
+            || proof.l_k_evals_multi[t].len() != instance.tables.len()
+        {
+            return Err(format!("terminal Lasso table count mismatch at instance {t}"));
+        }
+        let size = 1usize << m;
+        let mask = size - 1;
+        for k in 0..instance.tables.len() {
+            let mut l_hist = vec![F::ZERO; size];
+            for (j, &eq_j) in eq_at_point.iter().take(n).enumerate() {
+                let ch = chunk(all_query_indices[t][j], k, m, mask);
+                l_hist[ch] += weights[t] * eq_j;
+            }
+            let expected_l_at_r = DenseMLPoly::new(l_hist).evaluate(&r_vec);
+            if proof.l_k_evals_multi[t][k] != expected_l_at_r {
+                return Err(format!(
+                    "terminal Lasso selector mismatch at instance {t}, table {k}"
+                ));
+            }
+            if proof.table_openings[t][k] != proof.sumcheck.final_evals_f[table_idx] {
+                return Err(format!("terminal Lasso table opening mismatch at index {table_idx}"));
+            }
+            if proof.l_k_evals_multi[t][k] != proof.sumcheck.final_evals_g[table_idx] {
+                return Err(format!("terminal Lasso selector eval mismatch at index {table_idx}"));
+            }
+            expected_final_eval += proof.table_openings[t][k] * proof.l_k_evals_multi[t][k];
+            table_idx += 1;
+        }
+    }
+    if expected_final_eval != sumcheck_final_val {
+        return Err("terminal Lasso final value mismatch".into());
+    }
+
+    let mut group_representative: Vec<Option<usize>> = vec![None; vk.instance_table_coms.len()];
+    let mut flatten_commitments: Vec<HyraxCommitment> = Vec::new();
+    let mut flatten_openings: Vec<F> = Vec::new();
+    for (t, inst_coms) in vk.instance_table_coms.iter().enumerate() {
+        let g = vk.instance_to_group[t];
+        match group_representative[g] {
+            None => {
+                group_representative[g] = Some(t);
+                for (k, com) in inst_coms.iter().enumerate() {
+                    flatten_commitments.push(com.clone());
+                    flatten_openings.push(proof.table_openings[t][k]);
+                }
+            }
+            Some(rep_t) => {
+                for (k, &v) in proof.table_openings[t].iter().enumerate() {
+                    if v != proof.table_openings[rep_t][k] {
+                        return Err(format!(
+                            "terminal Lasso group consistency: instance {t} table {k} differs from representative {rep_t}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    hyrax_verify_batch(
+        &flatten_commitments,
+        &flatten_openings,
+        &r_vec,
+        &proof.hyrax_proof,
+        params,
+        transcript,
+    )
+    .map_err(|e| format!("terminal Lasso table opening: {e}"))
 }
 
 pub fn verify_lasso_multi_from_proof_outputs(

@@ -29,6 +29,11 @@ Oleg Fomenko and Anton Levochko.
 \newblock Understanding lasso: A novel lookup argument protocol.
 \newblock {\em Cryptology ePrint Archive}, 2025.
 
+\bibitem{habo2024logup}
+Ulrich Haböck.
+\newblock Improving logarithmic derivative lookups using gkr.
+\newblock {\em Cryptology ePrint Archive}, 2022.
+
 \bibitem{katharopoulos2020transformers}
 Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and Fran{\c{c}}ois
   Fleuret.
@@ -36,6 +41,11 @@ Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and Fran{\c{c}}ois
   attention.
 \newblock In {\em International conference on machine learning}, pages
   5156--5165. PMLR, 2020.
+
+\bibitem{kitaev2020reformer}
+Nikita Kitaev, {\L}ukasz Kaiser, and Anselm Levskaya.
+\newblock Reformer: The efficient transformer.
+\newblock {\em arXiv preprint arXiv:2001.04451}, 2020.
 
 \bibitem{kothapalli2022nova}
 Abhiram Kothapalli, Srinath Setty, and Ioanna Tzialla.
