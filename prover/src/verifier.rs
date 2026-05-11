@@ -1356,102 +1356,120 @@ pub fn verify(
     );
 
     let _tacc = Instant::now();
-    let ((r0, r1), (r2, r3)) = rayon::join(
-        || {
-            rayon::join(
-                || {
-                    HyraxBatchAccumulator::finalize_many_with_mus(
-                        &params_td,
-                        vec![
-                            (inter_acc, mu_inter),
-                            (ln_acc_td, mu_ln_td),
-                            (acc_attn_norm, mu_attn_norm),
-                        ],
-                        rho_td,
-                    )
-                    .map_err(|e| format!("td fused acc: {e}"))
-                },
-                || {
-                    ln_acc_t
-                        .finalize_with_mu(&params_t, mu_ln_t)
-                        .map_err(|e| format!("ln_acc_t: {e}"))
-                },
+    let params_td_ref = &params_td;
+    let params_t_ref = &params_t;
+    let params_qkvo_w_ref = &params_qkvo_w;
+    let params_qkvo_b_ref = &params_qkvo_b;
+    let params_lmh_w_ref = &params_lmh_w;
+    let params_lmh_b_ref = &params_lmh_b;
+    let params_range_sig_ref = &params_range_sig;
+    let params_range_y_ref = &params_range_y;
+    let params_range_m_ref = &params_range_m;
+    let params_mff_ref = &params_mff;
+    let (finalize_tx, finalize_rx) = std::sync::mpsc::channel();
+    rayon::scope(|s| {
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = HyraxBatchAccumulator::finalize_many_with_mus(
+                params_td_ref,
+                vec![
+                    (inter_acc, mu_inter),
+                    (ln_acc_td, mu_ln_td),
+                    (acc_attn_norm, mu_attn_norm),
+                ],
+                rho_td,
             )
-        },
-        || {
-            rayon::join(
-                || {
-                    proj_acc_w
-                        .finalize_with_mu(&params_qkvo_w, mu_proj_w)
-                        .map_err(|e| format!("proj_acc_w: {e}"))
-                },
-                || {
-                    acc_quant_ffn
-                        .finalize_with_mu(&params_mff, mu_quant_ffn)
-                        .map_err(|e| format!("acc_quant_ffn: {e}"))
-                },
-            )
-        },
-    );
-    let ((r4, r5), (r6, r7)) = rayon::join(
-        || {
-            rayon::join(
-                || {
-                    proj_acc_b
-                        .finalize_with_mu(&params_qkvo_b, mu_proj_b)
-                        .map_err(|e| format!("proj_acc_b: {e}"))
-                },
-                || {
-                    lmh_acc_w
-                        .finalize_with_mu(&params_lmh_w, mu_lmh_w)
-                        .map_err(|e| format!("lmh_acc_w: {e}"))
-                },
-            )
-        },
-        || {
-            rayon::join(
-                || {
-                    lmh_acc_b
-                        .finalize_with_mu(&params_lmh_b, mu_lmh_b)
-                        .map_err(|e| format!("lmh_acc_b: {e}"))
-                },
-                || {
-                    acc_range_sig
-                        .finalize_with_mu(&params_range_sig, mu_rng_sig)
-                        .map_err(|e| format!("acc_range_sig: {e}"))
-                },
-            )
-        },
-    );
-    let (r8, r9) = rayon::join(
-        || {
-            acc_range_y
-                .finalize_with_mu(&params_range_y, mu_rng_y)
-                .map_err(|e| format!("acc_range_y: {e}"))
-        },
-        || {
-            HyraxBatchAccumulator::finalize_many_with_mus(
-                &params_range_m,
+            .map_err(|e| format!("td fused acc: {e}"));
+            let _ = tx.send((0usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = ln_acc_t
+                .finalize_with_mu(params_t_ref, mu_ln_t)
+                .map_err(|e| format!("ln_acc_t: {e}"));
+            let _ = tx.send((1usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = proj_acc_w
+                .finalize_with_mu(params_qkvo_w_ref, mu_proj_w)
+                .map_err(|e| format!("proj_acc_w: {e}"));
+            let _ = tx.send((2usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = acc_quant_ffn
+                .finalize_with_mu(params_mff_ref, mu_quant_ffn)
+                .map_err(|e| format!("acc_quant_ffn: {e}"));
+            let _ = tx.send((3usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = proj_acc_b
+                .finalize_with_mu(params_qkvo_b_ref, mu_proj_b)
+                .map_err(|e| format!("proj_acc_b: {e}"));
+            let _ = tx.send((4usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = lmh_acc_w
+                .finalize_with_mu(params_lmh_w_ref, mu_lmh_w)
+                .map_err(|e| format!("lmh_acc_w: {e}"));
+            let _ = tx.send((5usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = lmh_acc_b
+                .finalize_with_mu(params_lmh_b_ref, mu_lmh_b)
+                .map_err(|e| format!("lmh_acc_b: {e}"));
+            let _ = tx.send((6usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = acc_range_sig
+                .finalize_with_mu(params_range_sig_ref, mu_rng_sig)
+                .map_err(|e| format!("acc_range_sig: {e}"));
+            let _ = tx.send((7usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = acc_range_y
+                .finalize_with_mu(params_range_y_ref, mu_rng_y)
+                .map_err(|e| format!("acc_range_y: {e}"));
+            let _ = tx.send((8usize, result));
+        });
+
+        let tx = finalize_tx.clone();
+        s.spawn(move |_| {
+            let result = HyraxBatchAccumulator::finalize_many_with_mus(
+                params_range_m_ref,
                 vec![(acc_range_m, mu_rng_m), (acc_quant_m, mu_quant_m)],
                 rho_range_m,
             )
-            .map_err(|e| format!("range_m fused acc: {e}"))
-        },
-    );
+            .map_err(|e| format!("range_m fused acc: {e}"));
+            let _ = tx.send((9usize, result));
+        });
+    });
+    drop(finalize_tx);
+    let mut finalize_results: Vec<Option<Result<(), String>>> = vec![None; 10];
+    for (idx, result) in finalize_rx {
+        finalize_results[idx] = Some(result);
+    }
     eprintln!(
         "[model] acc_finalize:{:>8.3}ms",
         _tacc.elapsed().as_secs_f64() * 1000.0
     );
-    r0?;
-    r1?;
-    r2?;
-    r3?;
-    r4?;
-    r5?;
-    r6?;
-    r7?;
-    r8?;
-    r9?;
+    for result in finalize_results {
+        result.expect("missing accumulator finalize result")?;
+    }
 
     // =========================================================================
     // 14. 13 cross-block weight/activation batch opens
