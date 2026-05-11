@@ -413,208 +413,156 @@ destabilises downstream LayerNorms. Both share one LN sub-protocol
 (\S\ref{ssec:ln}); their only cost is extra LN witnesses, folded into
 the model-level batched LN proof and the bucketed range batch.
 
-\subsection{Learnable Lookup Attention (LLA)}
+\subsection{Learnable Lookup Attention}
 \label{ssec:LLA}
 
-Standard softmax attention requires $T^2$ exponentials and $T$ row-wise
-divisions. We replace the kernel with a positive-definite inner product
-$\kappa(\bq,\bk)=\langle\bphi(\bq),\bphi(\bk)\rangle$ on the post-QK-norm
-tensors $\bQ^{\mathrm{n}},\bK^{\mathrm{n}}$, where
-$\bphi:\RR^{d_h}\!\to\!\RR^{d_h}$ is applied element-wise and realised as a
-structured lookup (\S\ref{ssec:phi}). The block computes the un-normalised
-numerator $\bN$ and the per-row denominator $Z$ as
-\begin{equation}
-  \bN_{tj} = \bphi(\bq_t^{\mathrm{n}})^{\!\top}\!\bigl({\textstyle\sum_s}\bphi(\bk_s^{\mathrm{n}})\bv_s^{\!\top}\bigr)_j,\;\;
-  Z_t = \bphi(\bq_t^{\mathrm{n}})^{\!\top}\!{\textstyle\sum_s}\bphi(\bk_s^{\mathrm{n}}).
-\end{equation}
-The context matrix $\bM=\sum_s\bphi(\bk_s^{\mathrm{n}})\bv_s^{\!\top}\!\in\!\FF^{d_h\times d_h}$
-depends only on the keys/values and is computed once: per-token output
-cost is $O(d_h^2)$ and the per-block prover cost becomes $O(T d_h^2)$
-instead of $O(T^2 d_h)$~\cite{katharopoulos2020transformers}.
+Softmax attention requires $T^2$ exponentials and $T$ row-wise
+divisions. We replace the kernel with a positive-definite inner
+product $\kappa(\bq,\bk)\!=\!\langle\bphi(\bq),\bphi(\bk)\rangle$ on
+the post-QK-norm tensors, where $\bphi\!:\!\RR^{d_h}\!\to\!\RR^{d_h}$
+is an element-wise structured lookup (\S\ref{ssec:phi}). The block
+computes the numerator
+$\bN_{tj}\!=\!\bphi(\bq_t^{\mathrm{n}})^\top\!(\sum_s\bphi(\bk_s^{\mathrm{n}})\bv_s^\top)_j$
+and the per-row denominator
+$Z_t\!=\!\bphi(\bq_t^{\mathrm{n}})^\top\!\sum_s\bphi(\bk_s^{\mathrm{n}})$.
+The context matrix
+$\bM\!=\!\sum_s\bphi(\bk_s^{\mathrm{n}})\bv_s^\top\!\in\!\FF^{d_h\times d_h}$
+is computed once per block, giving $O(T d_h^2)$ prover cost instead of
+$O(T^2 d_h)$~\cite{katharopoulos2020transformers}.
 
 \paragraph{Floor-division proof for row normalisation.}
-Unlike the previous prototype, \sys{} now proves the row normalisation
-$\bY^{\mathrm{att}}_{tj}=\lfloor S\!\cdot\!\bN_{tj}/Z_t\rfloor$ end-to-end.
-The witness includes auxiliary tensors $\bN,\bY^{\mathrm{att}},Z,\mathrm{rem},\mathrm{diff}$
-where $\mathrm{rem}_{tj}=S\bN_{tj}-Z_t\bY^{\mathrm{att}}_{tj}$ and
-$\mathrm{diff}_{tj}=Z_t-1-\mathrm{rem}_{tj}$, all committed via Hyrax. At a
-single random point $r_{\mathrm{norm}}\!\in\!\FF^{t_{\mathrm{bits}}+d_{\mathrm{bits}}}$
-the prover runs one cubic multi-batched sumcheck enforcing
-\begin{align}
-  S\!\cdot\!\bN \;-\; \mathrm{rem} \;-\; Z\!\cdot\!\bY^{\mathrm{att}} &\;=\; 0, \\
-  \lambda\bigl(\,Z \;-\; 1 \;-\; \mathrm{rem} \;-\; \mathrm{diff}\,\bigr) &\;=\; 0,
-\end{align}
-merged into one cubic claim by the Fiat--Shamir scalar $\lambda$. Range
-proofs on $\mathrm{rem},\mathrm{diff}$ (added to the 64-bit width bucket of
-\S\ref{ssec:range}) prove $\mathrm{rem},\mathrm{diff}\!\geq\!0$, which
-combined with the second identity gives $0\!\leq\!\mathrm{rem}\!<\!Z$~--- the
-floor-division witness. A second sumcheck binds $Z_t$ to
-$\bphi(\bq_t^{\mathrm{n}})\!\cdot\!\sum_s\bphi(\bk_s^{\mathrm{n}})$ via the
-already-committed $\bphi(\bQ^{\mathrm{n}}),\bphi(\bK^{\mathrm{n}})$ MLEs; a
-causal variant binds $Z$ to the prefix sum.
+\sys{} proves $\bY^{\mathrm{att}}_{tj}\!=\!\lfloor S\bN_{tj}/Z_t\rfloor$
+in-circuit. The witness includes auxiliary tensors $\mathrm{rem}$ and
+$\mathrm{diff}$ with $\mathrm{rem}_{tj}\!=\!S\bN_{tj}\!-\!Z_t\bY^{\mathrm{att}}_{tj}$
+and $\mathrm{diff}_{tj}\!=\!Z_t\!-\!1\!-\!\mathrm{rem}_{tj}$, all
+committed via Hyrax. At a random
+$r_{\mathrm{norm}}\!\in\!\FF^{t_{\mathrm{bits}}+d_{\mathrm{bits}}}$ one
+cubic multi-batched sumcheck merges
+$S\bN-\mathrm{rem}-Z\bY^{\mathrm{att}}=0$ and
+$\lambda(Z-1-\mathrm{rem}-\mathrm{diff})=0$ under a Fiat--Shamir
+scalar $\lambda$. Range proofs on $\mathrm{rem},\mathrm{diff}$ (in the
+64-bit bucket of \S\ref{ssec:range}) enforce both to be non-negative,
+which combined with the second identity gives
+$0\!\le\!\mathrm{rem}\!<\!Z$~--- the unique floor-division witness. A
+second sumcheck binds $Z_t$ to the committed
+$\bphi(\bQ^{\mathrm n}),\bphi(\bK^{\mathrm n})$; a causal variant
+binds $Z$ to a prefix sum.
 
-\paragraph{Lookup binding to post-QK-norm tensors.}
-The Lasso queries for $\bphi$ are evaluated on the post-QK-norm tensors,
-not on the pre-norm $\bQ,\bK$. The prover commits both
-$C_{\bQ},C_{\bK}$ (used by the QKV projection sumcheck) \emph{and}
-$C_{\bQ^{\mathrm{n}}},C_{\bK^{\mathrm{n}}}$ (used as the $\bphi$ inputs);
-the model-level $\bphi(\bQ),\bphi(\bK)$ Lasso binds its query indices to
-$C_{\bQ^{\mathrm{n}}},C_{\bK^{\mathrm{n}}}$ via one shared Hyrax batch open,
-and the QKV cross-block sumcheck binds $C_{\bQ},C_{\bK}$ separately. The
-LayerNorm sub-proof for $\LN_Q$/$\LN_K$ (folded into the model-level
-batched LN proof) ties the two together.
+\paragraph{Binding lookups to post-norm tensors.}
+The Lasso queries for $\bphi$ are evaluated on $\bQ^{\mathrm n},\bK^{\mathrm n}$,
+not the pre-norm $\bQ,\bK$. The prover commits both
+$C_{\bQ},C_{\bK}$ (used by the QKV sumcheck) and
+$C_{\bQ^{\mathrm n}},C_{\bK^{\mathrm n}}$ (used as $\bphi$ inputs); the
+global $\bphi$ Lasso binds its query indices to the post-norm commitments
+via one shared Hyrax batch open, and the LN sub-proof for $\LN_Q,\LN_K$
+ties pre- and post-norm together.
 
 \subsection{Additive sub-table feature map}
 \label{ssec:phi}
 
-Rather than committing to a fixed kernel, \sys{} parametrises
-$\bphi$ as a sum of \emph{learnable} sub-table lookups. Let $\bits$
-be the input bit-width and $\chunks\!\mid\!\bits$ the decomposition
-depth, $\chunkbits\!=\!\bits/\chunks$ bits per chunk. For scalar $x$,
-define the integer index
-$x_{\mathrm{int}}=\mathrm{clamp}(\lfloor x/s\rfloor,0,2^\bits-1)$ and
-chunk extractor
-$\chi_i(x_{\mathrm{int}})=(x_{\mathrm{int}}\!\gg\!i\chunkbits)\,\&\,(2^{\chunkbits}\!-\!1)$.
+Rather than fix a kernel, \sys{} parametrises $\bphi$ as a sum of
+learnable sub-table lookups. With input bit-width $\bits$, decomposition
+depth $\chunks\!\mid\!\bits$, and chunk width
+$\chunkbits\!=\!\bits/\chunks$, define the integer index
+$x_{\mathrm{int}}\!=\!\mathrm{clamp}(\lfloor x/s\rfloor,0,2^{\bits}\!-\!1)$
+and chunk extractor
+$\chi_i(x_{\mathrm{int}})\!=\!(x_{\mathrm{int}}\!\gg\!i\chunkbits)\,\&\,(2^{\chunkbits}\!-\!1)$.
 Then
 \begin{equation}
   \bphi(x) \;=\; \sum_{i=0}^{\chunks-1} T_i\bigl[\chi_i(x_{\mathrm{int}})\bigr],
   \label{eq:phi}
 \end{equation}
 where $T_0,\dots,T_{\chunks-1}\!\in\!\RR^{2^{\chunkbits}}$ are
-learnable sub-tables, initialised so $\sum_i T_i\!\approx\!\GELU$ and
-trained end-to-end with the straight-through
-estimator~\cite{bengio2013estimating}. For $\bits\!=\!16,\chunks\!=\!2$ this
-replaces a $65{,}536$-entry monolithic table with two $256$-entry
-tables: \emph{exactly} the Lasso structured condition.
-
-The crucial property exploited by \sys{} is that, under
-Lasso (\S\ref{ssec:lasso}), the cost of proving a batch of lookups
-against $T_i$ depends only on the size of $T_i$ and on the number of
-queries; it does not depend on the values of $T_i$. The model can
-therefore train the entries of every $T_i$ from scratch without
-incurring any additional proving cost. We implement
-\texttt{StructuredLookupActivation} on the Python side with a
-sub-table forward pass and an STE backward pass; the integer indices
-emitted by the Python forward are bit-identical to those proven on
-the Rust side.
+learnable sub-tables. They are initialised so $\sum_i T_i\!\approx\!\GELU$
+and trained end-to-end via the straight-through
+estimator~\cite{bengio2013estimating}. For $\bits\!=\!16,\chunks\!=\!2$
+this replaces a $65{,}536$-entry monolithic table with two $256$-entry
+sub-tables, matching Lasso's structured-decomposability condition
+(\S\ref{ssec:lasso}). Because Lasso prover cost is independent of table
+values, training the entries of every $T_i$ end-to-end imposes zero
+proving-cost penalty.
 
 \subsection{Ternary projections}
 \label{ssec:ternary}
-All projection matrices $\bW_Q,\bW_K,\bW_V,\bW_O,\bW_1,\bW_2$ and the
-LM head are constrained to entries in $\calT=\{-1,0,+1\}$ scaled by
-a single learnable scalar $\alpha\!\in\!\FF$ per layer, following
-BitNet b1.58~\cite{ma2025bitnet}. The forward pass is
-$\by=\alpha(\bx\bW)+\bb$ with $\bW\!\in\!\calT^{m\times n}$. Training
-uses the magnitude-thresholded mapping
-$w\!\mapsto\!\mathrm{sign}(w)\!\cdot\![|w|\!>\!0.7\overline{|w|}]$ with
-STE; the scalar $\alpha$ is multiplied in \emph{after} the matrix
-product so the in-circuit weight stays ternary.
+Following BitNet b1.58~\cite{ma2025bitnet}, every projection matrix
+($\bW_Q,\bW_K,\bW_V,\bW_O,\bW_1,\bW_2$, and the LM head) is constrained
+to entries in $\calT=\{-1,0,+1\}$ scaled by a learnable per-layer
+scalar $\alpha\!\in\!\FF$, so the forward pass is
+$\by\!=\!\alpha(\bx\bW)+\bb$ with $\bW\!\in\!\calT^{m\times n}$.
+Training uses the magnitude-thresholded
+$w\!\mapsto\!\mathrm{sign}(w)\!\cdot\![|w|\!>\!0.7\overline{|w|}]$ map
+with the straight-through estimator; $\alpha$ is multiplied in after
+the matrix product so the in-circuit weight stays ternary.
 
-In the SNARK, a degree-2 sumcheck for a ternary contraction
-\[
-  \bY(r_t,r_d)-\bb(r_d)=\alpha\!\sum_k\bX(r_t,k)\bW(k,r_d)
-\]
-materialises only the cheap vector $\alpha\!\cdot\!\bW(\cdot,r_d)$,
-never a field weight matrix; the prover folds the equality polynomial
-against ternary entries with $+\!=$/$-\!=$/skip rather than field
-multiplications. The Rust prover represents weights as
-\texttt{Vec<Vec<TernaryValue>>} with
-\texttt{TernaryValue}$\,\in\,$\texttt{\{ONE, ZERO, MINUSONE\}} and
-folds via a specialised \texttt{eval\_cols\_ternary} helper. A
-self-contained Lasso check
-(\texttt{attention/ternary\_check.rs}) over the 4-element table
-$[0,1,r-1,0]$ enforces ternarity by an integer encoding
-$\mathsf{enc}(w)\!\in\!\{0,1,2\}$; this module is currently a
-stand-alone protocol and is a candidate to fold into setup-time
-preprocessing so the verifying key carries a binding proof that
-$\bW\!\in\!\calT^{m\times n}$.
+In the SNARK, the contraction $\bY(r_t,r_d)\!-\!\bb(r_d)\!=\!\alpha\sum_k\bX(r_t,k)\bW(k,r_d)$
+is a degree-2 sumcheck that materialises only the cheap vector
+$\alpha\!\cdot\!\bW(\cdot,r_d)$. The prover folds the equality polynomial
+against ternary entries with $+\!=$/$-\!=$/skip; no field multiplication
+appears in the contraction.
 
 \subsection{Constraint-fused LayerNorm}
 \label{ssec:ln}
 Let $\bx\!\in\!\ZZ^d$ be a row,
 $\mathrm{sum\_x}\!=\!\sum_j x_j$,
-$\mathrm{sq\_sum\_x}\!=\!\sum_j x_j^2$,
-$\mathrm{sum\_x\_sq}\!=\!\mathrm{sum\_x}^2$, and
-$\sigma\mathrm{\_sq\_scaled}\!=\!(d\sigma)^2$ four auxiliary witness
-fields with $\sigma\!=\!\lfloor\sqrt{\mathrm{var\_x}}/d\rfloor$. The integer
-variance is recovered from
-$\mathrm{var\_x}\!=\!d\bigl(d\,\mathrm{sq\_sum\_x}-\mathrm{sum\_x\_sq}\bigr)$,
-which expands $\sum_j(d x_j\!-\!\mathrm{sum\_x})^2$ without ever taking
-$\mathrm{sum\_x}^2$ outside the sumcheck. \sys{} proves the entire LayerNorm
-in five sub-protocols with no field divisions and no square roots:
-
+$\mathrm{sq\_sum\_x}\!=\!\sum_j x_j^2$, and
+$\sigma\!=\!\lfloor\sqrt{\mathrm{var\_x}}/d\rfloor$. The integer variance
+is $\mathrm{var\_x}\!=\!d(d\,\mathrm{sq\_sum\_x}-\mathrm{sum\_x}^2)$,
+which expands $\sum_j(d x_j-\mathrm{sum\_x})^2$ without taking
+$\mathrm{sum\_x}^2$ outside the sumcheck. \sys{} proves a LayerNorm
+without divisions or square roots in five sub-protocols:
 \begin{enumerate}
-  \item \textbf{Mean (degree-2).} Sumcheck for
-        $\widetilde{\mathrm{sum\_x}}(r_t)\!=\!\sum_j x_{\mathrm{col}}(j)$
-        where $x_{\mathrm{col}}\!=\!\widetilde\bx.\mathrm{fix\_row}(r_t)$.
-  \item \textbf{Square-sum (cubic).} Sumcheck for
+  \item \textbf{Mean} (degree-2 sumcheck for $\widetilde{\mathrm{sum\_x}}$).
+  \item \textbf{Square-sum} (cubic sumcheck for
         $\widetilde{\mathrm{sq\_sum\_x}}(r_t)\!=\!\sum_j x_{\mathrm{col}}(j)^3$
-        via three copies of $x_{\mathrm{col}}$ (the third factor folds
-        $1\!=\!x/x$ so the round polynomial stays multilinear in degree
-        three).
-  \item \textbf{Sigma-residual (cubic multi-batched).} Bind
-        $\widetilde{\mathrm{sum\_x\_sq}}(r_{\sigma_t})\!=\!\sum_i\eq(r_{\sigma_t},i)\widetilde{\mathrm{sum\_x}}(i)^2$
-        and
-        $\widetilde{\sigma\mathrm{\_sq}}(r_{\sigma_t})\!=\!\sum_i\eq(r_{\sigma_t},i)(d\widetilde\sigma(i))^2$
-        in a single cubic multi-batched sumcheck under a Fiat--Shamir scalar
-        $\lambda_{\mathrm{sig}}$; the verifier then reconstructs
-        $\mathrm{var\_x}(r_{\sigma_t})$ algebraically.
-  \item \textbf{$\sigma$ floor-sqrt range proof.} Show $\sigma$ is the
-        integer floor square-root by range-checking
+        with three copies of $x_{\mathrm{col}}$, keeping the round
+        polynomial cubic).
+  \item \textbf{Sigma residual} (cubic multi-batched sumcheck combining
+        $\sum_i\eq\widetilde{\mathrm{sum\_x}}(i)^2$ and
+        $\sum_i\eq(d\widetilde\sigma(i))^2$ under a Fiat--Shamir scalar
+        $\lambda_{\mathrm{sig}}$; the verifier reconstructs
+        $\mathrm{var\_x}$ algebraically).
+  \item \textbf{Floor-sqrt} (range-check
         $\mathrm{var\_x}\!-\!(d\sigma)^2\!\geq\!0$ and
-        $(d\sigma\!+\!d)^2\!-\!1\!-\!\mathrm{var\_x}\!\geq\!0$ through the
-        chunked Lasso range proof of \S\ref{ssec:range}.
-  \item \textbf{Y constraint fusion.} For a single random
-        $(r_{y_t},r_{y_d})$, audit
-        $\bgamma\!\odot\!(d\bx-\mathrm{sum\_x})+\bbeta\cdot d\sigma\!\approx\!d\sigma\!\cdot\!\by$
-        (up to integer rounding) by another range proof on the
-        $\mathrm{lo}/\mathrm{hi}$ residuals; the $\gamma\bX$ and
-        $\sigma\bY$ legs are fused into a single multi-batched cubic
-        sumcheck.
+        $(d\sigma\!+\!d)^2\!-\!1\!-\!\mathrm{var\_x}\!\geq\!0$ via
+        \S\ref{ssec:range}).
+  \item \textbf{Y fusion} (at one random $(r_{y_t},r_{y_d})$, check
+        $\bgamma\!\odot\!(d\bx-\mathrm{sum\_x})+\bbeta\!\cdot\!d\sigma\approx d\sigma\!\cdot\!\by$
+        via a range proof on the lo/hi residuals; the $\gamma\bX$ and
+        $\sigma\bY$ legs share one multi-batched cubic sumcheck).
 \end{enumerate}
-The prover commits three internal Hyrax commitments per LN
-($\mathrm{sum\_x}$, $\mathrm{sq\_sum\_x}$, $\sigma$);
-$\mathrm{sum\_x\_sq}$ and $\sigma\mathrm{\_sq\_scaled}$ are bound
-algebraically by step~3 and need no separate commitment. The verifier
-evaluates $\bgamma$ and $\bbeta$ directly from the VK in $O(d)$ field
-operations per layer; everything else is one shared opening per witness.
+Per LN the prover commits three internal Hyrax values
+($\mathrm{sum\_x},\mathrm{sq\_sum\_x},\sigma$); the squared quantities
+are bound algebraically by step~3 and need no separate commitment. The
+verifier evaluates $\bgamma,\bbeta$ from the VK in $O(d)$ per layer.
 
-\paragraph{Model-level batched LN proof.}
-The end-to-end prover does not emit one independent LN sub-proof per LN.
-Instead, after Phase~1 has absorbed all $5L+1$ LN IO commitments
-($\LN_1$, $\LN_Q$, $\LN_K$, $\LN_{\mathrm{aon}}$, $\LN_2$ per block, plus
-the final LN), one call to \textsc{ProveLNsBatched} folds the mean,
-variance, $\sigma$-floor, and Y-fusion sub-claims of every LN into a single
-batched cubic sumcheck under Fiat--Shamir powers of an independent
-challenge. Soundness follows from the same Schwartz--Zippel argument as
-cross-block batching (Theorem~\ref{thm:cross-block}) with the role of $L$
-played by $5L+1$.
+\paragraph{Model-level LN batching.}
+After Phase~1 has absorbed all $5L\!+\!1$ LN IO commitments, one
+\textsc{ProveLNsBatched} call folds mean / variance / $\sigma$-floor /
+Y-fusion sub-claims of every LN into a single batched cubic sumcheck
+under Fiat--Shamir powers of an independent challenge. Soundness
+follows from the same Schwartz--Zippel argument as cross-block batching
+(Theorem~\ref{thm:cross-block}) with $L$ replaced by $5L+1$.
 
 \subsection{Globally batched range proof}
 \label{ssec:range}
-The range proof shows $V[i]\!\in\![0,2^{\mathrm{bits}})$ via a chunked Lasso
-approach over identity tables, with $\mathrm{CHUNK\_BITS}\!=\!16$. The
-implementation supports two width buckets, $\mathrm{bits}\!\in\!\{32,64\}$,
-and routes each witness to the narrowest bucket that contains it. The
-LayerNorm $\sigma$/$y$ witnesses use 64-bit range proofs
-($\mathrm{LAYERNORM\_RANGE\_BITS}\!=\!64$); the optional attention-
-normalisation residuals $\mathrm{rem},\mathrm{diff}$ (\S\ref{ssec:LLA}) are
-also 64-bit. Each non-empty bucket is processed independently and produces
-one $m_{\mathrm{com}}$.
+The range proof shows $V[i]\!\in\![0,2^{\mathrm{bits}})$ via chunked
+LogUp~\cite{habo2024logup} over an identity table, with chunk width
+$16$ and bucket widths $\{32,64\}$. LayerNorm $\sigma/y$ witnesses use
+the 64-bit bucket; each non-empty bucket produces one multiplicity
+commitment $m_{\mathrm{com}}$.
 
-For $B$ witnesses in a single bucket with $C\!=\!\lceil\mathrm{bits}/16\rceil$
-chunks each (so $C\!\in\!\{2,4\}$), Phase~1 commits all
-$V^{(b)}_0,\dots,V^{(b)}_{C-1}$ via Hyrax and merges all chunk arrays into
-one global multiplicity vector
-$m[v]=\sum_{b,c,i}[\mathrm{chunk}^{(b,c)}[i]\!=\!v]$ committed once.
-Phase~2 runs one degree-2 sumcheck per witness binding $V^{(b)}$ to a
-random $r_v^{(b)}$ and checks
-$V^{(b)}(r_v^{(b)})=\sum_c 2^{16c}V^{(b)}_c(r_v^{(b)})$ through one Hyrax
-batch open per witness. Phase~3 opens $m(r_m)$ once and checks the LogUp
-identity~\cite{habo2024logup} against the identity table
-$T_{\mathrm{id}}[i]\!=\!i$. The transcript-ordering invariant
-(Theorem~\ref{thm:range}) is that $m_{\mathrm{com}}$ is absorbed before
-any Phase~2 sumcheck challenge is sampled.
+For $B$ witnesses in a bucket with
+$C\!=\!\lceil\mathrm{bits}/16\rceil$ chunks each, Phase~1 commits all
+$V^{(b)}_0,\dots,V^{(b)}_{C-1}$ via Hyrax and merges chunk arrays
+into one global multiplicity vector
+$m[v]\!=\!\sum_{b,c,i}[\mathrm{chunk}^{(b,c)}[i]\!=\!v]$ committed
+once. Phase~2 runs one degree-2 sumcheck per witness binding $V^{(b)}$
+to a random $r_v^{(b)}$ and verifies
+$V^{(b)}(r_v^{(b)})\!=\!\sum_c 2^{16c}V^{(b)}_c(r_v^{(b)})$ through one
+Hyrax batch open. Phase~3 opens $m(r_m)$ once and checks the LogUp
+identity against $T_{\mathrm{id}}[i]\!=\!i$. The transcript-ordering
+invariant (Theorem~\ref{thm:range}) is that $m_{\mathrm{com}}$ is
+absorbed before any Phase~2 sumcheck challenge.
 
 \paragraph{Zerocheck-folded inverse polynomial.}
 The LogUp identity requires per-chunk inverse polynomials
@@ -652,16 +600,15 @@ consistency together with the combined-identity check; the chunk
 evaluation $V(r_{\mathrm{full}})$ remains bound to the Hyrax-committed
 $V_c$ via the per-chunk openings at the bucket challenge $r_k$.
 
-The model-level prover collects \emph{all} range witnesses across the
-entire model into a single bucket-routed list: $10L+2$ LN witnesses
-($\sigma,y$ for the five LNs per block plus the final LN's two), and
-$2L$ extra witnesses ($\mathrm{rem},\mathrm{diff}$ per block) when
-normalised attention is enabled. Sharing one $m_{\mathrm{com}}$ per
-bucket therefore saves $(B\!-\!1)\!\times\!\sqrt{2^{16}}$ G1 MSMs per
-bucket, and the savings scale with $L$ rather than being capped at the
-per-block level. The zerocheck fold further eliminates $B\!\cdot\!C$
-Hyrax commitments and as many Hyrax openings per bucket compared with
-the na\"ive LogUp scheme.
+The model-level prover routes \emph{all} range witnesses across the
+model into one bucketed list: $10L\!+\!2$ LN witnesses
+($\sigma,y$ for the five LNs per block, plus the final LN's two), and
+$2L$ further witnesses ($\mathrm{rem},\mathrm{diff}$ per block) when
+normalised attention is enabled. Sharing $m_{\mathrm{com}}$ per
+bucket saves $(B\!-\!1)\sqrt{2^{16}}$ G1 MSMs per bucket; the
+zerocheck fold removes a further $B\!\cdot\!C$ Hyrax commits and as
+many opens, with savings scaling with $L$ rather than capped at the
+per-block level.
 
 %-------------------------------------------------------------------------------
 \section{The \sys{} Protocol}
