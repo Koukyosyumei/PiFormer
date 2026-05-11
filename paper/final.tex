@@ -100,69 +100,62 @@ Columbia University\\
 \begin{document}
 
 \maketitle
-
 %-------------------------------------------------------------------------------
+
 \begin{abstract}
 %-------------------------------------------------------------------------------
-Verifiable transformer inference lets an untrusted operator prove
-that a posted output was produced by a committed model, without
-revealing the weights. The obstacle is that a transformer block is
-built from exactly the operations that finite-field SNARKs find
-expensive: softmax, GeLU, LayerNorm, and dense projections. Prior
-systems leave the model untouched and pay this cost on every block.
+Succinctly verifying transformer inference remains costly because
+the standard block is dominated by operations that do not have compact
+finite-field representations: softmax, GeLU, LayerNorm, and dense
+floating-point projections. Existing systems primarily optimize the
+proof system around this architecture, so every block continues to
+carry the cost of proving these non-arithmetic primitives.
 
-We present \sys{}, a succinct argument whose central design choice
-is to co-design the \emph{model} so the proof system has nothing
-expensive to absorb. Three architectural changes drive the design:
-(i) softmax attention is replaced by a kernel attention whose feature
-map is realised as an additively decomposed learnable lookup, so the
-only non-arithmetic operation is a structured Lasso table look-up;
-(ii) every projection is constrained to ternary entries scaled by a
-per-layer scalar, eliminating all field multiplications from weight
-contractions; and (iii) LayerNorm is reformulated as an integer
-protocol provable through sumcheck and chunked range proofs. We build
-a transparent BN254 SNARK on top with Hyrax commitments, batching
-every per-block sub-protocol into a constant number of model-level
-sumchecks, a globally shared range-multiplicity commitment, and a
-zerocheck-folded inverse polynomial that removes $B\!\cdot\!C$ Hyrax
-commitments per range bucket. Residual connections require no proof:
-they are verified by linearity of the commitment scheme. We prove
-end-to-end soundness under discrete log on BN254 G1 and implement a
-complete prototype in $\sim$19k lines of Rust with a bit-identical
-PyTorch training pipeline.
+We present \sys{}, a transparent succinct argument for a
+SNARK-friendly transformer architecture. The design replaces softmax
+with learnable lookup-based linear attention, constrains projections
+to ternary matrices with per-layer scales, and expresses LayerNorm as
+integer constraints discharged by sumcheck and range proofs. The
+protocol then batches repeated block structure into model-level
+sumchecks, a global Lasso lookup proof, and shared range
+multiplicity commitments. A zerocheck fold removes the Hyrax
+commitments otherwise needed for LogUp inverse polynomials. We prove
+end-to-end soundness under the discrete-log assumption for Hyrax on
+BN254 G1 and implement a Rust prototype with a bit-identical PyTorch
+export path. The current artifact is a succinct argument rather than
+a zero-knowledge system; standard masking is orthogonal to the
+protocol presented here.
 \end{abstract}
+
+\makeatother
 
 %-------------------------------------------------------------------------------
 \section{Introduction}
 \label{sec:intro}
 %-------------------------------------------------------------------------------
 
-Large language models are increasingly deployed as black-box
-services. The user submits a prompt, an opaque operator runs a
-proprietary model, and the user has no cryptographic guarantee that
-the returned output came from the advertised model. Verifiable
-inference~\cite{liu2021zkcnn,sun2024zkllm,qu2025zkgpt,abbaszadeh2024zero}
-closes this gap with a succinct non-interactive argument: the
-operator commits to the weights once, and for every input produces a
-small proof that the verifier checks without re-executing the model
-and without learning the weights.
+Large language models are often served behind an API. A client sees
+an input and an output, but not the computation that produced it.
+Verifiable inference~\cite{liu2021zkcnn,sun2024zkllm,qu2025zkgpt,abbaszadeh2024zero}
+addresses this gap by letting the operator commit to a model and
+attach a succinct proof to each response. The verifier checks the
+proof without re-executing the model.
 
-The core difficulty is that a transformer block is built from
-operations that finite-field SNARKs find expensive. Softmax requires
-exponentials and a row-wise division; GeLU is transcendental;
-LayerNorm contains a square root and a division by a running
-variance; a dense projection costs one field multiplication per
-weight entry. Prior work attacks this on the proof-system side:
-zkLLM~\cite{sun2024zkllm} introduces \texttt{tlookup}, a parallelised
-lookup argument tailored to softmax and SwiGLU; zkGPT~\cite{qu2025zkgpt}
-pairs Plonky2 with constraint fusion to drive down the cost of
-approximating softmax. Both keep the model fixed and pay an
-``unfriendly-operation tax'' on every block.
+Transformers are a difficult target for such proofs. Softmax uses
+exponentials and row-wise division, GeLU is transcendental, LayerNorm
+uses division and square roots, and dense projections dominate the
+arithmetic footprint. zkLLM~\cite{sun2024zkllm} and
+zkGPT~\cite{qu2025zkgpt} demonstrate that specialized lookups,
+constraint fusion, and parallel implementations can make standard LLM
+architectures substantially more practical to prove. Their results
+also make clear where the remaining cost comes from: the proof system
+is still asked to certify operations that were not designed for
+finite-field verification.
 
 \paragraph{Our approach.}
-\sys{} starts from a different premise: change the \emph{model} so
-that the proof system has nothing expensive to absorb. Three
-architectural principles drive the design:
+\sys{} takes the complementary approach of changing the model so that
+its operations have compact algebraic checks. Three choices drive the
+architecture:
 \begin{itemize}
   \item \textbf{SNARK-friendly operators.} Replace every operation
         without a compact arithmetic representation. Softmax becomes
@@ -183,26 +176,19 @@ architectural principles drive the design:
         table size and query count, not on table contents, so
         training adapts table values at zero proving cost.
 \end{itemize}
-Together these reduce a transformer block to operations that map
-directly to a low-degree sumcheck or to a Lasso lookup over a small
-structured table.
+Together these choices reduce a block to low-degree sumchecks and
+structured Lasso lookups.
 
 \paragraph{Model-level batching.}
-On top of this architecture we build a proof system around a single
-observation: the same protocol runs once per block with independent
-inputs but identical structure. \sys{} runs six model-level
-sumchecks (one per protocol type) that fold all $L$ per-block claims
-via a Fiat--Shamir random linear combination; the inner sumcheck
-transcript is shared across blocks. The same idea applies to Lasso
-(one global multi-instance proof per lookup family), to range checks
-(one shared multiplicity commitment per width bucket spanning the
-entire model), to residuals (homomorphic Hyrax addition; no proof at
-all), and to the final opening stage (deferred batch accumulators
-finalised in one MSM pair per parameter group). For the range proof
-specifically, we replace the explicit Hyrax commitment to each LogUp
-inverse polynomial by a zerocheck folded into the bucket sumcheck;
-this removes $B\cdot C$ commitments per bucket without changing the
-per-round prover cost.
+The protocol exploits the repeated structure of a depth-$L$
+transformer. Per-block claims are folded into model-level sumchecks
+with Fiat--Shamir random linear combinations; lookup claims are folded
+into global multi-instance Lasso proofs; range witnesses share one
+multiplicity commitment per width bucket; and residual connections
+are checked by homomorphic addition of Hyrax commitments. For range
+proofs, a zerocheck folded into the LogUp bucket sumcheck replaces
+the explicit commitments to inverse polynomials, removing
+$B\cdot C$ Hyrax commitments per bucket.
 
 \paragraph{Contributions.}
 \begin{enumerate}
@@ -211,32 +197,32 @@ per-round prover cost.
         projection each map to a sumcheck or a Lasso lookup, combining
         learnable lookup attention, ternary projections, and a
         constraint-fused integer LayerNorm.
-  \item A complete protocol (\S\ref{sec:protocol}) batching all
-        $L$ per-block sub-proofs into six model-level cross-block
-        sumchecks, one global Lasso for the $\bphi$ family, and a
-        bucket-batched range proof shared across the whole model.
+  \item A complete protocol (\S\ref{sec:protocol}) batching repeated
+        block structure into model-level cross-block sumchecks,
+        global Lasso proofs, and bucketed range proofs shared across
+        the whole model.
   \item A zerocheck-folded LogUp range proof (\S\ref{ssec:range},
         Theorem~\ref{thm:range}) that eliminates $B\cdot C$
         Hyrax commitments per width bucket while keeping the
         bucket sumcheck cubic and soundness within $O(n/|\FF|)$.
   \item End-to-end soundness (\S\ref{sec:soundness},
         Theorem~\ref{thm:end-to-end}) reducing to discrete log on
-        BN254 G1, and a working prototype in $\sim$19k Rust LoC with
-        a bit-identical PyTorch training pipeline
-        (\S\ref{sec:impl}).
+        BN254 G1, and a Rust prototype with a bit-identical PyTorch
+        export path (\S\ref{sec:impl}).
 \end{enumerate}
 
 \paragraph{Threat model.}
-We target the standard non-interactive argument-of-knowledge setting
-in the random-oracle model. The verifier holds a verifying key
+We target non-interactive arguments in the random-oracle model. The
+verifier holds a verifying key
 $\popvk$ binding the weights and lookup tables, a public input
 $\bx_{\mathrm{in}}$, and a claimed output $\by$, and accepts iff
 $\calM_\theta(\bx_{\mathrm{in}})\!=\!\by$ for the committed model.
 Soundness is computational under discrete log on BN254 G1, the
 standard assumption for the Hyrax PCS~\cite{wahby2018doubly}. The
-current implementation is not zero-knowledge: weight commitments are
-public and intermediate sumcheck evaluations are revealed. The
-standard masking extension is discussed in \S\ref{sec:disc}.
+prototype is not zero-knowledge: commitments are public and
+intermediate evaluations are revealed. We therefore claim integrity
+for committed inference, not privacy of all witness information.
+Standard masking extensions are discussed in \S\ref{sec:disc}.
 
 %-------------------------------------------------------------------------------
 \section{Preliminaries}
@@ -299,7 +285,7 @@ depend on table size and query count, but are independent of table
 impact.
 
 %-------------------------------------------------------------------------------
-\section{The \sys{} Architecture}
+\section{The \texorpdfstring{\sys{}}{Pi-Former} Architecture}
 \label{sec:arch}
 %-------------------------------------------------------------------------------
 
@@ -357,28 +343,17 @@ impact.
         fit=(ln1)(aon)(res1)(xmid)(xout)(res2),
         inner sep=8pt, label={[label]above:Single \sys{} block (one of $L$);\;5 LayerNorms (orange)}] {};
   \node[font=\scriptsize, color=gray!70!black, below=2.0cm of xmid,
-        align=left, text width=0.95\textwidth] (note) {%
-    \textbf{Cross-block batching.} The five LNs per block (LN$_1$,
-    QK-norm $\LN_Q\!/\LN_K$, sandwich $\LN_{\mathrm{aon}}$, LN$_2$),
-    plus the final LN, are folded into one
-    \emph{model-level} batched LN proof. Ternary projections fold into
-    \texttt{qkv}/\texttt{oproj}/\texttt{ffn} sumchecks; LLA inner products
-    fold into \texttt{batch\_attn\_out}/\texttt{ctx}; the row-normaliser $Z$
-    is enforced by a cubic multi-batched sumcheck with range proofs on the
-    floor-division residuals (\S\ref{ssec:LLA}); Lasso $\bphi$ folds into
-    one global multi-instance proof per lookup family; range checks fold
-    into one shared multiplicity commitment per width bucket;
-    residuals are homomorphic Hyrax addition.
+        align=left, text width=0.92\textwidth] (note) {%
+    \textbf{Proof structure.} LayerNorms, ternary projections,
+    attention normalisation, Lasso lookups, and range checks are each
+    batched at model level. Residual additions are verified by
+    homomorphic Hyrax addition and require no separate sub-proof.
   };
 \end{tikzpicture}}
-\caption{A single \sys{} block. Boxes are matrices; rounded green nodes are
-operations the SNARK proves; orange nodes are LayerNorms. \emph{Sandwich
-norm} ($\LN_{\mathrm{aon}}$) is applied to the attention output before the
-residual; \emph{QK-norm} ($\LN_Q$, $\LN_K$) is applied to $\bQ,\bK$ after the
-ternary projection and before $\bphi$. Ternary projections contain no field
-multiplications in the contraction; Lasso lookup cost is independent of
-table contents; residual $+$ is checked by homomorphic addition of Hyrax
-commitments and requires no proof.}
+\caption{A \sys{} block. Green nodes are algebraic sub-protocols;
+orange nodes are LayerNorms. QK-norm bounds lookup inputs before
+$\bphi$, sandwich norm bounds the attention output before the
+residual, and all linear maps use ternary weights.}
 \label{fig:block}
 \end{figure*}
 
@@ -578,12 +553,14 @@ bucket claim
 $\Lambda\!=\!\sum_p w_p\!\cdot\!\bigl(\sum_i h_p[i]+\beta\!\cdot\!n_{\mathrm{pad}}\bigr)$
 is absorbed, the verifier samples $\gamma_{\mathrm{fold}}\!\in\!\mathbb{F}$
 and $r_{zc}\!\in\!\mathbb{F}^{n}$, and the prover proves
-\[
-  \sum_{x}\Bigl[\;
-     w(x)\!\cdot\!h(x)\!\cdot\!\bigl(1+\beta(\alpha-V(x))\bigr)
-     \;+\;\gamma_{\mathrm{fold}}\!\cdot\!\mathrm{eq}(r_{zc},x)\!\cdot\!\bigl(h(x)(\alpha-V(x))-1\bigr)
-  \Bigr]\;=\;\Lambda.
-\]
+\begin{align*}
+  \sum_x \Bigl[
+    &w(x)h(x)\bigl(1+\beta(\alpha-V(x))\bigr) \\
+    &+\gamma_{\mathrm{fold}}\eq(r_{zc},x)
+      \bigl(h(x)(\alpha-V(x))-1\bigr)
+  \Bigr]
+  = \Lambda .
+\end{align*}
 The first term is the standard LogUp bucket claim; the second is the
 zerocheck term, which sums to zero on the boolean hypercube iff
 $h\!=\!1/(\alpha-V)$ pointwise. The integrand remains cubic in
@@ -612,7 +589,7 @@ per-block level.
 
 %-------------------------------------------------------------------------------
 %-------------------------------------------------------------------------------
-\section{The \sys{} Protocol}
+\section{The \texorpdfstring{\sys{}}{Pi-Former} Protocol}
 \label{sec:protocol}
 %-------------------------------------------------------------------------------
 
@@ -880,12 +857,16 @@ $\bphi(\bQ^{\mathrm n}),\bphi(\bK^{\mathrm n})$.
 \begin{theorem}[\sys{} end-to-end soundness]
 \label{thm:end-to-end}
 For any PPT adversary $\calA$,
-\[
-  \Pr[\,\Verify\!=\!\mathsf{ACCEPT}\,\wedge\,\calM_\theta(\bx_{\mathrm{in}})\!\ne\!\by\,]
-  \le
-  \frac{m_{\mathrm{sc}}\,n_{\max}\delta_{\max}+m_{\mathrm{batch}}(L\!-\!1)+m_{\mathrm{open}}}{|\FF|}
-  +\varepsilon_{\mathrm{DL}},
-\]
+\begin{align*}
+  &\Pr[\,\Verify=\mathsf{ACCEPT}
+       \wedge \calM_\theta(\bx_{\mathrm{in}})\ne\by\,] \\
+  &\quad \le
+  \frac{
+    m_{\mathrm{sc}}n_{\max}\delta_{\max}
+    +m_{\mathrm{batch}}(L-1)+m_{\mathrm{open}}
+  }{|\FF|}
+  +\varepsilon_{\mathrm{DL}} .
+\end{align*}
 where $m_{\mathrm{sc}}$ is the post-batching sumcheck count,
 $m_{\mathrm{batch}}\!=\!6$, $m_{\mathrm{open}}$ covers RLC checks,
 $n_{\max}\!\le\!64$, $\delta_{\max}\!\le\!3$, and
@@ -902,12 +883,14 @@ Lemmas~\ref{lem:hyrax}--\ref{lem:sumcheck}. A union bound over all
 sub-protocols yields the stated error.
 \end{proof}
 
-\subsection{Zero knowledge}
-The current implementation is not zero-knowledge: weight commitments
-are public VK entries and intermediate sumcheck evaluations are
-revealed. Standard techniques apply~--- blinding witness polynomials
-before commitment, and zero-knowledge variants of sumcheck and
-Hyrax~--- which we leave to future work.
+\subsection{Privacy}
+\sys{} currently provides integrity for committed inference, not
+zero knowledge. The verifier sees public commitments and the
+sumcheck-opening values needed for verification. Hiding all witness
+information would require blinding committed polynomials and using
+zero-knowledge variants of sumcheck and Hyrax. These changes are
+orthogonal to the algebraic reductions in this paper, but are not
+implemented in the present prototype.
 
 %-------------------------------------------------------------------------------
 \section{Implementation}
@@ -926,43 +909,42 @@ causal indicator polynomial; multi-head and zero-knowledge masking
 are out of scope.
 
 %-------------------------------------------------------------------------------
-\section{Preliminary Evaluation}
+\section{Prototype Evaluation}
 \label{sec:eval}
 %-------------------------------------------------------------------------------
 
 \paragraph{Setup.}
-We report prover-side timings on a 2-layer prototype (\texttt{small}
-in our benchmark harness: $L\!=\!2$, $T\!=\!16$, $d\!=\!64$,
-$d_{ff}\!=\!256$, vocabulary $256$, 8-bit activations), executed on a
-single x86-64 CPU thread (release profile, no SIMD/GPU acceleration).
-Numbers are end-to-end wall-clock from witness ingestion to proof
-serialization. The complete bibliographic comparison against
-zkLLM~\cite{sun2024zkllm} and zkGPT~\cite{qu2025zkgpt} on
-deployment-sized models is in progress and is not reported here.
+We evaluate the Rust prototype on a small end-to-end model:
+$L\!=\!2$, $T\!=\!16$, $d\!=\!64$, $d_{ff}\!=\!256$, vocabulary $256$,
+and 8-bit activations. Timings use the release build on one x86-64 CPU
+thread, with no SIMD, GPU MSM, or distributed sumcheck. The goal of
+this section is to validate the protocol decomposition and the range
+proof ablation, not to claim competitiveness with optimized GPU
+systems such as zkLLM~\cite{sun2024zkllm} or
+zkGPT~\cite{qu2025zkgpt}.
 
 \begin{table}[t]
 \centering
-\small
+\footnotesize
 \begin{tabular}{lr}
 \toprule
 \textbf{Stage} & \textbf{Time (ms)} \\
 \midrule
-Per-block commit + LN witness extraction         & 23.0  \\
-Globally batched range proof (LN bucket, bits=32)& 389.2 \\
-Globally batched range proofs (8-bit buckets)    & 240.0 \\
-Cross-block QKV / O-proj / attn sumchecks        & 65.0  \\
-Global $\bphi$ Lasso (FFN + attention)           & 110.0 \\
-Model-level batched LN proof                     & 71.0  \\
-LM head + deferred accumulator finalisation      & 14.3  \\
+Commit + LN witness extraction      & 23.0  \\
+Range proof (LN bucket, 32-bit)     & 389.2 \\
+Range proofs (8-bit buckets)        & 240.0 \\
+Cross-block linear/attention checks & 65.0  \\
+Global $\bphi$ Lasso                & 110.0 \\
+Model-level batched LN proof        & 71.0  \\
+LM head + accumulator finalisation  & 14.3  \\
 \midrule
 \textbf{Total prover time}                       & \textbf{912.5} \\
 \bottomrule
 \end{tabular}
-\caption{Preliminary prover-side breakdown for the 2-layer prototype.
-Phase numbering matches Alg.~\ref{alg:prove}. The zerocheck-folded
-range proof reduces the LN bucket from $435.9$\,ms to $389.2$\,ms
-($-10.7\%$) by eliminating $B\!\cdot\!C$ Hyrax commitments per
-bucket.}
+\caption{Prover-side breakdown for the 2-layer prototype. The
+zerocheck-folded range proof reduces the 32-bit LayerNorm bucket from
+$435.9$\,ms to $389.2$\,ms ($-10.7\%$) by eliminating
+$B\!\cdot\!C$ Hyrax commitments per bucket.}
 \label{tab:eval-small}
 \end{table}
 
@@ -976,40 +958,39 @@ scale with the number of range witnesses; for larger models the
 absolute reduction grows roughly linearly in $L$.
 
 \paragraph{Verifier.}
-Verifier wall-clock on the same prototype is dominated by the deferred
-Hyrax accumulator finalisation (one MSM pair per parameter group); the
-algebraic sumcheck checks are negligible. Detailed verifier
-microbenchmarks and a proof-size table are deferred to the full
-version.
+Verifier wall-clock on the same prototype is dominated by Hyrax
+opening checks and accumulator finalisation; algebraic sumcheck checks
+are small by comparison. This matches the protocol design: once
+per-block claims are folded, verification cost is governed primarily
+by the number and size of polynomial openings rather than by model
+depth.
 
 %-------------------------------------------------------------------------------
 \section{Discussion and Limitations}
 \label{sec:disc}
 %-------------------------------------------------------------------------------
 
-\paragraph{What is and is not in the SNARK.}
+\paragraph{Scope.}
 The prover proves the full normalised LLA output
 $\bY^{\mathrm{att}}\!=\!\lfloor S\bphi(\bQ^{\mathrm n})(\bphi(\bK^{\mathrm n})^\top\bV)/Z\rfloor$,
 the ternary output projection, and the sandwich-norm
 $\LN_{\mathrm{aon}}$ before the residual. Causal masking is fully
-supported. The principal limitations are (i) single-head attention,
-(ii) no zero-knowledge masking, and (iii) no formal model-quality
-evaluation: \sys{} replaces softmax by a learnable kernel attention
-and constrains weights to ternary, so a deployment-quality comparison
-requires matched baselines under identical parameter budget, dataset,
-and quantisation regime. None of (i)--(iii) changes the protocol
-architecture.
+supported. The main limitations are single-head attention, no
+zero-knowledge masking, and no deployment-scale quality evaluation.
+Because \sys{} changes the architecture by replacing softmax with a
+learnable kernel and constraining weights to ternary values, model
+quality must be evaluated against matched baselines under the same
+parameter budget, dataset, and quantisation regime.
 
-\paragraph{From prototype to deployment.}
-The reference prover is CPU-only and single-threaded. GPU MSM and
-parallel sumcheck~\cite{qu2025zkgpt} translate directly: every
-dominant inner loop (cross-block batched sumcheck, Lasso multi-instance,
-batched Hyrax open) is data-parallel, and the global Hyrax
-accumulators are pure MSMs at the boundary. Streaming token
-generation is the natural fit for Nova-style folding~\cite{kothapalli2022nova}:
-the running context matrix $\bphi(\bK)^\top\bV$ is the IVC
-accumulator and one folding step per token yields constant amortised
-proving cost.
+\paragraph{Engineering path.}
+The reference prover is CPU-only and single-threaded. The dominant
+kernels--cross-block sumcheck, multi-instance Lasso, and batched
+Hyrax opening--are data-parallel and should benefit from the same GPU
+MSM and parallel-sumcheck engineering used in recent LLM proof
+systems~\cite{sun2024zkllm,qu2025zkgpt}. Streaming generation is a
+natural setting for folding: the running context matrix
+$\bphi(\bK)^\top\bV$ can serve as the accumulator, with one proof step
+per generated token.
 
 %-------------------------------------------------------------------------------
 \section{Related Work}

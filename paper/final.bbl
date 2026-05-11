@@ -47,12 +47,6 @@ Nikita Kitaev, {\L}ukasz Kaiser, and Anselm Levskaya.
 \newblock Reformer: The efficient transformer.
 \newblock {\em arXiv preprint arXiv:2001.04451}, 2020.
 
-\bibitem{kothapalli2022nova}
-Abhiram Kothapalli, Srinath Setty, and Ioanna Tzialla.
-\newblock Nova: Recursive zero-knowledge arguments from folding schemes.
-\newblock In {\em Annual International Cryptology Conference}, pages 359--388.
-  Springer, 2022.
-
 \bibitem{liu2021zkcnn}
 Tianyi Liu, Xiang Xie, and Yupeng Zhang.
 \newblock Zkcnn: Zero knowledge proofs for convolutional neural network
