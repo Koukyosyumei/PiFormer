@@ -1098,3 +1098,260 @@ fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) 
         transcript.append_bytes(label, &buf);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Soundness tests for the zerocheck-fused range proof.
+//
+// These tests target the protocol-level binding properties of the new fold:
+//   * The bucket sumcheck's terminal h-claim binds h(r_full) via round-poly
+//     consistency only — no Hyrax commitment to h exists. Tampering it must
+//     break the combined-identity check.
+//   * Tampering C(r_full) at the terminal breaks the reconstruction step
+//     against chunk_at_rk openings (which are bound by chunk_com).
+//   * Tampering combined_claims shifts bucket_claim, which feeds the FS state
+//     via `logup_bucket_claim` BEFORE γ_fold / r_zc are drawn — so the
+//     verifier's challenges diverge from the prover's and the sumcheck fails.
+//     This is the load-bearing FS-order check.
+//   * Tampering a round_poly evaluation breaks round consistency or the
+//     terminal evaluation.
+//   * Tampering chunk_at_rk breaks the per-chunk Hyrax opening bound by
+//     chunk_com.
+//
+// All tampering tests perform a single +F::ONE shift on one field of the
+// proof, which the verifier should reject w.h.p. (soundness error bounded by
+// ~6n/|F| per bucket, where n is the bucket variable count).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod soundness_tests {
+    use super::*;
+    use crate::pcs::{params_from_vars, HyraxBatchAccumulator};
+    use crate::transcript::Transcript;
+
+    /// Build a deterministic two-witness range proof at bits=32 and return all
+    /// the artefacts a verifier needs. Witness 0 is short (forces the small
+    /// bucket); witness 1 is long (forces the large bucket). Values are kept
+    /// in-range so the honest proof verifies.
+    fn build_honest_proof() -> (
+        Vec<RangeWitnessProof>,
+        GlobalRangeM,
+        Vec<usize>,
+        usize,
+    ) {
+        let bits = 32usize;
+        let w0_vals: Vec<F> = (0..4u64).map(F::from).collect();
+        let w1_vals: Vec<F> = (0..16u64).map(F::from).collect();
+        let w0 = RangeProofWitness { values: w0_vals };
+        let w1 = RangeProofWitness { values: w1_vals };
+
+        let mut pt = Transcript::new(b"range_soundness_test");
+        let (proofs, gm, _r_vs) =
+            prove_range_batched(&[&w0, &w1], bits, &mut pt).expect("honest prove");
+        let nv: Vec<usize> = vec![
+            w0.values.len().next_power_of_two().trailing_zeros() as usize,
+            w1.values.len().next_power_of_two().trailing_zeros() as usize,
+        ];
+        (proofs, gm, nv, bits)
+    }
+
+    /// Run verify_range_batched + accumulator finalization. Returns Ok(()) iff
+    /// the proof is fully accepted (sumcheck identity + Hyrax openings).
+    fn try_verify(
+        proofs: &[RangeWitnessProof],
+        gm: &GlobalRangeM,
+        nv: &[usize],
+        bits: usize,
+    ) -> Result<(), String> {
+        let mut vt = Transcript::new(b"range_soundness_test");
+        let refs: Vec<&RangeWitnessProof> = proofs.iter().collect();
+
+        // Distinct num_vars buckets → one accumulator per bucket.
+        let mut distinct: Vec<usize> = nv.to_vec();
+        distinct.sort();
+        distinct.dedup();
+        let mut acc_storage: Vec<HyraxBatchAccumulator> =
+            distinct.iter().map(|_| HyraxBatchAccumulator::new()).collect();
+        let mut acc_m = HyraxBatchAccumulator::new();
+
+        // Borrow the storage mutably as the chunk_accs slice.
+        let mut chunk_accs: Vec<(usize, &mut HyraxBatchAccumulator)> = distinct
+            .iter()
+            .copied()
+            .zip(acc_storage.iter_mut())
+            .collect();
+
+        verify_range_batched(&refs, gm, nv, bits, &mut vt, &mut chunk_accs, &mut acc_m)?;
+        drop(chunk_accs);
+
+        // Finalize accumulators so deferred Hyrax opens are actually checked.
+        // finalize takes self by value; consume from the storage vec in order.
+        for (nv_i, acc) in distinct.iter().zip(acc_storage.into_iter()) {
+            let (_, _, params) = params_from_vars(*nv_i);
+            acc.finalize(&params, &mut vt)
+                .map_err(|e| format!("chunk-acc finalize nv={nv_i}: {e}"))?;
+        }
+        let (_, _, params_m) = params_from_vars(CHUNK_BITS);
+        acc_m
+            .finalize(&params_m, &mut vt)
+            .map_err(|e| format!("m-acc finalize: {e}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn honest_range_proof_verifies() {
+        let (proofs, gm, nv, bits) = build_honest_proof();
+        try_verify(&proofs, &gm, &nv, bits).expect("honest proof should verify");
+    }
+
+    /// Tampering the prover-claimed h(r_full) — the only "free" terminal value
+    /// in the new protocol — must be caught by the combined-identity check.
+    /// This is the zerocheck fold's *only* binding on h beyond round-poly
+    /// consistency; if this test ever stops failing, the zerocheck is broken.
+    #[test]
+    fn rejects_tampered_h_terminal_claim() {
+        let (proofs, mut gm, nv, bits) = build_honest_proof();
+        let nb = gm.bucket_sumchecks.len();
+        for b in 0..nb {
+            gm.bucket_sumchecks[b].final_evals_f[0] += F::ONE;
+            assert!(
+                try_verify(&proofs, &gm, &nv, bits).is_err(),
+                "verifier accepted a tampered h(r_full) claim in bucket {b}"
+            );
+            gm.bucket_sumchecks[b].final_evals_f[0] -= F::ONE;
+        }
+    }
+
+    /// Tampering C(r_full) breaks reconstruction against chunk_at_rk openings.
+    #[test]
+    fn rejects_tampered_c_terminal_claim() {
+        let (proofs, mut gm, nv, bits) = build_honest_proof();
+        let nb = gm.bucket_sumchecks.len();
+        for b in 0..nb {
+            gm.bucket_sumchecks[b].final_evals_h[0] += F::ONE;
+            assert!(
+                try_verify(&proofs, &gm, &nv, bits).is_err(),
+                "verifier accepted a tampered C(r_full) claim in bucket {b}"
+            );
+            gm.bucket_sumchecks[b].final_evals_h[0] -= F::ONE;
+        }
+    }
+
+    /// Tampering W(r_full) breaks reconstruction against the verifier's
+    /// public weights.
+    #[test]
+    fn rejects_tampered_w_terminal_claim() {
+        let (proofs, mut gm, nv, bits) = build_honest_proof();
+        let nb = gm.bucket_sumchecks.len();
+        for b in 0..nb {
+            gm.bucket_sumchecks[b].final_evals_g[0] += F::ONE;
+            assert!(
+                try_verify(&proofs, &gm, &nv, bits).is_err(),
+                "verifier accepted a tampered W(r_full) claim in bucket {b}"
+            );
+            gm.bucket_sumchecks[b].final_evals_g[0] -= F::ONE;
+        }
+    }
+
+    /// Tampering a round polynomial's eval should be caught by either
+    /// round-consistency (`rp.evals[0] + rp.evals[1] == current`) or by the
+    /// terminal-identity check (the round challenges shift after the tamper).
+    #[test]
+    fn rejects_tampered_round_poly() {
+        let (proofs, mut gm, nv, bits) = build_honest_proof();
+        let nb = gm.bucket_sumchecks.len();
+        for b in 0..nb {
+            if gm.bucket_sumchecks[b].round_polys.is_empty() {
+                continue;
+            }
+            gm.bucket_sumchecks[b].round_polys[0].evals[0] += F::ONE;
+            assert!(
+                try_verify(&proofs, &gm, &nv, bits).is_err(),
+                "verifier accepted a tampered round polynomial in bucket {b}"
+            );
+            gm.bucket_sumchecks[b].round_polys[0].evals[0] -= F::ONE;
+        }
+    }
+
+    /// Tampering combined_claims is the load-bearing FS-order check: the
+    /// verifier recomputes bucket_claim from combined_claims and absorbs it
+    /// BEFORE drawing γ_fold and r_zc. A shifted combined_claims absorbs a
+    /// different value → divergent challenges → sumcheck fails. If anyone
+    /// ever moves the bucket_claim absorb to AFTER γ_fold/r_zc draws, this
+    /// test will (correctly) start failing — but so will soundness in
+    /// general, because the prover could then adapt the claim.
+    #[test]
+    fn rejects_tampered_combined_claims() {
+        let (mut proofs, gm, nv, bits) = build_honest_proof();
+        let np = proofs.len();
+        for i in 0..np {
+            let nc = proofs[i].logup.combined_claims.len();
+            for c in 0..nc {
+                proofs[i].logup.combined_claims[c] += F::ONE;
+                assert!(
+                    try_verify(&proofs, &gm, &nv, bits).is_err(),
+                    "verifier accepted tampered combined_claims (witness {i}, chunk {c})"
+                );
+                proofs[i].logup.combined_claims[c] -= F::ONE;
+            }
+        }
+    }
+
+    /// Tampering chunk_at_rk must be caught by the Hyrax opening verification
+    /// against chunk_com (chunk_com is still committed in the new protocol).
+    #[test]
+    fn rejects_tampered_chunk_at_rk() {
+        let (mut proofs, gm, nv, bits) = build_honest_proof();
+        let np = proofs.len();
+        for i in 0..np {
+            let nc = proofs[i].logup.chunk_at_rk.len();
+            for c in 0..nc {
+                proofs[i].logup.chunk_at_rk[c] += F::ONE;
+                assert!(
+                    try_verify(&proofs, &gm, &nv, bits).is_err(),
+                    "verifier accepted a tampered chunk_at_rk opening (witness {i}, chunk {c})"
+                );
+                proofs[i].logup.chunk_at_rk[c] -= F::ONE;
+            }
+        }
+    }
+
+    /// Scope note: `prove_range_batched` binds the *chunks* to lie in
+    /// `[0, 2^CHUNK_BITS)` and binds the chunk values via `chunk_com`, but it
+    /// does **not** by itself verify that the chunks reassemble to the
+    /// original witness value. That binding is enforced by the caller via the
+    /// Phase-2 chunk-eval reconstruction `v(r_v) = Σ_c chunk_c(r_v)·2^(c·b)`.
+    /// As a result, a witness containing a value ≥ 2^bits will produce an
+    /// accepting `prove_range_batched` proof (with chunks of `v mod 2^bits`),
+    /// and the higher-level protocol is responsible for catching the
+    /// truncation. The tests below therefore target binding *within* the
+    /// range proof, not the chunk-to-value relation.
+    ///
+    /// A malicious-h test that surgically corrupts the prover-claimed
+    /// h(r_full) such that the zerocheck identity `h·(α - C) - 1 = 0` is the
+    /// load-bearing reason for the rejection (rather than, say, an unrelated
+    /// algebra check). The combined-identity terminal evaluates to
+    ///   main + γ_fold · zc
+    /// where zc = eq · (h·(α-C) - 1). Shifting h by Δ changes the terminal by
+    ///   Δ · [w·(1+β(α-C)) + γ_fold · eq · (α-C)]
+    /// which equals zero only with probability 1/|F| over the (random)
+    /// challenges — i.e., the zerocheck term is what breaks the equation.
+    #[test]
+    fn zerocheck_catches_non_inverse_h_terminal() {
+        let (proofs, mut gm, nv, bits) = build_honest_proof();
+        let nb = gm.bucket_sumchecks.len();
+        // Three different shifts: at least one will trigger the combined-
+        // identity rejection even if a single shift accidentally lands on a
+        // 1/|F| collision. (Practically impossible, but it documents intent.)
+        for shift in [F::ONE, F::from(2u64), F::from(7u64)] {
+            for b in 0..nb {
+                gm.bucket_sumchecks[b].final_evals_f[0] += shift;
+            }
+            assert!(
+                try_verify(&proofs, &gm, &nv, bits).is_err(),
+                "zerocheck-bound h(r_full) survived a {shift:?} shift"
+            );
+            for b in 0..nb {
+                gm.bucket_sumchecks[b].final_evals_f[0] -= shift;
+            }
+        }
+    }
+}
