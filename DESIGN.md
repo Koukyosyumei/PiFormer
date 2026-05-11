@@ -218,14 +218,37 @@ $$\sum_{x \in \{0,1\}^m} \widetilde{T}_k(x) \cdot L_k(x) = \sum_{j=1}^N \rho^j \
 
 **Complexity (per sub-table):** Prover O($N \cdot 2^m + m \cdot 2^m$); verifier O($N \cdot m$) plus O($m$) sumcheck.
 
-**Model-level multi-Lasso.** The end-to-end prover does not emit independent lookup proofs for every block. Instead, it uses `LassoMultiProof` to batch:
+**Model-level multi-Lasso.** The end-to-end prover does not emit independent lookup proofs for every block. Instead, it uses two distinct mechanisms:
 
-- all attention $\phi(Q)$ and $\phi(K)$ lookup instances across all blocks into `all_lasso_proof`;
-- all FFN activation $A = \phi(M)$ lookup instances across all blocks into `ffn_lasso_proof`.
+- For attention, all $\phi(Q_n)$ and $\phi(K_n)$ lookup instances across all blocks are batched into a single `LassoMultiProof` (`all_lasso_proof`) in committed-output mode: before the multi-Lasso batching challenges, the prover absorbs every `attn_phi_q_com` / `attn_phi_k_com`; a second sumcheck inside the multi-proof binds the combined lookup grand sum to those committed outputs.
+- For FFN, the structure is rotated: a single cross-block `batch_ffn_y` sumcheck reduces "all $A_\ell(r) \cdot W_2(\cdot, r)$" to a terminal claim
+  $$\sum_\ell w_\ell\,\widetilde A_\ell(r_t, r_{k_{fy}}) = c$$
+  and a separate `LassoTerminalEvalProof` (`ffn_a_terminal_proof`) proves that this terminal claim is consistent with the Lasso lookup tables at the *same* terminal point. This is functionally equivalent to a committed-output multi-Lasso plus a Hyrax batch open of $\{A_\ell\}$, but folds them into one sub-protocol. The per-block `TransformerBlockProof.ffn_lasso_proof` field is an empty compatibility placeholder; only the model-level `ffn_a_terminal_proof` actually carries the FFN lookup proof.
 
-For committed-output mode, the prover first absorbs the output commitments (`attn_phi_q_com`, `attn_phi_k_com`, or `ffn_a_com`) into the Fiat-Shamir transcript, then samples the multi-Lasso batching challenges. A second sumcheck proves that the combined lookup output grand sum equals the corresponding committed output polynomials, and one Hyrax batch opening binds those committed outputs at the sumcheck terminal point.
+The proof still carries raw lookup query indices (`ffn_lasso_query_indices` and `all_lasso_proof.all_query_indices`). Two complementary mechanisms tie them to the committed inputs:
 
-The proof still carries raw lookup query indices. To prevent those indices from being chosen independently of the committed lookup inputs, the model proof also binds them to the committed input tensors (`q_com`, `k_com`, or `ffn_m_com`) by evaluating the index vector as an MLE at a transcript-derived point and verifying one Hyrax batch opening.
+1. **Quantization proof** (§3.5b) — binds each public index $\mathsf{idx}_j$ to the committed raw input value $\mathsf{raw}_j$ through the integer relation
+   $$\mathsf{raw}_j \cdot s_{\mathrm{den}} + \lfloor s_{\mathrm{num}}/2 \rfloor = s_{\mathrm{num}} \cdot (\mathsf{idx}_j - \mathsf{zp}) + \mathsf{rem}_j, \qquad 0 \le \mathsf{rem}_j < s_{\mathrm{num}},$$
+   committed as `ffn_quant_proof` / `qk_quant_proof`. This is the primary binding.
+2. A redundant self-consistency check `ffn_lasso_bind_open` / `qk_lasso_bind_open` verifies, via a single Hyrax inner-product identity, that the proof's index-MLE opening vector is the one the verifier reconstructs from the public index list.
+
+The FFN quantization proof binds against `ffn_m_com`; the QK quantization proof binds against the post-norm `q_norm_y_com` / `k_norm_y_com` (not the pre-norm `q_com` / `k_com`), since the Lasso queries are evaluated on $Q_n, K_n$.
+
+### 3.5b Quantization Proof
+
+The Lasso protocol works over *integer indices* $\mathsf{idx}_j \in [0, 2^B)$, while the committed input tensors (`q_norm_y_com`, `k_norm_y_com`, `ffn_m_com`) carry *signed* field-element values. The quantization proof bridges this gap. With per-layer quantization parameters $(s_{\mathrm{num}}, s_{\mathrm{den}})$ where $s_{\mathrm{num}}$ is a power of two (`scale_num.is_power_of_two()` is enforced) and zero-point $\mathsf{zp} = 2^{B-1}$ (centered encoding for $\ge 2$ sub-tables, $0$ for a single table), each raw value $r$ corresponds to the lookup index $\mathsf{idx} = \lfloor (r \cdot s_{\mathrm{den}} + s_{\mathrm{num}}/2) / s_{\mathrm{num}} \rfloor + \mathsf{zp}$.
+
+For each lookup instance the prover:
+
+1. Computes the remainder tensor $\mathsf{rem}_j = r_j s_{\mathrm{den}} + \lfloor s_{\mathrm{num}}/2 \rfloor - s_{\mathrm{num}}(\mathsf{idx}_j - \mathsf{zp})$ and commits it via Hyrax (`rem_coms`).
+2. Adds $\mathsf{rem}$ to the global range batch with bit-width $\log_2 s_{\mathrm{num}}$ (so $0 \le \mathsf{rem}_j < s_{\mathrm{num}}$).
+3. Samples a random $r$ ∈ $\mathbb{F}^{t_{\mathsf{bits}} + d_{\mathsf{bits}}}$ from the transcript.
+4. Opens both the raw input commitment and the remainder commitment at $r$ via Hyrax batch opens.
+5. The verifier checks the algebraic identity
+   $$\widetilde r(\mathbf r) \cdot s_{\mathrm{den}} + \lfloor s_{\mathrm{num}}/2 \rfloor \cdot \widetilde 1(\mathbf r) \stackrel{?}{=} s_{\mathrm{num}} \cdot (\widetilde{\mathsf{idx}}(\mathbf r) - \mathsf{zp} \cdot \widetilde 1(\mathbf r)) + \widetilde{\mathsf{rem}}(\mathbf r)$$
+   where $\widetilde{\mathsf{idx}}(\mathbf r)$ is computed by the verifier directly from the *public* index list. The indicator $\widetilde 1$ compensates for zero-padding when the matrix size is not a power of two.
+
+Combined with the range proof of step 2, this argument is sound: a cheating prover who submits an index inconsistent with the committed raw value would have to find a non-zero remainder outside $[0, s_{\mathrm{num}})$, which fails the range proof, or violate the algebraic identity, which fails by Schwartz–Zippel over $r$. The two quantization proofs (FFN and QK) share machinery in `lookup/quantization.rs` and contribute two accumulators (`acc_quant_ffn`/`acc_quant_m` for FFN, `acc_quant_qk`/`acc_quant_qk_m` for QK) to the deferred Hyrax pool.
 
 ### 3.6 Global Batched Range Proof
 
@@ -276,25 +299,43 @@ with $L$: $(B-1)$ saved $m_{\mathsf{com}}$ MSMs per bucket.
 
 ### 3.7 LayerNorm Circuit
 
-LayerNorm is proved without any division gates using **constraint fusion**:
+LayerNorm is proved without any division gates using **constraint fusion**.
+The witness for one LN exposes seven per-row tensors:
 
-**Step 1 — Mean sumcheck.** Prove $\mathsf{sum\_x}[i] = \sum_j x[i][j]$ at a random row evaluation point $r_t$:
-$$\mathsf{sum\_x\_mle}(r_t) = \sum_{j \in \{0,1\}^{d_{\mathsf{bits}}}} x_{\mathsf{col}}(j)$$
-where $x_{\mathsf{col}}$ is $x_{\mathsf{mle}}$ with row variables fixed to $r_t$.
+| Symbol | Meaning |
+|--------|---------|
+| $x \in \mathbb{F}^{T \times d}$, $y \in \mathbb{F}^{T \times d}$ | LN input / output |
+| $\mathsf{sum\_x}[i] = \sum_j x[i][j]$ | row sum |
+| $\mathsf{sq\_sum\_x}[i] = \sum_j x[i][j]^2$ | row sum of squares |
+| $\mathsf{sum\_x\_sq}[i] = \mathsf{sum\_x}[i]^2$ | square of the row sum |
+| $\sigma[i]$ | integer floor of $\sqrt{\mathsf{var\_x}[i]}/d$ |
+| $\sigma\mathsf{\_sq\_scaled}[i] = (d \cdot \sigma[i])^2$ | committed for the residual sumcheck |
 
-**Step 2 — Variance sumcheck.** Prove $\mathsf{var\_x}[i] = \sum_j (d \cdot x[i][j] - \mathsf{sum\_x}[i])^2$ at $r_t$:
-$$\mathsf{var\_x\_mle}(r_t) = \sum_{j \in \{0,1\}^{d_{\mathsf{bits}}}} h(j)^2, \quad h(j) = d \cdot x_{\mathsf{col}}(j) - \mathsf{sum\_x\_mle}(r_t)$$
-(Cubic sumcheck over three copies of $h$.)
+The integer variance is recovered from these via
+$$\mathsf{var\_x}[i] = d \cdot \bigl(d \cdot \mathsf{sq\_sum\_x}[i] - \mathsf{sum\_x\_sq}[i]\bigr).$$
 
-**Step 3 — Sigma range proof.** Prove $\sigma[i]$ is the integer floor square-root of $\mathsf{var\_x}[i]$:
-$$\mathsf{var\_x}[i] - (d \cdot \sigma[i])^2 \geq 0 \quad \text{and} \quad (d \cdot \sigma[i] + d)^2 - 1 - \mathsf{var\_x}[i] \geq 0$$
-Both residuals are range-checked via the global batched range proof (§3.6). The verifier reconstructs $\sigma(r_\sigma)$ from chunk evaluations: $\sigma(r_\sigma) = \mathsf{cc}_0(r_\sigma) + 2^{16} \cdot \mathsf{cc}_1(r_\sigma)$.
+The prover commits $\mathsf{sum\_x}$, $\mathsf{sq\_sum\_x}$, and $\sigma$ (three internal Hyrax commitments per LN); $\mathsf{sum\_x\_sq}$ and $\sigma\mathsf{\_sq\_scaled}$ appear inside the sigma-residual sumcheck and are bound algebraically rather than separately committed.
 
-**Step 4 — Y constraint fusion.** Prove the LayerNorm output $y[i][j]$ satisfies:
-$$\gamma_j \cdot (d \cdot x[i][j] - \mathsf{sum\_x}[i]) + \beta_j \cdot d \cdot \sigma[i] \approx d \cdot \sigma[i] \cdot y[i][j]$$
-(up to integer rounding), verified at a single random point $(r_{y_t}, r_{y_d})$ via another range proof over the lo/hi residuals. The verifier evaluates $\gamma$ and $\beta$ directly from the public VK in O($d$) operations.
+**Step 1 — Mean sumcheck (degree 2).** Prove $\mathsf{sum\_x}(r_t) = \sum_{j \in \{0,1\}^{d_{\mathsf{bits}}}} x_{\mathsf{col}}(j)$ where $x_{\mathsf{col}}$ is $\widetilde x$ with the row variables fixed to a transcript challenge $r_t \in \mathbb{F}^{t_{\mathsf{bits}}}$.
 
-**All constraints are verified at a single random point** — the verifier runs O(1) equations, not O($T \cdot d$) loops.
+**Step 2 — Square-sum sumcheck (cubic).** Prove $\mathsf{sq\_sum\_x}(r_t) = \sum_{j} x_{\mathsf{col}}(j)^2$ via a degree-3 sumcheck over three copies of $x_{\mathsf{col}}$.
+
+**Step 3 — Sigma-residual sumcheck (cubic multi-batched).** Sample $r_{\mathsf{sig}_t}$ (the row-prefix of the sigma range-proof challenge), then prove jointly
+$$\mathsf{sum\_x\_sq}(r_{\mathsf{sig}_t}) = \sum_{i} \widetilde{\mathsf{eq}}(r_{\mathsf{sig}_t}, i) \cdot \mathsf{sum\_x}(i)^2,$$
+$$\sigma\mathsf{\_sq\_scaled}(r_{\mathsf{sig}_t}) = \sum_{i} \widetilde{\mathsf{eq}}(r_{\mathsf{sig}_t}, i) \cdot (d \cdot \sigma(i))^2,$$
+folded into a single cubic multi-batched sumcheck under a Fiat–Shamir scalar $\lambda_{\mathsf{sig}}$. This binds $\mathsf{sum\_x\_sq}$ and $\sigma\mathsf{\_sq\_scaled}$ to derivable squares of the already-committed $\mathsf{sum\_x}$ and $\sigma$, eliminating the need for separate commitments.
+
+**Step 4 — Sigma range proof (floor-sqrt).** With $\mathsf{var\_x}(r_{\mathsf{sig}_t}) := d \cdot (d \cdot \mathsf{sq\_sum\_x}(r_{\mathsf{sig}_t}) - \mathsf{sum\_x\_sq}(r_{\mathsf{sig}_t}))$, the prover proves
+$$\mathsf{var\_x} - (d\sigma)^2 \geq 0 \quad\text{and}\quad (d\sigma + d)^2 - 1 - \mathsf{var\_x} \geq 0$$
+by range-checking the lo/hi residual pair via the global batched range proof (§3.6) with $\mathsf{LAYERNORM\_RANGE\_BITS} = 64$.
+
+**Step 5 — Y constraint fusion (cubic multi-batched).** At a transcript point $(r_{y_t}, r_{y_d})$ derived from the global Y-range batch, fuse the two legs
+$$\gamma \odot \widetilde x_{r_y} \quad\text{and}\quad \sigma_{r_y} \odot \widetilde y_{r_y}$$
+into one cubic multi-batched sumcheck under a Fiat–Shamir scalar $\alpha$. The final Y range proof verifies
+$$\gamma_j(d \cdot x[i][j] - \mathsf{sum\_x}[i]) + \beta_j(d\sigma[i]) \approx d\sigma[i] \cdot y[i][j]$$
+up to integer rounding through lo/hi residual range proofs. The verifier evaluates $\gamma$ and $\beta$ directly from the public VK in $O(d)$ operations.
+
+**Total per LN:** 1 quadratic + 3 cubic (multi-batched) sumchecks plus 2 range witnesses (σ and y), all verified at four shared random points.
 
 **Model-level batched LN proof.** The end-to-end prover (§4.2) does **not**
 emit one independent LayerNorm sub-proof per LN. Instead, a single call to
@@ -398,16 +439,36 @@ $\mathsf{attn\_num}, \mathsf{attn\_y}, \mathsf{rem}, \mathsf{diff}$ at the
 shared evaluation points are folded into the global cross-block batch opens
 (`attn_norm_r_batch_open`, `attn_norm_attn_point_open`).
 
+**Causal-mode protocol variants.** When `inst_attn.causal` is set, the
+prover runs a different (but structurally analogous) set of sumchecks:
+
+| Non-causal | Causal |
+|------------|--------|
+| `batch_attn_out` (degree-2 multi over $k$) | `batch_attn_out_causal` (cubic multi over $(t,k)$, third multiplicand $\widetilde{\mathsf{eq}}(r_t,\cdot)$ verifier-reproducible) |
+| `batch_attn_ctx`  (degree-2 multi over $t$) | `batch_attn_ctx_causal` (cubic multi over $(s,a,b)$, third multiplicand $\mathrm{suffix}(s)\cdot\widetilde{\mathsf{eq}}_a(a)\cdot\widetilde{\mathsf{eq}}_b(b)$ verifier-reproducible) |
+| `attn_z_sumcheck` + `attn_z_ksum_sumcheck` (two degree-2 multis) | `attn_z_causal_sumcheck` (one cubic multi over $(i,s,a)$, third multiplicand $\widetilde{\mathsf{eq}}_t(i)$) |
+
+The causal context $C[i] = \sum_{s \le i} \phi(K_n)_s \cdot V_s$ is *not*
+separately committed; its prefix value at the OUT-sumcheck terminal point
+is recovered as the cubic CTX sumcheck's $f \cdot g$ leaf, and the leaf
+constraint is verifier-reproducible because the prefix kernel
+$\mathrm{suffix}(s) \widetilde{\mathsf{eq}}_a(a) \widetilde{\mathsf{eq}}_b(b)$ is
+a public function of the OUT terminal point and $r_{k_o}$. This avoids any
+proof-carried causal-context opening at the cost of one extra round of
+sumcheck per cubic instance.
+
 ### 3.10 FFN Circuit
 
 Proves $\mathsf{Out} = \phi(X \cdot W_1) \cdot W_2$:
 
 **GKR backward ordering:**
-1. **Activation** $A = \phi(M)$: the prover commits `ffn_a_com = Com(A)` and includes the block in the model-level `ffn_lasso_proof`.
-2. **Second projection** $\mathsf{Out} = A \cdot W_2$: degree-2 sumcheck at a random entry. Verifier checks the sampled $A(r)$ evaluation against `ffn_a_com` through `ffn_a_batch_open`.
-3. **First projection** $M = X \cdot W_1$: degree-2 sumcheck at a random entry. $M_{\mathsf{com}}$ is kept (field values of $M$ can be negative, unlike Lasso query indices).
+1. **Activation** $A = \phi(M)$: the prover commits `ffn_m_com = Com(M)` and absorbs it into the transcript; $A$ itself is never independently committed in the current proof bundle.
+2. **Second projection** $\mathsf{Out} = A \cdot W_2$: a cross-block `batch_ffn_y` degree-2 sumcheck reduces $\widetilde{Y}(r_t, r_{\mathsf{out}}) - \widetilde{b}(r_{\mathsf{out}}) = \alpha\sum_k A(r_t, k) \cdot W_2(k, r_{\mathsf{out}})$ across all blocks to a single terminal claim
+   $$\textstyle\sum_\ell w_\ell\, \widetilde A_\ell(r_t, r_{k_{fy}}) \;=\; c$$
+   where $w_\ell = \eta^\ell \cdot \widetilde W_{2,\ell}(r_{k_{fy}}, r_{\mathsf{out}})$. A `LassoTerminalEvalProof` (`ffn_a_terminal_proof`) then proves $c$ is consistent with applying the Lasso lookup tables to the per-block index streams, evaluated as an MLE at the terminal point. This fuses the equivalent of an `ffn_a_com` commitment, a Lasso multi-proof's output binding, and a Hyrax batch open of $\{A_\ell\}$ into one sub-protocol with no proof-carried $A_\ell$ outputs.
+3. **First projection** $M = X_{\mathsf{n2}} \cdot W_1$: cross-block `batch_ffn_m` degree-2 sumcheck at shared random entry $(\mathsf{rx}_m, \mathsf{ry}_m)$. $M_{\mathsf{com}}$ is kept (field values of $M$ can be negative, unlike Lasso query indices, which is why the quantization proof of §3.5b is necessary to bridge the two).
 
-The global FFN Lasso binds lookup outputs to `ffn_a_com`, while `ffn_lasso_bind_open` binds the raw lookup indices to `ffn_m_com`. This keeps the GKR-style backward ordering without relying on proof-carried activation outputs.
+`ffn_quant_proof` (§3.5b) binds the public FFN lookup indices to `ffn_m_com`, and `ffn_lasso_bind_open` is the auxiliary index-MLE self-consistency check.
 
 ### 3.11 Multi-Claim Combine Protocol
 
@@ -615,9 +676,15 @@ Algorithm Prove(PK, witness W, instances inst):
   lm_head_logits_open ← HyraxOpen(W.lm_head_wit.y, lm_y_claim.point, ...)
 
   // ── 13. Advance transcript for accumulator μ-challenges ─────────────────
-  For 5 deferred accumulators (params_td, params_qkvo_w, params_qkvo_b,
-                                params_wff, params_mff):
+  // The verifier draws 13 μ-challenges for the post-LM-head accumulator
+  // pool: inter, ln_t, ln_td, proj_w, proj_b, lmh_w, lmh_b, rng_sig, rng_y,
+  // rng_m, quant_ffn, quant_m, attn_norm.  It also reads two read-only ρ
+  // fuse challenges (hyrax_fuse_td, hyrax_fuse_range_m) used by the
+  // shared-params `finalize_many_with_mus` calls.
+  For 13 deferred accumulators:
       FS.challenge("hyrax_group_mu")
+  FS.challenge_readonly("hyrax_fuse_td")
+  FS.challenge_readonly("hyrax_fuse_range_m")
 
   // ── 14. Global intermediate batch open ──────────────────────────────────
   // 5L matrices (Q, K, V, Out_attn, Out_ffn) opened at shared r_td.
@@ -667,7 +734,7 @@ Algorithm Prove(PK, witness W, instances inst):
   }
 ```
 
-Each `TransformerBlockProof` carries the 7 intermediate commitments, the LN1/LN2 sub-proofs, the per-block range-multiplicity commitment, the FFN `A` and `M` commitments, the `phi_q`/`phi_k` commitments, and the per-block scalar evaluations consumed by the cross-block batch sumchecks (`q_eval`, `k_eval`, `v_eval`, `attn_phi_q_eval`, `attn_phi_k_eval`, `attn_ctx_eval`, `attn_v_eval`, etc.). The per-block FFN Lasso field is now an empty compatibility placeholder; the real FFN activation lookup proof is the model-level `ffn_lasso_proof`.
+Each `TransformerBlockProof` carries up to 15 commitments — 10 always-present (`x_norm1_com`, `q_com`, `k_com`, `v_com`, `q_norm_y_com`, `k_norm_y_com`, `out_attn_com`, `attn_out_norm_y_com`, `x_norm2_com`, `out_ffn_com`) plus 5 optional under normalized attention (`attn_num_com`, `attn_norm_com`, `attn_z_com`, `attn_rem_com`, `attn_diff_com`) — the `ffn_m_com`, the `phi_q`/`phi_k` commitments, and the per-block scalar evaluations consumed by the cross-block batch sumchecks (`q_eval`, `k_eval`, `v_eval_rtd`, `attn_phi_q_eval`, `attn_phi_k_eval`, `attn_ctx_eval`, etc.). No per-block LN sub-proof and no per-block FFN Lasso proof are stored — both are subsumed by the model-level batched protocols. The `TransformerBlockProof.ffn_lasso_proof` field is an empty compatibility placeholder; the real FFN activation argument is the model-level `ffn_a_terminal_proof` plus the QK `all_lasso_proof`.
 
 ### 4.3 Block Phase 1 (Per-Block Commit + LN IO Absorption)
 
@@ -831,77 +898,68 @@ same Schwartz–Zippel argument as cross-block batching (Theorem 2).
 ```
 Algorithm ProveLayerNorm(wit, io_coms, vk, σ_range, y_range, FS):
   Input:
-    wit     = { x, y, sum_x, sq_sum_x, σ }   // witness arrays
+    wit     = { x, y, sum_x, sq_sum_x, sum_x_sq, σ, σ_sq_scaled }
     io_coms = { x_com, y_com }                // from pipeline
     vk      = { γ, β, d, scale_γ, scale_β }
     σ_range = (RangeWitnessProof, r_σ)        // pre-committed, from global batch
     y_range = (RangeWitnessProof, r_y)        // pre-committed, from global batch
 
-  // 1. Commit intermediate witnesses
-  sum_x_com  ← Com(sum_x)
-  sq_sum_com ← Com(sq_sum_x)
-  σ_com      ← Com(σ)
+  // 1. Commit intermediate witnesses (3 commitments per LN)
+  sum_x_com    ← Com(sum_x)        // per-row sum
+  sq_sum_x_com ← Com(sq_sum_x)     // per-row sum of squares
+  σ_com        ← Com(σ)            // floor-sqrt witness
   FS.absorb("x_com",      io_coms.x_com)
   FS.absorb("y_com",      io_coms.y_com)
   FS.absorb("sum_x_com",  sum_x_com)
-  FS.absorb("sq_sum_com", sq_sum_com)
-  FS.absorb("σ_com",      σ_com)
+  FS.absorb("sq_sum_x_com", sq_sum_x_com)
+  FS.absorb("sigma_com",  σ_com)
 
   // 2. Row audit challenge
   r_t ← FS.challenge_vec("layernorm_rt", t_bits)
 
-  // 3. Mean sumcheck: Σ_j x_col[j] = sum_x_mle(r_t)
+  // 3. Mean sumcheck (deg 2): sum_x_mle(r_t) = Σ_j x_col(j)
   x_col ← x_mle.fix_row(r_t)
   sum_x_rt ← sum_x_mle(r_t)
   FS.append("sum_x_at_rt", sum_x_rt)
   (mean_sc, r_d_mean) ← ProveSumcheck(x_col, ones_mle, sum_x_rt, FS)
 
-  // 4. Variance sumcheck (cubic): Σ_j h[j]^2 = var_x_mle(r_t)
-  //    h[j] = d * x_col[j] - sum_x_rt
-  var_x_rt ← sq_sum_mle(r_t)
-  FS.append("var_x_at_rt", var_x_rt)
-  h_mle ← d * x_col - sum_x_rt
-  (var_sc, r_d_var) ← ProveSumcheckCubic(h_mle, h_mle, h_mle,
-                                           var_x_rt, FS)
+  // 4. Square-sum sumcheck (cubic): sq_sum_x_mle(r_t) = Σ_j x_col(j)^3
+  //    (degree-3 sumcheck over three copies of x_col)
+  sq_sum_x_rt ← sq_sum_x_mle(r_t)
+  FS.append("sq_sum_x_at_rt", sq_sum_x_rt)
+  (sq_sum_sc, r_d_var) ← ProveSumcheckCubic(x_col, x_col, x_col, sq_sum_x_rt, FS)
 
-  // 5. Sigma constraint verification (uses pre-committed σ_range)
-  //    Verifier will reconstruct σ(r_σ) from chunk_evals
+  // 5. Sigma-residual sumcheck (cubic multi-batched).  Binds
+  //    sum_x_sq, σ_sq_scaled to derivable squares at r_sig_t.
   (σ_rp, r_σ) ← σ_range
-  r_σ_t ← r_σ[0..t_bits];  r_σ_b ← r_σ[t_bits+d_bits]
-  var_x_rσ ← var_x_mle(r_σ_t)
-  σ_rσ     ← σ_mle(r_σ_t)
-  // (These evaluations are included in the proof for the verifier)
+  r_sig_t ← r_σ[0..t_bits]
+  claim_sum_x_sq ← sum_x_sq_mle(r_sig_t)
+  claim_σ_sq    ← σ_sq_scaled_mle(r_sig_t)
+  FS.append("claim_sum_x_sq", claim_sum_x_sq)
+  FS.append("claim_sigma_sq", claim_σ_sq)
+  λ_sig ← FS.challenge("sigma_residual_batch_lambda")
+  combined ← claim_sum_x_sq + λ_sig · claim_σ_sq
+  (sig_res_sc, r_f_sig) ← ProveSumcheckCubicMultiBatched(
+      [(eq(r_sig_t,·), sum_x, sum_x), (eq(r_sig_t,·), d·σ, d·σ)], λ_sig, FS)
 
-  // 6. Y constraint (multi-cubic batched sumcheck)
+  // 6. Y constraint fusion (cubic multi-batched): γ·X and σ·Y legs.
   (y_rp, r_y) ← y_range
-  r_y_t ← r_y[0..t_bits];  r_y_d ← r_y[t_bits..t_bits+d_bits];  r_y_b ← r_y[...]
-  γ_r ← γ_mle(r_y_d);  β_r ← β_mle(r_y_d)
+  r_y_t ← r_y[0..t_bits];  r_y_d ← r_y[t_bits..t_bits+d_bits]
+  γ_r   ← γ_mle(r_y_d);   β_r ← β_mle(r_y_d)
+  α     ← FS.challenge("layernorm_alpha")
+  (gx_sy_sc, r_f_y) ← ProveSumcheckCubicMultiBatched(
+      [γ_leg, σ_leg], α, FS)
 
-  // Fuse γX and σY constraints into a single batched sumcheck:
-  α ← FS.challenge("layernorm_alpha")
-  // Claim: α * Σ_j eq_t(j)*γ(j)*x(j) + Σ_j eq_t(j)*σ(j)*y(j) = combined
-  (gx_sy_sc, r_f) ← ProveSumcheckMultiBatched(
-      [γ_mle ⊙ x_mle_col_ry, σ_mle_row_ry ⊙ y_mle_col_ry], α, FS)
-
-  // 7. Collect Hyrax openings (deferred to batch accumulators)
-  acc_t.add(sum_x_com,  sum_x_rt,  r_t)
-  acc_t.add(sq_sum_com, var_x_rt,  r_t)
-  acc_t.add(σ_com,      σ_rσ,      r_σ_t)
-  acc_t.add(sum_x_com,  sum_x_rσ,  r_σ_t)
-  acc_td.add(x_com,     x_rt_mean, (r_t, r_d_mean))
-  acc_td.add(x_com,     x_rt_var,  (r_t, r_d_var))
-  acc_td.add(x_com,     x_ry,      (r_y_t, r_y_d))
-  acc_td.add(y_com,     y_ry,      (r_y_t, r_y_d))
-  acc_t.add(sum_x_com,  sum_x_ryt, r_y_t)
-  acc_t.add(σ_com,      σ_ryt,     r_y_t)
+  // 7. Push Hyrax openings to deferred accumulators (acc_t / acc_td).
 
   return LayerNormProof {
-    sum_x_com, sq_sum_com, σ_com,
-    σ_range_proof: σ_rp,
-    y_range_proof: y_rp,
-    mean_sc, var_sc, gx_sy_sc,
-    openings: { sum_x_rt, var_x_rt, x_rt_mean, x_rt_var,
-                var_x_rσ, σ_rσ, x_ry, y_ry, sum_x_ryt, σ_ryt }
+    internal_coms: { sum_x_com, sq_sum_x_com, σ_com },
+    mean_sc, sq_sum_sc, sig_res_sc, gx_sy_sc,
+    sigma_range_proof, y_range_proof,
+    openings: { many shared per-LN evaluations described in
+                 LayerNormOpenings; the verifier opens sum_x / sq_sum_x
+                 / σ at the four shared random points r_t, r_sig_t,
+                 r_f_sig, r_y_t, r_f_y via batched Hyrax opens }
   }
 ```
 
@@ -917,11 +975,15 @@ Algorithm Verify(VK, π, inst_attn, inst_ffn, public_x_in, public_logits):
   Output:
     ACCEPT or REJECT
 
-  // ── 1. Bind public I/O via re-commitment ────────────────────────────────
-  Assert Com(public_x_in)   == π.x_in_com
-  Assert Com(public_logits) == π.logits_com
+  // ── 1. Bind public input via re-commitment ──────────────────────────────
+  Assert Com(public_x_in) == π.x_in_com
   FS.init("piformer")
   FS.absorb("x_in_com", π.x_in_com)
+
+  // (Public output is bound later in step 12 by evaluating public_logits
+  // as a multilinear extension at a transcript-derived point lm_y_point
+  // and chaining that claim through the LM-head proof to final_ln_out_com.
+  // No separate logits commitment is published.)
 
   // ── 2. Phase 1 verify (per block): absorb LN IO + projection commitments ─
   Initialize deferred accumulators (10 cross-cutting groups).
@@ -963,13 +1025,30 @@ Algorithm Verify(VK, π, inst_attn, inst_ffn, public_x_in, public_logits):
                            σ-range r_v's, y-range r_v's, FS,
                            ln_acc_t, ln_acc_td)
 
-  // ── 12. LM head + logits opening ───────────────────────────────────────
-  VerifyProjection(π.lm_head_proof, VK.lm_head_vk,
-                   {x_com: π.final_ln_out_com}, FS, lmh_acc_w, lmh_acc_b)
-  Assert HyraxVerify(π.logits_com, lm_y_claim, π.lm_head_logits_open, FS)
+  // ── 12. LM head + public-output binding ────────────────────────────────
+  // The verifier samples lm_y_point ∈ F^{t_bits + v_bits} from the transcript,
+  // computes lm_y_value = ̃logits(lm_y_point) directly from public_logits,
+  // and feeds (lm_y_point, lm_y_value) into the LM-head projection sumcheck.
+  // VerifyProjectionGKR reduces this to an opening claim
+  //   lm_x_claim = (point: r_x, value: v_x)  on  final_ln_out_com.
+  // π.lm_head_input_open is verified via the ln_acc_td deferred accumulator,
+  // which closes the chain back to the LayerNorm proof.
+  lm_y_point ← FS.challenge_vec("lm_gkr_y", t_bits + v_bits)
+  lm_y_value ← MLE_eval(public_logits, lm_y_point)
+  lm_x_claim ← VerifyProjectionGKR(π.lm_head_proof, VK.lm_head_vk,
+                                    {point: lm_y_point, value: lm_y_value},
+                                    FS, lmh_acc_w, lmh_acc_b)
+  ln_acc_td.add_verify(π.final_ln_out_com, lm_x_claim.value, lm_x_claim.point,
+                        π.lm_head_input_open)
 
-  // ── 13. Drain accumulator μ-challenges (5 groups, mirrors prover) ──────
-  for _ in 0..5: FS.challenge("hyrax_group_mu")
+  // ── 13. Drain accumulator μ-challenges (13 groups, mirrors prover) ─────
+  // Same as the prover side of step 13 above.  After the cross-block batch
+  // opens of step 14–15 the verifier additionally draws 5 cross-block-batch
+  // μ-challenges (cb_td, cb_qkvo_w, cb_qkvo_b, cb_wff, cb_mff) and, when
+  // the QK quantization proof is present, 2 more (quant_qk, quant_qk_m).
+  for _ in 0..13: FS.challenge("hyrax_group_mu")
+  FS.challenge_readonly("hyrax_fuse_td")
+  FS.challenge_readonly("hyrax_fuse_range_m")
 
   // ── 14–15. Global intermediate batch open + cross-block batch opens ───
   Assert HyraxVerifyBatch({Q_ℓ, K_ℓ, V_ℓ, Out_attn_ℓ, Out_ffn_ℓ}_ℓ at r_td,
@@ -1255,6 +1334,31 @@ $\eta$ non-zero of degree $\le 5L$, caught with probability $\ge 1 - 5L/|\mathbb
 The shared inner sumchecks (mean, variance, Y-fusion) inherit
 Lemma 1 soundness on the combined claim. $\square$
 
+**Theorem 6d (Quantization proof soundness).** *For each lookup family, the
+`prove_quantization_batch` sub-protocol binds every public lookup query index
+$\mathsf{idx}_j$ to the committed raw input value $r_j$ via the integer
+relation
+$r_j \cdot s_{\mathrm{den}} + \lfloor s_{\mathrm{num}}/2 \rfloor =
+s_{\mathrm{num}}(\mathsf{idx}_j - \mathsf{zp}) + \mathsf{rem}_j$
+with $0 \le \mathsf{rem}_j < s_{\mathrm{num}}$, except with negligible
+probability.*
+
+*Proof sketch.* The prover commits the remainder tensor $\mathsf{rem}$ via
+Hyrax before any quantization challenge is drawn; the global range batch
+(Theorem 6) then forces $0 \le \mathsf{rem}_j < s_{\mathrm{num}}$ (with
+$s_{\mathrm{num}}$ a power of two so the bit-width bucket is exact). At a
+Fiat–Shamir random point $\mathbf r \in \mathbb F^{n}$ ($n = t_{\mathsf{bits}} + d_{\mathsf{bits}}$)
+the verifier checks the algebraic identity over the four MLEs
+$\widetilde r$, $\widetilde 1$, $\widetilde{\mathsf{idx}}$, $\widetilde{\mathsf{rem}}$.
+By Schwartz–Zippel a non-zero residual polynomial in any of the witnesses
+fails the identity with probability $\ge 1 - n/|\mathbb F_r|$. Hyrax binding
+(Lemma 2) closes the loop: a cheating prover cannot open $\widetilde r$ or
+$\widetilde{\mathsf{rem}}$ inconsistently with their commitments.
+Together with Theorem 6, this ensures the unique-quotient property:
+$\mathsf{idx}_j$ is forced to be the unique integer in $[0, 2^B)$ satisfying
+the relation, i.e. $\mathsf{idx}_j = \lfloor (r_j s_{\mathrm{den}} + s_{\mathrm{num}}/2) / s_{\mathrm{num}} \rfloor + \mathsf{zp}$.
+$\square$
+
 **Theorem 6c (Attention-normalization sumcheck soundness).** *When
 `has_attn_norm` is set, the cubic multi-batched sumcheck for*
 $\mathsf{ATTN\_NORM\_SCALE} \cdot \mathsf{attn\_num} - \mathsf{rem} - Z\!\cdot\!\mathsf{attn\_y} = 0$
@@ -1292,7 +1396,7 @@ $$\varepsilon_{\mathsf{sound}} \leq L \cdot n_{\max} \cdot \delta_{\max} / |\mat
 
 1. **Hyrax binding** (Lemma 2): If $\mathcal{A}$ can forge any committed evaluation, it breaks DL in G1.
 
-2. **Block-level chaining:** In block $\ell$, the output commitment $C_{x_{\mathsf{out}}}^\ell$ is the *homomorphic sum* of three committed tensors. Binding of each component tensor (Lemma 2) implies binding of $C_{x_{\mathsf{out}}}^\ell$. The first block's input is $x_{\mathsf{in\_com}}$, which the verifier holds independently; binding proceeds inductively.
+2. **Block-level chaining:** In block $\ell$, the output commitment $C_{x_{\mathsf{out}}}^\ell$ is a two-step *homomorphic sum*: first $C_{x_{\mathsf{mid}}}^\ell = C_{x_{\mathsf{in}}}^\ell + C_{\mathsf{attn\_out\_norm}.y}^\ell$ (sandwich-norm residual), then $C_{x_{\mathsf{out}}}^\ell = C_{x_{\mathsf{mid}}}^\ell + C_{\mathsf{out\_ffn}}^\ell$. Binding of each component (Lemma 2) implies binding of the sums. The first block's input is `proof.x_in_com`, which the verifier recomputes from `public_x_in` and checks for equality; binding proceeds inductively.
 
 3. **Within each block:** The transcript state after block $\ell-1$ is a deterministic function of all commitments and proofs from blocks $0 \ldots \ell-1$. All challenges in block $\ell$ are Fiat-Shamir outputs from this state. Given Hyrax binding and sumcheck soundness:
    - The bucketed global range batch over all witnesses (LN $\sigma$/$y$ + optional attn-norm rem/diff) is sound (Theorem 6).
@@ -1303,7 +1407,7 @@ $$\varepsilon_{\mathsf{sound}} \leq L \cdot n_{\max} \cdot \delta_{\max} / |\mat
    - GKR fusion soundness (Theorem 2) for the six cross-block sumchecks.
    - Global FFN Lasso soundness (Theorem 4).
    - Homomorphic residuals require no proof (Theorem 3).
-   - Lasso soundness (Lemma 4) for all activation tables, with lookup binding to the post-norm `q_norm_y_com`, `k_norm_y_com` (attention) and `ffn_m_com` (FFN) — i.e. the φ inputs are exactly the LayerNorm outputs.
+   - Lasso soundness (Lemma 4) for all activation tables, with lookup-index-to-input binding via the quantization proofs (Theorem 6d), which tie the public indices in `ffn_lasso_query_indices` and `all_lasso_proof.all_query_indices` to the committed post-norm `q_norm_y_com`, `k_norm_y_com` and the committed `ffn_m_com` through the integer quantization relation. The φ inputs are exactly the LayerNorm outputs.
 
 4. **Final layer + LM head:** Same argument as a single block.
 
@@ -1452,7 +1556,7 @@ The implementation enforces several strict transcript-ordering rules that the so
 
 7. **Lookup indices are transcript-bound before index-opening challenges**. The raw query-index vectors in both global Lasso proofs are absorbed before deriving `ffn_lasso_bind_r` or `qk_lasso_bind_r`. The corresponding Hyrax batch openings bind those index vectors to `ffn_m_com` (FFN) or to the post-norm `q_norm_y_com` / `k_norm_y_com` (attention) — *not* to the pre-norm `q_com` / `k_com`, since the Lasso queries are evaluated on the post-QK-norm tensors.
 
-8. **Five deferred μ-challenges** are advanced after the model-level batched LN proof, after the LM-head proof, and before the global intermediate batch open. The verifier mirrors this `for _ in 0..5 { transcript.challenge_field(b"hyrax_group_mu") }` loop so that the Hyrax accumulators consume the same μ values the prover used. The five groups are `params_td`, `params_qkvo_w`, `params_qkvo_b`, `params_wff`, `params_mff`.
+8. **Thirteen deferred μ-challenges** are advanced after the model-level batched LN proof and the LM-head proof, before the global intermediate batch open. The thirteen groups are `inter`, `ln_t`, `ln_td`, `proj_w`, `proj_b`, `lmh_w`, `lmh_b`, `rng_sig`, `rng_y`, `rng_m`, `quant_ffn`, `quant_m`, `attn_norm`. Two read-only ρ challenges (`hyrax_fuse_td`, `hyrax_fuse_range_m`) are then sampled to fuse subsets of the accumulators that share Hyrax parameters into a single MSM pair via `HyraxBatchAccumulator::finalize_many_with_mus`. After the cross-block batch opens of step 15 the prover and verifier draw an additional 5 μ-challenges (`cb_td`, `cb_qkvo_w`, `cb_qkvo_b`, `cb_wff`, `cb_mff`) and, when the QK quantization proof fires, 2 more (`quant_qk`, `quant_qk_m`).
 
 ### Bit-Ordering Convention
 
@@ -1534,7 +1638,7 @@ All field elements are serialized as lowercase hex strings with `0x` prefix, zer
 
 ```
 Magic:      b"PFMR_PK\0"  (8 bytes)
-Version:    u8             (1 byte; current key version = 2)
+Version:    u8             (1 byte; current key version = 5)
 num_blocks: varint u64
 seq_len:    varint u64
 d_model:    varint u64
@@ -1554,19 +1658,23 @@ Same layout as `.pk` but all `ProjectionPK` / `FFN_PK` weight fields are replace
 
 ```
 Magic:       b"PFMR_PR\0"  (8 bytes)
-Version:     u8             (current proof version = 7)
+Version:     u8             (current proof version = 22)
 proof:       [TransformerModelProof]
 lasso_sigma: varint u64
 ```
 
 `TransformerModelProof` carries:
 
-- One `TransformerBlockProof` per block with the per-block intermediate Hyrax commitments (`x_norm1_com`, `q_com`, `k_com`, `v_com`, `q_norm_y_com`, `k_norm_y_com`, optional `attn_norm_com`/`attn_num_com`/`attn_z_com`/`attn_rem_com`/`attn_diff_com`, `out_attn_com`, `attn_out_norm_y_com`, `x_norm2_com`, `out_ffn_com`), `ffn_a_com`, `ffn_m_com`, the per-block `phi_q`/`phi_k` commitments, and the per-block scalar evaluations consumed by the cross-block batch sumchecks. The per-block LN sub-proofs are no longer carried — they are replaced by a single model-level `ln_batched_proof`.
-- A model-level `ln_batched_proof` (`prove_layernorms_batched` output) covering all $5L+1$ LayerNorms (`ln1, q_norm, k_norm, attn_out_norm, ln2` per block, plus the final LN), and the five LN's IO commitments are recovered from the per-block proofs and the top-level `final_ln_out_com`.
-- A bucketed range batch (one `GlobalRangeM` per non-empty bit-width bucket) covering all LN $\sigma$/$y$ witnesses and, when normalized attention is used, the attn-norm `rem`/`diff` residuals.
-- When normalized attention is used: the cubic multi-batched `attn_norm_sumcheck`, the auxiliary `attn_z_sumcheck` (and a causal variant when applicable), and the corresponding batch opens `attn_norm_r_batch_open`, `attn_z_open`, `attn_norm_attn_point_open`.
-- Six model-level cross-block batched sumcheck proofs: `batch_qkv`, `batch_oproj`, `batch_attn_out`, `batch_attn_ctx`, `batch_ffn_y`, `batch_ffn_m`.
-- One `inter_batch_open` covering the 5L intermediate matrices (Q, K, V, Out_attn, Out_ffn for each block) opened jointly at `r_td`.
-- Cross-block batch opens for the per-type weight, bias, activation, and intermediate matrices at their respective shared evaluation points (`x_norm1`, `w_q`, `w_k`, `w_v`, `bias_q`, `bias_k`, `bias_v`, `w_o`, `bias_o`, `w2`, `ffn_a`, `w1`, `x_norm2`, `ffn_m_com`, `ffn_lasso_bind`, `phi_q`, `phi_k`, `v_attn`, `qk_lasso_bind`).
-- Two model-level committed-output `LassoMultiProof`s: `ffn_lasso_proof` covers all FFN activations $A=\phi(M)$; `all_lasso_proof` covers all $\phi(Q)$ / $\phi(K)$ Lasso instances across every block.
-- The final-LayerNorm sub-proof + `GlobalRangeM`, the LM-head projection sub-proof, the LM-head logits opening, and Hyrax commitments for the final-LN output and logits.
+- One `TransformerBlockProof` per block with the per-block intermediate Hyrax commitments (`x_norm1_com`, `q_com`, `k_com`, `v_com`, `q_norm_y_com`, `k_norm_y_com`, optional `attn_num_com`/`attn_norm_com`/`attn_z_com`/`attn_rem_com`/`attn_diff_com`, `out_attn_com`, `attn_out_norm_y_com`, `x_norm2_com`, `out_ffn_com`), the `ffn_m_com`, the per-block `phi_q`/`phi_k` commitments, the per-block scalar evaluations consumed by the cross-block batch sumchecks, and a placeholder (empty) `ffn_lasso_proof` field retained for codec compatibility.
+- A model-level `ln_batched_proof` (`prove_layernorms_batched` output) covering all $5L+1$ LayerNorms (per block: `ln1`, `q_norm`, `k_norm`, `attn_out_norm`, `ln2`; plus the final LN). LayerNorms are grouped by shape (`seq_len`, `d_head`) first; each shape group emits one set of (mean, sq_sum, sigma_residual, gamma_sigma) multi-batched sumchecks. The σ/y range proofs are carried inside the same struct in input order.
+- A bucketed range batch (`ln_range_ms`: one `RangeBatchM` per non-empty bit-width bucket) covering all LN σ/y witnesses (routed via `choose_range_bits` to the narrowest of {32, 64} bits) and, when normalized attention is used, the attn-norm `rem`/`diff` residuals.
+- When normalized attention is used: the cubic multi-batched `attn_norm_sumcheck`, the auxiliary `attn_z_sumcheck` + `attn_z_ksum_sumcheck` (non-causal) or `attn_z_causal_sumcheck` (causal), plus the corresponding batch opens `attn_norm_r_batch_open`, `attn_z_open`, `attn_norm_attn_point_open`, `attn_z_phi_q_open`, `attn_z_phi_k_open`. The `attn_norm_rem_range_proofs`, `attn_norm_diff_range_proofs`, and their per-witness bit-width vectors live as top-level fields so the verifier can route them into the right range buckets.
+- Six (non-causal) or six causal-variant model-level cross-block batched sumcheck proofs: `batch_qkv`, `batch_oproj`, (`batch_attn_out` | `batch_attn_out_causal`), (`batch_attn_ctx` | `batch_attn_ctx_causal`), `batch_ffn_y`, `batch_ffn_m`. In causal mode additional `causal_phi_k_prefix_evals`, `causal_v_prefix_evals` scalar vectors are included.
+- One `inter_batch_open` covering the 5L intermediate matrices (`q`, `k`, `v`, `out_attn`, `out_ffn` per block) opened jointly at `r_td`.
+- Cross-block batch opens for the per-type weight, bias, activation, and intermediate matrices at their respective shared evaluation points: `x_norm1_batch_open`, `qkv_w_batch_open` (3L wq/wk/wv merged), `w_o_batch_open`, `qkvo_bias_batch_open` (4L bq/bk/bv/bo merged), `w2_batch_open`, `w1_batch_open`, `x_norm2_batch_open`, `ffn_m_com_batch_open`, `ffn_lasso_bind_open`, `phi_q_batch_open`, `phi_k_batch_open`, `v_attn_batch_open`, `qk_lasso_bind_open`.
+- `ffn_lasso_query_indices`: the per-block FFN lookup index vectors in plaintext, used by the verifier to evaluate the index MLE for the quantization-proof and self-consistency check.
+- `ffn_a_terminal_proof`: the model-level FFN Lasso terminal-eval proof binding the `batch_ffn_y` terminal claim to the Lasso table evaluations.
+- `all_lasso_proof`: a committed-output `LassoMultiProof` covering all $\phi(Q_n)$ / $\phi(K_n)$ Lasso instances across every block.
+- `ffn_quant_proof` and `qk_quant_proof`: the two quantization sub-proofs of §3.5b, each carrying remainder commitments, a range proof for the remainders, and raw/remainder openings at a shared transcript-derived random point.
+- `final_ln_out_com` (Hyrax commitment to the final-LN output) and `lm_head_input_open` (Hyrax opening that closes the LM-head proof's input claim back to `final_ln_out_com`). The public output is *not* committed separately; it is bound by evaluating it as an MLE at the transcript-derived `lm_gkr_y` point.
+- `lm_head_proof`: the LM-head ternary projection sumcheck plus its weight/bias openings.

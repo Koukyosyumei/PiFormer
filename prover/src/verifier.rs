@@ -354,8 +354,9 @@ pub fn verify(
     let mut acc_attn_norm = HyraxBatchAccumulator::new();
     let mut acc_quant_ffn = HyraxBatchAccumulator::new();
     let mut acc_quant_m = HyraxBatchAccumulator::new();
-    // inter_acc: per-block v_attn opens (different eval point per block)
-    let inter_acc = HyraxBatchAccumulator::new();
+    // inter_acc: global intermediate opening at r_td; mu is drawn before the
+    // opening eta to match the prover's transcript schedule.
+    let mut inter_acc = HyraxBatchAccumulator::new();
 
     // =========================================================================
     // 2. Phase 1: verify range proofs (LN sumchecks/openings deferred to the
@@ -1301,9 +1302,8 @@ pub fn verify(
     );
 
     // =========================================================================
-    // 12. Finalize accumulators (same order as prover's mu challenge loop)
+    // 12. Draw accumulator challenges (same order as prover's mu challenge loop)
     // =========================================================================
-    let _tacc = Instant::now();
     let mu_inter = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_ln_t = transcript.challenge_field::<F>(b"hyrax_group_mu");
     let mu_ln_td = transcript.challenge_field::<F>(b"hyrax_group_mu");
@@ -1323,6 +1323,39 @@ pub fn verify(
     let rho_td = transcript.challenge_field_readonly::<F>(b"hyrax_fuse_td");
     let rho_range_m = transcript.challenge_field_readonly::<F>(b"hyrax_fuse_range_m");
 
+    // =========================================================================
+    // 13. Global batch open for 5L intermediate matrices at r_td (inter_batch_open)
+    // =========================================================================
+    let _t0 = Instant::now();
+    let mut all_coms: Vec<HyraxCommitment> = Vec::with_capacity(5 * num_blocks);
+    let mut all_evals: Vec<F> = Vec::with_capacity(5 * num_blocks);
+    for bp in &proof.block_proofs {
+        all_coms.push(bp.q_com.clone());
+        all_coms.push(bp.k_com.clone());
+        all_coms.push(bp.v_com.clone());
+        all_coms.push(bp.out_attn_com.clone());
+        all_coms.push(bp.out_ffn_com.clone());
+        all_evals.push(bp.q_eval);
+        all_evals.push(bp.k_eval);
+        all_evals.push(bp.v_eval_rtd);
+        all_evals.push(bp.out_attn_eval);
+        all_evals.push(bp.out_ffn_eval);
+    }
+    inter_acc
+        .add_verify_batch(
+            &all_coms,
+            &all_evals,
+            &r_td,
+            &proof.inter_batch_open,
+            transcript,
+        )
+        .map_err(|e| format!("Global inter_batch (deferred): {e}"))?;
+    eprintln!(
+        "[model] inter_batch:{:>8.3}ms",
+        _t0.elapsed().as_secs_f64() * 1000.0
+    );
+
+    let _tacc = Instant::now();
     let ((r0, r1), (r2, r3)) = rayon::join(
         || {
             rayon::join(
@@ -1419,38 +1452,6 @@ pub fn verify(
     r7?;
     r8?;
     r9?;
-
-    // =========================================================================
-    // 13. Global batch open for 5L intermediate matrices at r_td (inter_batch_open)
-    // =========================================================================
-    let _t0 = Instant::now();
-    let mut all_coms: Vec<HyraxCommitment> = Vec::with_capacity(5 * num_blocks);
-    let mut all_evals: Vec<F> = Vec::with_capacity(5 * num_blocks);
-    for bp in &proof.block_proofs {
-        all_coms.push(bp.q_com.clone());
-        all_coms.push(bp.k_com.clone());
-        all_coms.push(bp.v_com.clone());
-        all_coms.push(bp.out_attn_com.clone());
-        all_coms.push(bp.out_ffn_com.clone());
-        all_evals.push(bp.q_eval);
-        all_evals.push(bp.k_eval);
-        all_evals.push(bp.v_eval_rtd);
-        all_evals.push(bp.out_attn_eval);
-        all_evals.push(bp.out_ffn_eval);
-    }
-    hyrax_verify_batch(
-        &all_coms,
-        &all_evals,
-        &r_td,
-        &proof.inter_batch_open,
-        &params_td,
-        transcript,
-    )
-    .map_err(|e| format!("Global inter_batch: {e}"))?;
-    eprintln!(
-        "[model] inter_batch:{:>8.3}ms",
-        _t0.elapsed().as_secs_f64() * 1000.0
-    );
 
     // =========================================================================
     // 14. 13 cross-block weight/activation batch opens
