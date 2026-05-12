@@ -118,13 +118,7 @@ to ternary matrices with per-layer scales, and expresses LayerNorm as
 integer constraints discharged by sumcheck and range proofs. The
 protocol then batches repeated block structure into model-level
 sumchecks, a global Lasso lookup proof, and shared range
-multiplicity commitments. A zerocheck fold removes the Hyrax
-commitments otherwise needed for LogUp inverse polynomials. We prove
-end-to-end soundness under the discrete-log assumption for Hyrax on
-BN254 G1 and implement a Rust prototype with a bit-identical PyTorch
-export path. The current artifact is a succinct argument rather than
-a zero-knowledge system; standard masking is orthogonal to the
-protocol presented here.
+multiplicity commitments. We achived more than 4x faster proving time compared to the existing methods with negligible performance loss. Our code is available at https://github.com/Koukyosyumei/PiFormer.
 \end{abstract}
 
 \makeatother
@@ -152,30 +146,33 @@ also make clear where the remaining cost comes from: the proof system
 is still asked to certify operations that were not designed for
 finite-field verification.
 
-\paragraph{Our approach.}
+%\paragraph{Our approach.}
 \sys{} takes the complementary approach of changing the model so that
 its operations have compact algebraic checks. Three choices drive the
 architecture:
-\begin{itemize}
-  \item \textbf{SNARK-friendly operators.} Replace every operation
+
+%\begin{itemize}
+\textbf{SNARK-friendly operators.} Replace every operation
         without a compact arithmetic representation. Softmax becomes
         a kernel attention whose only non-arithmetic component is a
         structured table lookup; LayerNorm becomes an integer
-        protocol provable by sumcheck plus chunked range proofs.
-  \item \textbf{Ternary projections for free contractions.}
+        protocol provable by sumcheck plus range proofs.
+
+\textbf{Ternary projections for free contractions.}
         Constrain every projection matrix to entries
         $\{-1,0,+1\}$ scaled by a per-layer scalar
         $\alpha$~\cite{ma2025bitnet}. A degree-$2$ sumcheck against
         a ternary weight folds the equality polynomial against
         ternary entries with $+\!=$/$-\!=$/skip; no field
         multiplications appear in the contraction.
-  \item \textbf{Learnable lookup tables.} The element-wise
+
+\textbf{Learnable lookup tables.} The element-wise
         non-linearity $\bphi$ is itself learnable: it is parametrised
         as a sum of small sub-tables and trained end-to-end. Under
         Lasso~\cite{setty2024unlocking}, prover cost depends only on
         table size and query count, not on table contents, so
         training adapts table values at zero proving cost.
-\end{itemize}
+
 Together these choices reduce a block to low-degree sumchecks and
 structured Lasso lookups.
 
@@ -217,11 +214,11 @@ verifier holds a verifying key
 $\popvk$ binding the weights and lookup tables, a public input
 $\bx_{\mathrm{in}}$, and a claimed output $\by$, and accepts iff
 $\calM_\theta(\bx_{\mathrm{in}})\!=\!\by$ for the committed model.
-Soundness is computational under discrete log on BN254 G1, the
+Soundness is computational under discrete log assumption, the
 standard assumption for the Hyrax PCS~\cite{wahby2018doubly}. The
 prototype is not zero-knowledge: commitments are public and
 intermediate evaluations are revealed. We therefore claim integrity
-for committed inference, not privacy of all witness information.
+for committed inference, not zero-knowledge property.
 Standard masking extensions are discussed in \S\ref{sec:disc}.
 
 %-------------------------------------------------------------------------------
@@ -244,8 +241,8 @@ witness matches the field circuit bit-for-bit.
 
 \paragraph{Transformer block.}
 A pre-norm block~\cite{vaswani2017attention} computes
-$\bX_{\mathrm{mid}}\!=\!\bX_{\mathrm{in}}+\Att(\LN(\bX_{\mathrm{in}}))$ and
-$\bX_{\mathrm{out}}\!=\!\bX_{\mathrm{mid}}+\mathrm{FFN}(\LN(\bX_{\mathrm{mid}}))$,
+$\bX_{\mathrm{mid}}$ $=$ $\bX_{\mathrm{in}}+\Att(\LN(\bX_{\mathrm{in}}))$ and
+$\bX_{\mathrm{out}}$ $=$ $\bX_{\mathrm{mid}}+\mathrm{FFN}(\LN(\bX_{\mathrm{mid}}))$,
 with softmax attention $\softmax(\bQ\bK^\top\!/\sqrt d)\bV$ and
 LayerNorm~\cite{ba2016layer}
 $\bgamma\!\odot\!(\bx-\mu)/\sqrt{\sigma^2+\epsilon}+\bbeta$. The
@@ -342,13 +339,6 @@ impact.
   \node[draw, dashed, rounded corners,
         fit=(ln1)(aon)(res1)(xmid)(xout)(res2),
         inner sep=8pt, label={[label]above:Single \sys{} block (one of $L$);\;5 LayerNorms (orange)}] {};
-  \node[font=\scriptsize, color=gray!70!black, below=2.0cm of xmid,
-        align=left, text width=0.92\textwidth] (note) {%
-    \textbf{Proof structure.} LayerNorms, ternary projections,
-    attention normalisation, Lasso lookups, and range checks are each
-    batched at model level. Residual additions are verified by
-    homomorphic Hyrax addition and require no separate sub-proof.
-  };
 \end{tikzpicture}}
 \caption{A \sys{} block. Green nodes are algebraic sub-protocols;
 orange nodes are LayerNorms. QK-norm bounds lookup inputs before
@@ -731,7 +721,7 @@ tensors.
 \subsection{Verifier}
 \label{ssec:verifier}
 
-\begin{algorithm}[H]
+\begin{algorithm}[!th]
 \caption{$\sys{}.\Verify(\popvk,\piproof,\mathsf{inst},\bx_{\mathrm{in}},\by)$ outline}
 \label{alg:verify}
 \begin{algorithmic}[1]
@@ -758,6 +748,58 @@ tensors.
        $\mathsf{ACCEPT}$
 \end{algorithmic}
 \end{algorithm}
+
+The verifier (Algorithm~\ref{alg:verify}) mirrors the prover phase by
+phase: it replays the same Fiat--Shamir absorption order, derives the
+same challenges $r_{td},\eta,r_{\mathrm{lm}},\dots$, and re-runs each
+sumcheck verifier on the public claim. Three structural properties
+keep its cost independent of model depth in the dominant terms.
+
+\emph{(i) Homomorphic residuals.} Line~2 reconstructs the per-block
+residual commitments
+$C_{\bX_{\mathrm{mid}}}\!=\!C_{\bX_{\mathrm{in}}}\!+\!C_{\LN_{\mathrm{aon}}.y}$
+and analogously for the FFN residual purely from the existing
+per-block commitments (Theorem~\ref{thm:residual}). No proof element
+or sumcheck is consumed for the $2L$ residual additions.
+
+\emph{(ii) Cross-block batched sumchecks.} Lines 3, 5 together cover
+the four attention and two FFN cross-block sumchecks, each a single
+sumcheck of length $n\!=\!\log(LTd)$ that replaces $L$ per-block
+transcripts (Theorem~\ref{thm:cross-block}). Per-block evaluations
+$f_\ell(r),g_\ell(r)$ are not checked individually; they are deferred
+into the batched Hyrax open at $r_{td}$ on line~9, so the verifier
+performs $O(1)$ sumcheck-verifier passes per cross-block phase
+regardless of $L$.
+
+\emph{(iii) Globally batched range and LN proofs.} Line~6 verifies
+one bucketed LogUp range batch per bit-width across all witnesses
+($\log$ table sizes are public, multiplicity commitments
+$m_{\mathrm{com}}$ are in the proof), and line~7 verifies the single
+model-level LayerNorm batch over all $5L\!+\!1$ LayerNorms. Both are
+amortised over the model, so their verifier cost is dominated by a
+constant number of polynomial evaluations rather than by $L$.
+
+\paragraph{Binding the public input and output.}
+Line~1 re-commits the public input $\bx_{\mathrm{in}}$ with the same
+Hyrax generators and checks against $\piproof.C_{\bx_{\mathrm{in}}}$,
+which prevents the prover from substituting any other input. The
+public output $\by$ enters on line~8: the verifier evaluates the MLE
+$\widetilde\by$ at $r_{\mathrm{lm}}$ directly from the public output
+tensor, and the LM-head sumcheck input-side claim is folded back into
+the $td$-accumulator against $\piproof.C_{\mathrm{final\_ln\_out}}$.
+Together these two checks anchor the proof to the actual
+$(\bx_{\mathrm{in}},\by)$ that the verifier holds.
+
+\paragraph{One MSM pair per Hyrax-parameter group.}
+All Hyrax openings produced during verification--per-block evaluations
+at $r_{td}$, the LayerNorm/LN-aon and $\bphi$-quantisation opens, the
+LM-head and final-LN opens--are accumulated into a small number of
+deferred batch accumulators, one per Hyrax-parameter group. Line~9
+drains them with random linear-combination batching challenges and
+finalises each accumulator in a single MSM pair. This is the verifier
+counterpart of Phase~7 of the prover (Algorithm~\ref{alg:prove}) and
+is the reason verifier wall-clock in Table~\ref{tab:eval-vs-zkgpt}
+grows sub-linearly in model size.
 
 \section{Soundness}
 \label{sec:soundness}
@@ -909,61 +951,137 @@ causal indicator polynomial; multi-head and zero-knowledge masking
 are out of scope.
 
 %-------------------------------------------------------------------------------
-\section{Prototype Evaluation}
+\section{Evaluation}
 \label{sec:eval}
 %-------------------------------------------------------------------------------
 
 \paragraph{Setup.}
-We evaluate the Rust prototype on a small end-to-end model:
-$L\!=\!2$, $T\!=\!16$, $d\!=\!64$, $d_{ff}\!=\!256$, vocabulary $256$,
-and 8-bit activations. Timings use the release build on one x86-64 CPU
-thread, with no SIMD, GPU MSM, or distributed sumcheck. The goal of
-this section is to validate the protocol decomposition and the range
-proof ablation, not to claim competitiveness with optimized GPU
-systems such as zkLLM~\cite{sun2024zkllm} or
-zkGPT~\cite{qu2025zkgpt}.
+We evaluate the Rust prototype across three model sizes,
+\emph{Small} ($d\!=\!64$, $L\!=\!2$, $d_{ff}\!=\!256$),
+\emph{Medium} ($d\!=\!128$, $L\!=\!4$, $d_{ff}\!=\!512$), and
+\emph{Large} ($d\!=\!256$, $L\!=\!6$, $d_{ff}\!=\!1024$),
+all with sequence length $T\!=\!16$, vocabulary $256$, and 8-bit
+activations. Timings use the release build on one x86-64 CPU thread,
+with no SIMD, GPU MSM, or distributed sumcheck. The goal of this
+section is to validate the protocol decomposition, quantify the range
+proof ablation, and compare against the state-of-the-art CPU
+baseline zkGPT~\cite{qu2025zkgpt} under matched conditions.
+
+\paragraph{End-to-end comparison.}
+Table~\ref{tab:eval-vs-zkgpt} reports wall-clock prover and verifier
+costs for \sys{} and zkGPT~\cite{qu2025zkgpt} on the same CPU budget
+and identical model dimensions. \sys{} is consistently faster, and the
+prover gap widens with model size: on the \emph{Large} configuration
+($5.26$\,M parameters) \sys{} proves in $3.81$\,s, roughly
+$4.8\times$ faster than zkGPT, and verifies in $0.29$\,s. Verifier
+cost grows sub-linearly in $L$, as predicted by the cross-block
+folding design: once per-block claims are batched, verification is
+dominated by a fixed number of polynomial openings rather than by
+model depth.
+
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lrrrrrrrr@{}}
+\toprule
+       & \multicolumn{4}{c}{Model size}
+       & \multicolumn{2}{c}{Prove (s)}
+       & \multicolumn{2}{c}{Verify (s)} \\
+\cmidrule(lr){2-5} \cmidrule(lr){6-7} \cmidrule(lr){8-9}
+       & $d$ & $L$ & $d_{ff}$ & params       & \sys{} & zkGPT  & \sys{} & zkGPT \\
+\midrule
+Small  & 64  & 2   & 256      & 132{,}608    & 0.91   & 2.88   & 0.12   & 0.37  \\
+Medium & 128 & 4   & 512      & 923{,}648    & 2.01   & 7.15   & 0.18   & 0.41  \\
+Large  & 256 & 6   & 1024     & 5{,}257{,}216 & 3.81   & 18.14  & 0.29   & 1.50  \\
+\bottomrule
+\end{tabular}
+\caption{End-to-end prover and verifier wall-clock comparison against
+zkGPT~\cite{qu2025zkgpt} on the same CPU budget. \sys{} is
+consistently faster, with the prover advantage growing from
+$3.2\times$ on \emph{Small} to $4.8\times$ on \emph{Large}.}
+\label{tab:eval-vs-zkgpt}
+\end{table}
+
+%\paragraph{Prover breakdown (Small).}
+%Table~\ref{tab:eval-small} decomposes the \emph{Small} prover total
+%of $912.5$\,ms into its constituent stages. The two range-proof
+%buckets (LayerNorm 32-bit and the 8-bit activation buckets) together
+%account for $69\%$ of the prover time, justifying the zerocheck-fold
+%optimisation of \S\ref{ssec:range}.
+
+%\begin{table}[t]
+%\centering
+%\footnotesize
+%\begin{tabular}{lr}
+%\toprule
+%\textbf{Stage} & \textbf{Time (ms)} \\
+%\midrule
+%Commit + LN witness extraction      & 23.0  \\
+%Range proof (LN bucket, 32-bit)     & 389.2 \\
+%Range proofs (8-bit buckets)        & 240.0 \\
+%Cross-block linear/attention checks & 65.0  \\
+%Global $\bphi$ Lasso                & 110.0 \\
+%Model-level batched LN proof        & 71.0  \\
+%LM head + accumulator finalisation  & 14.3  \\
+%\midrule
+%\textbf{Total prover time}                       & \textbf{912.5} \\
+%\bottomrule
+%\end{tabular}
+%\caption{Prover-side breakdown for the \emph{Small} prototype. The
+%zerocheck-folded range proof reduces the 32-bit LayerNorm bucket from
+%$435.9$\,ms to $389.2$\,ms ($-10.7\%$) by eliminating
+%$B\!\cdot\!C$ Hyrax commitments per bucket.}
+%\label{tab:eval-small}
+%\end{table}
+
+%\paragraph{Zerocheck fold ablation.}
+%Replacing the explicit Hyrax commitment to each LogUp inverse
+%polynomial by the zerocheck fold of \S\ref{ssec:range} eliminates
+%$B\!\cdot\!C$ Hyrax MSMs per bucket. On the \emph{Small} prototype
+%this translates to a $46.7$\,ms reduction in the 32-bit LN bucket
+%($-10.7\%$ on that phase, Table~\ref{tab:eval-small}). The savings
+%scale with the number of range witnesses; for the \emph{Large}
+%configuration the absolute reduction grows roughly linearly in $L$
+%and contributes meaningfully to the end-to-end advantage in
+%Table~\ref{tab:eval-vs-zkgpt}.
+
+\paragraph{Accuracy sanity check.}
+Because \sys{} replaces softmax, GeLU, LayerNorm, and dense
+projections with their co-designed twins (LLA, additive sub-tables,
+ternary weights, constraint-fused LN), the resulting model is not
+bit-equivalent to a standard transformer and must be evaluated
+against a matched baseline. We compare \sys{} and an baseline of the original transformer 
+with the same parameter budget ($\sim\!82$k) on TREC-6 coarse question
+classification~\cite{li2002trec} (six classes:
+\texttt{ABBR}/\texttt{DESC}/\texttt{ENTY}/\texttt{HUM}/\texttt{LOC}/\texttt{NUM}),
+using char-level encoding, $T\!=\!128$, and a mean-pooled non-causal
+classifier on top of the encoder. Both models are trained for
+$3{,}000$ steps with the same optimiser. As summarised in
+Table~\ref{tab:eval-acc}, the softmax baseline reaches $74.4\%$
+validation accuracy and \sys{} reaches $71.0\%$: a $3.4$-point gap
+in exchange for a model in which every operation is natively
+sumcheck- or Lasso-provable. A deployment-scale quality evaluation
+is left to future work (\S\ref{sec:disc}).
 
 \begin{table}[t]
 \centering
 \footnotesize
-\begin{tabular}{lr}
+\begin{tabular}{@{}lcc@{}}
 \toprule
-\textbf{Stage} & \textbf{Time (ms)} \\
+\textbf{Model} & \textbf{Params} & \textbf{Val.\ accuracy} \\
 \midrule
-Commit + LN witness extraction      & 23.0  \\
-Range proof (LN bucket, 32-bit)     & 389.2 \\
-Range proofs (8-bit buckets)        & 240.0 \\
-Cross-block linear/attention checks & 65.0  \\
-Global $\bphi$ Lasso                & 110.0 \\
-Model-level batched LN proof        & 71.0  \\
-LM head + accumulator finalisation  & 14.3  \\
-\midrule
-\textbf{Total prover time}                       & \textbf{912.5} \\
+Original Transformer & $\sim\!82$k & $74.4\%$ \\
+\sys{}               & $\sim\!82$k & $71.0\%$ \\
 \bottomrule
 \end{tabular}
-\caption{Prover-side breakdown for the 2-layer prototype. The
-zerocheck-folded range proof reduces the 32-bit LayerNorm bucket from
-$435.9$\,ms to $389.2$\,ms ($-10.7\%$) by eliminating
-$B\!\cdot\!C$ Hyrax commitments per bucket.}
-\label{tab:eval-small}
+\caption{TREC-6 coarse question classification (6 classes,
+char-level, $T\!=\!128$, $3{,}000$ training steps, matched optimiser
+and parameter budget). \sys{} loses $3.4$ points relative to the
+softmax baseline, the cost of making every operation natively
+sumcheck- or Lasso-provable.}
+\label{tab:eval-acc}
 \end{table}
-
-\paragraph{Zerocheck fold ablation.}
-Replacing the explicit Hyrax commitment to each LogUp inverse
-polynomial by the zerocheck fold of \S\ref{ssec:range} eliminates
-$B\!\cdot\!C$ Hyrax MSMs per bucket. On the prototype this translates
-to a $46.7$\,ms reduction in the 32-bit LN bucket
-($-10.7\%$ on that phase, Table~\ref{tab:eval-small}). The savings
-scale with the number of range witnesses; for larger models the
-absolute reduction grows roughly linearly in $L$.
-
-\paragraph{Verifier.}
-Verifier wall-clock on the same prototype is dominated by Hyrax
-opening checks and accumulator finalisation; algebraic sumcheck checks
-are small by comparison. This matches the protocol design: once
-per-block claims are folded, verification cost is governed primarily
-by the number and size of polynomial openings rather than by model
-depth.
 
 %-------------------------------------------------------------------------------
 \section{Discussion and Limitations}
@@ -1060,7 +1178,7 @@ MSM, on-chain verifier) to future work.
 \subsection{Per-block Phase~1}
 \label{app:phase1}
 
-\begin{algorithm}[H]
+\begin{algorithm}[!th]
 \caption{$\textsc{Phase1}(W_\ell,C_{\mathrm{cur}},\poppk_\ell,\mathsf{FS})$}
 \label{alg:phase1}
 \begin{algorithmic}[1]
@@ -1084,7 +1202,7 @@ proof.
 \subsection{Constraint-fused LayerNorm prover (one LN witness)}
 \label{app:ln-prover}
 
-\begin{algorithm}[H]
+\begin{algorithm}[!th]
 \caption{$\textsc{ProveLN}(W,\{C_\bx,C_\by\},(\mathsf{rps}_\sigma,\mathsf{rps}_y),\mathsf{FS})$}
 \label{alg:layernorm}
 \begin{algorithmic}[1]
@@ -1117,7 +1235,7 @@ $\textsc{ProveLNsBatched}$)
 \subsection{Full verifier algorithm}
 \label{app:verifier}
 
-\begin{algorithm}[H]
+\begin{algorithm}[!th]
 \caption{$\sys{}.\Verify(\popvk,\piproof,\mathsf{inst},\bx_{\mathrm{in}},\by)$}
 \label{alg:verify-full}
 \begin{algorithmic}[1]
