@@ -52,7 +52,7 @@ const PK_MAGIC: &[u8; 8] = b"PFMR_PK\0";
 const VK_MAGIC: &[u8; 8] = b"PFMR_VK\0";
 const PROOF_MAGIC: &[u8; 8] = b"PFMR_PR\0";
 const VERSION: u8 = 5;
-const PROOF_VERSION: u8 = 22;
+const PROOF_VERSION: u8 = 23;
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -620,20 +620,14 @@ fn read_lasso_terminal_eval_proof<R: Read>(r: &mut R) -> io::Result<LassoTermina
 }
 
 fn write_logup_witness_proof<W: Write>(w: &mut W, p: &LogUpWitnessProof) -> io::Result<()> {
-    write_vec(w, &p.h_coms, write_hyrax_commitment)?;
     write_vec_f(w, &p.combined_claims)?;
     write_vec_f(w, &p.chunk_at_rk)?;
-    write_vec_f(w, &p.h_at_rk)?;
-    write_vec(w, &p.h_open_proofs, write_hyrax_proof)?;
     write_vec(w, &p.chunk_open_proofs, write_hyrax_proof)
 }
 fn read_logup_witness_proof<R: Read>(r: &mut R) -> io::Result<LogUpWitnessProof> {
     Ok(LogUpWitnessProof {
-        h_coms: read_vec(r, read_hyrax_commitment)?,
         combined_claims: read_vec_f(r)?,
         chunk_at_rk: read_vec_f(r)?,
-        h_at_rk: read_vec_f(r)?,
-        h_open_proofs: read_vec(r, read_hyrax_proof)?,
         chunk_open_proofs: read_vec(r, read_hyrax_proof)?,
     })
 }
@@ -661,9 +655,7 @@ fn write_global_range_m<W: Write>(w: &mut W, m: &GlobalRangeM) -> io::Result<()>
     write_f(w, &m.logup_rhs_claim)?;
     write_f(w, &m.logup_m_at_rm2)?;
     write_hyrax_proof(w, &m.logup_m_open_rm2)?;
-    write_vec(w, &m.bucket_sumchecks, write_sumcheck_cubic_proof_multi)?;
-    write_vec(w, &m.bucket_h_coms, write_hyrax_commitment)?;
-    write_vec(w, &m.bucket_h_opens, write_hyrax_proof)
+    write_vec(w, &m.bucket_sumchecks, write_sumcheck_cubic_proof_multi)
 }
 
 fn write_range_batch_m<W: Write>(w: &mut W, b: &RangeBatchM) -> io::Result<()> {
@@ -675,6 +667,8 @@ fn write_quantization_proof<W: Write>(w: &mut W, p: &QuantizationProof) -> io::R
     write_vec(w, &p.rem_coms, write_hyrax_commitment)?;
     write_vec(w, &p.rem_range_proofs, write_range_witness_proof)?;
     write_global_range_m(w, &p.rem_range_m)?;
+    write_vec_f(w, &p.rem_range_evals)?;
+    write_vec(w, &p.rem_range_opens, write_hyrax_proof)?;
     write_vec_f(w, &p.raw_evals)?;
     write_vec_f(w, &p.rem_evals)?;
     write_hyrax_proof(w, &p.raw_open)?;
@@ -686,6 +680,8 @@ fn read_quantization_proof<R: Read>(r: &mut R) -> io::Result<QuantizationProof> 
         rem_coms: read_vec(r, read_hyrax_commitment)?,
         rem_range_proofs: read_vec(r, read_range_witness_proof)?,
         rem_range_m: read_global_range_m(r)?,
+        rem_range_evals: read_vec_f(r)?,
+        rem_range_opens: read_vec(r, read_hyrax_proof)?,
         raw_evals: read_vec_f(r)?,
         rem_evals: read_vec_f(r)?,
         raw_open: read_hyrax_proof(r)?,
@@ -702,8 +698,6 @@ fn read_global_range_m<R: Read>(r: &mut R) -> io::Result<GlobalRangeM> {
         logup_m_at_rm2: read_f(r)?,
         logup_m_open_rm2: read_hyrax_proof(r)?,
         bucket_sumchecks: read_vec(r, read_sumcheck_cubic_proof_multi)?,
-        bucket_h_coms: read_vec(r, read_hyrax_commitment)?,
-        bucket_h_opens: read_vec(r, read_hyrax_proof)?,
     })
 }
 

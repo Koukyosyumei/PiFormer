@@ -5,101 +5,99 @@
 \citation{liu2021zkcnn,sun2024zkllm,qu2025zkgpt,abbaszadeh2024zero}
 \citation{sun2024zkllm}
 \citation{qu2025zkgpt}
-\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
-\newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
-\@writefile{toc}{\contentsline {paragraph}{Our approach.}{1}{section*.1}\protected@file@percent }
 \citation{ma2025bitnet}
 \citation{setty2024unlocking}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Model-level batching.}{1}{section*.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Contributions.}{1}{section*.2}\protected@file@percent }
 \citation{wahby2018doubly}
 \citation{vaswani2017attention}
 \citation{ba2016layer}
 \citation{setty2020spartan,thaler2022proofs}
-\@writefile{toc}{\contentsline {paragraph}{Cross-block batching.}{2}{section*.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Contributions.}{2}{section*.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Threat model.}{2}{section*.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {2}Background}{2}{section.2}\protected@file@percent }
-\newlabel{sec:bg}{{2}{2}{Background}{section.2}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Notation}{2}{subsection.2.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}The transformer block}{2}{subsection.2.2}\protected@file@percent }
 \citation{wahby2018doubly}
 \citation{setty2024unlocking,arun2024jolt,fomenko2025understanding}
 \citation{katharopoulos2020transformers}
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Sumcheck}{3}{subsection.2.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Hyrax PCS}{3}{subsection.2.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.5}Lasso}{3}{subsection.2.5}\protected@file@percent }
-\newlabel{ssec:lasso}{{2.5}{3}{Lasso}{subsection.2.5}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.6}Fixed-point encoding}{3}{subsection.2.6}\protected@file@percent }
-\newlabel{ssec:fixed-point}{{2.6}{3}{Fixed-point encoding}{subsection.2.6}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {3}The \ensuremath  {\pi \text  {-Former}}{} Architecture}{3}{section.3}\protected@file@percent }
-\newlabel{sec:arch}{{3}{3}{The \sys {} Architecture}{section.3}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Learnable Lookup Attention (LLA)}{3}{subsection.3.1}\protected@file@percent }
-\newlabel{ssec:LLA}{{3.1}{3}{Learnable Lookup Attention (LLA)}{subsection.3.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Threat model.}{2}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Preliminaries}{2}{section.2}\protected@file@percent }
+\newlabel{sec:bg}{{2}{2}{Preliminaries}{section.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Notation.}{2}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Transformer block.}{2}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Sumcheck.}{2}{section*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Hyrax PCS.}{2}{section*.7}\protected@file@percent }
+\newlabel{ssec:lasso}{{2}{2}{Lasso}{section*.8}{}}
+\@writefile{toc}{\contentsline {paragraph}{Lasso.}{2}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}The \ensuremath  {\pi \text  {-Former}}{} Architecture}{2}{section.3}\protected@file@percent }
+\newlabel{sec:arch}{{3}{2}{The \texorpdfstring {\sys {}}{Pi-Former} Architecture}{section.3}{}}
 \citation{bengio2013estimating}
 \citation{ma2025bitnet}
-\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces A single \ensuremath  {\pi \text  {-Former}}{} block. Boxes are matrices; rounded green nodes are operations the SNARK proves; orange nodes are LayerNorms. \emph  {Sandwich norm} ($\LN  _{\mathrm  {aon}}$) is applied to the attention output before the residual; \emph  {QK-norm} ($\LN  _Q$, $\LN  _K$) is applied to $\mathbf  {Q},\mathbf  {K}$ after the ternary projection and before $\boldsymbol  {\phi }$. Ternary projections contain no field multiplications in the contraction; Lasso lookup cost is independent of table contents; residual $+$ is checked by homomorphic addition of Hyrax commitments and requires no proof.}}{4}{figure.1}\protected@file@percent }
-\newlabel{fig:block}{{1}{4}{A single \sys {} block. Boxes are matrices; rounded green nodes are operations the SNARK proves; orange nodes are LayerNorms. \emph {Sandwich norm} ($\LN _{\mathrm {aon}}$) is applied to the attention output before the residual; \emph {QK-norm} ($\LN _Q$, $\LN _K$) is applied to $\bQ ,\bK $ after the ternary projection and before $\bphi $. Ternary projections contain no field multiplications in the contraction; Lasso lookup cost is independent of table contents; residual $+$ is checked by homomorphic addition of Hyrax commitments and requires no proof}{figure.1}{}}
-\@writefile{toc}{\contentsline {paragraph}{Floor-division proof for row normalisation.}{4}{section*.5}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Lookup binding to post-QK-norm tensors.}{4}{section*.6}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Additive sub-table feature map}{4}{subsection.3.2}\protected@file@percent }
-\newlabel{ssec:phi}{{3.2}{4}{Additive sub-table feature map}{subsection.3.2}{}}
-\newlabel{eq:phi}{{15}{4}{Additive sub-table feature map}{equation.3.15}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Ternary projections}{4}{subsection.3.3}\protected@file@percent }
-\newlabel{ssec:ternary}{{3.3}{4}{Ternary projections}{subsection.3.3}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces A \ensuremath  {\pi \text  {-Former}}{} block. Green nodes are algebraic sub-protocols; orange nodes are LayerNorms. QK-norm bounds lookup inputs before $\boldsymbol  {\phi }$, sandwich norm bounds the attention output before the residual, and all linear maps use ternary weights.}}{3}{figure.1}\protected@file@percent }
+\newlabel{fig:block}{{1}{3}{A \sys {} block. Green nodes are algebraic sub-protocols; orange nodes are LayerNorms. QK-norm bounds lookup inputs before $\bphi $, sandwich norm bounds the attention output before the residual, and all linear maps use ternary weights}{figure.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Learnable Lookup Attention}{3}{subsection.3.1}\protected@file@percent }
+\newlabel{ssec:LLA}{{3.1}{3}{Learnable Lookup Attention}{subsection.3.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Floor-division proof for row normalisation.}{3}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Binding lookups to post-norm tensors.}{3}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Additive sub-table feature map}{3}{subsection.3.2}\protected@file@percent }
+\newlabel{ssec:phi}{{3.2}{3}{Additive sub-table feature map}{subsection.3.2}{}}
+\newlabel{eq:phi}{{1}{3}{Additive sub-table feature map}{equation.3.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Ternary projections}{3}{subsection.3.3}\protected@file@percent }
+\newlabel{ssec:ternary}{{3.3}{3}{Ternary projections}{subsection.3.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Constraint-fused LayerNorm}{3}{subsection.3.4}\protected@file@percent }
+\newlabel{ssec:ln}{{3.4}{3}{Constraint-fused LayerNorm}{subsection.3.4}{}}
 \citation{habo2024logup}
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Constraint-fused LayerNorm}{5}{subsection.3.4}\protected@file@percent }
-\newlabel{ssec:ln}{{3.4}{5}{Constraint-fused LayerNorm}{subsection.3.4}{}}
-\@writefile{toc}{\contentsline {paragraph}{Model-level batched LN proof.}{5}{section*.7}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Globally batched range proof}{5}{subsection.3.5}\protected@file@percent }
-\newlabel{ssec:range}{{3.5}{5}{Globally batched range proof}{subsection.3.5}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {4}The \ensuremath  {\pi \text  {-Former}}{} Protocol}{5}{section.4}\protected@file@percent }
-\newlabel{sec:protocol}{{4}{5}{The \sys {} Protocol}{section.4}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Preprocessing}{6}{subsection.4.1}\protected@file@percent }
-\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Setup  (\theta ;\,\text  {params})$}}{6}{algorithm.1}\protected@file@percent }
-\newlabel{alg:setup}{{1}{6}{Preprocessing}{algorithm.1}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}The model-level prover}{7}{subsection.4.2}\protected@file@percent }
-\@writefile{loa}{\contentsline {algorithm}{\numberline {2}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Prove  (\poppk  ,W,\mathsf  {inst})$}}{7}{algorithm.2}\protected@file@percent }
-\newlabel{alg:prove}{{2}{7}{The model-level prover}{algorithm.2}{}}
-\newlabel{ssec:quant}{{4.2}{7}{Quantization-proof binding}{section*.8}{}}
-\@writefile{toc}{\contentsline {paragraph}{Quantization-proof binding.}{7}{section*.8}\protected@file@percent }
-\newlabel{eq:quant}{{16}{7}{Quantization-proof binding}{equation.4.16}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Per-block Phase~1}{8}{subsection.4.3}\protected@file@percent }
-\@writefile{loa}{\contentsline {algorithm}{\numberline {3}{\ignorespaces $\textsc  {Phase1}(W_\ell ,C_{\mathrm  {cur}},\poppk  _\ell ,\mathsf  {FS})$}}{8}{algorithm.3}\protected@file@percent }
-\newlabel{alg:phase1}{{3}{8}{Per-block Phase~1}{algorithm.3}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Cross-block batched sumcheck}{8}{subsection.4.4}\protected@file@percent }
-\@writefile{loa}{\contentsline {algorithm}{\numberline {4}{\ignorespaces $\textsc  {CrossBatch}(\{f_\ell ,g_\ell ,H_\ell \}_{\ell =1}^L,\mathsf  {FS})$}}{8}{algorithm.4}\protected@file@percent }
-\newlabel{alg:cross-block}{{4}{8}{Cross-block batched sumcheck}{algorithm.4}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.5}Constraint-fused LayerNorm prover}{8}{subsection.4.5}\protected@file@percent }
-\@writefile{loa}{\contentsline {algorithm}{\numberline {5}{\ignorespaces $\textsc  {ProveLN}(W,\{C_\mathbf  {x},C_\mathbf  {y}\},(\mathsf  {rps}_\sigma ,\mathsf  {rps}_y),\mathsf  {FS})$}}{9}{algorithm.5}\protected@file@percent }
-\newlabel{alg:layernorm}{{5}{9}{Constraint-fused LayerNorm prover}{algorithm.5}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.6}The verifier}{9}{subsection.4.6}\protected@file@percent }
-\@writefile{loa}{\contentsline {algorithm}{\numberline {6}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Verify  (\popvk  ,\pi ,\mathsf  {inst},\mathbf  {x}_{\mathrm  {in}},\mathbf  {y})$}}{9}{algorithm.6}\protected@file@percent }
-\newlabel{alg:verify}{{6}{9}{The verifier}{algorithm.6}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {5}Soundness}{9}{section.5}\protected@file@percent }
-\newlabel{sec:soundness}{{5}{9}{Soundness}{section.5}{}}
-\newlabel{lem:sumcheck}{{1}{9}{Sumcheck soundness}{theorem.1}{}}
-\newlabel{lem:hyrax}{{2}{9}{Hyrax binding}{theorem.2}{}}
-\citation{habo2024logup}
-\newlabel{thm:cross-block}{{3}{10}{Cross-block batching is sound}{theorem.3}{}}
-\newlabel{thm:residual}{{4}{10}{Homomorphic residuals}{theorem.4}{}}
-\newlabel{thm:range}{{5}{10}{Globally batched range proof is sound}{theorem.5}{}}
-\newlabel{thm:lnbatch}{{6}{10}{Model-level batched LayerNorm is sound}{theorem.6}{}}
-\newlabel{thm:attnnorm}{{7}{10}{Attention-normalisation sumcheck is sound}{theorem.7}{}}
-\newlabel{thm:end-to-end}{{8}{10}{\sys {} end-to-end soundness}{theorem.8}{}}
+\@writefile{toc}{\contentsline {paragraph}{Model-level LN batching.}{4}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Globally batched range proof}{4}{subsection.3.5}\protected@file@percent }
+\newlabel{ssec:range}{{3.5}{4}{Globally batched range proof}{subsection.3.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{Zerocheck-folded inverse polynomial.}{4}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}The \ensuremath  {\pi \text  {-Former}}{} Protocol}{4}{section.4}\protected@file@percent }
+\newlabel{sec:protocol}{{4}{4}{The \texorpdfstring {\sys {}}{Pi-Former} Protocol}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Setup}{4}{subsection.4.1}\protected@file@percent }
+\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Setup  (\theta )$}}{4}{algorithm.1}\protected@file@percent }
+\newlabel{alg:setup}{{1}{4}{Setup}{algorithm.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Model-level prover}{5}{subsection.4.2}\protected@file@percent }
+\newlabel{ssec:prover}{{4.2}{5}{Model-level prover}{subsection.4.2}{}}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {2}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Prove  (\poppk  ,W,\mathsf  {inst})$ outline}}{5}{algorithm.2}\protected@file@percent }
+\newlabel{alg:prove}{{2}{5}{Model-level prover}{algorithm.2}{}}
+\newlabel{ssec:cross-block}{{4.2}{5}{Cross-block batched sumcheck}{section*.13}{}}
+\@writefile{toc}{\contentsline {paragraph}{Cross-block batched sumcheck.}{5}{section*.13}\protected@file@percent }
+\@writefile{loa}{\contentsline {algorithm}{\numberline {3}{\ignorespaces $\textsc  {CrossBatch}(\{f_\ell ,g_\ell ,H_\ell \}_\ell ,\mathsf  {FS})$}}{5}{algorithm.3}\protected@file@percent }
+\newlabel{alg:cross-block}{{3}{5}{Cross-block batched sumcheck}{algorithm.3}{}}
+\newlabel{ssec:quant}{{4.2}{5}{Quantisation binding}{section*.14}{}}
+\@writefile{toc}{\contentsline {paragraph}{Quantisation binding.}{5}{section*.14}\protected@file@percent }
+\newlabel{eq:quant}{{2}{5}{Quantisation binding}{equation.4.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Lasso instances.}{5}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Verifier}{5}{subsection.4.3}\protected@file@percent }
+\newlabel{ssec:verifier}{{4.3}{5}{Verifier}{subsection.4.3}{}}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {4}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Verify  (\popvk  ,\pi ,\mathsf  {inst},\mathbf  {x}_{\mathrm  {in}},\mathbf  {y})$ outline}}{6}{algorithm.4}\protected@file@percent }
+\newlabel{alg:verify}{{4}{6}{Verifier}{algorithm.4}{}}
+\@writefile{toc}{\contentsline {paragraph}{Binding the public input and output.}{6}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{One MSM pair per Hyrax-parameter group.}{6}{section*.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Soundness}{6}{section.5}\protected@file@percent }
+\newlabel{sec:soundness}{{5}{6}{Soundness}{section.5}{}}
+\newlabel{lem:sumcheck}{{1}{6}{Sumcheck soundness}{theorem.1}{}}
+\newlabel{lem:hyrax}{{2}{6}{Hyrax binding}{theorem.2}{}}
+\newlabel{thm:cross-block}{{3}{6}{Cross-block batching is sound}{theorem.3}{}}
+\newlabel{thm:residual}{{4}{6}{Homomorphic residuals}{theorem.4}{}}
+\newlabel{thm:range}{{5}{6}{Globally batched range proof is sound}{theorem.5}{}}
+\newlabel{thm:lnbatch}{{6}{6}{Model-level batched LayerNorm is sound}{theorem.6}{}}
 \citation{qu2025zkgpt}
-\citation{kothapalli2022nova}
-\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces \ensuremath  {\pi \text  {-Former}}{} Rust implementation, lines of code per module.}}{11}{table.1}\protected@file@percent }
-\newlabel{tab:loc}{{1}{11}{\sys {} Rust implementation, lines of code per module}{table.1}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Zero knowledge}{11}{subsection.5.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {6}Implementation}{11}{section.6}\protected@file@percent }
-\newlabel{sec:impl}{{6}{11}{Implementation}{section.6}{}}
-\@writefile{toc}{\contentsline {paragraph}{PyTorch pipeline.}{11}{section*.9}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Single-head, causal supported, no ZK.}{11}{section*.10}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {7}Discussion and Limitations}{11}{section.7}\protected@file@percent }
-\newlabel{sec:disc}{{7}{11}{Discussion and Limitations}{section.7}{}}
-\@writefile{toc}{\contentsline {paragraph}{What is and is not in the SNARK.}{11}{section*.11}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Model-quality evaluation.}{11}{section*.12}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{From prototype to deployment.}{11}{section*.13}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Beyond \ensuremath  {\pi \text  {-Former}}{}.}{11}{section*.14}\protected@file@percent }
+\citation{qu2025zkgpt}
+\citation{qu2025zkgpt}
+\citation{qu2025zkgpt}
+\citation{li2002trec}
+\newlabel{thm:attnnorm}{{7}{7}{Attention-normalisation sumcheck is sound}{theorem.7}{}}
+\newlabel{thm:end-to-end}{{8}{7}{\sys {} end-to-end soundness}{theorem.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Privacy}{7}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Implementation}{7}{section.6}\protected@file@percent }
+\newlabel{sec:impl}{{6}{7}{Implementation}{section.6}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces End-to-end prover and verifier wall-clock comparison against zkGPT~\cite  {qu2025zkgpt} on the same CPU budget. \ensuremath  {\pi \text  {-Former}}{} is consistently faster, with the prover advantage growing from $3.2\times $ on \emph  {Small} to $4.8\times $ on \emph  {Large}.}}{7}{table.1}\protected@file@percent }
+\newlabel{tab:eval-vs-zkgpt}{{1}{7}{End-to-end prover and verifier wall-clock comparison against zkGPT~\cite {qu2025zkgpt} on the same CPU budget. \sys {} is consistently faster, with the prover advantage growing from $3.2\times $ on \emph {Small} to $4.8\times $ on \emph {Large}}{table.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Evaluation}{7}{section.7}\protected@file@percent }
+\newlabel{sec:eval}{{7}{7}{Evaluation}{section.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{Setup.}{7}{section*.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{End-to-end comparison.}{7}{section*.19}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Accuracy sanity check.}{7}{section*.20}\protected@file@percent }
+\citation{sun2024zkllm,qu2025zkgpt}
 \citation{liu2021zkcnn}
 \citation{abbaszadeh2024zero}
 \citation{sun2024zkllm}
@@ -108,9 +106,7 @@
 \citation{setty2024unlocking,arun2024jolt,fomenko2025understanding}
 \citation{habo2024logup}
 \citation{wahby2018doubly}
-\citation{katharopoulos2020transformers}
-\citation{wang2020linformer}
-\citation{kitaev2020reformer}
+\citation{katharopoulos2020transformers,wang2020linformer,kitaev2020reformer}
 \citation{ma2025bitnet}
 \bibstyle{plain}
 \bibdata{ref}
@@ -121,15 +117,21 @@
 \bibcite{fomenko2025understanding}{5}
 \bibcite{habo2024logup}{6}
 \bibcite{katharopoulos2020transformers}{7}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces TREC-6 coarse question classification (6 classes, char-level, $T\!=\!128$, $3{,}000$ training steps, matched optimiser and parameter budget). \ensuremath  {\pi \text  {-Former}}{} loses $3.4$ points relative to the softmax baseline, the cost of making every operation natively sumcheck- or Lasso-provable.}}{8}{table.2}\protected@file@percent }
+\newlabel{tab:eval-acc}{{2}{8}{TREC-6 coarse question classification (6 classes, char-level, $T\!=\!128$, $3{,}000$ training steps, matched optimiser and parameter budget). \sys {} loses $3.4$ points relative to the softmax baseline, the cost of making every operation natively sumcheck- or Lasso-provable}{table.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Discussion and Limitations}{8}{section.8}\protected@file@percent }
+\newlabel{sec:disc}{{8}{8}{Discussion and Limitations}{section.8}{}}
+\@writefile{toc}{\contentsline {paragraph}{Scope.}{8}{section*.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Engineering path.}{8}{section*.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Related Work}{8}{section.9}\protected@file@percent }
+\newlabel{sec:related}{{9}{8}{Related Work}{section.9}{}}
+\@writefile{toc}{\contentsline {paragraph}{Verifiable ML.}{8}{section*.23}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Sumcheck and lookup arguments.}{8}{section*.24}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Linear attention and ternary networks.}{8}{section*.25}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Conclusion}{8}{section.10}\protected@file@percent }
+\newlabel{sec:conclusion}{{10}{8}{Conclusion}{section.10}{}}
 \bibcite{kitaev2020reformer}{8}
-\bibcite{kothapalli2022nova}{9}
-\@writefile{toc}{\contentsline {section}{\numberline {8}Related Work}{12}{section.8}\protected@file@percent }
-\newlabel{sec:related}{{8}{12}{Related Work}{section.8}{}}
-\@writefile{toc}{\contentsline {paragraph}{Verifiable ML.}{12}{section*.15}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Sumcheck and lookup arguments.}{12}{section*.16}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Linear attention and ternary networks.}{12}{section*.17}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {9}Conclusion}{12}{section.9}\protected@file@percent }
-\newlabel{sec:conclusion}{{9}{12}{Conclusion}{section.9}{}}
+\bibcite{li2002trec}{9}
 \bibcite{liu2021zkcnn}{10}
 \bibcite{ma2025bitnet}{11}
 \bibcite{qu2025zkgpt}{12}
@@ -140,4 +142,25 @@
 \bibcite{vaswani2017attention}{17}
 \bibcite{wahby2018doubly}{18}
 \bibcite{wang2020linformer}{19}
-\gdef \@abspage@last{13}
+\@writefile{toc}{\contentsline {section}{\numberline {A}Detailed algorithms}{9}{appendix.A}\protected@file@percent }
+\newlabel{app:full-algorithms}{{A}{9}{Detailed algorithms}{appendix.A}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {A.1}Per-block Phase~1}{9}{subsection.A.1}\protected@file@percent }
+\newlabel{app:phase1}{{A.1}{9}{Per-block Phase~1}{subsection.A.1}{}}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {5}{\ignorespaces $\textsc  {Phase1}(W_\ell ,C_{\mathrm  {cur}},\poppk  _\ell ,\mathsf  {FS})$}}{9}{algorithm.5}\protected@file@percent }
+\newlabel{alg:phase1}{{5}{9}{Per-block Phase~1}{algorithm.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {A.2}Constraint-fused LayerNorm prover (one LN witness)}{9}{subsection.A.2}\protected@file@percent }
+\newlabel{app:ln-prover}{{A.2}{9}{Constraint-fused LayerNorm prover (one LN witness)}{subsection.A.2}{}}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {6}{\ignorespaces $\textsc  {ProveLN}(W,\{C_\mathbf  {x},C_\mathbf  {y}\},(\mathsf  {rps}_\sigma ,\mathsf  {rps}_y),\mathsf  {FS})$}}{9}{algorithm.6}\protected@file@percent }
+\newlabel{alg:layernorm}{{6}{9}{Constraint-fused LayerNorm prover (one LN witness)}{algorithm.6}{}}
+\citation{habo2024logup}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {7}{\ignorespaces $\ensuremath  {\pi \text  {-Former}}{}.\Verify  (\popvk  ,\pi ,\mathsf  {inst},\mathbf  {x}_{\mathrm  {in}},\mathbf  {y})$}}{10}{algorithm.7}\protected@file@percent }
+\newlabel{alg:verify-full}{{7}{10}{Full verifier algorithm}{algorithm.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {A.3}Full verifier algorithm}{10}{subsection.A.3}\protected@file@percent }
+\newlabel{app:verifier}{{A.3}{10}{Full verifier algorithm}{subsection.A.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {B}Full soundness proofs}{10}{appendix.B}\protected@file@percent }
+\newlabel{app:proofs}{{B}{10}{Full soundness proofs}{appendix.B}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.1}Cross-block batching}{10}{subsection.B.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.2}Homomorphic residuals}{10}{subsection.B.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.3}Range proof with zerocheck fold}{10}{subsection.B.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.4}End-to-end}{10}{subsection.B.4}\protected@file@percent }
+\gdef \@abspage@last{10}

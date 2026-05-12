@@ -3369,6 +3369,13 @@ mod tests {
     }
 
     #[test]
+    fn test_model_rejects_tampered_ffn_quant_range_remainder_binding() {
+        assert_tampered_model_rejected(b"model_tamper_ffn_quant_range_rem_bind", |proof, _| {
+            proof.ffn_quant_proof.rem_range_evals[0] += F::ONE;
+        });
+    }
+
+    #[test]
     fn test_model_rejects_tampered_ffn_quant_remainder_commitment() {
         assert_tampered_model_rejected(b"model_tamper_ffn_quant_rem_com", |proof, _| {
             proof.ffn_quant_proof.rem_coms[0] = proof.block_proofs[0].ffn_m_com.clone();
@@ -3398,9 +3405,21 @@ mod tests {
     }
 
     #[test]
+    fn test_model_rejects_tampered_qk_quant_range_remainder_binding() {
+        assert_tampered_model_rejected(b"model_tamper_qk_quant_range_rem_bind", |proof, _| {
+            proof.qk_quant_proof.rem_range_evals[0] += F::ONE;
+        });
+    }
+
+    #[test]
     fn test_model_rejects_tampered_range_h_terminal_claim() {
+        // The fused bucket sumcheck's terminal `final_evals_f` carries the
+        // prover-claimed h(r_full); tampering it breaks the combined-identity
+        // check on the verifier side (formerly we tampered LogUp.h_at_rk,
+        // which was eliminated by the zerocheck fold).
         assert_tampered_model_rejected(b"model_tamper_range_h_terminal", |proof, _| {
-            proof.ffn_quant_proof.rem_range_proofs[0].logup.h_at_rk[0] += F::ONE;
+            let bucket = &mut proof.ffn_quant_proof.rem_range_m.bucket_sumchecks[0];
+            bucket.final_evals_f[0] += F::ONE;
         });
     }
 

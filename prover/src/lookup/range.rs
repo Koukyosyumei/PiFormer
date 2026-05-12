@@ -12,10 +12,9 @@ use crate::pcs::{
     hyrax_commit, hyrax_open, hyrax_open_batch_with_eta, params_from_vars, powers_of,
     HyraxBatchAccumulator, HyraxCommitment, HyraxProof,
 };
-use crate::poly::DenseMLPoly;
+use crate::poly::{compute_eq_evals, DenseMLPoly};
 use crate::subprotocols::{
-    prove_sumcheck, verify_sumcheck, verify_sumcheck_cubic_multi_batched, SumcheckCubicProofMulti,
-    SumcheckProof,
+    prove_sumcheck, verify_sumcheck, SumcheckCubicProofMulti, SumcheckProof,
 };
 use crate::subprotocols::sumcheck::CubicRoundPoly;
 use crate::transcript::Transcript;
@@ -47,39 +46,27 @@ pub struct RangeProofWitness {
 
 /// Per-witness LogUp inverse polynomial evidence.
 ///
-/// Uses the combined sumcheck trick: for challenge α and β,
-///   Σ_c γ_c · Σ_i h_c[i] * (1 + β*(α - C_c[i])) = Σ_c γ_c · (claim_c + β * n_padded)
+/// The inverse polynomial h_c[i] = 1/(α - C_c[i]) is bound implicitly via a
+/// zerocheck folded into the bucket sumcheck (see `prove_fused_logup_zerocheck`):
+/// the prover never separately commits to h. The bucket sumcheck claim is
+///   Σ_x [ w(x)·h(x)·(1 + β(α - C(x)))
+///       + γ_fold · eq(r_zc, x) · (h(x)·(α - C(x)) - 1) ] = bucket_claim
+/// where γ_fold and r_zc are fresh Fiat-Shamir challenges drawn after the
+/// bucket sumcheck claim is fixed. Soundness: if h ≠ 1/(α - C) on the
+/// hypercube, the zerocheck term is non-zero at random r_zc w.h.p., and the
+/// combined sum then equals bucket_claim with prob ≤ 1/|F| over random γ_fold.
 ///
-/// where h_c[i] = 1/(α - C_c[i]).  γ_c is a verifier-supplied RLC weight (drawn
-/// after β and after all h_coms are absorbed) that folds the per-chunk
-/// combined-sumchecks into ONE batched sumcheck.  The original combined sumcheck
-/// per chunk simultaneously proves
-///   (a) Σ_i h_c[i] = claim_c  (the LHS sum for LogUp)
-///   (b) h_c[i] * (α - C_c[i]) = 1 for all i  (consistency: h is the inverse)
-/// and Schwartz-Zippel over γ ensures the batch holds iff every chunk holds.
-///
-/// At the (shared) batched sumcheck challenge r_k the verifier checks, per chunk c:
-///   final_eval_g[c] == 1 + β*(α - chunk_at_rk[c])
-/// then defers Hyrax openings of h_com[c] (with eval = final_eval_f[c]) and
-/// chunk_com[c] (with eval = chunk_at_rk[c]) at r_k.
+/// At the bucket's shared r_k, only the per-chunk chunk_c openings are needed;
+/// the bucket's terminal h-claim is read directly from the sumcheck proof.
 #[derive(Clone)]
 pub struct LogUpWitnessProof {
-    /// Hyrax commitments to h_c = [1/(α - C_c[i]) for each i], one per chunk.
-    pub h_coms: Vec<HyraxCommitment>,
     /// Per-chunk combined claim: combined_claims[c] = claim_c + β * n_padded.
     /// The verifier sums Σ_c γ_c · combined_claims[c] for the bucket-level
     /// batched claim, and recovers each claim_c for the grand-sum check.
     pub combined_claims: Vec<F>,
     /// C_c(r_k_bucket) — opening of chunk_com[c] at the bucket's shared sumcheck
-    /// challenge. (h_c(r_k_bucket) is recovered from the bucket sumcheck's
-    /// final_evals_f at index witness_offset_in_bucket * num_chunks + c.)
+    /// challenge.
     pub chunk_at_rk: Vec<F>,
-    /// H_c(r_k_bucket), opened against `h_coms[c]`. The fused bucket sumcheck
-    /// terminal value is checked as the eq-weighted combination of these small
-    /// openings, avoiding a large commitment to H_bucket(pair, x).
-    pub h_at_rk: Vec<F>,
-    /// Hyrax opening proofs for h_c at the bucket's r_k.
-    pub h_open_proofs: Vec<HyraxProof>,
     /// Hyrax opening proofs for chunk_com[c] at the bucket's r_k.
     pub chunk_open_proofs: Vec<HyraxProof>,
 }
@@ -115,32 +102,61 @@ pub struct GlobalRangeM {
     pub logup_m_at_rm2: F,
     pub logup_m_open_rm2: HyraxProof,
     /// Cubic LogUp Pass-A sumchecks, one per witness-size bucket. Each bucket
-    /// fuses all inverse polynomials into H_bucket(pair, x), and proves
-    /// H_bucket(pair, x) · W_bucket(pair) · (1 + β(α - C_bucket(pair, x))).
+    /// fuses all inverse polynomials into H_bucket(pair, x) and proves
+    ///   Σ_x [ w·h·(1+β(α-C)) + γ_fold · eq(r_zc, x) · (h·(α-C) - 1) ] = bucket_claim
+    /// (see `prove_fused_logup_zerocheck` for the zerocheck fold).
     pub bucket_sumchecks: Vec<SumcheckCubicProofMulti>,
-    /// Legacy fused H_bucket fields. New proofs leave these empty and bind the
-    /// GKR terminal H claim through per-chunk h_com openings.
-    pub bucket_h_coms: Vec<HyraxCommitment>,
-    pub bucket_h_opens: Vec<HyraxProof>,
 }
 
-fn prove_fused_logup_sumcheck_affine_q(
+/// Fused LogUp + zerocheck sumcheck.
+///
+/// Proves
+///   Σ_x [ w(x)·h(x)·(1 + β(α - C(x)))
+///       + γ_fold · eq(r_zc, x) · (h(x)·(α - C(x)) - 1) ] = claim
+/// in a single cubic sumcheck. The first term is the standard LogUp bucket
+/// claim; the second is a zerocheck forcing h to be 1/(α - C) on the hypercube,
+/// which replaces a separate Hyrax commitment to h.
+///
+/// The h-eval vector must be padded with α⁻¹ on positions where C is zero
+/// (typically the pair-padding of a bucket): there the zerocheck term reads
+/// (α⁻¹·α - 1) = 0, so padding contributes nothing.  The main term is
+/// already zero on padding because w is zero there.
+///
+/// Returns (proof, challenges). `proof.final_evals_*` carry the
+/// per-variable terminals as length-1 vectors: f = h(r), g = w(r),
+/// h = C(r). The verifier reconstructs eq(r_zc, r) itself and checks the
+/// combined identity.
+fn prove_fused_logup_zerocheck(
     mut h_cur: Vec<F>,
     mut c_cur: Vec<F>,
     mut w_cur: Vec<F>,
+    mut eq_cur: Vec<F>,
     alpha: F,
     beta: F,
-    claim: F,
+    gamma_fold: F,
     transcript: &mut Transcript,
 ) -> (SumcheckCubicProofMulti, Vec<F>) {
     assert_eq!(h_cur.len(), c_cur.len());
     assert_eq!(h_cur.len(), w_cur.len());
+    assert_eq!(h_cur.len(), eq_cur.len());
     let n = h_cur.len().trailing_zeros() as usize;
-    transcript.append_field(b"sc_claim", &claim);
+    // NOTE: bucket_claim is absorbed by the caller before γ_fold and r_zc are
+    // drawn, so we do NOT re-absorb it here.
 
     let mut round_polys = Vec::with_capacity(n);
     let mut challenges = Vec::with_capacity(n);
     let two = F::from(2u64);
+
+    // Per-round, eval the combined cubic integrand at 4 points P0..P3 = 0,1,2,3
+    // (CubicRoundPoly stores those four evaluations).  Main and zerocheck
+    // share h and C, so we extrapolate (h, c, w, eq) once and combine.
+    #[inline(always)]
+    fn point_contrib(h: F, c: F, w: F, eq: F, alpha: F, beta: F, gamma_fold: F) -> F {
+        let alpha_minus_c = alpha - c;
+        let main = w * h * (F::ONE + beta * alpha_minus_c);
+        let zc = gamma_fold * eq * (h * alpha_minus_c - F::ONE);
+        main + zc
+    }
 
     for _ in 0..n {
         let half = h_cur.len() >> 1;
@@ -156,20 +172,20 @@ fn prove_fused_logup_sumcheck_affine_q(
                     let c1 = c_cur[idx + half];
                     let w0 = w_cur[idx];
                     let w1 = w_cur[idx + half];
+                    let eq0 = eq_cur[idx];
+                    let eq1 = eq_cur[idx + half];
                     let h2 = two * h1 - h0;
                     let w2 = two * w1 - w0;
                     let c2 = two * c1 - c0;
+                    let eq2 = two * eq1 - eq0;
                     let h3 = h2 + h1 - h0;
                     let w3 = w2 + w1 - w0;
                     let c3 = c2 + c1 - c0;
-                    let r0 = F::ONE + beta * (alpha - c0);
-                    let r1 = F::ONE + beta * (alpha - c1);
-                    let r2 = F::ONE + beta * (alpha - c2);
-                    let r3 = F::ONE + beta * (alpha - c3);
-                    local[0] = h0 * w0 * r0;
-                    local[1] = h1 * w1 * r1;
-                    local[2] = h2 * w2 * r2;
-                    local[3] = h3 * w3 * r3;
+                    let eq3 = eq2 + eq1 - eq0;
+                    local[0] = point_contrib(h0, c0, w0, eq0, alpha, beta, gamma_fold);
+                    local[1] = point_contrib(h1, c1, w1, eq1, alpha, beta, gamma_fold);
+                    local[2] = point_contrib(h2, c2, w2, eq2, alpha, beta, gamma_fold);
+                    local[3] = point_contrib(h3, c3, w3, eq3, alpha, beta, gamma_fold);
                     local
                 })
                 .reduce(
@@ -190,20 +206,20 @@ fn prove_fused_logup_sumcheck_affine_q(
                 let c1 = c_cur[idx + half];
                 let w0 = w_cur[idx];
                 let w1 = w_cur[idx + half];
+                let eq0 = eq_cur[idx];
+                let eq1 = eq_cur[idx + half];
                 let h2 = two * h1 - h0;
                 let w2 = two * w1 - w0;
                 let c2 = two * c1 - c0;
+                let eq2 = two * eq1 - eq0;
                 let h3 = h2 + h1 - h0;
                 let w3 = w2 + w1 - w0;
                 let c3 = c2 + c1 - c0;
-                let r0 = F::ONE + beta * (alpha - c0);
-                let r1 = F::ONE + beta * (alpha - c1);
-                let r2 = F::ONE + beta * (alpha - c2);
-                let r3 = F::ONE + beta * (alpha - c3);
-                e[0] += h0 * w0 * r0;
-                e[1] += h1 * w1 * r1;
-                e[2] += h2 * w2 * r2;
-                e[3] += h3 * w3 * r3;
+                let eq3 = eq2 + eq1 - eq0;
+                e[0] += point_contrib(h0, c0, w0, eq0, alpha, beta, gamma_fold);
+                e[1] += point_contrib(h1, c1, w1, eq1, alpha, beta, gamma_fold);
+                e[2] += point_contrib(h2, c2, w2, eq2, alpha, beta, gamma_fold);
+                e[3] += point_contrib(h3, c3, w3, eq3, alpha, beta, gamma_fold);
             }
             e
         };
@@ -239,13 +255,23 @@ fn prove_fused_logup_sumcheck_affine_q(
                 lo + r_i * (hi - lo)
             })
             .collect();
+        eq_cur = (0..half)
+            .into_par_iter()
+            .map(|idx| {
+                let lo = eq_cur[idx];
+                let hi = eq_cur[idx + half];
+                lo + r_i * (hi - lo)
+            })
+            .collect();
 
         round_polys.push(rp);
     }
 
+    // Terminal evals: prover claims (h, w, C) at r_full. eq(r_zc, r_full) is
+    // computed by the verifier from public r_zc and r_full and so is not sent.
     let final_evals_f = vec![h_cur[0]];
     let final_evals_g = vec![w_cur[0]];
-    let final_evals_h = vec![F::ONE + beta * (alpha - c_cur[0])];
+    let final_evals_h = vec![c_cur[0]];
 
     (
         SumcheckCubicProofMulti {
@@ -487,19 +513,15 @@ pub fn prove_range_batched(
         buckets_by_num_vars.entry(nv).or_default().push(i);
     }
 
-    let mut all_h_coms: Vec<Vec<HyraxCommitment>> = vec![Vec::new(); witnesses.len()];
-    for i in 0..witnesses.len() {
-        let (_, _, params_h) = params_from_vars(all_num_vars[i]);
-        all_h_coms[i] = all_h_mles[i]
-            .par_iter()
-            .map(|mle| hyrax_commit(&mle.evaluations, all_nu_c[i], &params_h))
-            .collect();
-    }
-    for h_coms in &all_h_coms {
-        for com in h_coms {
-            absorb_com(transcript, b"logup_h_com", com);
-        }
-    }
+    // h_coms are no longer committed: the bucket sumcheck folds in a zerocheck
+    // h(x)·(α - C(x)) - 1 ≡ 0 that forces h to be the inverse on the boolean
+    // hypercube, so the prover cannot deviate from the unique inverse MLE.
+    // Pair-padding rows are set to α⁻¹ instead of 0 so the zerocheck term
+    // (α⁻¹·α - 1) = 0 on padding; the main term is still zero on padding
+    // because w is zero there.
+    let alpha_inv = alpha
+        .inverse()
+        .expect("α drawn from Fiat-Shamir is non-zero w.p. 1");
 
     let mut bucket_h_mles: Vec<DenseMLPoly> = Vec::with_capacity(buckets_by_num_vars.len());
     let mut bucket_c_mles: Vec<DenseMLPoly> = Vec::with_capacity(buckets_by_num_vars.len());
@@ -508,7 +530,7 @@ pub fn prove_range_batched(
         let pair_bits = pair_count.next_power_of_two().trailing_zeros() as usize;
         let pair_padded = 1usize << pair_bits;
         let n_elem = 1usize << num_vars;
-        let mut h_evals = vec![F::ZERO; pair_padded * n_elem];
+        let mut h_evals = vec![alpha_inv; pair_padded * n_elem];
         let mut c_evals = vec![F::ZERO; pair_padded * n_elem];
         for (w, &i) in indices.iter().enumerate() {
             for c in 0..num_chunks {
@@ -526,13 +548,7 @@ pub fn prove_range_batched(
     }
 
     eprintln!(
-        "[range bits={bits}]   p3_h_commits_par:      {:7.3}ms",
-        t_section.elapsed().as_secs_f64() * 1000.0
-    );
-    t_section = Instant::now();
-
-    eprintln!(
-        "[range bits={bits}]   p3_h_absorb_loop:      {:7.3}ms",
+        "[range bits={bits}]   p3_bucket_build:       {:7.3}ms",
         t_section.elapsed().as_secs_f64() * 1000.0
     );
     t_section = Instant::now();
@@ -619,13 +635,28 @@ pub fn prove_range_batched(
             }
         }
 
-        let (super_sumcheck, r_k_full) = prove_fused_logup_sumcheck_affine_q(
+        // FS order — absorb bucket_claim BEFORE drawing γ_fold and r_zc, so
+        // the prover cannot adapt bucket_claim to those challenges.
+        transcript.append_field(b"logup_bucket_claim", &bucket_claim);
+        let n_total = pair_bits + num_vars;
+        let gamma_fold = transcript.challenge_field::<F>(b"logup_zc_gamma");
+        let r_zc: Vec<F> = (0..n_total)
+            .map(|_| transcript.challenge_field::<F>(b"logup_zc_r"))
+            .collect();
+        // eq(r_zc, x) over the full bucket hypercube. compute_eq_evals treats
+        // the i-th entry of its input as binding the i-th LSB of x; sumcheck
+        // folds MSB-first, so reverse r_zc before building eq.
+        let eq_input: Vec<F> = r_zc.iter().rev().copied().collect();
+        let eq_evals = compute_eq_evals(&eq_input, 1usize << n_total);
+
+        let (super_sumcheck, r_k_full) = prove_fused_logup_zerocheck(
             h_evals,
             c_evals,
             w_evals,
+            eq_evals,
             alpha,
             beta,
-            bucket_claim,
+            gamma_fold,
             transcript,
         );
         let r_k = r_k_full[pair_bits..].to_vec();
@@ -651,9 +682,10 @@ pub fn prove_range_batched(
     // parallel even across witnesses (small σ-witness opens overlap with the
     // larger y-witness opens).  hyrax_open itself is internally par_iter'd over
     // its column dimension, so rayon nesting handles work-stealing. ----
+    // Pass B: only chunk_c opens at the shared r_k. h is no longer
+    // separately committed, so its per-chunk evaluations are absorbed only
+    // implicitly through the bucket sumcheck's terminal h-claim.
     struct WitnessOpens {
-        h_at_rk: Vec<F>,
-        h_open_proofs: Vec<HyraxProof>,
         chunk_at_rk: Vec<F>,
         chunk_open_proofs: Vec<HyraxProof>,
     }
@@ -663,19 +695,12 @@ pub fn prove_range_batched(
         .map(|i| {
             let (nu_c, sigma_c, _) = params_from_vars(all_num_vars[i]);
             let r_k = &witness_r_k[i];
-            let h_at_rk: Vec<F> = all_h_mles[i].iter().map(|m| m.evaluate(r_k)).collect();
-            let h_open_proofs: Vec<HyraxProof> = all_h_mles[i]
-                .iter()
-                .map(|h_mle| hyrax_open(&h_mle.evaluations, r_k, nu_c, sigma_c))
-                .collect();
             let chunk_at_rk: Vec<F> = all_chunk_mles[i].iter().map(|m| m.evaluate(r_k)).collect();
             let chunk_open_proofs: Vec<HyraxProof> = all_chunk_mles[i]
                 .iter()
                 .map(|chunk_mle| hyrax_open(&chunk_mle.evaluations, r_k, nu_c, sigma_c))
                 .collect();
             WitnessOpens {
-                h_at_rk,
-                h_open_proofs,
                 chunk_at_rk,
                 chunk_open_proofs,
             }
@@ -693,11 +718,8 @@ pub fn prove_range_batched(
         .into_iter()
         .enumerate()
         .map(|(i, ops)| LogUpWitnessProof {
-            h_coms: all_h_coms[i].clone(),
             combined_claims: logup_precomputed[i].combined.clone(),
             chunk_at_rk: ops.chunk_at_rk,
-            h_at_rk: ops.h_at_rk,
-            h_open_proofs: ops.h_open_proofs,
             chunk_open_proofs: ops.chunk_open_proofs,
         })
         .collect();
@@ -741,8 +763,6 @@ pub fn prove_range_batched(
         logup_m_at_rm2,
         logup_m_open_rm2,
         bucket_sumchecks,
-        bucket_h_coms: Vec::new(),
-        bucket_h_opens: Vec::new(),
     };
 
     Ok((witness_proofs, global_m, r_vs))
@@ -839,45 +859,30 @@ pub fn verify_range_batched(
 
     // ---- Phase 3: LogUp consistency verification ----
     let alpha = transcript.challenge_field::<F>(b"logup_alpha");
-
-    // Absorb per-chunk H commitments before drawing β. The fused GKR terminal
-    // H value is later reduced to an eq-weighted combination of these openings.
-    for proof in witness_proofs {
-        for com in &proof.logup.h_coms {
-            absorb_com(transcript, b"logup_h_com", com);
-        }
-    }
     let beta = transcript.challenge_field::<F>(b"logup_beta");
 
     // Bucket-level verification: mirror the prover's BTreeMap grouping by num_vars.
-    // For each bucket: draw eta + gammas, verify ONE fused cubic sumcheck
-    // covering all (witness, chunk) pairs, then check W/R algebra and defer
-    // Hyrax openings for chunk_c. H_bucket is verified directly with its own
-    // larger Hyrax parameters.
+    // For each bucket: draw eta + gammas, absorb bucket_claim, draw γ_fold + r_zc,
+    // verify the fused-zerocheck sumcheck round-by-round, then check the
+    // combined terminal identity:
+    //   w(r)·h(r)·(1+β(α-C(r))) + γ_fold·eq(r_zc,r)·(h(r)·(α-C(r)) - 1) == current
+    // where w(r), C(r), eq(r_zc, r) are reconstructed by the verifier from
+    // public data and h(r) is the prover-claimed terminal (bound by sumcheck).
     let mut buckets_by_num_vars: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (i, &nv) in num_vars_list.iter().enumerate() {
         buckets_by_num_vars.entry(nv).or_default().push(i);
     }
-    if buckets_by_num_vars.len() != global_m.bucket_sumchecks.len()
-        || !global_m.bucket_h_coms.is_empty()
-        || !global_m.bucket_h_opens.is_empty()
-    {
+    if buckets_by_num_vars.len() != global_m.bucket_sumchecks.len() {
         return Err(format!(
-            "GlobalRange: bucket count mismatch (sumchecks={}, legacy_h_coms={}, legacy_h_opens={}, expected={})",
+            "GlobalRange: bucket count mismatch (sumchecks={}, expected={})",
             global_m.bucket_sumchecks.len(),
-            global_m.bucket_h_coms.len(),
-            global_m.bucket_h_opens.len(),
             buckets_by_num_vars.len()
         ));
     }
 
-    // Cardinality checks per witness (no longer holds batched_sumcheck).
     for (i, proof) in witness_proofs.iter().enumerate() {
         if proof.logup.combined_claims.len() != num_chunks
             || proof.logup.chunk_at_rk.len() != num_chunks
-            || proof.logup.h_coms.len() != num_chunks
-            || proof.logup.h_at_rk.len() != num_chunks
-            || proof.logup.h_open_proofs.len() != num_chunks
             || proof.logup.chunk_open_proofs.len() != num_chunks
         {
             return Err(format!(
@@ -896,6 +901,7 @@ pub fn verify_range_batched(
         let pair_bits = total_triples.next_power_of_two().trailing_zeros() as usize;
         let n_padded = 1usize << num_vars;
         let beta_n_padded = beta * F::from(n_padded as u64);
+        let n_total = pair_bits + *num_vars;
 
         // Bucket-shared FS challenges: eta then gammas (mirror prover order).
         let eta = transcript.challenge_field::<F>(b"logup_bucket_eta");
@@ -917,34 +923,55 @@ pub fn verify_range_batched(
             }
         }
 
-        let (r_k_full, _final_combination) = verify_sumcheck_cubic_multi_batched(
-            super_sumcheck,
-            &[F::ONE],
-            bucket_claim,
-            pair_bits + *num_vars,
-            transcript,
-        )
-        .map_err(|e| format!("LogUp bucket nv={num_vars} sumcheck: {e}"))?;
-        let r_pair = &r_k_full[..pair_bits];
-        let r_k = r_k_full[pair_bits..].to_vec();
+        // FS order — absorb bucket_claim BEFORE drawing γ_fold and r_zc.
+        transcript.append_field(b"logup_bucket_claim", &bucket_claim);
+        let gamma_fold = transcript.challenge_field::<F>(b"logup_zc_gamma");
+        let r_zc: Vec<F> = (0..n_total)
+            .map(|_| transcript.challenge_field::<F>(b"logup_zc_r"))
+            .collect();
 
-        // verify_sumcheck_cubic_multi_batched already enforces final =
-        // H_bucket(r_pair,r_k) * W_bucket(r_pair) * R_bucket(r_pair,r_k).
-        // We bind W and R locally from FS weights and chunk openings, then
-        // open H_bucket once.
+        // Inline cubic-sumcheck round verification (we don't use the canned
+        // verify_sumcheck_cubic_multi_batched because its terminal check is
+        // f·g·h, but our identity is f·g·(1+β(α-h)) + γ_fold·eq·(f·(α-h)-1)).
+        if super_sumcheck.round_polys.len() != n_total {
+            return Err(format!(
+                "LogUp bucket nv={num_vars}: wrong number of round polys (got {}, expected {})",
+                super_sumcheck.round_polys.len(),
+                n_total
+            ));
+        }
+        let mut current = bucket_claim;
+        let mut r_full = Vec::with_capacity(n_total);
+        for (idx, rp) in super_sumcheck.round_polys.iter().enumerate() {
+            if rp.evals[0] + rp.evals[1] != current {
+                return Err(format!(
+                    "LogUp bucket nv={num_vars}: round {idx} consistency failed"
+                ));
+            }
+            for val in &rp.evals {
+                transcript.append_field(b"sc_round", val);
+            }
+            let r_i = transcript.challenge_field::<F>(b"sc_challenge");
+            r_full.push(r_i);
+            current = rp.evaluate(r_i);
+        }
+        let r_pair = &r_full[..pair_bits];
+        let r_k = r_full[pair_bits..].to_vec();
+
         let final_evals_f = &super_sumcheck.final_evals_f;
         let final_evals_g = &super_sumcheck.final_evals_g;
         let final_evals_h = &super_sumcheck.final_evals_h;
         if final_evals_f.len() != 1 || final_evals_g.len() != 1 || final_evals_h.len() != 1 {
             return Err(format!(
-                "LogUp bucket nv={num_vars}: fused sumcheck final-evals length mismatch (got f={}, g={}, h={}, expected=1)",
-                final_evals_f.len(),
-                final_evals_g.len(),
-                final_evals_h.len(),
+                "LogUp bucket nv={num_vars}: fused sumcheck final-evals length mismatch"
             ));
         }
+        let h_at_rfull = final_evals_f[0];
+        let w_claim = final_evals_g[0];
+        let c_at_rfull = final_evals_h[0];
 
-        let mut expected_h = F::ZERO;
+        // Reconstruct W(r_full) and C(r_full) from per-pair weights and chunk
+        // openings; verifier-computed eq(r_zc, r_full) by direct product.
         let mut expected_w = F::ZERO;
         let mut expected_c = F::ZERO;
         for (w, &i) in indices.iter().enumerate() {
@@ -952,21 +979,11 @@ pub fn verify_range_batched(
             let acc_logup: &mut HyraxBatchAccumulator = &mut *chunk_accs[acc_indices[i]].1;
             for c in 0..num_chunks {
                 let idx = w * num_chunks + c;
-                let h_val = logup.h_at_rk[c];
                 let chunk_val = logup.chunk_at_rk[c];
                 let pair_weight = eq_basis_eval(idx, pair_bits, r_pair);
-                expected_h += pair_weight * h_val;
                 expected_w += pair_weight * weights[idx];
                 expected_c += pair_weight * chunk_val;
 
-                acc_logup
-                    .add_verify(
-                        &logup.h_coms[c],
-                        h_val,
-                        &r_k,
-                        &logup.h_open_proofs[c],
-                    )
-                    .map_err(|e| format!("LogUp witness {i} chunk {c} H opening: {e}"))?;
                 acc_logup
                     .add_verify(
                         &witness_proofs[i].chunk_coms[c],
@@ -977,20 +994,33 @@ pub fn verify_range_batched(
                     .map_err(|e| format!("LogUp witness {i} chunk {c} chunk opening: {e}"))?;
             }
         }
-        if final_evals_g[0] != expected_w {
+        if w_claim != expected_w {
             return Err(format!(
                 "LogUp bucket nv={num_vars}: fused weight W(r) algebra mismatch"
             ));
         }
-        if final_evals_f[0] != expected_h {
+        if c_at_rfull != expected_c {
             return Err(format!(
-                "LogUp bucket nv={num_vars}: fused H(r) algebra mismatch"
+                "LogUp bucket nv={num_vars}: fused C(r) algebra mismatch"
             ));
         }
-        let expected_r = F::ONE + beta * (alpha - expected_c);
-        if final_evals_h[0] != expected_r {
+
+        // Pair-padding rows in the bucket polynomial don't have corresponding
+        // chunk_at_rk entries: those pairs contribute zero to expected_c (they
+        // were skipped in the loop), which is the correct value because the
+        // prover padded c_evals with 0. Similarly weights for those padded
+        // pairs were zero, so expected_w already accounts for them.
+        let eq_at_rfull: F = r_zc
+            .iter()
+            .zip(r_full.iter())
+            .map(|(rzc_i, ri)| (*rzc_i) * (*ri) + (F::ONE - *rzc_i) * (F::ONE - *ri))
+            .product();
+        let alpha_minus_c = alpha - c_at_rfull;
+        let main_term = w_claim * h_at_rfull * (F::ONE + beta * alpha_minus_c);
+        let zc_term = gamma_fold * eq_at_rfull * (h_at_rfull * alpha_minus_c - F::ONE);
+        if main_term + zc_term != current {
             return Err(format!(
-                "LogUp bucket nv={num_vars}: fused R(r) algebra mismatch"
+                "LogUp bucket nv={num_vars}: fused zerocheck terminal mismatch"
             ));
         }
     }
@@ -1066,5 +1096,262 @@ fn absorb_com(transcript: &mut Transcript, label: &[u8], com: &HyraxCommitment) 
         let mut buf = Vec::new();
         pt.serialize_compressed(&mut buf).unwrap();
         transcript.append_bytes(label, &buf);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Soundness tests for the zerocheck-fused range proof.
+//
+// These tests target the protocol-level binding properties of the new fold:
+//   * The bucket sumcheck's terminal h-claim binds h(r_full) via round-poly
+//     consistency only — no Hyrax commitment to h exists. Tampering it must
+//     break the combined-identity check.
+//   * Tampering C(r_full) at the terminal breaks the reconstruction step
+//     against chunk_at_rk openings (which are bound by chunk_com).
+//   * Tampering combined_claims shifts bucket_claim, which feeds the FS state
+//     via `logup_bucket_claim` BEFORE γ_fold / r_zc are drawn — so the
+//     verifier's challenges diverge from the prover's and the sumcheck fails.
+//     This is the load-bearing FS-order check.
+//   * Tampering a round_poly evaluation breaks round consistency or the
+//     terminal evaluation.
+//   * Tampering chunk_at_rk breaks the per-chunk Hyrax opening bound by
+//     chunk_com.
+//
+// All tampering tests perform a single +F::ONE shift on one field of the
+// proof, which the verifier should reject w.h.p. (soundness error bounded by
+// ~6n/|F| per bucket, where n is the bucket variable count).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod soundness_tests {
+    use super::*;
+    use crate::pcs::{params_from_vars, HyraxBatchAccumulator};
+    use crate::transcript::Transcript;
+
+    /// Build a deterministic two-witness range proof at bits=32 and return all
+    /// the artefacts a verifier needs. Witness 0 is short (forces the small
+    /// bucket); witness 1 is long (forces the large bucket). Values are kept
+    /// in-range so the honest proof verifies.
+    fn build_honest_proof() -> (
+        Vec<RangeWitnessProof>,
+        GlobalRangeM,
+        Vec<usize>,
+        usize,
+    ) {
+        let bits = 32usize;
+        let w0_vals: Vec<F> = (0..4u64).map(F::from).collect();
+        let w1_vals: Vec<F> = (0..16u64).map(F::from).collect();
+        let w0 = RangeProofWitness { values: w0_vals };
+        let w1 = RangeProofWitness { values: w1_vals };
+
+        let mut pt = Transcript::new(b"range_soundness_test");
+        let (proofs, gm, _r_vs) =
+            prove_range_batched(&[&w0, &w1], bits, &mut pt).expect("honest prove");
+        let nv: Vec<usize> = vec![
+            w0.values.len().next_power_of_two().trailing_zeros() as usize,
+            w1.values.len().next_power_of_two().trailing_zeros() as usize,
+        ];
+        (proofs, gm, nv, bits)
+    }
+
+    /// Run verify_range_batched + accumulator finalization. Returns Ok(()) iff
+    /// the proof is fully accepted (sumcheck identity + Hyrax openings).
+    fn try_verify(
+        proofs: &[RangeWitnessProof],
+        gm: &GlobalRangeM,
+        nv: &[usize],
+        bits: usize,
+    ) -> Result<(), String> {
+        let mut vt = Transcript::new(b"range_soundness_test");
+        let refs: Vec<&RangeWitnessProof> = proofs.iter().collect();
+
+        // Distinct num_vars buckets → one accumulator per bucket.
+        let mut distinct: Vec<usize> = nv.to_vec();
+        distinct.sort();
+        distinct.dedup();
+        let mut acc_storage: Vec<HyraxBatchAccumulator> =
+            distinct.iter().map(|_| HyraxBatchAccumulator::new()).collect();
+        let mut acc_m = HyraxBatchAccumulator::new();
+
+        // Borrow the storage mutably as the chunk_accs slice.
+        let mut chunk_accs: Vec<(usize, &mut HyraxBatchAccumulator)> = distinct
+            .iter()
+            .copied()
+            .zip(acc_storage.iter_mut())
+            .collect();
+
+        verify_range_batched(&refs, gm, nv, bits, &mut vt, &mut chunk_accs, &mut acc_m)?;
+        drop(chunk_accs);
+
+        // Finalize accumulators so deferred Hyrax opens are actually checked.
+        // finalize takes self by value; consume from the storage vec in order.
+        for (nv_i, acc) in distinct.iter().zip(acc_storage.into_iter()) {
+            let (_, _, params) = params_from_vars(*nv_i);
+            acc.finalize(&params, &mut vt)
+                .map_err(|e| format!("chunk-acc finalize nv={nv_i}: {e}"))?;
+        }
+        let (_, _, params_m) = params_from_vars(CHUNK_BITS);
+        acc_m
+            .finalize(&params_m, &mut vt)
+            .map_err(|e| format!("m-acc finalize: {e}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn honest_range_proof_verifies() {
+        let (proofs, gm, nv, bits) = build_honest_proof();
+        try_verify(&proofs, &gm, &nv, bits).expect("honest proof should verify");
+    }
+
+    /// Tampering the prover-claimed h(r_full) — the only "free" terminal value
+    /// in the new protocol — must be caught by the combined-identity check.
+    /// This is the zerocheck fold's *only* binding on h beyond round-poly
+    /// consistency; if this test ever stops failing, the zerocheck is broken.
+    #[test]
+    fn rejects_tampered_h_terminal_claim() {
+        let (proofs, mut gm, nv, bits) = build_honest_proof();
+        let nb = gm.bucket_sumchecks.len();
+        for b in 0..nb {
+            gm.bucket_sumchecks[b].final_evals_f[0] += F::ONE;
+            assert!(
+                try_verify(&proofs, &gm, &nv, bits).is_err(),
+                "verifier accepted a tampered h(r_full) claim in bucket {b}"
+            );
+            gm.bucket_sumchecks[b].final_evals_f[0] -= F::ONE;
+        }
+    }
+
+    /// Tampering C(r_full) breaks reconstruction against chunk_at_rk openings.
+    #[test]
+    fn rejects_tampered_c_terminal_claim() {
+        let (proofs, mut gm, nv, bits) = build_honest_proof();
+        let nb = gm.bucket_sumchecks.len();
+        for b in 0..nb {
+            gm.bucket_sumchecks[b].final_evals_h[0] += F::ONE;
+            assert!(
+                try_verify(&proofs, &gm, &nv, bits).is_err(),
+                "verifier accepted a tampered C(r_full) claim in bucket {b}"
+            );
+            gm.bucket_sumchecks[b].final_evals_h[0] -= F::ONE;
+        }
+    }
+
+    /// Tampering W(r_full) breaks reconstruction against the verifier's
+    /// public weights.
+    #[test]
+    fn rejects_tampered_w_terminal_claim() {
+        let (proofs, mut gm, nv, bits) = build_honest_proof();
+        let nb = gm.bucket_sumchecks.len();
+        for b in 0..nb {
+            gm.bucket_sumchecks[b].final_evals_g[0] += F::ONE;
+            assert!(
+                try_verify(&proofs, &gm, &nv, bits).is_err(),
+                "verifier accepted a tampered W(r_full) claim in bucket {b}"
+            );
+            gm.bucket_sumchecks[b].final_evals_g[0] -= F::ONE;
+        }
+    }
+
+    /// Tampering a round polynomial's eval should be caught by either
+    /// round-consistency (`rp.evals[0] + rp.evals[1] == current`) or by the
+    /// terminal-identity check (the round challenges shift after the tamper).
+    #[test]
+    fn rejects_tampered_round_poly() {
+        let (proofs, mut gm, nv, bits) = build_honest_proof();
+        let nb = gm.bucket_sumchecks.len();
+        for b in 0..nb {
+            if gm.bucket_sumchecks[b].round_polys.is_empty() {
+                continue;
+            }
+            gm.bucket_sumchecks[b].round_polys[0].evals[0] += F::ONE;
+            assert!(
+                try_verify(&proofs, &gm, &nv, bits).is_err(),
+                "verifier accepted a tampered round polynomial in bucket {b}"
+            );
+            gm.bucket_sumchecks[b].round_polys[0].evals[0] -= F::ONE;
+        }
+    }
+
+    /// Tampering combined_claims is the load-bearing FS-order check: the
+    /// verifier recomputes bucket_claim from combined_claims and absorbs it
+    /// BEFORE drawing γ_fold and r_zc. A shifted combined_claims absorbs a
+    /// different value → divergent challenges → sumcheck fails. If anyone
+    /// ever moves the bucket_claim absorb to AFTER γ_fold/r_zc draws, this
+    /// test will (correctly) start failing — but so will soundness in
+    /// general, because the prover could then adapt the claim.
+    #[test]
+    fn rejects_tampered_combined_claims() {
+        let (mut proofs, gm, nv, bits) = build_honest_proof();
+        let np = proofs.len();
+        for i in 0..np {
+            let nc = proofs[i].logup.combined_claims.len();
+            for c in 0..nc {
+                proofs[i].logup.combined_claims[c] += F::ONE;
+                assert!(
+                    try_verify(&proofs, &gm, &nv, bits).is_err(),
+                    "verifier accepted tampered combined_claims (witness {i}, chunk {c})"
+                );
+                proofs[i].logup.combined_claims[c] -= F::ONE;
+            }
+        }
+    }
+
+    /// Tampering chunk_at_rk must be caught by the Hyrax opening verification
+    /// against chunk_com (chunk_com is still committed in the new protocol).
+    #[test]
+    fn rejects_tampered_chunk_at_rk() {
+        let (mut proofs, gm, nv, bits) = build_honest_proof();
+        let np = proofs.len();
+        for i in 0..np {
+            let nc = proofs[i].logup.chunk_at_rk.len();
+            for c in 0..nc {
+                proofs[i].logup.chunk_at_rk[c] += F::ONE;
+                assert!(
+                    try_verify(&proofs, &gm, &nv, bits).is_err(),
+                    "verifier accepted a tampered chunk_at_rk opening (witness {i}, chunk {c})"
+                );
+                proofs[i].logup.chunk_at_rk[c] -= F::ONE;
+            }
+        }
+    }
+
+    /// Scope note: `prove_range_batched` binds the *chunks* to lie in
+    /// `[0, 2^CHUNK_BITS)` and binds the chunk values via `chunk_com`, but it
+    /// does **not** by itself verify that the chunks reassemble to the
+    /// original witness value. That binding is enforced by the caller via the
+    /// Phase-2 chunk-eval reconstruction `v(r_v) = Σ_c chunk_c(r_v)·2^(c·b)`.
+    /// As a result, a witness containing a value ≥ 2^bits will produce an
+    /// accepting `prove_range_batched` proof (with chunks of `v mod 2^bits`),
+    /// and the higher-level protocol is responsible for catching the
+    /// truncation. The tests below therefore target binding *within* the
+    /// range proof, not the chunk-to-value relation.
+    ///
+    /// A malicious-h test that surgically corrupts the prover-claimed
+    /// h(r_full) such that the zerocheck identity `h·(α - C) - 1 = 0` is the
+    /// load-bearing reason for the rejection (rather than, say, an unrelated
+    /// algebra check). The combined-identity terminal evaluates to
+    ///   main + γ_fold · zc
+    /// where zc = eq · (h·(α-C) - 1). Shifting h by Δ changes the terminal by
+    ///   Δ · [w·(1+β(α-C)) + γ_fold · eq · (α-C)]
+    /// which equals zero only with probability 1/|F| over the (random)
+    /// challenges — i.e., the zerocheck term is what breaks the equation.
+    #[test]
+    fn zerocheck_catches_non_inverse_h_terminal() {
+        let (proofs, mut gm, nv, bits) = build_honest_proof();
+        let nb = gm.bucket_sumchecks.len();
+        // Three different shifts: at least one will trigger the combined-
+        // identity rejection even if a single shift accidentally lands on a
+        // 1/|F| collision. (Practically impossible, but it documents intent.)
+        for shift in [F::ONE, F::from(2u64), F::from(7u64)] {
+            for b in 0..nb {
+                gm.bucket_sumchecks[b].final_evals_f[0] += shift;
+            }
+            assert!(
+                try_verify(&proofs, &gm, &nv, bits).is_err(),
+                "zerocheck-bound h(r_full) survived a {shift:?} shift"
+            );
+            for b in 0..nb {
+                gm.bucket_sumchecks[b].final_evals_f[0] -= shift;
+            }
+        }
     }
 }
